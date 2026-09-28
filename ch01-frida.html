@@ -1,0 +1,1256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 1 章 · Frida 高级逆向 | 安卓高级研修班模拟器</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body data-chapter="1">
+<div class="wrap">
+
+  <div class="chapter-hero">
+    <span class="ch-no">CHAPTER 01</span>
+    <h1>Frida 高级逆向</h1>
+    <p class="lede">
+      这是整门课的地基。你要在这里建立的第一个、也是最重要的分界线是：
+      <strong>Hook Java 层</strong>和 <strong>Hook Native 层</strong>是两条完全不同的技术路径，
+      它们的原理、工具、能解决的问题、以及失败时的排查方向，全都不一样。
+      建立不了这条分界线，后面 17 章你会一直在"为什么我 hook 不到"里打转。
+    </p>
+    <div class="hero-meta">
+      <span>核心问题：<b>怎么让程序按我的意志执行？</b></span>
+      <span>关键工具：<b>Frida / Interceptor / Stalker</b></span>
+      <span>对手：<b>OLLVM 混淆</b></span>
+    </div>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.1</span>先建立直觉：Hook 到底是什么</h2>
+
+  <div class="intuition">
+    <span class="tag">直觉模型 · 电话总机</span>
+    <p>想象你在一家公司里，所有打给"财务部"的电话都要经过<strong>总机</strong>。
+    现在你想知道老板什么时候给财务部打电话、说了什么、财务部回了什么。</p>
+    <p>你有两个办法：</p>
+    <ul>
+      <li><strong>办法 A（改分机号表）</strong>：你在总机的号码簿上把"财务部"改成你自己的分机。
+      电话来了你先接，记录完再转给真财务部。—— 这是 <em>Hook Java 层</em>。</li>
+      <li><strong>办法 B（在电话线上并联一个监听器）</strong>：你不改号码簿，而是在物理线路上接一个设备，
+      任何经过这条线的语音你都听得到。—— 这是 <em>Hook Native 层</em>。</li>
+    </ul>
+    <p>两者都能"截获调用"，但它们的<strong>作用位置</strong>、<strong>能找到的目标</strong>、
+    <strong>被发现的难度</strong>完全不同。这就是为什么你必须先分清它们。</p>
+  </div>
+
+  <h3>那么，Frida 在这张图里扮演什么角色？</h3>
+
+  <p><span class="term" data-def="Frida 是一个跨平台的动态代码插桩（Dynamic Binary Instrumentation, DBI）框架。它把一个 JavaScript 引擎（QuickJS/V8）注入到目标进程里，让你用 JS 写 Hook 逻辑，实时改内存、改函数、调函数。">Frida</span>
+  的角色是：<strong>它同时提供了办法 A 和办法 B 两套 API</strong>，而且都只需要写 JavaScript。</p>
+
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>维度</th><th>Hook Java 层</th><th>Hook Native 层</th></tr></thead>
+      <tbody>
+        <tr><td>Frida API</td><td><code>Java.perform</code> / <code>Java.use</code></td><td><code>Interceptor.attach</code></td></tr>
+        <tr><td>作用对象</td><td>Dex 里的方法（Java/Kotlin 编译产物）</td><td>so 库里的机器码函数</td></tr>
+        <tr><td>依赖什么</td><td>ART 虚拟机的 Java 反射机制</td><td>CPU 层面的指令改写</td></tr>
+        <tr><td>能找到的目标</td><td>只要方法存在，就能被 use 到</td><td>需要拿到函数地址（导出符号 / 基址+偏移）</td></tr>
+        <tr><td>典型失败原因</td><td>类加载器不对、方法被内联、方法被抽走</td><td>地址算错、so 还没加载、函数被混淆改名</td></tr>
+        <tr><td>被检测难度</td><td>较容易（查调用栈、查 Method 结构）</td><td>较难（需要扫内存特征）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note key">
+    <div class="note-h">🔑 记住这条分界线的判断方法</div>
+    <p style="margin-bottom:0">当你 hook 不到一个方法时，先问自己一个问题：
+    <strong>这个方法是写在 Java 代码里的，还是写在 so 里的？</strong><br>
+    如果是 Java 代码 → 用 <code>Java.use</code>，失败就往「类加载器」「方法内联」方向查。<br>
+    如果是 so 里的函数 → 用 <code>Interceptor.attach</code>，失败就往「地址」「so 加载时机」方向查。<br>
+    <em>90% 的新手卡住，是因为拿错了工具去查错了方向。</em></p>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.2</span>Hook Java 层：从一行代码看懂全过程</h2>
+
+  <p>先看一段最经典的 Frida Java Hook 脚本。别急着背，我们把它拆成 5 步逐步执行，
+  你会看到 ART 内部到底发生了什么。</p>
+
+  <div id="stepper-java"></div>
+
+  <h3>三个必须理解的细节</h3>
+
+  <h4>细节 1：为什么必须有 <code>Java.perform</code>？</h4>
+  <p>因为 <span class="term" data-def="ART 是 Android Runtime，Android 5.0 起取代 Dalvik 的虚拟机。它把 dex 字节码编译成机器码执行，同时保留了 Java 的反射能力。">ART</span>
+  虚拟机<strong>不是一开始就准备好的</strong>。App 启动时，VM 还在初始化，类还没加载。
+  如果你在 VM 就绪前调用 <code>Java.use</code>，就会拿到一个空的、不可用的环境。</p>
+  <p><code>Java.perform(fn)</code> 的语义是：<strong>"等 VM 就绪，并且把我这段代码挂到 VM 的线程上执行"</strong>。
+  它保证了两件事：VM 已启动、当前线程已 attach 到 VM。</p>
+  <div class="note warn">
+    <div class="note-h">⚠️ 常见误解</div>
+    <p style="margin-bottom:0">很多人以为 <code>Java.perform</code> 只是"延迟一下"。
+    不是。它是<strong>线程 attach</strong>——Frida 注入的线程默认不是 Java 线程，
+    没有 JNIEnv，根本没法调用 Java API。<code>Java.perform</code> 帮你完成了 attach 和 detach 的配对管理。</p>
+  </div>
+
+  <h4>细节 2：<code>Java.use</code> 拿到的到底是什么？</h4>
+  <p>它返回的是一个<strong>包装器（wrapper）</strong>，不是原始的 Class 对象。这个包装器会拦截你对它的所有调用。</p>
+
+  <div class="grid2">
+    <div class="card tight">
+      <div class="card-title">你想做的事</div>
+      <pre style="margin:0"><code>var C = Java.use('com.a.b.C');
+C.f.overload('java.lang.String')
+   .implementation = function (s) {
+  return this.f(s);
+};</code></pre>
+    </div>
+    <div class="card tight">
+      <div class="card-title">Frida 实际做的事</div>
+      <ol style="margin:0;font-size:13.5px">
+        <li>找到目标 Class 的 <code>jclass</code></li>
+        <li>反射出方法签名 <code>(Ljava/lang/String;)V</code></li>
+        <li>把原方法标记为 <code>native</code></li>
+        <li>把自己的 C 函数注册进去</li>
+        <li>调用时进你的 JS，<code>this.f(s)</code> 再调回原实现</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="note bad">
+    <div class="note-h">🔥 关键结论：为什么 <code>overload</code> 不能省</div>
+    <p style="margin-bottom:0">Java 允许<strong>方法重载</strong>——同一个方法名可以有多个不同参数签名的版本。
+    当你写 <code>C.f</code> 时，ART 不知道你要 hook 哪个。Frida 会直接报错
+    <code>Error: f(): has more than one overload</code>。
+    <code>overload()</code> 就是在告诉 Frida：<strong>我要的是参数类型为 String 的那一个</strong>。</p>
+  </div>
+
+  <h4>细节 3：<code>this.f(s)</code> 为什么不会无限递归？</h4>
+  <p>这是初学者最容易困惑的地方："我把 <code>f</code> 换成了我的函数，然后在里面又调用 <code>this.f</code>，
+  这不就是自己调自己吗？"</p>
+
+  <div id="stage-recurse"></div>
+
+  <p>Frida 在设置 <code>implementation</code> 时，会把<strong>原始方法</strong>保存起来，
+  并让包装器上的 <code>this.f</code> 指向那个原始实现（而不是包装后的）。
+  所以你的调用会落到<strong>真正的 Java 实现</strong>上。</p>
+
+  <details class="acc">
+    <summary>那如果我不想调用原方法，想直接返回我自己的值呢？</summary>
+    <div class="acc-body">
+      <p>完全可以，而且这是最常用的"绕过校验"手法：</p>
+      <pre data-hl><code>Java.use('com.a.b.Sign').check.overload('java.lang.String')
+  .implementation = function (input) {
+    console.log('[!] check() 被调用，输入 =', input);
+    return true;          // 直接返回 true，根本不执行原逻辑
+  };</code></pre>
+      <p>这种写法叫 <strong>"直接替换"</strong>。它的优点是快、稳、不受原逻辑影响；
+      缺点是如果原方法有副作用（比如初始化了某个字段），你不调用就会漏掉，
+      后续代码可能崩溃。所以<b>能调原方法就调原方法</b>，只在确实要改变返回值时才直接返回。</p>
+    </div>
+  </details>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.3</span>Hook Native 层：为什么地址是核心问题</h2>
+
+  <p>Native Hook 的思路完全不同。它不经过 ART，直接在<strong>机器码层面</strong>动手。</p>
+
+  <div class="intuition">
+    <span class="tag">直觉模型 · 修改黑板上的字</span>
+    <p>想象函数是一块写在黑板上的指令清单，学生（CPU）从头往下读。<br>
+    <code>Interceptor.attach</code> 做的事是：<strong>在清单开头贴一张便签，写着"先跳到讲台（你的 JS 函数），
+    讲完再回来接着读"</strong>。</p>
+    <p>这就是 <span class="term" data-def="Inline Hook：在目标函数开头写入一条跳转指令（ARM 上是 B 或 LDR+BR），把执行流劫持到自己的代码；自己的代码保存现场、执行逻辑、恢复现场，再跳回原函数被覆盖指令之后继续执行。">Inline Hook</span>
+    的本质。它需要三个东西：</p>
+    <ol>
+      <li><strong>目标函数的地址</strong>——你总得知道便签贴在哪块黑板上</li>
+      <li><strong>能写内存的权限</strong>——黑板上原本是只读的，得先改成可写</li>
+      <li><strong>保存被覆盖的那几条指令</strong>——回来时要能接上</li>
+    </ol>
+  </div>
+
+  <h3>三种拿到函数地址的姿势</h3>
+
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>方式</th><th>代码</th><th>适用场景</th><th>坑</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>导出符号</strong></td>
+          <td><code>Module.getExportByName('libx.so','f')</code></td>
+          <td>函数是 <code>JNIEXPORT</code> 导出的</td>
+          <td>混淆后符号名可能被抹掉</td>
+        </tr>
+        <tr>
+          <td><strong>模块基址 + 偏移</strong></td>
+          <td><code>Module.findBaseAddress('libx.so').add(0x1234)</code></td>
+          <td>静态分析拿到了偏移</td>
+          <td>偏移随版本变化；Thumb 要 +1</td>
+        </tr>
+        <tr>
+          <td><strong>运行时查找</strong></td>
+          <td><code>Module.enumerateExports()</code> / 扫描特征</td>
+          <td>符号被改了名，但还在</td>
+          <td>性能开销大</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div id="stepper-native"></div>
+
+  <h3>必须搞清楚的 <code>onEnter</code> / <code>onLeave</code></h3>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-title">onEnter — 函数刚进入，还没执行</div>
+      <ul style="font-size:13.5px">
+        <li>能读到<strong>输入参数</strong>（args[0], args[1]...）</li>
+        <li>能<strong>改参数</strong>：<code>args[0] = ptr('...')</code></li>
+        <li>读不到返回值（还没产生）</li>
+        <li>可以用 <code>this.xxx = v</code> 存东西给 onLeave 用</li>
+      </ul>
+    </div>
+    <div class="card">
+      <div class="card-title">onLeave — 函数执行完，即将返回</div>
+      <ul style="font-size:13.5px">
+        <li>能读到<strong>返回值</strong>：<code>retval</code></li>
+        <li>能<strong>改返回值</strong>：<code>retval.replace(...)</code></li>
+        <li>能读到 onEnter 里存的状态</li>
+        <li>读不到参数（除非 onEnter 时存了）</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="note warn">
+    <div class="note-h">⚠️ <code>retval.replace()</code> 的经典陷阱</div>
+    <p style="margin-bottom:0">如果你想改一个返回 <code>jstring</code> 的函数，写
+    <code>retval.replace(ptr('0x0'))</code> 是对的；但如果写 <code>retval = ptr('0x0')</code>
+    <strong>完全无效</strong>——那只是改了个 JS 局部变量。这是新手第一大坑。</p>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.4</span>OLLVM 登场：为什么静态分析会失效</h2>
+
+  <p>到目前为止一切顺利。但当 App 用 <span class="term" data-def="OLLVM（Obfuscator-LLVM）是基于 LLVM 的开源代码混淆器，通过一系列自定义 LLVM Pass 在编译期改写 IR，使产出机器码极难静态分析。">OLLVM</span>
+  保护关键函数后，你会发现：<strong>IDA 里打开那个函数，什么都看不懂了。</strong></p>
+
+  <p>OLLVM 有四大杀手锏。我们用同一段逻辑，看看它被每种手段改造后的样子。</p>
+
+  <div class="card">
+    <div class="card-title">原始逻辑（很简单）</div>
+<pre data-hl><code>int check(int x) {
+    if (x == 0x1234) {
+        return 1;        // 通过
+    }
+    return 0;            // 拒绝
+}</code></pre>
+  </div>
+
+  <div id="stage-ollvm"></div>
+
+  <h3>四大手段逐个拆解</h3>
+
+  <details class="acc">
+    <summary>① 字符串加密（String Encryption）—— 让常量在内存里也看不见</summary>
+    <div class="acc-body">
+      <p><strong>做了什么：</strong>把代码里的字符串常量（比如 API 地址、密钥、错误提示）
+      替换成一段<strong>解密代码 + 密文</strong>。原始字符串在 so 文件里根本不存在，
+      只有运行时才在栈上解密出来。</p>
+      <div class="grid2">
+        <div>
+          <p class="small muted">混淆前：</p>
+          <pre style="margin-top:0"><code>strcmp(input, "secret_key")</code></pre>
+          <p class="small muted">so 文件里能搜到：</p>
+          <pre style="margin-top:0"><code>strings libx.so | grep secret
+→ secret_key     ← 一眼就看到</code></pre>
+        </div>
+        <div>
+          <p class="small muted">混淆后：</p>
+          <pre style="margin-top:0"><code>char buf[16];
+decrypt(buf, "\x3a\x7f\x21...", 10);
+strcmp(input, buf);</code></pre>
+          <p class="small muted">so 文件里搜不到明文，但：</p>
+          <pre style="margin-top:0"><code>// 运行时在 decrypt 返回处
+// 下一个断点，直接读 buf</code></pre>
+        </div>
+      </div>
+      <div class="note ok">
+        <div class="note-h">✅ 破法</div>
+        <p style="margin-bottom:0">静态搜不到就<strong>动态抓</strong>。Hook 字符串比较函数
+        （<code>strcmp</code>/<code>strncmp</code>/<code>memcmp</code>）或解密函数，
+        在它返回的那一刻把明文 dump 出来。这类脚本是 Frida 最常用的"起手式"。</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="acc">
+    <summary>② 控制流平坦化（Control Flow Flattening，<code>-fla</code>）—— 把 if/else 打散成状态机</summary>
+    <div class="acc-body">
+      <p><strong>做了什么：</strong>把原本"从上到下、带分支"的控制流，
+      改写成<strong>一个巨大的 switch 循环</strong>。所有基本块变成 case，
+      用一个人工变量（<code>state</code>）来决定下一步跳哪。</p>
+<pre data-hl><code><span class="c">// 混淆前：控制流清晰</span>
+<span class="k">if</span> (x == <span class="n">0x1234</span>) <span class="k">return</span> <span class="n">1</span>;
+<span class="k">return</span> <span class="n">0</span>;
+
+<span class="c">// 混淆后：一个 switch 分发器 + 状态变量</span>
+<span class="t">int</span> state = <span class="n">0x8A3F21</span>;          <span class="c">// 初始状态是随机数</span>
+<span class="k">while</span> (<span class="n">1</span>) {
+    <span class="k">switch</span> (state) {
+    <span class="k">case</span> <span class="n">0x8A3F21</span>:
+        state = (x == <span class="n">0x1234</span>) ? <span class="n">0x11B7C2</span> : <span class="n">0x44DE09</span>;
+        <span class="k">break</span>;
+    <span class="k">case</span> <span class="n">0x11B7C2</span>:
+        ret = <span class="n">1</span>; state = <span class="n">0xFFFFFF</span>;   <span class="c">// 出口</span>
+        <span class="k">break</span>;
+    <span class="k">case</span> <span class="n">0x44DE09</span>:
+        ret = <span class="n">0</span>; state = <span class="n">0xFFFFFF</span>;
+        <span class="k">break</span>;
+    }
+    <span class="k">if</span> (state == <span class="n">0xFFFFFF</span>) <span class="k">break</span>;
+}</code></pre>
+      <div class="note">
+        <div class="note-h">为什么这让 IDA 崩溃</div>
+        <p style="margin-bottom:0">IDA 的 F5 反编译依赖<strong>识别控制流结构</strong>（if、循环、switch）。
+        平坦化之后，所有代码都变成了"一个 switch 的 case"，
+        反编译器无法判断真实的执行顺序，产出的伪代码就成了一坨
+        <code>while(1) switch(state)</code> 里塞满赋值语句的东西。</p>
+      </div>
+      <div class="note ok">
+        <div class="note-h">✅ 破法</div>
+        <p style="margin-bottom:0">关键洞察：<strong>state 的取值序列是确定的</strong>。
+        用动态 Trace 记录每次 switch 分发时 state 的值，
+        就能还原出真实的执行路径（下一节 Stalker 就是干这个的）。
+        工具层面，<b>D-810</b> 这类 IDA 插件就是自动化做这件事。</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="acc">
+    <summary>③ 虚假控制流（Bogus Control Flow，<code>-bcf</code>）—— 插入永不执行的分支</summary>
+    <div class="acc-body">
+      <p><strong>做了什么：</strong>在真实代码前后插入<strong>不透明谓词</strong>
+      （Opaque Predicate）——一种<strong>结果恒定、但静态看不出来</strong>的条件。
+      看起来程序有两条路，实际上永远走同一条。</p>
+<pre data-hl><code><span class="c">// 插入的不透明谓词：这个条件永远为真，但 IDA 看不出来</span>
+<span class="k">if</span> (((x * x) &amp; <span class="n">1</span>) == ((x * x) % <span class="n">2</span>)) {   <span class="c">// 恒真：平方的奇偶性</span>
+    <span class="c">// 真实代码在这里</span>
+    <span class="k">if</span> (x == <span class="n">0x1234</span>) <span class="k">return</span> <span class="n">1</span>;
+} <span class="k">else</span> {
+    <span class="c">// 死代码：一堆垃圾运算，永远不执行</span>
+    <span class="t">int</span> junk = <span class="n">0</span>;
+    <span class="k">for</span> (<span class="t">int</span> i = <span class="n">0</span>; i &lt; <span class="n">1000</span>; i++) junk += i * i;
+    <span class="k">return</span> junk;
+}</code></pre>
+      <div class="note warn">
+        <div class="note-h">⚠️ 为什么它这么烦人</div>
+        <p style="margin-bottom:0">它不改变程序语义，只是<strong>让控制流图变复杂</strong>。
+        大量虚假分支会让 IDA 的反编译超时、让分析者浪费时间去判断哪个分支是活的。
+        更狠的版本会把一个函数拆成十几个互相跳转的碎片。</p>
+      </div>
+      <div class="note ok">
+        <div class="note-h">✅ 破法</div>
+        <p style="margin-bottom:0">动态执行时，<strong>死代码根本不会出现在 trace 里</strong>。
+        所以"跑一遍看真实路径"是最高效的破法。这也是本课的核心方法论：
+        <em>静观看不懂的，就让程序自己告诉你</em>。</p>
+      </div>
+    </div>
+  </details>
+
+  <details class="acc">
+    <summary>④ 指令替换（Instruction Substitution，<code>-sub</code>）—— 用等价复杂指令迷惑反编译</summary>
+    <div class="acc-body">
+      <p><strong>做了什么：</strong>把简单指令替换成<strong>语义等价但形式复杂</strong>的指令序列。</p>
+<pre data-hl><code><span class="c">; 混淆前</span>
+<span class="k">ADD</span>  <span class="r">R0</span>, <span class="r">R1</span>, <span class="r">R2</span>          <span class="c">; R0 = R1 + R2  —— 一眼看懂</span>
+
+<span class="c">; 混淆后（等价变形）</span>
+<span class="k">SUB</span>  <span class="r">R0</span>, <span class="r">R1</span>, <span class="r">R2</span>
+<span class="k">MVN</span>  <span class="r">R3</span>, <span class="r">R2</span>              <span class="c">; R3 = ~R2</span>
+<span class="k">ADD</span>  <span class="r">R0</span>, <span class="r">R0</span>, <span class="n">#1</span>
+<span class="k">EOR</span>  <span class="r">R0</span>, <span class="r">R0</span>, <span class="r">R3</span>
+<span class="k">EOR</span>  <span class="r">R0</span>, <span class="r">R0</span>, <span class="r">R3</span>          <span class="c">; 绕了一圈还是 R1+R2</span></code></pre>
+      <p>它偏爱用在<strong>常量比较</strong>上。比如 <code>if (x == 0x1234)</code> 会被拆成
+      一堆位运算组合，让你看不出那个魔数 0x1234 在哪。</p>
+      <div class="note ok">
+        <div class="note-h">✅ 破法</div>
+        <p style="margin-bottom:0">这类混淆<strong>对动态执行毫无影响</strong>——CPU 算出来的值是一样的。
+        所以在 Trace 里看<strong>寄存器最终的值</strong>，而不是看指令本身。
+        算法还原时我们关心的正是"这一轮算出什么"，而不是"它怎么算的"。</p>
+      </div>
+    </div>
+  </details>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.5</span>Stalker：让程序自己把路走一遍给你看</h2>
+
+  <p>上面四个"破法"都指向同一件事：<strong>动态 Trace</strong>。
+  Frida 里做这件事的引擎叫 <span class="term" data-def="Stalker 是 Frida 的代码追踪引擎。它通过动态重编译（dynamic recompilation）把目标代码复制一份并插入回调，从而记录每一条被执行的指令、每个读写的内存地址、每次函数调用。">Stalker</span>。</p>
+
+  <div class="intuition">
+    <span class="tag">直觉模型 · 行车记录仪</span>
+    <p>静态分析像看<strong>地图</strong>——能看到所有道路，但不知道司机实际走了哪条。<br>
+    Stalker 像<strong>行车记录仪</strong>——它不关心地图上有没有岔路，只记录<strong>车轮实际碾过的每一米</strong>。</p>
+    <p>对于 OLLVM 混淆的代码，"地图"（控制流图）已经被搅成一团乱麻，
+    但"实际路线"永远只有一条，而且那条路上跑的就是真实算法。</p>
+  </div>
+
+  <h3>Stalker 的三种追踪模式</h3>
+
+  <div class="tbl-wrap">
+    <table class="tbl">
+      <thead><tr><th>API</th><th>粒度</th><th>能看到什么</th><th>性能</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><code>Stalker.follow(threadId, {events:{call:true}})</code></td>
+          <td>函数级</td>
+          <td>调用了哪些函数（call 事件）</td>
+          <td>较好</td>
+        </tr>
+        <tr>
+          <td><code>Stalker.follow(id, {transform})</code></td>
+          <td>基本块级</td>
+          <td>每个基本块的地址、指令数</td>
+          <td>中等</td>
+        </tr>
+        <tr>
+          <td><code>Stalker.follow(id, {transform})</code> + <code>iterator</code></td>
+          <td><em>指令级</em></td>
+          <td>每一条指令、寄存器读写、内存读写</td>
+          <td>很慢（10-100x）</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note bad">
+    <div class="note-h">🔥 性能警告</div>
+    <p style="margin-bottom:0">指令级 Trace 会让程序慢<strong>十倍到上百倍</strong>。
+    直接对一个 App 全程开指令级 Trace，结果通常是：程序卡死、ANR、或者被反调试检测到超时。
+    <br><strong>正确做法：</strong>先用静态分析定位可疑函数，<strong>只对那一个函数</strong>开 Stalker
+    （用 <code>transform</code> 里的 <code>iterator.putCallout</code> 加范围判断），
+    或者用 <code>Stalker.exclude()</code> 把无关模块排除掉。</p>
+  </div>
+
+  <div id="stepper-stalker"></div>
+
+  <h3>把 Trace 变成算法：实战工作流</h3>
+
+  <p>拿到一大堆指令 Trace 之后，怎么找到加密算法？这是本课第一次给出<strong>可复用的方法论</strong>：</p>
+
+  <div id="decision-trace"></div>
+
+  <div class="note key">
+    <div class="note-h">🔑 加密算法的三个"落脚点"</div>
+    <p style="margin-bottom:0">无论算法怎么魔改，它总要在某个时刻碰到这三样东西——这就是你的钩子位置：</p>
+    <ol style="margin-bottom:0">
+      <li><strong>输入</strong>：明文从哪来（读内存的位置）</li>
+      <li><strong>常量表 / 轮常量</strong>：S 盒、K 常量、初始向量——魔改也改不掉这一坨数据的<em>结构</em></li>
+      <li><strong>输出</strong>：密文写到哪去（写内存的位置）</li>
+    </ol>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.5L</span>动手实验：选对 Hook 位置</h2>
+
+  <p>前面几节都是"看"。这一节<b>你自己判断</b>——我给你几个真实场景，你选出该 hook 哪个函数、为什么。</p>
+
+  <div class="note warn">
+    <div class="note-h">⚠️ 为什么这个判断这么重要</div>
+    <p style="margin-bottom:0">第 1 章讲的所有技术，落到实战里都会收敛成一个动作：<b>把 Interceptor.attach 挂在哪个地址上</b>。
+    挂错了不会报错——脚本照样跑、attach 照样成功，只是 onEnter 永远不触发。<br>
+    <span class="hit">所以"选位置"这个判断，比"怎么写脚本"更考验理解深度。</span></p>
+  </div>
+
+  <div id="lab1"></div>
+
+  <!-- ================================================================ -->
+  <h2 id="sec-1.5C"><span class="h2-num">1.5C</span>实战案例：一个银行 App 的三层 Hook 递进</h2>
+
+  <p>本节讲的所有技术，在一个真实项目里会以什么顺序登场？下面这个案例展示了一条完整的递进路径：
+  <b>Java 层用不了 → Native 层用不了 → 最后自己写 inline hook</b>。</p>
+
+  <div id="case1"></div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.6</span>决策演练：真实工程里怎么选</h2>
+
+  <p>下面三个情境都来自真实工作。请认真选——选错了我不会只告诉你答案，还会告诉你错在哪。</p>
+
+  <div id="decision-1"></div>
+  <div id="decision-2"></div>
+  <div id="decision-3"></div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.7</span>自测：检查你的模型有没有歪</h2>
+
+  <div id="quiz1"></div>
+  <div id="quiz2"></div>
+  <div id="quiz3"></div>
+  <div id="quiz4"></div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.8</span>本章名词表</h2>
+
+  <div class="glossary">
+    <div class="g-item"><dt>DBI</dt><dd>Dynamic Binary Instrumentation，动态二进制插桩。在程序运行时插入代码以观测/修改其行为。Frida 是最流行的移动端 DBI 框架。</dd></div>
+    <div class="g-item"><dt>ART</dt><dd>Android Runtime，Android 5.0 起取代 Dalvik。把 dex 字节码 AOT/JIT 编译为机器码，同时保留 Java 反射能力。</dd></div>
+    <div class="g-item"><dt>JNIEnv</dt><dd>JNI 环境指针，是 Native 代码调用 Java 层的唯一入口。每个线程一份，通过 JavaVM 获取。</dd></div>
+    <div class="g-item"><dt>Inline Hook</dt><dd>在目标函数入口写入跳转指令劫持执行流。需要可写内存权限与指令重定位能力。</dd></div>
+    <div class="g-item"><dt>PLT / GOT</dt><dd>Procedure Linkage Table / Global Offset Table。外部函数调用的跳转表，Hook 导入函数（如 strcmp）时常改这里。</dd></div>
+    <div class="g-item"><dt>不透明谓词</dt><dd>Opaque Predicate。结果恒定但静态难以判定的条件表达式，是虚假控制流的核心构件。</dd></div>
+    <div class="g-item"><dt>基本块</dt><dd>Basic Block。一段只有一个入口一个出口、内部无分支的指令序列。控制流分析与 Trace 的基本单位。</dd></div>
+    <div class="g-item"><dt>魔数 / 常量表</dt><dd>算法中固定的特征数据，如 MD5 的初始值、AES 的 S 盒。算法还原的主要突破口。</dd></div>
+    <div class="g-item"><dt>overload</dt><dd>Frida 中用于在方法重载时指定具体签名的方法。省略它会因歧义报错。</dd></div>
+    <div class="g-item"><dt>retval.replace()</dt><dd>唯一能修改 Native 函数返回值的方式。直接赋值 retval 无效。</dd></div>
+  </div>
+
+  <!-- ================================================================ -->
+  <h2><span class="h2-num">1.9</span>🧑‍🏫 严师时间：不答完不准走</h2>
+
+  <p>下面这位老师不会给你标准答案。他会一题一题逼问你，直到你把关键概念<strong>用自己的话说全</strong>。
+  答不上来可以要提示，但提示不算过关。</p>
+
+  <div id="teacher1"></div>
+
+  <div id="completeBox" style="margin-top:40px"></div>
+  <div id="chapnav"></div>
+</div>
+
+<script src="assets/app.js"></script>
+<script src="assets/labs.js"></script>
+<script src="assets/labx.js"></script>
+<script>
+(function () {
+  const { CodeStepper, SocraticTeacher, Quiz, Decision, Term, Stage, Lab, Case, $ } = window.AKKC;
+
+  /* ---------------------------------------------------------- 1.2 步进器 */
+  new CodeStepper(document.getElementById('stepper-java'), {
+    title: 'Java Hook 五步推演',
+    lines: [
+      {
+        code: '<span class="c">// 第 1 步：等 VM 就绪 + attach 当前线程</span>',
+        note: '<b>Java.perform 是入口，不是装饰。</b>它做了两件事：等待 ART 虚拟机初始化完成；把 Frida 的注入线程 attach 到 VM 上，这样这个线程才有 JNIEnv。跳过它，后面所有 Java API 都会抛 "VM not ready" 或空指针。',
+        state: { 'VM 状态': '未就绪 → 就绪', '当前线程': '已 attach', 'JNIEnv': '已获取' }
+      },
+      {
+        code: 'Java.perform(<span class="k">function</span> () {',
+        note: '回调函数在 VM 就绪后执行。从现在开始，你可以自由调用 Java 层 API 了。注意：<b>如果 App 反调试导致 attach 失败，会卡在这一步</b>，表现为脚本无输出也不报错。',
+        state: { 'VM 状态': '就绪', '当前线程': '已 attach', 'JNIEnv': '有效' }
+      },
+      {
+        code: '  <span class="k">var</span> Sign = Java.use(<span class="s">\'com.akkc.Sign\'</span>);',
+        note: '<b>Java.use 通过 ART 的类加载器找到这个类。</b>此刻 Frida 会反射出类里的所有方法、字段、构造器，构建一个 JS 包装器。如果这里报 "ClassNotFoundException"，不是名字写错，就是<b>类加载器不对</b>——加固 App 常用自定义 ClassLoader。',
+        state: { 'VM 状态': '就绪', '目标类': 'com.akkc.Sign', '方法数': '3（已反射）', '包装器': '已创建' }
+      },
+      {
+        code: '  Sign.encode.overload(<span class="s">\'java.lang.String\'</span>)',
+        note: '<b>overload 指定你要 hook 哪一个重载版本。</b>括号里写的是<b>参数类型列表</b>。如果 encode 只有一个版本，可以省略；有多个版本时必须写，否则 Frida 直接抛 "has more than one overload"。',
+        state: { 'VM 状态': '就绪', '目标方法': 'encode(String)', '签名': '(Ljava/lang/String;)Ljava/lang/String;', '歧义': '已消除' }
+      },
+      {
+        code: '    .implementation = <span class="k">function</span> (input) {',
+        note: '<b>这里发生了真正的 Hook。</b>Frida 把目标方法的 ART 入口标记为 native，并注册了自己的 trampoline。同时，它<b>保存了原始方法的引用</b>——这就是下一步 this.encode() 不会无限递归的原因。',
+        state: { 'VM 状态': '就绪', '原方法': '已备份', '新实现': '已注册', 'Hook 状态': '✅ 生效' },
+        mem: 'ART 方法结构体（简化）\n┌────────────────────────┐\n│ art::ArtMethod encode   │\n│  entry_point_ │─────────┼──▶ [Frida trampoline] ──▶ 你的 JS\n│  access_flags │ native  │\n└────────────────────────┘\n    原实现入口已保存 ◀────────┘'
+      },
+      {
+        code: '      console.log(<span class="s">\'[+] encode 输入:\'</span>, input);',
+        note: 'JS 侧记录参数。<b>注意：此时 Java 层的执行流已经暂停在你的 JS 里</b>，你做什么都不影响原逻辑，除非你主动调原方法或返回值。',
+        state: { 'VM 状态': '就绪', '执行流': '停在 JS 中', 'input': '"hello"', '原逻辑': '尚未执行' }
+      },
+      {
+        code: '      <span class="k">return</span> <span class="k">this</span>.encode(input);',
+        note: '<b>调用原始实现。</b>关键：这里的 this.encode 指向的是<b>被保存的原始方法</b>，不是包装后的版本，所以不会递归。执行到这里，控制权交回 ART，真正的 Java 代码开始跑。',
+        state: { 'VM 状态': '就绪', '执行流': '交回 ART', '原逻辑': '正在执行…', '递归风险': '无' }
+      },
+      {
+        code: '    };',
+        note: 'Hook 安装完成。此后<b>任何</b>对 Sign.encode(String) 的调用——无论来自哪个线程、哪个类——都会先进入你的 JS。这就是 "改分机号表" 的完整过程。',
+        state: { 'VM 状态': '就绪', 'Hook 状态': '✅ 持续生效', '后续调用': '全部被拦截' }
+      }
+    ]
+  });
+
+  /* ---------------------------------------------------------- 1.2 递归动画 */
+  const recurseSteps = [];
+  (function () {
+    const set = (id, cls) => {
+      const el = document.getElementById(id);
+      if (el) el.className = 'blk ' + (cls || '');
+    };
+    recurseSteps.push(
+      { run: () => { set('rc1', 'active'); }, note: '<b>App 调用 Sign.encode("hello")</b>。这是最外层的调用，来自正常业务代码。它并不知道自己被 Hook 了。' },
+      { run: () => { set('rc1', 'hot'); set('rc2', 'active'); }, note: '<b>调用进入 Frida trampoline。</b>ART 执行到 encode 的入口时，发现这里已经被改成 native 跳转，于是控制流转向 Frida 注入的代码。' },
+      { run: () => { set('rc2', 'hot'); set('rc3', 'active'); }, note: '<b>控制流进入你的 JS implementation。</b>参数 input = "hello" 已经传进来。此刻你可以为所欲为：打印、改参数、直接返回。' },
+      { run: () => { set('rc3', 'hot'); set('rc4', 'active'); }, note: '<b>你执行 this.encode(input)。</b>这是关键的一步：Frida 把它解析为「调用<em>被保存的原始方法</em>」，而不是「调用我刚替换掉的那个方法」。' },
+      { run: () => { set('rc4', 'cool'); }, note: '<b>原始 Java 逻辑真正执行了。</b>假设它返回 "aGVsbG8="。返回值沿着原路返回给你的 JS。这里没有递归——因为入口已经被"标记为已进入"，Frida 做了短路。' },
+      { run: () => { set('rc5', 'active'); }, note: '<b>返回值回到你的 JS。</b>你可以在这里改它：比如 return "AAAA" 来伪造结果，或者原样返回。' },
+      { run: () => { set('rc5', 'cool'); set('rc1', 'cool'); }, note: '<b>最终返回给调用方。</b>整个过程中，调用方完全无感——它以为自己在和一个普通的 Java 方法打交道。<span class="hit">这就是 Hook 的完整闭环。</span>' }
+    );
+  })();
+  new Stage(document.getElementById('stage-recurse'), {
+    title: 'Hook 调用链完整动画',
+    render:
+      '<div class="flow-row" style="flex-direction:column;align-items:stretch;gap:11px">' +
+        '<div class="flow-row"><span class="blk" id="rc1">App 调用 encode("hello")</span><span class="arrow">→</span><span class="blk" id="rc2">Frida trampoline</span><span class="arrow">→</span><span class="blk" id="rc3">你的 JS implementation</span></div>' +
+        '<div class="flow-row" style="margin-left:60px">' +
+          '<span class="arrow">↓ this.encode()</span>' +
+        '</div>' +
+        '<div class="flow-row" style="margin-left:60px">' +
+          '<span class="blk" id="rc4">原始 Java 实现（被保存）</span><span class="arrow">→ 返回</span><span class="blk" id="rc5">回到你的 JS</span><span class="arrow">→</span><span class="blk" id="rc1b" style="opacity:.6">返回调用方</span>' +
+        '</div>' +
+      '</div>',
+    reset: () => ['rc1','rc2','rc3','rc4','rc5'].forEach(i => set(i, '')),
+    steps: recurseSteps
+  });
+  function set(id, cls) { const el = document.getElementById(id); if (el) el.className = 'blk ' + (cls || ''); }
+
+  /* ---------------------------------------------------------- 1.3 Native 步进器 */
+  new CodeStepper(document.getElementById('stepper-native'), {
+    title: 'Native Hook：从地址到拦截',
+    lines: [
+      {
+        code: '<span class="k">var</span> base = Module.findBaseAddress(<span class="s">\'libakkc.so\'</span>);',
+        note: '<b>第一步永远是拿模块基址。</b>so 每次加载的地址都不同（ASLR 地址空间布局随机化），所以不能写死绝对地址。findBaseAddress 返回本次加载的真实基址。返回 null 说明 <b>so 还没被加载</b>——这是最常见的失败原因。',
+        state: { 'libakkc.so 基址': '0x7a3c4000', 'ASLR': '已随机化', '加载状态': '✅ 已加载' },
+        mem: '进程内存映射（简化）\n0x7a3c4000 ┌──────────────────┐ ← base\n           │ .text  代码段     │\n           │ .rodata 只读数据  │\n           │ .data  可写数据   │\n           └──────────────────┘'
+      },
+      {
+        code: '<span class="k">var</span> addr = base.add(<span class="n">0x1A4C</span>);',
+        note: '<b>偏移来自静态分析。</b>在 IDA 里看到目标函数相对于 so 起始的偏移是 0x1A4C，加上运行时基址就是真实地址。<br><b>ARM 平台大坑：</b>如果目标函数是 <em>Thumb</em> 指令集，地址必须 <b>+1</b>（即 0x1A4D），否则 Interceptor 会按 ARM 模式解析，指令错乱。</p>',
+        state: { 'libakkc.so 基址': '0x7a3c4000', '静态偏移': '0x1A4C', '真实地址': '0x7a3c5a4c', '指令集': 'ARM（无需 +1）' }
+      },
+      {
+        code: 'Interceptor.attach(addr, {',
+        note: '<b>Interceptor.attach 执行 Inline Hook。</b>Frida 会：① 把目标地址所在内存页改成可写（mprotect）；② 保存开头几条指令；③ 写入跳转指令指向自己的 trampoline；④ 恢复内存权限。整个过程是原子的，避免其他线程看到半成品。',
+        state: { '目标地址': '0x7a3c5a4c', '内存权限': 'r-x → rwx → r-x', '原指令': '已备份', '跳转指令': '已写入' }
+      },
+      {
+        code: '  onEnter: <span class="k">function</span> (args) {',
+        note: '<b>函数即将执行，但还没执行。</b>args 是参数数组：args[0] 是第一个参数。注意这只是<b>指针值</b>，如果参数是字符串，你需要自己读内存：args[0].readUtf8String()。',
+        state: { '执行状态': '已拦截', 'args[0]': '0x7ffd1234 (char*)', 'args[1]': '0x20 (size_t)', '返回值': '尚不存在' }
+      },
+      {
+        code: '    console.log(<span class="s">\'[in]\'</span>, args[0].readUtf8String());',
+        note: '<b>读出字符串参数。</b>这是最常用的观测手段。但如果参数是加密后的缓冲区，你会看到乱码——那说明这一层的输入已经被处理过了，你得往上追一层。',
+        state: { '执行状态': '已拦截', '读取结果': '"hello_world"', '日志': '已输出' }
+      },
+      {
+        code: '  }, onLeave: <span class="k">function</span> (retval) {',
+        note: '<b>函数执行完毕，即将返回。</b>此时才能拿到返回值 retval。onLeave 里访问不到 args——所以如果你想在 onLeave 里对比输入输出，必须在 onEnter 时用 <code>this.input = ...</code> 存下来。',
+        state: { '执行状态': '原逻辑已完成', 'retval': '0x7a3d0010 (char*)', 'args': '❌ 不可访问' }
+      },
+      {
+        code: '    console.log(<span class="s">\'[out]\'</span>, retval.readUtf8String());',
+        note: '读出返回值。到这里你就完成了"输入 → 输出"的完整观测。<b>算法还原的第一步就是拿到足够多的输入输出对</b>，然后才能反推逻辑。',
+        state: { '执行状态': '已完成', '输出': '"aGVsbG8="', '样本对': '1 组' }
+      },
+      {
+        code: '    retval.replace(ptr(<span class="s">\'0x0\'</span>));',
+        note: '<b>修改返回值 —— 必须用 replace。</b>写 <code>retval = ptr("0x0")</code> 是无效的，那只是改了个 JS 局部变量，Native 层的寄存器完全不变。这是新手第一大坑。',
+        state: { '执行状态': '已完成', '原返回值': '"aGVsbG8="', '修改后': 'NULL', '生效': '✅（因为用了 replace）' }
+      }
+    ]
+  });
+
+  /* ---------------------------------------------------------- 1.4 OLLVM 动画 */
+  new Stage(document.getElementById('stage-ollvm'), {
+    title: 'OLLVM 四大手段对同一段逻辑的改造',
+    speed: 1600,
+    render:
+      '<div id="ol-panel" style="font-family:var(--mono);font-size:13px;line-height:1.9">' +
+        '<div class="pill acc" id="ol-title" style="margin-bottom:12px">原始逻辑</div>' +
+        '<pre id="ol-code" style="margin:0;background:#0a0e14;border:1px solid var(--line);border-radius:8px;padding:14px 16px;min-height:210px;white-space:pre-wrap"></pre>' +
+      '</div>' +
+      '<div class="flex" style="margin-top:14px;gap:8px">' +
+        '<span class="pill" id="ol-s1">① 字符串加密</span>' +
+        '<span class="pill" id="ol-s2">② 平坦化 -fla</span>' +
+        '<span class="pill" id="ol-s3">③ 虚假控制流 -bcf</span>' +
+        '<span class="pill" id="ol-s4">④ 指令替换 -sub</span>' +
+      '</div>',
+    reset: () => {
+      document.getElementById('ol-title').textContent = '原始逻辑';
+      document.getElementById('ol-code').textContent = 'int check(int x) {\n    if (x == 0x1234) {\n        return 1;        // 通过\n    }\n    return 0;            // 拒绝\n}';
+      ['ol-s1','ol-s2','ol-s3','ol-s4'].forEach(i => { const e = document.getElementById(i); if (e) e.className = 'pill'; });
+    },
+    steps: [
+      {
+        run: () => { document.getElementById('ol-title').textContent = '① 字符串加密 — 常量在 so 里搜不到'; document.getElementById('ol-s1').className = 'pill acc'; },
+        note: '<b>字符串加密</b>：把 <code>"secret_key"</code> 这类明文常量替换成密文 + 解密函数。so 文件里 <code>strings</code> 搜不到，但运行时会在栈上解密。<span class="hit">破法：Hook 解密函数返回处，dump 明文。</span>'
+      },
+      {
+        run: () => { document.getElementById('ol-title').textContent = '② 控制流平坦化 -fla — if/else 变成状态机'; document.getElementById('ol-s2').className = 'pill acc'; },
+        note: '<b>控制流平坦化</b>：真实分支被拆成 switch 的 case，用一个随机初始值的 state 变量驱动。IDA 反编译失去结构。<span class="hit">破法：Trace state 变量的取值序列，还原真实路径。</span>'
+      },
+      {
+        run: () => { document.getElementById('ol-title').textContent = '③ 虚假控制流 -bcf — 插入永不执行的分支'; document.getElementById('ol-s3').className = 'pill warn'; },
+        note: '<b>虚假控制流</b>：插入不透明谓词（恒真条件）+ 死代码。语义没变，但控制流图被撑大。<span class="hit">破法：死代码不会出现在动态 trace 里，跑一遍就滤掉了。</span>'
+      },
+      {
+        run: () => { document.getElementById('ol-title').textContent = '④ 指令替换 -sub — 一条 ADD 变成五条'; document.getElementById('ol-s4').className = 'pill bad'; },
+        note: '<b>指令替换</b>：简单运算被等价展开成复杂指令序列，魔数被位运算隐藏。<span class="hit">破法：关注寄存器的最终值，而不是指令形式——CPU 算出来是一样的。</span>'
+      },
+      {
+        run: () => { document.getElementById('ol-title').textContent = '四招叠加 — 真实加固的常态'; document.getElementById('ol-code').textContent = '// 真实场景：四招同时上\nint check(int x) {\n    // ① 字符串已加密，运行时解密\n    char k[5]; dec(k, "\\x3a\\x7f\\x21\\x9c\\x02", 4);\n\n    // ② 平坦化：一个巨大 switch\n    int state = 0x8A3F21;\n    while (1) {\n        switch (state) {\n        // ③ 每个 case 里都塞了不透明谓词\n        case 0x8A3F21:\n            if (((x*x)&1) == ((x*x)%2)) {   // 恒真\n                // ④ 指令替换：魔数 0x1234 被拆成位运算\n                int t = ((x ^ 0x1234) + 1) ^ 1;\n                state = (t == 0) ? 0x11B7C2 : 0x44DE09;\n            } else {\n                int j=0; for(int i=0;i<99;i++) j+=i*i;  // 死代码\n                state = 0x44DE09;\n            }\n            break;\n        case 0x11B7C2: return 1;\n        case 0x44DE09: return 0;\n        }\n    }\n}'; },
+        note: '<b>这才是真实加固的样子。</b>四招叠加后，静态分析基本瘫痪。<br>但请注意：<span class="hit">无论怎么混淆，程序运行时仍然只有一条真实路径，CPU 仍然要算出 <code>x == 0x1234</code> 这个结果。</span>这就是动态 Trace 永远有效的原因。'
+      }
+    ]
+  });
+
+  /* ---------------------------------------------------------- 1.5 Stalker 步进器 */
+  new CodeStepper(document.getElementById('stepper-stalker'), {
+    title: 'Stalker 指令级 Trace 实战',
+    lines: [
+      {
+        code: '<span class="k">var</span> target = Module.findBaseAddress(<span class="s">\'libakkc.so\'</span>).add(<span class="n">0x1A4C</span>);',
+        note: '<b>先定位目标函数。</b>Stalker 的代价极高，绝不建议全局开启。正确姿势是：先用 IDA 静态定位可疑函数，再只对它开 Trace。',
+        state: { '目标函数': '0x7a3c5a4c', '范围': '仅此函数', '全局 Trace': '❌ 已避免' }
+      },
+      {
+        code: 'Interceptor.attach(target, {',
+        note: '用 Interceptor 作为"开关"——只有当这个函数被调用时才启动 Stalker，返回时关闭。这样既精准又能避免误伤其他线程。',
+        state: { '触发方式': '函数入口触发', 'Stalker 状态': '待启动' }
+      },
+      {
+        code: '  onEnter: <span class="k">function</span> () {',
+        note: '<b>进入目标函数，准备开始追踪。</b>注意：Stalker.follow 追踪的是<b>整个当前线程</b>，不只是这一个函数。所以必须配合 exclusion 或范围过滤。',
+        state: { '当前线程': 'tid=12345', 'Stalker 状态': '即将 follow' }
+      },
+      {
+        code: '    Stalker.follow(Process.getCurrentThreadId(), {',
+        note: '<b>开始追踪。</b>Stalker 采用<strong>动态重编译</strong>：它把执行到的代码复制一份到自己的代码缓存，在复制过程中插入回调。所以它<em>不修改原代码</em>，也就更难被检测。',
+        state: { 'Stalker 状态': '🔴 追踪中', '代码缓存': '已分配', '原代码': '未被修改' }
+      },
+      {
+        code: '      transform: <span class="k">function</span> (iterator) {',
+        note: '<b>transform 是关键回调。</b>每当 Stalker 要编译一个基本块，就会调用它，把指令迭代器交给你。你可以在这里读每条指令、插桩、甚至修改。',
+        state: { 'Stalker 状态': '🔴 追踪中', '当前基本块': '0x7a3c5a4c', '指令数': '6' }
+      },
+      {
+        code: '        <span class="k">let</span> ins = iterator.next();',
+        note: '<b>遍历基本块里的每一条指令。</b>iterator.next() 返回一条指令对象，包含助记符、操作数、大小。这是"指令级"粒度的入口。',
+        state: { '当前指令': 'MOV R0, R1', '地址': '0x7a3c5a4c', '大小': '4 字节' }
+      },
+      {
+        code: '        <span class="k">if</span> (ins.mnemonic === <span class="s">\'str\'</span>) {',
+        note: '<b>按助记符筛选。</b>典型的筛选目标：<code>str</code>/<code>stur</code>（写内存）、<code>eor</code>（异或，加密特征）、<code>ldr</code>（读内存）。异或指令密集出现的地方，往往是加密轮函数。',
+        state: { '筛选条件': '写内存指令', '匹配': '✅', '命中数': '1' }
+      },
+      {
+        code: '          iterator.putCallout(<span class="k">function</span> (ctx) {',
+        note: '<b>插入回调。</b>putCallout 会在这一条指令执行<em>之前</em>调用你的函数，并把 CPU 上下文 ctx 交给你——你能读到所有寄存器的实时值。这是"抓中间状态"的核心武器。',
+        state: { '回调': '已插入', '粒度': '指令执行前', '可读': '全部寄存器' }
+      },
+      {
+        code: '            console.log(<span class="s">\'str\'</span>, ctx.x1, <span class="s">\'←\'</span>, ctx.x0.toString(<span class="n">16</span>));',
+        note: '<b>实时打印寄存器的值。</b>AArch64 上 x0/x1 常作参数与地址。这一行能让你看到"哪个值被写到了哪个地址"——加密算法的中间状态就这样暴露出来。',
+        state: { '输出': 'str x1=0x7ffd1234 ← x0=0x61', '含义': '把 0x61(\'a\') 写入缓冲区', '轮次': '1' }
+      },
+      {
+        code: '          });',
+        note: '回调注册完成。后续每一条匹配的指令都会触发它。<b>注意性能</b>：即使只筛选 str，回调本身的开销也不小，所以务必用范围限制。',
+        state: { '回调数': '1', '预计开销': '中等' }
+      },
+      {
+        code: '      },',
+        note: 'transform 结束。Stalker 继续编译下一个基本块，循环往复，直到 follow 被解除。',
+        state: { 'Stalker 状态': '🔴 持续追踪' }
+      },
+      {
+        code: '      events: { call: <span class="k">true</span>, ret: <span class="k">false</span>, exec: <span class="k">false</span> }',
+        note: '<b>events 控制"事件流"。</b>开启 call 后，Stalker 会把函数调用事件塞进队列，你可以用 <code>Stalker.parse()</code> 批量解析——这比逐指令回调<strong>快得多</strong>，适合先摸清调用关系。',
+        state: { '事件队列': 'call 事件 ON', '性能': '比指令级快 10x+' }
+      },
+      {
+        code: '    });',
+        note: 'Stalker 启动完成。接下来函数体的执行会被完整记录。',
+        state: { 'Stalker 状态': '🔴 追踪中' }
+      },
+      {
+        code: '  },',
+        note: 'onEnter 结束。目标函数的代码开始真正执行——但每一条指令都已经过 Stalker 的"复印机"。',
+        state: { '执行': '在代码缓存中运行' }
+      },
+      {
+        code: '  onLeave: <span class="k">function</span> () { Stalker.unfollow(); }',
+        note: '<b>函数返回，关闭追踪。</b>unfollow 必须调用，否则 Stalker 会一直追踪下去，App 会越来越卡直到崩溃。<br>最后一句口诀：<span class="hit">Interceptor 定范围，Stalker 抓细节。</span>',
+        state: { 'Stalker 状态': '⚪ 已停止', 'Trace 记录': '已保存', 'App 性能': '恢复正常' }
+      }
+    ]
+  });
+
+  /* ---------------------------------------------------------- 1.5C 实战案例 */
+  new Case(document.getElementById('case1'), {
+    source: 'kanxue',
+    title: '[原创]某金融App 登录请求逆向实战：从梆梆加固反 Frida 自毁到 Go 业务层明文抓包',
+    date: '2026-9-7',
+    author: 'xiao_qi_lin',
+    target: '某银行 App v1.0.4（梆梆 DexHelper 抽取式壳 + Go 业务层）',
+    background:
+      '<p>这是本章技术栈的一次完整实战：目标是一个加固银行 App，' +
+      '作者要拿的是<b>登录请求的明文</b>。听起来很简单——hook 一下签名函数不就行了？' +
+      '但实际过程是<b>三条常规路线接连撞墙</b>，最后靠自写 arm64 inline hook 才拿到结果。</p>' +
+      '<p>值得细看的是它的<b>失败顺序</b>：eCapture 抓包失败 → Frida 被反调试干掉 → ' +
+      '内核硬件断点原理上不成立 → 自写 inline hook 成功。' +
+      '这条路径恰好就是本章的目录结构。</p>',
+    points: [
+      '<b>第一层失败：eCapture 抓不到</b>。eCapture 的 <code>tls -m text</code> 只挂系统 ' +
+        '<code>libssl.so</code> 的 <code>SSL_write</code> / <code>SSL_read</code>，' +
+        '而目标的登录走的是<b>Go 自带 crypto/tls</b>——<code>libgojni.so</code> 是 gomobile bind 生成的 ' +
+        'c-shared JNI 库（go1.15.15），<b>从不调用 libssl.so</b>。换 <code>gotls</code> 模式则报 ' +
+        '<code>not a Go executable</code>（因为 TLS 逻辑在动态库里，没有 Go build info 段）',
+      '<b>第二层失败：Frida 被自毁</b>。spawn 阶段 App 直接崩，崩溃现场极其特殊：' +
+        '<code>pc=0x97c</code> 落在比任何合法映射都小的低地址，且 <code>sp/lr</code> 被清零——' +
+        '这是壳主动把控制流劫持到未映射低地址的自毁手法',
+      '用 spawn 早注入拿到自毁 backtrace：<code>libc.so!fdopendir</code> → ' +
+        '<code>libDexHelper.so!0x35d4</code> → <code>0x4944</code> → ' +
+        '<code>linker64!call_constructors+0x2c4</code>——<b>自毁点在壳的 constructor 加载期</b>，' +
+        '比 <code>JNI_OnLoad</code> 还早',
+      '<b>检测的真面目</b>：<code>strcmp</code> 反复命中字符串 ' +
+        '<code>/memfd:frida-agent-64.so (deleted)</code>，壳反复读 <code>/proc/self/maps</code> 逐行比对后调用 ' +
+        '<code>abort()</code>',
+      '<b>第三层失败：内核硬件断点原理上不成立</b>。作者用了 stealth-hook 的 KPM 内核硬件断点方案，' +
+        '但它的 handler <b>只保存 X0–X7、只 dump 寄存器指向的内存（上限 128 字节）、不 dump SP 栈内存</b>；' +
+        '而 Go 1.15 是<b>栈式 ABI</b>（参数在栈上不在寄存器里）——' +
+        '所以在裸函数入口下断点时，<b>寄存器里根本没有明文指针</b>',
+      '<b>换注入载体绕过检测</b>：用定制系统的"任意 so 注入"（日志目录 ' +
+        '<code>/data/local/tmp/xiaojianbang/lib64</code>），它<b>不产生 frida-agent 的 memfd 映射</b>，' +
+        '于是壳的 maps 检测天然不触发',
+      '<b>定位 hook 点</b>：用 native 注册监听采集冷启动 18 秒、共 5183 条 ' +
+        '<code>ArtMethod::RegisterNative</code>，非系统 so 只有 <code>libweexcore.so</code>（80 条 UI 桥接）和 ' +
+        '<code>libgojni.so</code>（34 条业务注册），锁定网络总入口 ' +
+        '<code>worker.ServiceWorker.resourceApi(...)</code> @ <b>offset 0x637b1c</b>',
+      '<b>解出 AAPCS64 参数序</b>：<code>X0=JNIEnv*</code>、<code>X1=this</code>、<code>X2=url</code>、' +
+        '<code>X3=method</code>、<code>X4=body</code>、<code>X5=header</code>、<code>W6=flag</code>。' +
+        '静态依据是 Go 实现里的 debug 日志串 ' +
+        '<code>"Receive :url:"+a2+",method:"+a3+",body:"+a4+",header:"+a5</code>，实测 100% 吻合',
+      '<b>自写 arm64 免修复 inline hook</b>：用 <code>dl_iterate_phdr</code> 取基址，' +
+        '32 字节 trampoline（搬运原 16 字节 prologue + <code>ldr x16,#8; br x16</code> + 目标地址），' +
+        '<code>mprotect</code> 连续两页为 RWX 防 patch 跨页，patch 后 <code>__builtin___clear_cache</code> 刷指令 cache，再恢复 RX',
+      '不用替换 <code>RegisterNatives</code> 表指针的原因：那需要 ' +
+        '<code>FindClass("worker/ServiceWorker")</code>，而该类由系统 classloader 持有，' +
+        '注入 so 里的 native 线程找不到——经典 classloader 阻塞问题',
+      '<b>实测证明无 CRC 自校验</b>：改了 <code>libgojni.so</code> 的 <code>.text</code> 前 16 字节后 ' +
+        'App 持续存活、无二次自毁'
+    ],
+    method: [
+      '<b>做对照实验</b>：停掉 frida-server，App 立刻恢复正常 → 确认存在反 Frida 自毁（一次只变一个变量）',
+      '<b>抓包验证</b>：eCapture 先 <code>tls -m text</code> 再 <code>gotls</code>，两条都失败 → ' +
+        '反推"登录不走系统 TLS 库"',
+      '<b>静态定位后端</b>：先 <code>file</code> 确认架构（避免 32/64 位错位），' +
+        '再在 IDA 里反编译 <code>crypto/tls.(*Conn).Write</code> 与 <code>writeRecordLocked</code>，' +
+        '确认 Go 栈式 ABI 与 TLS record type <code>23</code>（application data）',
+      '<b>硬件断点试错并放弃</b>：确认 KPM 不 dump SP → 从原理上排除该方案',
+      '<b>Frida spawn 早注入定位自毁点</b>：挂 <code>strcmp</code>/<code>strstr</code>/<code>fopen</code>/' +
+        '<code>open</code>/<code>readlink</code>/<code>abort</code> 等 libc 兜底探针拿 backtrace，' +
+        '再跑 <b>OBSERVE_ONLY 纯观察对照</b>排除"自己篡改导致的 abort"',
+      '<b>换载体 + 抬高 hook 层</b>：改用不产生 memfd 的注入方式 → native 注册监听锁定 ' +
+        '<code>resourceApi @0x637b1c</code> → 自写 inline hook 落明文'
+    ],
+    result:
+      '<p>最终拿到登录明文四件套：<code>POST /pweb/appLogintic.do</code>、' +
+      '<code>Host: 127.0.0.1:43483</code>（本地 Weex 代理）、<code>Content-Length: 893</code>、' +
+      '响应 <code>200</code> / <code>Server: nginx</code>。</p>' +
+      '<p>但 body 里的 <code>loginId</code>（三段 <code>|</code> 分隔密文）与 <code>password</code>（base64 前缀 ' +
+      '<code>MDAwMDAxMjQ</code>）<b>在 JNI 边界处已经是密文</b>——真正的加密发生在更上层的 Weex/JS 层，' +
+      '作者列为后续可做项，本文未展开。</p>',
+    terms: ['Interceptor.attach', 'inline hook', 'trampoline', 'AAPCS64', 'Go 栈式 ABI', 'memfd', '/proc/self/maps', 'RegisterNatives', 'TLD record type'],
+    limits:
+      '<p>① <b>包名被作者匿名化</b>为 <code>com.xxx.xxx</code>，真实目标不可复现；</p>' +
+      '<p>② <b>加密算法未还原</b>——<code>loginId</code> 三段密文与 <code>password</code> 的加密过程需另逆 ' +
+      '<code>worker.Worker.aesEncrypt @0x6338e4</code>，作者明确列为"后续可做"；</p>' +
+      '<p>③ <b>响应体未取到</b>（只拿到 138 字节的响应头信息）；</p>' +
+      '<p>④ <b>重度依赖定制系统</b>：全文的关键一步"任意 so 注入"与"native 函数注册监听"来自作者的' +
+      '"小肩膀定制系统"，其实现细节未公开，<b>可复现性受限于是否拥有该环境</b>；</p>' +
+      '<p>⑤ 作者记录的踩坑：第一次导出的 so 是 <b>32 位 ARM（ELFCLASS32/EM_ARM）</b>导致偏移全错；' +
+      'Frida 17 移除了 <code>Module.findExportByName(null, ...)</code> 全局查找形式，' +
+      '报 <code>TypeError</code> 且恰好排在自毁观察器之前，白费一轮；' +
+      '想 hook <code>read</code>/<code>fgets</code> 擦除 maps 敏感行的方案<b>此路不通</b>——' +
+      '因为壳自己的 ELF 加载器也合法地读 maps 做重定位。</p>',
+    analysis:
+      '<p><b>本课第 1 章的核心是一句话：Hook 的第一条分界线是"Java 层还是 Native 层"。</b>' +
+      '这个案例把这个判断推进了一层——<b>当两层都不行时，还有第三层：自己写 hook。</b></p>' +
+      '<p><b>① 三条失败路线，恰好对应本章三节。</b>' +
+      'eCapture 失败是因为目标<b>绕过了系统库</b>（相当于第 1.3 节的"native 层"再往下）；' +
+      'Frida 失败是因为<b>反调试检测</b>（第 10 章的主题，但根源在第 1 章讲的"Frida 会留下映射特征"）；' +
+      '硬件断点失败是因为<b>Go 的栈式 ABI 让寄存器断点原理上抓不到参数</b>。' +
+      '<span class="hit">这三条失败各自都很有教学价值：它们说明"工具能用"是有前提的，' +
+      '前提不成立时，再熟练的用法也没用。</span></p>' +
+      '<p><b>② 最精彩的是作者对"检测与抓包"的解耦。</b>' +
+      '他写道：检测针对的是 <code>frida-agent</code> 的 <b>memfd 特征</b>，' +
+      '那么换一种<b>不产生 memfd</b> 的注入方式，自毁就天然不触发——' +
+      '根本不需要去 hook 那些检测函数。' +
+      '这跟第 1.4 节"混淆改变代码长相、改变不了运行结果"是同一类思维：' +
+      '<b>不要去对抗机制本身，而要改变自己的特征。</b></p>' +
+      '<p><b>③ 还有一个必须记住的元教训。</b>' +
+      '作者原话：<b>"App 能稳定运行" ≠ "绕过了反 Frida"，只是"没开 frida-server"而已。</b>' +
+      '他一度为了继续测试又把 frida-server 拉起来，结果自毁立刻卷土重来，' +
+      '之前"已稳定"的环境被自己亲手打回原形。' +
+      '这就是本章动手实验里强调的那条纪律：<b>判断"过没过"要靠对照实验，不能靠感觉。</b></p>',
+    link: 'https://bbs.kanxue.com/thread-292885.htm',
+    linkNote: '看雪论坛原创帖'
+  });
+
+  /* ---------------------------------------------------------- 1.5L 动手实验 */
+  new Lab(document.getElementById('lab1'), {
+    title: '实验：从症状反推该 hook 哪里',
+    goal: '目标：选对挂载点',
+    intro:
+      '<p>下面三个场景，每个都只有一段"症状描述"。<b>你的任务：判断该 hook 哪个东西，以及为什么。</b></p>' +
+      '<p class="small muted">填函数名关键词即可（如 <code>strcmp</code>、<code>open</code>、<code>encode</code>）。</p>',
+    inputs: [
+      { key: 's1', label: '场景 A：App 启动就闪退，没有任何日志。你想先确认它是不是在检测 Frida。该 hook 什么？',
+        hint: '检测要读 /proc、要比字符串、要连端口——哪一类最容易拦？', ph: '例如 open / strstr / connect' },
+      { key: 's2', label: '场景 B：你能 hook 到签名函数，但它的输入参数全是乱码。该往哪个方向查？',
+        hint: '输入是乱码，说明它在被调用前已经被处理过了', ph: '往上游找……' },
+      { key: 's3', label: '场景 C：函数被 OLLVM 混淆，静态完全看不懂。你决定用动态手段。该用哪个工具？',
+        hint: '回忆 1.4 / 1.5 两节', ph: 'Stalker / Interceptor / ...' }
+    ],
+    runLabel: '🔍 对照参考判断',
+    run: function (v) {
+      var html = '<div class="lab-msg key"><b>🔑 三个场景的参考判断</b><div class="lab-note">' +
+        '<b>场景 A → hook <code>open</code> / <code>fopen</code> 或 <code>strstr</code> / <code>strcmp</code></b><br>' +
+        '理由：检测 Frida 必然要"读文件看映射表"或"比字符串找特征"。' +
+        '这两类系统调用是<b>绕不过去的必经之路</b>——它可以用 OLLVM 把检测逻辑混淆得面目全非，' +
+        '但没法不用 <code>open</code> 就读到 <code>/proc/self/maps</code>。<br>' +
+        '<span class="hit">这就是第 10 章那条元原则的第一次登场：混淆保护逻辑，保护不了副作用。</span><br><br>' +
+        '<b>场景 B → 往调用链上游找</b><br>' +
+        '理由：输入是乱码，说明你 hook 的位置<b>太靠后</b>了——数据在进入这个函数之前已经被加工过。' +
+        '常见的情况是：真正的明文入口在上游某个类的方法里，而你看的这个函数接收的已经是编码后的中间态。<br>' +
+        '做法：<code>Java.use(...).method.overloads</code> 看有没有其他重载；或者用 <code>Stalker</code> 往上追溯调用者。<br><br>' +
+        '<b>场景 C → 用 <code>Stalker</code>（必要时配合 Interceptor）</b><br>' +
+        '理由：这是 1.4 / 1.5 两节的核心结论。<b>OLLVM 混淆的是控制流，改变不了"程序实际会走哪条路"。</b>' +
+        'Stalker 让程序自己把路走一遍，你读 trace 而不是读汇编。<br>' +
+        '注意配合关系：<b>Interceptor 定范围（缩小 trace 区间），Stalker 抓细节（看每一步）。</b>' +
+        '不设范围直接 trace 整个 App 会卡到没法用。</div></div>';
+      return html;
+    },
+    expected: function (v) {
+      var a = String(v.s1 || ''), b = String(v.s2 || ''), c = String(v.s3 || '');
+      var okA = window.AKKC_hasConcept(a, ['open', 'fopen', 'strstr', 'strcmp', 'read', 'connect', 'socket']);
+      var okB = window.AKKC_hasConcept(b, ['上游', '调用者', '上层', '前面', '调用链', '更早', 'overload', '重载', 'stalker', '追溯']);
+      var okC = window.AKKC_hasConcept(c, ['stalker', 'trace', '追踪']);
+      var ok = okA && okB && okC;
+      return {
+        ok: ok,
+        detail: (okA ? '✅ 场景 A：对了。' : '❌ 场景 A：应选 <code>open</code> / <code>strstr</code> 这类"检测必经之路"。') +
+          '<br>' + (okB ? '✅ 场景 B：对了，往上游找调用者。' : '❌ 场景 B：输入是乱码说明位置太靠后，该<b>往上游</b>查。') +
+          '<br>' + (okC ? '✅ 场景 C：对了，用 Stalker。' : '❌ 场景 C：OLLVM 混淆控制流，该用 <b>Stalker</b> 动态 trace。')
+      };
+    },
+    showAnswer:
+      '场景 A：hook open / fopen 或 strstr / strcmp\n' +
+      '  检测 Frida 必须读 /proc/self/maps 或比对特征字符串——\n' +
+      '  这些是"必经之路"，混淆改变不了它要调用这些函数的事实。\n\n' +
+      '场景 B：往调用链上游找\n' +
+      '  输入是乱码 = 你 hook 的位置太靠后，数据已被加工过。\n' +
+      '  查法：看方法重载、或用 Stalker 往上追溯调用者。\n\n' +
+      '场景 C：用 Stalker\n' +
+      '  OLLVM 混淆的是控制流，改变不了程序实际会走哪条路。\n' +
+      '  配合口诀：Interceptor 定范围，Stalker 抓细节。',
+    hint:
+      '三个场景分别对应本章三节的结论：<br>' +
+      'A → 1.4 节（OLLVM 与"必经之路"）<br>' +
+      'B → 1.2 节（Java Hook 的位置与调用链）<br>' +
+      'C → 1.5 节（Stalker）<br><br>' +
+      '关键提示：<b>"看不到"往往不是你 hook 错了，而是 hook 的位置不对</b>。' +
+      '问自己"这个数据在被我看之前，还经过了谁？"',
+    after:
+      '<div class="note ok"><div class="note-h">✅ 这个实验训练的是什么</div>' +
+      '<p style="margin-bottom:0">不是记住"哪个场景 hook 哪个函数"——那三组答案你迟早会忘。<br>' +
+      '真正要建立的是<b>一条反推路径</b>：<br>' +
+      '<b>症状 → 数据流走向 → 必经之路 → 挂载点</b><br><br>' +
+      '症状是"闪退"？那就问"要检测我需要读什么"。<br>' +
+      '症状是"参数乱码"？那就问"这个数据在被我看之前经过了谁"。<br>' +
+      '症状是"看不懂"？那就问"能不能让程序自己走一遍"（而不是我去读它）。<br><br>' +
+      '<span class="hit">这三条问法，会贯穿后面 17 章。</span></p></div>'
+  });
+
+  /* ---------------------------------------------------------- 决策演练 1 */
+  new Decision(document.getElementById('decision-1'), {
+    start: 'n0',
+    nodes: {
+      n0: {
+        label: '情境一',
+        scenario: '<b>情境：</b>你要 hook <code>com.example.app.utils.CryptoUtil</code> 类的 <code>encrypt(String)</code> 方法。脚本写好了，但一运行就报 <code>ClassNotFoundException</code>。类名你反复核对过，绝对没写错。',
+        q: '你的第一个动作是？',
+        choices: [
+          { t: '改用 Interceptor.attach，直接 hook Native 层', next: 'n1' },
+          { t: '检查这个类是由哪个 ClassLoader 加载的，用 Java.enumerateClassLoaders 找到它', next: 'n2' },
+          { t: '加一个 setTimeout 延迟 3 秒再 Java.use', next: 'n3' },
+          { t: '在 Java.perform 里先 dump 所有已加载的类，确认类真的存在', next: 'n4' }
+        ]
+      },
+      n1: {
+        label: '选A',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '方向错了：你在用错工具查错问题',
+        result: '类找不到是 <b>Java 层的问题</b>，跟 Native 层毫无关系。改成 Interceptor 只会让你从"报错"变成"静默失败"——脚本能跑，但什么也 hook 不到，反而更难排查。<br><br><b>记住本章的分界线：</b>Java 层方法用 Java.use，Native 函数用 Interceptor。工具选错，排查方向就全错了。'
+      },
+      n2: {
+        label: '选B',
+        terminal: true, verdict: 'good',
+        verdictTitle: '正确：这就是根因所在',
+        result: '<code>Java.use</code> 默认使用 <b>App 的默认 ClassLoader</b>。但加固 App 常用自定义 ClassLoader 加载真正的业务 dex，此时默认加载器根本看不到这个类。<br><br><b>标准解法：</b><pre>Java.enumerateClassLoaders({\n  onMatch: function (loader) {\n    try {\n      if (loader.findClass("com.example.app.utils.CryptoUtil")) {\n        Java.classFactory.loader = loader;   // 切换加载器\n        console.log("[+] 找到了！");\n      }\n    } catch (e) {}\n  }, onComplete: function () {}\n});</pre>找到之后再执行 <code>Java.use</code> 就成功了。<br><br><span class="hit">这是"类找不到"问题的第一排查方向。</span>'
+      },
+      n3: {
+        label: '选C',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '治标不治本，而且很危险',
+        result: '延迟有时候"看起来管用"，是因为恰好等到了某个时机。<br><br>但问题是：<b>如果是 ClassLoader 不对，等多久都没用</b>——默认加载器永远看不到那个类。<br>而且固定延迟很脆弱：慢设备上不够、快设备上浪费，还会让你的脚本在 App 启动关键期注入，容易触发反调试。<br><br><b>正确做法是</b>用 <code>Java.enumerateClassLoaders</code> 主动找到正确的加载器，或者用 <code>ClassLoader.loadClass</code> 显式指定。'
+      },
+      n4: {
+        label: '选D',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '思路对了一半，但代价太大',
+        result: 'dump 所有类确实能确认"类到底存不存在"，方向不算错。<br><br>但问题是：<b>枚举全部已加载的类在大型 App 上非常慢</b>，而且你大概率只会看到一堆系统类。就算你确认了类存在，你还是得回到"用哪个加载器"这个问题上。<br><br><b>更高效的做法：</b>直接遍历 ClassLoader（选项 B），一步到位。枚举类适合"我不确定类名到底叫什么"的场景。'
+      }
+    }
+  });
+
+  /* ---------------------------------------------------------- 决策演练 2 */
+  new Decision(document.getElementById('decision-2'), {
+    start: 'n0',
+    nodes: {
+      n0: {
+        label: '情境二',
+        scenario: '<b>情境：</b>你已经在 IDA 里定位到一个可疑函数，偏移 0x1A4C。用 Interceptor.attach 挂上去之后，脚本不报错，但 <code>onEnter</code> 一次都没触发。目标 App 的功能是正常的，说明这个函数确实被调用了。',
+        q: '你怎么查？',
+        choices: [
+          { t: '在 IDA 里确认这个函数是不是 Thumb 指令集，是的话地址 +1 再试', next: 'n1' },
+          { t: '把 IDA 里看到的偏移再加 0x1000（so 文件头），重新算地址', next: 'n2' },
+          { t: '先确认 so 是否真的已经加载，打印 Module.findBaseAddress 的结果', next: 'n3' },
+          { t: '可能是函数被内联了，改用 Stalker 全量 trace 找', next: 'n4' }
+        ]
+      },
+      n1: {
+        label: '选A',
+        terminal: true, verdict: 'good',
+        verdictTitle: '正确：Thumb 位是 ARM 逆向的经典陷阱',
+        result: '<b>这是 ARM 32 位平台最高频的坑。</b><br><br>ARM 处理器有两种指令集：<b>ARM</b>（4 字节定长）和 <b>Thumb</b>（2/4 字节混合）。函数地址的<b>最低位</b>用来标记模式：<br>• 最低位 = 0 → ARM 模式<br>• 最低位 = 1 → Thumb 模式<br><br>所以如果目标函数是 Thumb 编译的，你必须传 <code>base.add(0x1A4C + 1)</code>。<br>传错了不会报错，Interceptor 会按 ARM 模式去解析 Thumb 指令，得到完全错误的指令边界，Hook 静默失效。<br><br><span class="hit">判断方法：</span>IDA 里函数名左侧会显示 <code>loc_</code> 还是 <code>sub_</code> 之外，还可以看反汇编的指令宽度；或者直接在 Frida 里试两种地址。'
+      },
+      n2: {
+        label: '选B',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '概念混淆：文件偏移 ≠ 内存偏移',
+        result: '你把两种完全不同的"偏移"搞混了：<br><br>• <b>IDA 里显示的地址</b>通常已经是"虚拟地址"，相对 so 的加载基址<br>• <b>文件偏移</b>是数据在 so 文件里的位置，两者之间差一个 section 的对齐关系<br><br>IDA 默认显示的就是虚拟地址（你可以看 IDA 的 Options → General → Display 设置）。<br><br><b>正确做法：</b>在 IDA 里看函数地址（例如 <code>.text:00001A4C</code>），用这个值减掉 so 的 ImageBase（通常 IDA 里是 0），得到的就是相对偏移。<br>如果你确实只有文件偏移，得查 program headers 做转换。'
+      },
+      n3: {
+        label: '选C',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '排查方向合理，但解释了你的现象',
+        result: '检查 so 是否加载是对的，<b>但这解释不了你的现象</b>。<br><br>如果 so 没加载，<code>Module.findBaseAddress</code> 会返回 <code>null</code>，紧接着 <code>null.add(0x1A4C)</code> 会直接抛异常——<b>你的脚本会报错</b>。<br><br>而你的现象是"脚本不报错，但 onEnter 不触发"，说明地址算出来了、attach 也成功了，只是<b>执行流没走到那个地址上</b>。<br><br>这强烈指向<b>指令集模式错误</b>（Thumb 位）或者<b>函数被内联</b>。'
+      },
+      n4: {
+        label: '选D',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '可能性存在，但你跳过了最便宜的检查',
+        result: '函数被内联（inline）确实是 Native Hook 失效的一个原因——编译器把函数体直接展开到调用处，那个"函数"在运行时根本不存在。<br><br>但你的排查顺序错了：<b>应该先做零成本的检查，再上重型武器</b>。<br><br><b>正确的排查顺序：</b><ol><li>打印 base 和 addr，确认地址有效（1 行代码）</li><li>确认指令集模式，试 Thumb +1（改一个数字）</li><li>在 IDA 里跳转到该地址，确认它真是函数入口而不是代码中间</li><li>以上都不行，才考虑内联 / 花指令 / 动态注册</li></ol>Stalker 全量 trace 会让 App 卡到无法操作，而且海量输出淹没你。'
+      }
+    }
+  });
+
+  /* ---------------------------------------------------------- 决策演练 3 */
+  new Decision(document.getElementById('decision-3'), {
+    start: 'n0',
+    nodes: {
+      n0: {
+        label: '情境三',
+        scenario: '<b>情境：</b>你要还原一个被 OLLVM 混淆的签名算法。函数体很大，IDA 的 F5 出来是一坨 <code>while(1) switch(state)</code>。你已经用 Stalker 拿到了完整的指令 trace，有几万行。',
+        q: '下一步你怎么从这几万行里找到算法逻辑？',
+        choices: [
+          { t: '在 trace 里找异或、移位、加法这些"加密特征"指令密集的区段', next: 'n1' },
+          { t: '把 trace 里的内存读写地址提取出来，找输入缓冲区被读、输出缓冲区被写的区间', next: 'n2' },
+          { t: '把 trace 按函数调用分组，看它调用了哪些库函数', next: 'n3' },
+          { t: '先把 trace 全量导出成文本，逐行人工阅读', next: 'n4' }
+        ]
+      },
+      n1: {
+        label: '选A',
+        terminal: true, verdict: 'good',
+        verdictTitle: '正确：算法有"形状"，指令密度暴露它',
+        result: '这是最高效的切入点。<b>任何加密算法都有特征指令轮廓：</b><br><br>• <b>AES</b>：<code>eor</code> 密集 + <code>tbl</code>（查表，S 盒）<br>• <b>MD5/SHA</b>：<code>add</code>/<code>eor</code>/<code>and</code>/<code>orr</code>/<code>ror</code> 五连循环，且循环次数是 64 或 80<br>• <b>RC4</b>：两个 <code>ldrb</code> + 一次 <code>strb</code> 交换，成对出现<br>• <b>Base64</b>：大量 <code>and 0x3F</code> + <code>lsr</code> 移位<br><br><b>实操技巧：</b>在 trace 里统计每 100 条指令中各类助记符的占比，画出"指令密度图"。突变的区段就是算法核心。'
+      },
+      n2: {
+        label: '选B',
+        terminal: true, verdict: 'good',
+        verdictTitle: '正确：追数据流比追控制流更有效',
+        result: '这是另一个极其有效的角度，而且<b>对混淆免疫</b>——因为 OLLVM 混淆的是<em>控制流</em>，数据怎么流动它改不了。<br><br><b>做法：</b><br>1. 在 onEnter 时记下参数指针（输入地址）<br>2. 在 Trace 中筛选所有读该地址区间的指令 → 这是"输入被消费"的点<br>3. 找出最终写入某块新内存的指令序列 → 这是"输出产生"的点<br>4. 这两点之间的所有指令，就是算法本体<br><br><b>这个方法的价值：</b>它把"几万行 trace"缩到"几十行核心逻辑"，而且天然绕过了所有虚假分支和状态机噪声。<br><br>实际工作中，<span class="hit">选项 A 和 B 经常配合使用</span>：先用 B 框定范围，再用 A 在范围内识别具体算法。'
+      },
+      n3: {
+        label: '选C',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '方向可行，但你会一无所获',
+        result: '按调用分组是 Trace 分析的常规手段，但在这个场景下<b>大概率是空的</b>。<br><br>原因：<b>加密算法的核心轮函数通常被内联了</b>。为了性能，编译器会把轮函数直接展开进循环，你根本看不到 <code>call</code> 指令。<br>你能看到的调用可能只有 <code>malloc</code>、<code>memcpy</code> 这种无关紧要的。<br><br>而且 OLLVM 混淆后的代码里，"函数边界"本身就很模糊。<br><br><b>更可行的：</b>如果你确实想用调用关系破局，去找<b>算法结束后调用的库函数</b>——比如 <code>memcpy</code>、<code>strlen</code>，它们常常标记算法的"收尾位置"，可以当作参考点。'
+      },
+      n4: {
+        label: '选D',
+        terminal: true, verdict: 'bad',
+        verdictTitle: '这是最慢、最容易放弃的路',
+        result: '几万行指令人工逐行阅读——这不是"细致"，这是<b>没有方法</b>。<br><br>现实情况是：OLLVM 混淆后的 trace 里，<b>60%-90% 是垃圾指令和状态机调度</b>。逐行读等于把 90% 的时间浪费在死代码和 switch 分发上。<br><br>而且人的短期记忆扛不住几万行，读到 500 行你就忘了前面在做什么了。<br><br><b>正确的顺序永远是：先缩小范围，再细看。</b><br>缩小范围的手段：按内存读写筛选（选项 B）、按指令特征筛选（选项 A）、按循环边界切分。'
+      }
+    }
+  });
+
+  /* ---------------------------------------------------------- 测验 */
+  new Quiz(document.getElementById('quiz1'), {
+    id: 'q1-1', chapter: 1, answer: 1,
+    stem: '为什么 Frida 脚本里必须有 <code>Java.perform</code>？',
+    options: [
+      { t: '纯粹是为了延迟执行，等 App 启动完', why: '不是延迟。它是线程 attach 语义，延迟只是副作用。' },
+      { t: '等待 ART 虚拟机就绪，并把 Frida 的注入线程 attach 到 VM 上以获得 JNIEnv', why: '正确。没有 JNIEnv，任何 Java API 调用都会失败。' },
+      { t: '为了提高脚本执行性能', why: '与性能无关。' },
+      { t: '为了绕过 App 的反调试检测', why: '它不具备反检测能力。' }
+    ],
+    explain: '<b>Java.perform(fn)</b> 的完整语义是：阻塞等待 VM 初始化完成 → 把当前线程 attach 到 VM → 在 attach 状态下执行 fn → 执行完 detach。<br><br>Frida 注入的线程本质是 Native 线程，对 ART 来说它是"外部线程"，没有 JNIEnv，无法调用任何 Java 方法。这就是必须 attach 的原因。'
+  });
+
+  new Quiz(document.getElementById('quiz2'), {
+    id: 'q1-2', chapter: 1, answer: 0,
+    stem: '你想把一个 Native 函数的返回值强制改成 NULL，下面哪种写法真正生效？',
+    options: [
+      { t: '<code>retval.replace(ptr("0x0"))</code>', why: '正确。replace 会把新值真正写回 CPU 寄存器。' },
+      { t: '<code>retval = ptr("0x0")</code>', why: '错误。这只是重新赋值了一个 JS 局部变量，Native 层的返回寄存器完全没变。' },
+      { t: '<code>this.retval = ptr("0x0")</code>', why: '错误。挂到 this 上只是存了个状态，同样不影响真实返回值。' },
+      { t: '在 <code>onEnter</code> 里写 <code>retval = ptr("0x0")</code>', why: '错误。onEnter 阶段返回值根本还不存在，且赋值方式本身就是错的。' }
+    ],
+    explain: '<b>唯一正确的方式是 <code>retval.replace(newValue)</code>。</b><br><br>原因：Frida 的 <code>retval</code> 是一个 <code>NativePointer</code> 包装对象。<code>retval.replace()</code> 会调用底层实现，把新值写回函数返回时使用的那个 CPU 寄存器（ARM32 是 r0，AArch64 是 x0）。<br><br>而 <code>retval = something</code> 只是把 JS 变量 <code>retval</code> 重新指向了另一个对象——原来那个寄存器里的值纹丝不动。<br><br><b>记忆口诀：</b>要改返回值，只有 <code>replace</code>。'
+  });
+
+  new Quiz(document.getElementById('quiz3'), {
+    id: 'q1-3', chapter: 1, answer: 2,
+    stem: 'OLLVM 的控制流平坦化（<code>-fla</code>）为什么会让 IDA 的反编译失效？',
+    options: [
+      { t: '因为它加密了函数里的字符串常量', why: '那是字符串加密，是另一个手段。' },
+      { t: '因为它插入了大量永不执行的分支', why: '那是虚假控制流 -bcf。' },
+      { t: '因为它把结构化控制流改写成一个由状态变量驱动的 switch 分发器，使反编译器无法恢复 if/while 结构', why: '正确。' },
+      { t: '因为它把简单指令替换成了等价复杂指令', why: '那是指令替换 -sub。' }
+    ],
+    explain: '反编译器（如 IDA 的 Hex-Rays）依赖识别<b>结构化控制流模式</b>来生成可读的伪代码。<br><br>平坦化后，所有基本块都成了同一个 switch 的 case，块与块之间的真实顺序被一个运行时变量 <code>state</code> 决定。反编译器无从判断"哪个 case 之后该走哪个 case"，只能原样输出一个巨大的 switch。<br><br><b>破解关键：</b>state 的取值序列在动态执行时是确定的，Trace 它就能还原真实顺序。'
+  });
+
+  new Quiz(document.getElementById('quiz4'), {
+    id: 'q1-4', chapter: 1, answer: 0,
+    stem: '你写了一个 Stalker 指令级 Trace 脚本，对整个 App 全程开启。最可能的结果是？',
+    options: [
+      { t: 'App 严重卡顿甚至 ANR 崩溃，或者触发超时类反调试', why: '正确。指令级 Trace 有 10-100 倍性能损耗。' },
+      { t: 'Trace 记录不完整，会丢指令', why: 'Stalker 不会丢指令，只是慢。' },
+      { t: 'Frida 会自动限制频率，影响不大', why: 'Frida 不会自动限流。' },
+      { t: '没有任何影响，Stalker 是零开销的', why: '完全错误。' }
+    ],
+    explain: 'Stalker 采用<b>动态重编译</b>：每执行到一个新基本块，它都要复制代码并插入回调。这个开销在指令级粒度下极其可观。<br><br><b>正确用法：</b><br>• 用 <code>Interceptor.attach</code> 在目标函数入口开启、出口关闭<br>• 用 <code>Stalker.exclude()</code> 排除无关模块（如 libc）<br>• 优先用 <code>events: {call: true}</code> 事件流代替逐指令回调<br>• 必要时只统计不打印，把结果累积到数组里最后一次性输出'
+  });
+
+  /* ---------------------------------------------------------- 严师 */
+  new SocraticTeacher(document.getElementById('teacher1'), {
+    id: 'ch1', chapter: 1,
+    name: '追问老师 · 第一章',
+    sub: 'Hook 的边界、地址的来源、混淆的破法——说不清就别往下走',
+    intro: '<p style="margin:0">我不考你 API 怎么写，API 查文档就有。我考的是<b>为什么</b>。<br>下面每道题，你要用<em>自己的话</em>把关键概念说全。说得含糊我会追问，追问三次还不行我直接给答案——但那不算你过关。</p>',
+    questions: [
+      {
+        id: 'c1q1', depth: 1, threshold: 0.7,
+        q: '用你自己的话说清楚：<b>Java 层 Hook</b> 和 <b>Native 层 Hook</b> 的本质区别是什么？为什么说它们需要"不同方向"的排查思路？',
+        concepts: [
+          { label: 'Java Hook 依赖 ART 虚拟机的反射机制，作用在方法层面', any: ['反射', 'ART', '虚拟机', 'Java.use', '方法层', 'dex'] },
+          { label: 'Native Hook 直接改写机器码指令（inline hook），作用在地址层面', any: ['机器码', '指令', 'inline', 'Interceptor', '地址', '汇编', '内存'] },
+          { label: '失败原因不同：Java 是类加载器/内联，Native 是地址算错/so未加载/指令集', any: ['类加载器', 'ClassLoader', '地址', '偏移', 'Thumb', 'so 没加载', '加载时机', '重载'] }
+        ],
+        hints: [
+          '想想"改电话簿"和"在线路上并联监听器"的比喻，两者改的东西一样吗？',
+          '一个失败时你查"类在不在、谁加载的"，另一个失败时你查什么？'
+        ],
+        probes: [
+          '那我再问：如果一个方法被 ART 内联优化掉了，你用 Java.use 还能 hook 到吗？为什么？',
+          '如果 so 是通过 <code>dlopen</code> 动态加载的，你在脚本启动时就 attach 会发生什么？'
+        ],
+        model: '<b>核心区别在于"作用层级"：</b><br><br><b>Java Hook</b> 借用 ART 的反射能力。ART 里每个方法都有对应的 ArtMethod 结构体，Frida 通过 Java.use 拿到它，把 access_flags 改成 native 并替换入口。所以它失败的原因都在"虚拟机层面"：类加载器不对（找不到类）、方法被内联（没有独立的 ArtMethod 入口）、方法被抽取壳抽走（code item 是空的）。<br><br><b>Native Hook</b> 绕过虚拟机，直接在内存里改机器码。Frida 把目标函数开头几条指令保存下来，写入跳转到自己 trampoline 的指令。所以它失败的原因都在"内存与地址层面"：so 还没加载（返回 null）、偏移算错（文件偏移 vs 虚拟地址混淆）、Thumb 位没加 1（指令边界错乱）、函数被内联（地址上没有函数入口）。<br><br><b>所以排查方向必须匹配层级：</b>Java 层的问题在虚拟机的类管理体系里找，Native 层的问题在内存布局与指令编码里找。拿错工具去查，就会像我第一个情境里那样，越查越远。',
+        after: '<p style="margin-bottom:0">你刚才把本章最重要的那条分界线说清楚了。<b>后面 17 章的所有技术，你都可以用这个问题去定位它：它工作在虚拟机上，还是内存上？</b></p>'
+      },
+      {
+        id: 'c1q2', depth: 2, threshold: 0.75,
+        q: 'Frida 的 <code>NativeFunction</code> / <code>Interceptor</code> 需要知道函数地址。请说出<b>三种</b>获取函数地址的方式，并说明各自的适用场景和坑。',
+        concepts: [
+          { label: '导出符号：Module.getExportByName / findExportByName', any: ['getExportByName', 'findExportByName', '导出', 'export', '符号'] },
+          { label: '模块基址 + 静态偏移：findBaseAddress().add(offset)', any: ['基址', 'base', '偏移', 'offset', 'findBaseAddress'] },
+          { label: '运行时枚举/扫描：enumerateExports / 特征扫描 / 遍历内存', any: ['enumerateExports', '枚举', '扫描', '遍历', '特征', 'search'] },
+          { label: '提到坑：符号被抹掉、偏移随版本变、Thumb 要 +1', any: ['抹掉', '改名', '版本', 'Thumb', '加 1', '+1', '混淆', 'strip'] }
+        ],
+        hints: [
+          '最省事的那一种，前提是函数得"愿意被看见"——什么情况下它不愿意？',
+          '如果符号全没了，你怎么在内存里把它找出来？'
+        ],
+        probes: [
+          '追问：so 加载后基址每次都不一样，那"静态偏移"是从哪里来的？IDA 里显示的那个地址可以直接当偏移用吗？',
+          '如果目标函数不是导出函数，是 so 内部的 static 函数，这三种方法哪种还能用？'
+        ],
+        model: '<b>三种方式及其取舍：</b><br><br><b>1. 导出符号</b>：<code>Module.getExportByName("libx.so", "encrypt")</code>。最稳、最省事，因为符号表是 so 自己提供的。<b>坑：</b>加固/混淆后符号常被 strip 掉或改成随机名，这时返回 null。<br><br><b>2. 基址 + 偏移</b>：<code>Module.findBaseAddress("libx.so").add(0x1A4C)</code>。适用符号被抹掉的情况。<b>坑一：</b>偏移来自 IDA 里看到的虚拟地址，要减掉 ImageBase；<b>坑二：</b>App 更新后代码变了，偏移就失效，脚本要跟着更新；<b>坑三：</b>ARM32 的 Thumb 函数地址要 +1。<br><br><b>3. 运行时枚举/扫描</b>：<code>Module.enumerateExports()</code> 列出所有导出逐个匹配，或者用 <code>Memory.scan</code> 按机器码特征搜索。<b>适用：</b>符号改成了随机名，但函数还在。<b>坑：</b>开销大、特征可能不唯一（多个匹配）。<br><br><b>补充第四种（实战常用）：</b>Hook JNI 的 <code>RegisterNatives</code>，在动态注册的那一刻捕获 Java 方法名到函数地址的映射。这是第 4 章"定制 ART"要解决的问题，也是应对"地址飘忽不定"的终极手段。'
+      },
+      {
+        id: 'c1q3', depth: 2, threshold: 0.75,
+        q: 'OLLVM 有四大混淆手段。请说出其中<b>三种</b>，并说明为什么"动态 Trace"能同时破掉它们。',
+        concepts: [
+          { label: '控制流平坦化 -fla（switch 状态机）', any: ['平坦化', 'fla', 'switch', '状态机', 'state'] },
+          { label: '虚假控制流 -bcf（不透明谓词 / 死代码）', any: ['虚假控制流', 'bcf', '不透明谓词', '死代码', '垃圾代码', '恒真'] },
+          { label: '指令替换 -sub（等价复杂指令）', any: ['指令替换', 'sub', '等价', '指令替换'] },
+          { label: '字符串加密（运行时解密）', any: ['字符串加密', '字符串', '解密', '密文'] },
+          { label: '动态 Trace 的理由：真实执行路径只有一条，死代码不会出现，寄存器最终值确定', any: ['真实路径', '只有一条', '死代码不执行', '不会执行', '运行时', '最终值', '执行过'] }
+        ],
+        hints: [
+          '想想"地图"和"行车记录仪"的区别——地图上有很多路，但车只走了一条。',
+          '混淆改变的是代码的"长相"，它能改变代码的"计算结果"吗？如果不能，那你该看什么？'
+        ],
+        probes: [
+          '那如果 App 每次运行都用随机初始 state（比如从时间戳派生），平坦化还能被 Trace 破掉吗？',
+          '字符串加密的情况下，静态搜不到明文，你怎么知道该 hook 哪个解密函数？'
+        ],
+        model: '<b>四大手段：</b><br>① <b>控制流平坦化（-fla）</b>：真实分支被拆成 switch 的 case，用随机初始值的 state 变量驱动。<br>② <b>虚假控制流（-bcf）</b>：插入恒真的不透明谓词和永不执行的死代码，把控制流图撑大。<br>③ <b>指令替换（-sub）</b>：简单运算展开成等价但复杂的指令序列，隐藏魔数。<br>④ <b>字符串加密</b>：常量替换为密文+解密例程，运行时才在内存里还原。<br><br><b>为什么动态 Trace 能同时破掉它们：</b><br><br>因为这四种手段改变的都是<b>代码的静态形式</b>，而不是<b>运行时的语义</b>——程序最终还是要算出同样的结果，这是混淆器的铁律（否则程序就坏了）。<br><br>• 平坦化：<b>state 的取值序列在动态执行时是一条确定的链</b>，Trace 它就能把 switch 重新串成线性流程。<br>• 虚假控制流：<b>死代码永远不会出现在 trace 里</b>，不透明谓词的真实结果直接暴露。<br>• 指令替换：<b>CPU 算出来的寄存器值是等价的</b>，你看最终值而非指令形式。<br>• 字符串加密：<b>解密那一刻明文必然出现在内存里</b>，在解密函数返回处 dump 即可。<br><br>所以本课的核心方法论是：<span class="hit">静态看不懂的，让程序自己走一遍给你看。</span>'
+      },
+      {
+        id: 'c1q4', depth: 3, threshold: 0.7,
+        q: '<b>综合题：</b>目标 App 有一个签名函数藏在 so 里，函数被 OLLVM 全面混淆（四招全上），符号已被抹掉，且 App 有反调试会检测 Frida。请描述你的<b>完整攻击路线</b>——从拿到样本到最终能算出签名。',
+        concepts: [
+          { label: '先解决反调试 / 隐藏 Frida 特征（改名、改端口、绕过检测）', any: ['反调试', '检测', '隐藏', '改名', '端口', '绕过', 'spawn', 'gadget', 'frida-server'] },
+          { label: '定位 so 与目标函数：静态找可疑点或 hook RegisterNatives', any: ['定位', 'RegisterNatives', 'IDA', '静态', '偏移', '导出', 'JNI_OnLoad'] },
+          { label: '用 Stalker / Interceptor 做动态 Trace，配合内存读写筛选缩小范围', any: ['Stalker', 'Trace', '动态', 'Interceptor', '内存读写', '筛选'] },
+          { label: '抓输入输出对 + 常量特征比对，识别算法族', any: ['输入输出', '样本', '常量', '特征', '魔数', 'S 盒', '比对', '识别'] },
+          { label: '最终用 Frida RPC 或 unidbg 封装成可调用服务', any: ['RPC', 'unidbg', '封装', '服务', '批量', '黑盒调用', '自动化'] }
+        ],
+        hints: [
+          '第一步不是 hook，是"让 hook 能活下去"。顺序反了后面全白做。',
+          '想想本章说的"加密算法的三个落脚点"：输入在哪、常量表在哪、输出在哪。'
+        ],
+        probes: [
+          '如果 Stalker 一开就被检测到（因为性能骤降或者 Frida 的代码缓存特征），你怎么办？',
+          '如果算法依赖了 App 运行时才生成的数据（比如从服务端下发的密钥），静态比对常量还够用吗？'
+        ],
+        model: '<b>完整攻击路线（六步）：</b><br><br><b>1. 让 Frida 活下来。</b>先解决反调试。常见手段：用 <code>frida-gadget</code> 注入而不是 frida-server（避免端口检测）；改 frida-server 进程名和默认端口；hook 掉 <code>/proc/self/maps</code>、<code>/proc/self/status</code> 的读取；用 <code>frida -f</code> spawn 模式在反调试初始化前就介入。这一步不解决，后面全是空谈。<br><br><b>2. 定位目标。</b>符号被抹掉，所以走两条路：① IDA 里静态分析，找 JNI 函数表、找可疑的位运算密集区域，拿到偏移；② Hook <code>RegisterNatives</code> 或 <code>JNI_OnLoad</code>，在动态注册那一刻捕获"Java 方法名 → Native 地址"的映射。后者更可靠。<br><br><b>3. 动态 Trace 缩小范围。</b>用 Interceptor 在可疑函数入口开 Stalker，同时记录：输入缓冲区的地址、被读写的内存区间、指令密度分布。几万行 trace 用内存读写筛选后通常能压到几十行。<br><br><b>4. 识别算法族。</b>两条线索：① <b>常量特征</b>——在 trace 或内存里找 MD5 的初始魔数、SHA 的 K 常量、AES 的 S 盒（魔改也会保留类似的<em>结构</em>：256 字节的置换表、64 轮循环）；② <b>输入输出对</b>——喂已知明文，看输出的长度和分布，能快速区分是哈希（定长）还是分组加密（长度对齐）还是编码（长度膨胀）。<br><br><b>5. 还原或绕过。</b>如果是标准算法的魔改变种，往往不需要逐行还原——改用现成库 + 换表/换常量即可。如果是完全自定义的，就按轮函数逐个还原。<br><br><b>6. 落地成服务。</b>用 Frida RPC（<code>rpc.exports</code>）或 unidbg（第 7 章）把算法封装成"输入明文 → 输出密文"的接口，实现批量/远程调用。这是算法还原的最终形态。<br><br><span class="hit">关键点：顺序不能乱。</span>反调试没解决就做 trace，trace 会被污染；范围没缩小就看指令，等于大海捞针；算法族没识别就逐行还原，可能白干——因为那可能只是 AES 换了个 S 盒。'
+      },
+      {
+        id: 'c1q5', depth: 1, threshold: 0.7,
+        q: '为什么 <code>this.encode(input)</code> 在你的 Hook 实现里调用<em>原始方法</em>，而不会无限递归调用自己？',
+        concepts: [
+          { label: 'Frida 在设置 implementation 时保存了原始方法的引用', any: ['保存', '备份', '原始方法', '原始实现', '引用', '缓存'] },
+          { label: '包装器上的 this.encode 指向的是那个保存的原始实现，而不是被替换后的版本', any: ['指向', '包装', '原始', '替换后', '不是自己'] }
+        ],
+        hints: [
+          '如果 Frida 不做任何特殊处理，你确实会写出死循环。它做了什么呢？',
+          '想想"改电话簿"的比喻：你把财务部分机改成自己，那你想转接给真财务部时，得知道真号码。'
+        ],
+        probes: [
+          '追问：那如果你在 Hook 里写 <code>Sign.encode(input)</code>（用类名而不是 this）会怎样？',
+          '如果原方法是 static 的，this 还指向什么？'
+        ],
+        model: 'Frida 在安装 <code>implementation</code> 的时候，会同时<strong>保存原始方法的调用入口</strong>，并把包装器对象上的方法属性指向那个保存的入口。<br><br>所以 <code>this.encode(input)</code> 中的 <code>this</code> 是 Frida 的包装器实例，它的 <code>encode</code> 属性已经被绑定到<strong>原始 Java 实现</strong>（通过 ART 的 <code>jmethodID</code> 直接调用），而不是你替换进去的那个 JS 函数。<br><br>换句话说：<span class="hit">Frida 给你两个入口——"被 Hook 的入口"和执行流现在所在的那个，"原始入口"被单独藏起来供你调用。</span>'
+      }
+    ]
+  });
+
+  window.AKKC_initTerms && window.AKKC_initTerms();
+})();
+</script>
+</body>
+</html>

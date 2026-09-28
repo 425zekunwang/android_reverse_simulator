@@ -1,0 +1,23 @@
+# ===========================================================================
+# 统一换行符：仓库内一律 LF，检出与提交都不做转换。
+# 本项目是纯静态站点，LF 在所有平台都能正常工作；
+# 统一之后可以避免"Windows 上检出变 CRLF → 整文件 diff"这类噪声。
+# ===========================================================================
+* text=auto eol=lf
+
+# —— 明确标记为二进制，git 不要尝试做行尾转换或 diff ——
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+
+# —— 这些文件天然带 CRLF（将来若加 Windows 脚本），保持原样 ——
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
