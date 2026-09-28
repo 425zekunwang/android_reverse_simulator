@@ -48,29 +48,30 @@
   </div>
 
   <div class="note warn">
-    <div class="note-h">⚠️ 这 32 章来自三份不同的课程大纲，请先搞清它们的关系</div>
-    <p>本站是按三份大纲<b>逐步补全</b>的：最初只有 <b>3w 计划班</b>的目录（第 1–18 章），
+    <div class="note-h">📖 章节顺序 = 学习顺序（32 章已按从易到难重排）</div>
+    <p>本站内容来自三份大纲、<b>逐步补全</b>：最初只有 <b>3w 计划班</b>的目录（18 章），
     后来拿到 <b>2w 计划班</b>目录补出 7 章，最后拿到 <b>1w 计划班</b>目录又补出 7 章。
-    <span class="hit">所以章节编号的先后<strong>不代表学习顺序</strong>——后补的两批反而是更基础的内容。</span></p>
+    <span class="hit">于是曾经出现一个问题：章节号记录的是"写作批次"，不是学习顺序——最难的部分被排在了最前面。</span>
+    现在编号已按学习顺序重排（入门 → 基础补遗 → 进阶），<strong>照编号往下读即可</strong>。</p>
     <div class="tbl-wrap" style="margin-top:10px">
       <table class="tbl">
-        <thead><tr><th>来源</th><th>章节</th><th>性质</th><th>你该什么时候看</th></tr></thead>
+        <thead><tr><th>阶段</th><th>章节</th><th>性质</th><th>你该什么时候看</th></tr></thead>
         <tbody>
           <tr>
-            <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">1w 计划</span></td>
-            <td>第 26–32 章<br><span class="muted small">（入门程）</span></td>
+            <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">第一程 · 入门地基</span></td>
+            <td>第 <b>1–7</b> 章<br><span class="muted small">（原 1w 计划）</span></td>
             <td><b>最基础</b>：四大组件 / 生命周期 / Handler / Binder、Smali 与重打包、APK·DEX·ELF 格式、应用安全风险与审计、环境配置与定位方法论、RSA、AI 辅助</td>
             <td><b>完全零基础从这里开始。</b>这 7 章回答的是"安卓本身怎么跑起来"</td>
           </tr>
           <tr>
-            <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">2w 计划</span></td>
-            <td>第 19–25 章<br><span class="muted small">（补遗程）</span></td>
+            <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">第二程 · 基础技能补遗</span></td>
+            <td>第 <b>8–14</b> 章<br><span class="muted small">（原 2w 计划）</span></td>
             <td><b>基础</b>：加固全景、JNI/NDK 开发、Frida 自动化、Xposed/LSPosed、抓包与协议、自吐沙箱、白盒密码</td>
-            <td>补上"逆向工作"的必备技能，是第 1–18 章默认你会的前置</td>
+            <td>补上"逆向工作"的必备技能，是第 15–32 章默认你会的前置</td>
           </tr>
           <tr>
-            <td><span class="pill acc">3w 计划</span></td>
-            <td>第 1–18 章</td>
+            <td><span class="pill acc">第三程 · 进阶与深水区</span></td>
+            <td>第 <b>15–32</b> 章<br><span class="muted small">（原 3w 计划）</span></td>
             <td>进阶：脱壳演进、编译器中立、虚拟机保护、跨平台与基础设施</td>
             <td>已经有逆向底子，想往深水区走</td>
           </tr>
@@ -78,15 +79,15 @@
       </table>
     </div>
     <p><b>两个具体例子：</b><br>
-    ① 第 2 章讲 FART 脱壳时，默认你已知"加固分哪几代、壳的特征怎么判定"——这块在第 19 章。<br>
-    ② 第 8 章讲算法还原时，默认你已会抓包拿到请求样本，也默认你知道"这个方法是怎么被系统调起来的"——
-    前者在第 23 章，后者在 <b>第 26 章</b>。</p>
+    ① 第 16 章讲 FART 脱壳时，默认你已知"加固分哪几代、壳的特征怎么判定"——这块在第 8 章。<br>
+    ② 第 22 章讲算法还原时，默认你已会抓包拿到请求样本，也默认你知道"这个方法是怎么被系统调起来的"——
+    前者在第 12 章，后者在 <b>第 1 章</b>。</p>
     <p style="margin-bottom:0"><span class="hit">所以顺序不影响正确性，但影响你的挫败感。</span>
-    不确定从哪开始的话，直接看下面那张卡片里的<b>「1w 入门模块」</b>路线。</p>
+    不确定从哪开始的话，直接看下面那张卡片里的<b>「零基础完整路线」</b>。</p>
   </div>
 
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:26px 0">
-    <a class="btn primary" href="ch01-frida.html" style="text-decoration:none;padding:11px 22px;font-size:14px">▶ 从第 1 章开始</a>
+    <a class="btn primary" href="ch01-android-model.html" style="text-decoration:none;padding:11px 22px;font-size:14px">▶ 从第 1 章开始</a>
     <a class="btn" href="#map" style="text-decoration:none;padding:11px 22px;font-size:14px">🗺 浏览全部 32 章</a>
     <a class="btn" href="slides.html" style="text-decoration:none;padding:11px 22px;font-size:14px">📊 复习演示稿</a>
     <a class="btn" href="cases.html" style="text-decoration:none;padding:11px 22px;font-size:14px">📁 实战案例库</a>
@@ -109,11 +110,11 @@
       <div class="card-title" style="color:var(--ok)">🎯 算法还原（最短路径）</div>
       <p class="muted small" style="margin-bottom:10px">目标：拿到 App 的签名/加密结果，能用代码复现。</p>
       <div class="flex" style="gap:6px">
-        <span class="pill ok">CH 1</span><span class="pill ok">CH 3</span>
-        <span class="pill ok">CH 7</span><span class="pill ok">CH 8</span><span class="pill ok">CH 9</span>
+        <span class="pill ok">CH 15</span><span class="pill ok">CH 17</span>
+        <span class="pill ok">CH 21</span><span class="pill ok">CH 22</span><span class="pill ok">CH 23</span>
       </div>
       <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>5 章即可干活。</b>第 5、6 章是为"遇到 OLLVM/VMP 啃不动"时准备的加深内容，可以后补。
+        <b>5 章即可干活。</b>第 19、20 章是为"遇到 OLLVM/VMP 啃不动"时准备的加深内容，可以后补。
       </p>
     </div>
 
@@ -121,11 +122,11 @@
       <div class="card-title" style="color:var(--acc)">📦 脱壳 / 加固对抗</div>
       <p class="muted small" style="margin-bottom:10px">目标：把加壳 App 的原始 dex 或 so 完整还原出来。</p>
       <div class="flex" style="gap:6px">
-        <span class="pill acc">CH 1</span><span class="pill acc">CH 2</span>
-        <span class="pill acc">CH 4</span><span class="pill acc">CH 10</span><span class="pill acc">CH 12</span>
+        <span class="pill acc">CH 15</span><span class="pill acc">CH 16</span>
+        <span class="pill acc">CH 18</span><span class="pill acc">CH 24</span><span class="pill acc">CH 26</span>
       </div>
       <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>关键是第 4 章。</b>读懂 ART 源码才能自己定位脱壳点——只会用别人的 FART，遇到新壳就没辙。
+        <b>关键是第 18 章。</b>读懂 ART 源码才能自己定位脱壳点——只会用别人的 FART，遇到新壳就没辙。
       </p>
     </div>
 
@@ -133,8 +134,8 @@
       <div class="card-title" style="color:var(--bad)">🛡️ 反检测 / 环境对抗</div>
       <p class="muted small" style="margin-bottom:10px">目标：让分析环境不被发现，或识别对方的环境检测。</p>
       <div class="flex" style="gap:6px">
-        <span class="pill bad">CH 6</span><span class="pill bad">CH 11</span>
-        <span class="pill bad">CH 13</span><span class="pill bad">CH 15</span><span class="pill bad">CH 18</span>
+        <span class="pill bad">CH 20</span><span class="pill bad">CH 25</span>
+        <span class="pill bad">CH 27</span><span class="pill bad">CH 29</span><span class="pill bad">CH 32</span>
       </div>
       <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
         <b>核心思想是降维。</b>把观测点放到比对手更低的层级（内核、Hypervisor），对方的检测就看不见你。
@@ -142,39 +143,39 @@
     </div>
 
     <div class="card path-card" data-path="zero" style="cursor:pointer;border-color:rgba(163,230,53,.45)">
-      <div class="card-title" style="color:#a3e635">🌱 1w 入门模块（完全零基础）</div>
+      <div class="card-title" style="color:#a3e635">🌱 零基础完整路线（照编号读）</div>
       <p class="muted small" style="margin-bottom:10px">目标：先搞懂"安卓本身是怎么跑起来的"，再谈逆向。</p>
       <div class="flex" style="gap:6px">
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 26</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 27</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 28</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 29</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 30</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 31</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 32</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 1</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 2</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 3</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 5</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 8</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 9</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 12</span>
       </div>
       <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>一行逆向经验都没有？从这里开始。</b>这 7 章补的是"安卓自己的模型"：
+        <b>一行逆向经验都没有？从这里开始。</b>先读第 1–7 章补"安卓自己的模型"：
         组件与 IPC → Smali 与改包 → 文件格式 → 应用安全 → 环境与定位 → RSA → AI 辅助。
-        <span class="hit">学完这 7 章，第 19–25 章会变得好读很多。</span>
+        <span class="hit">学完第 1–7 章，第 8–14 章会变得好读很多。</span>
       </p>
     </div>
 
     <div class="card path-card" data-path="basic" style="cursor:pointer;border-color:rgba(232,121,249,.42)">
-      <div class="card-title" style="color:#e879f9">🧱 2w 基础模块（新手入口）</div>
-      <p class="muted small" style="margin-bottom:10px">目标：把第 1–18 章默认你已经会的前置补上。</p>
+      <div class="card-title" style="color:#e879f9">🧱 基础技能补遗（第 8–14 章）</div>
+      <p class="muted small" style="margin-bottom:10px">目标：把第 15–32 章默认你已经会的前置补上。</p>
       <div class="flex" style="gap:6px">
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 19</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 20</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 21</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 22</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 23</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 24</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 25</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 8</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 9</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 10</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 11</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 12</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 13</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 14</span>
       </div>
       <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>零基础就走这条。</b>加固全景 → JNI/NDK → Frida 自动化 → Xposed/LSPosed → 抓包与协议 → 自吐沙箱 → 白盒密码。
-        走完再回去看第 1–18 章，你会发现那些章节的"默认前提"全都有了。
+        <b>基础补齐就走这条。</b>加固全景 → JNI/NDK → Frida 自动化 → Xposed/LSPosed → 抓包与协议 → 自吐沙箱 → 白盒密码。
+        走完再进第 15–32 章，你会发现那些章节的"默认前提"全都有了。
       </p>
     </div>
   </div>
@@ -191,11 +192,11 @@
   <div class="card">
     <div class="card-title">🎯 三大核心能力，外加一个地基</div>
     <div class="note" style="margin-top:12px;border-color:rgba(163,230,53,.35)">
-      <div class="note-h" style="color:#a3e635">地基：安卓自己的模型（第 26–32 章）</div>
+      <div class="note-h" style="color:#a3e635">地基：安卓自己的模型（第 1–7 章）</div>
       <p style="margin-bottom:0">下面三种能力都站在同一个前提上：<b>你得知道安卓是怎么运作的。</b>
       组件怎么被系统唤起、代码跑在哪条线程、进程之间怎么说话、dex 长什么样、改了包会破坏什么——
       <span class="hit">这些不是"进阶知识"，它们是坐标系。</span>
-      <b>第 26 章（应用模型）、28 章（文件格式）、30 章（定位方法）</b>是这块地基的三根柱子。
+      <b>第 1 章（应用模型）、3 章（文件格式）、5 章（定位方法）</b>是这块地基的三根柱子。
       没有它，你所有的"下钩子"都只能靠试。</p>
     </div>
     <div class="grid3" style="margin-top:12px">
@@ -203,21 +204,20 @@
         <div class="note-h">能力一：加壳 / 混淆对抗</div>
         <p style="margin-bottom:0">壳把真 dex 藏起来 → 你要在它解密的那一刻截胡（脱壳）；
         混淆把逻辑打散 → 你要用动态执行轨迹把它拼回来。
-        <b>第 2、5、6、10、12、13 章</b>都在打这场仗，而<b>第 19 章</b>是这张战场的地图。</p>
-      </div>
+        <b>第 16、19、20、24、26、27 章</b>都在打这场仗，而<b>第 8 章</b>是这张战场的地图。</p>      </div>
       <div class="note ok" style="margin:0">
         <div class="note-h">能力二：算法还原</div>
         <p style="margin-bottom:0">App 把标准算法魔改（换表、加盐、塞进 OLLVM）→ 你要靠
         <b>常量特征比对</b> + <b>动态抓中间状态</b>认出它到底是哪个算法的变种，
-        再用 unidbg 黑盒调用直接出结果。<b>第 3、7、8、9 章</b>是主线，
-        <b>第 24、25、31 章</b>处理"密钥根本不在你手上"的三种极端情况。</p>
+        再用 unidbg 黑盒调用直接出结果。<b>第 17、21、22、23 章</b>是主线，
+        <b>第 13、14、6 章</b>处理"密钥根本不在你手上"的三种极端情况。</p>
       </div>
       <div class="note" style="margin:0;border-color:rgba(232,121,249,.35)">
         <div class="note-h" style="color:#e879f9">能力三：观测能力本身</div>
         <p style="margin-bottom:0">上面两种能力都建立在一件事上：<b>你得先看得见</b>。
-        JNI 怎么绑定（<b>第 20 章</b>）、Frida 怎么自动化与去特征（<b>第 21 章</b>）、
-        Xposed/LSPosed 怎么常驻（<b>第 22 章</b>）、抓包怎么突破校验（<b>第 23 章</b>）、
-        怎么让算法自己招供（<b>第 24 章</b>）——<b>这一层不牢，后面全是碰运气。</b></p>
+        JNI 怎么绑定（<b>第 9 章</b>）、Frida 怎么自动化与去特征（<b>第 10 章</b>）、
+        Xposed/LSPosed 怎么常驻（<b>第 11 章</b>）、抓包怎么突破校验（<b>第 12 章</b>）、
+        怎么让算法自己招供（<b>第 13 章</b>）——<b>这一层不牢，后面全是碰运气。</b></p>
       </div>
     </div>
   </div>
@@ -226,41 +226,41 @@
     <table class="tbl">
       <thead><tr><th>层级</th><th>你控制的东西</th><th>对应章节</th><th>典型对手</th></tr></thead>
       <tbody>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用模型层</span></td><td>组件、生命周期、消息循环、IPC</td><td>26</td><td>"这段代码是被谁调起来的"</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">文件格式层</span></td><td>APK / DEX / ELF 的结构</td><td>28</td><td>加固对文件结构的破坏</td></tr>
-        <tr><td><span class="pill cool">加固方案层</span></td><td>壳的代际、特征与判定</td><td>19</td><td>市面上各类加固壳</td></tr>
-        <tr><td><span class="pill">Java 层</span></td><td>类方法、字段</td><td>1、2、20</td><td>简单校验、Java 层加密</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">Smali / 改包层</span></td><td>Dalvik 字节码、重打包</td><td>27</td><td>签名校验、完整性校验</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用缺陷层</span></td><td>导出组件、存储、WebView</td><td>29</td><td>App 自身的漏洞</td></tr>
-        <tr><td><span class="pill">协议层</span></td><td>HTTP(S)、TLS、socket 报文</td><td>23</td><td>证书绑定、自定义协议</td></tr>
-        <tr><td><span class="pill acc">Native 层</span></td><td>so 导出函数、JNI 接口表</td><td>1、3、8、9、20</td><td>OLLVM 混淆的加密函数、隐藏入口的壳</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">分析方法层</span></td><td>环境配置、七条定位线索</td><td>30</td><td>"找不到关键代码"</td></tr>
-        <tr><td><span class="pill acc">Hook 框架层</span></td><td>注入时机、Zygote</td><td>21、22</td><td>Frida / Xposed 特征检测</td></tr>
-        <tr><td><span class="pill acc">编译器层</span></td><td>LLVM IR / Pass</td><td>5</td><td>控制流平坦化、虚假控制流</td></tr>
-        <tr><td><span class="pill warn">虚拟机层</span></td><td>ART 源码、解释器</td><td>2、4、10、12、24</td><td>抽取壳、DexProtector</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">公钥密码层</span></td><td>RSA、公钥、填充</td><td>31</td><td>客户端验签、假 RSA</td></tr>
-        <tr><td><span class="pill warn">密码学实现层</span></td><td>算法表结构、密钥嵌入方式</td><td>24、25</td><td>白盒 AES、DFA 故障分析</td></tr>
-        <tr><td><span class="pill bad">字节码层</span></td><td>VMP 解释器、映射表</td><td>6、8</td><td>虚拟机保护</td></tr>
-        <tr><td><span class="pill bad">内核 / Hypervisor</span></td><td>syscall、调试寄存器</td><td>11、13、15</td><td>反调试、Frida 检测</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">工具形态层</span></td><td>反编译器 + 大模型</td><td>32</td><td>混淆导致的"读不完"</td></tr>
-        <tr><td><span class="pill ok">基础设施层</span></td><td>namespace、cgroup、KVM</td><td>16、17、18</td><td>风控环境检测</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用模型层</span></td><td>组件、生命周期、消息循环、IPC</td><td>1</td><td>"这段代码是被谁调起来的"</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">文件格式层</span></td><td>APK / DEX / ELF 的结构</td><td>3</td><td>加固对文件结构的破坏</td></tr>
+        <tr><td><span class="pill cool">加固方案层</span></td><td>壳的代际、特征与判定</td><td>8</td><td>市面上各类加固壳</td></tr>
+        <tr><td><span class="pill">Java 层</span></td><td>类方法、字段</td><td>15、16、9</td><td>简单校验、Java 层加密</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">Smali / 改包层</span></td><td>Dalvik 字节码、重打包</td><td>2</td><td>签名校验、完整性校验</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用缺陷层</span></td><td>导出组件、存储、WebView</td><td>4</td><td>App 自身的漏洞</td></tr>
+        <tr><td><span class="pill">协议层</span></td><td>HTTP(S)、TLS、socket 报文</td><td>12</td><td>证书绑定、自定义协议</td></tr>
+        <tr><td><span class="pill acc">Native 层</span></td><td>so 导出函数、JNI 接口表</td><td>15、17、22、23、9</td><td>OLLVM 混淆的加密函数、隐藏入口的壳</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">分析方法层</span></td><td>环境配置、七条定位线索</td><td>5</td><td>"找不到关键代码"</td></tr>
+        <tr><td><span class="pill acc">Hook 框架层</span></td><td>注入时机、Zygote</td><td>10、11</td><td>Frida / Xposed 特征检测</td></tr>
+        <tr><td><span class="pill acc">编译器层</span></td><td>LLVM IR / Pass</td><td>19</td><td>控制流平坦化、虚假控制流</td></tr>
+        <tr><td><span class="pill warn">虚拟机层</span></td><td>ART 源码、解释器</td><td>16、18、24、26、13</td><td>抽取壳、DexProtector</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">公钥密码层</span></td><td>RSA、公钥、填充</td><td>6</td><td>客户端验签、假 RSA</td></tr>
+        <tr><td><span class="pill warn">密码学实现层</span></td><td>算法表结构、密钥嵌入方式</td><td>13、14</td><td>白盒 AES、DFA 故障分析</td></tr>
+        <tr><td><span class="pill bad">字节码层</span></td><td>VMP 解释器、映射表</td><td>20、22</td><td>虚拟机保护</td></tr>
+        <tr><td><span class="pill bad">内核 / Hypervisor</span></td><td>syscall、调试寄存器</td><td>25、27、29</td><td>反调试、Frida 检测</td></tr>
+        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">工具形态层</span></td><td>反编译器 + 大模型</td><td>7</td><td>混淆导致的"读不完"</td></tr>
+        <tr><td><span class="pill ok">基础设施层</span></td><td>namespace、cgroup、KVM</td><td>30、31、32</td><td>风控环境检测</td></tr>
       </tbody>
     </table>
   </div>
 
   <div class="note warn">
     <div class="note-h">⚠️ 一句话学习建议</div>
-    <p style="margin-bottom:0">这条路线<strong>不能跳着学</strong>。第 5 章看不懂 OLLVM 源码，是因为第 3 章汇编没读透；
-    第 6 章啃不动 VMP，是因为第 5 章的 LLVM Pass 没吃透。
-    如果你的目标是算法还原（大多数人都是），<b>第 1 → 3 → 7 → 8 → 9 章就是最短路径</b>，
+    <p style="margin-bottom:0">这条路线<strong>不能跳着学</strong>。第 19 章看不懂 OLLVM 源码，是因为第 17 章汇编没读透；
+    第 20 章啃不动 VMP，是因为第 19 章的 LLVM Pass 没吃透。
+    如果你的目标是算法还原（大多数人都是），<b>第 15 → 17 → 21 → 22 → 23 章就是最短路径</b>，
     剩下的章节是让你在遇到"这招不管用"的时候，知道该往哪一层去找答案。</p>
-    <p style="margin:12px 0 0"><b>如果你完全零基础</b>，最短路径要先绕一下：
-    <b>26 → 27 → 28 → 30</b>（安卓怎么运作 → 怎么改包 → 文件格式 → 环境与定位），
-    再走 <b>19 → 20 → 23</b>（壳的分代 → JNI 怎么绑定 → 怎么抓到第一份样本），最后才进 <b>1 → 3 → 7 → 8 → 9</b>。</p>
+    <p style="margin:12px 0 0"><b>如果你完全零基础</b>，路径更简单——<b>照编号从第 1 章往下读</b>：
+    先读 <b>1 → 2 → 3 → 5</b>（安卓怎么运作 → 怎么改包 → 文件格式 → 环境与定位），
+    再走 <b>8 → 9 → 12</b>（壳的分代 → JNI 怎么绑定 → 怎么抓到第一份样本），最后才进 <b>15 → 17 → 21 → 22 → 23</b>。</p>
     <p style="margin:12px 0 0">看着绕了 7 步，但每一步都在拆掉后面的一堵墙：
-    <b>不学 26，你在第 2 章会看不懂"为什么 dump 出来是空的"、在第 30 章会不知道该怎么找代码；
-    不学 27，你连"改一行试试"这个最便宜的手段都用不了；
-    不学 23，第 8 章的算法还原连靶子都没有。</b>
+    <b>不学 1，你在第 16 章会看不懂"为什么 dump 出来是空的"、在第 5 章会不知道该怎么找代码；
+    不学 2，你连"改一行试试"这个最便宜的手段都用不了；
+    不学 12，第 22 章的算法还原连靶子都没有。</b>
     <span class="hit">先补地基再往上盖，比爬到一半发现地基是空的要快。</span></p>
   </div>
 
@@ -341,75 +341,76 @@
   // ---- 学习路线 ----
   const PATHS = {
     algo: {
-      chs: [1, 3, 7, 8, 9],
+      chs: [15, 17, 21, 22, 23],
       title: '🎯 路线：算法还原（最短路径）',
       body: '<p style="margin-top:0"><b>适合谁：</b>只想拿到 App 的签名/加密算法并用代码复现的人。这是大多数人的真实目标。</p>' +
         '<p><b>为什么这 5 章就够：</b></p><ol style="margin-bottom:8px">' +
-        '<li><b>第 1 章</b>——学会观测。不会 Hook 就什么都拿不到。</li>' +
-        '<li><b>第 3 章</b>——学会读汇编。加密算法最终都是指令，看不懂汇编就只能靠工具碰运气。</li>' +
-        '<li><b>第 7 章</b>——学会黑盒调用。很多时候你根本不需要还原逻辑，直接把 so 跑起来调用就行。</li>' +
-        '<li><b>第 8 章</b>——学会识别。用常量特征认出"这是 MD5 换了 IV"。</li>' +
-        '<li><b>第 9 章</b>——学会收尾。动态编码表、组合变种、自动化 RPC 服务。</li></ol>' +
-        '<p style="margin-bottom:0"><b>什么时候再回来补：</b>当你发现目标用了 OLLVM（回第 5 章）、或者算法跑在 VMP 里（回第 6 章）。' +
+        '<li><b>第 15 章</b>——学会观测。不会 Hook 就什么都拿不到。</li>' +
+        '<li><b>第 17 章</b>——学会读汇编。加密算法最终都是指令，看不懂汇编就只能靠工具碰运气。</li>' +
+        '<li><b>第 21 章</b>——学会黑盒调用。很多时候你根本不需要还原逻辑，直接把 so 跑起来调用就行。</li>' +
+        '<li><b>第 22 章</b>——学会识别。用常量特征认出"这是 MD5 换了 IV"。</li>' +
+        '<li><b>第 23 章</b>——学会收尾。动态编码表、组合变种、自动化 RPC 服务。</li></ol>' +
+        '<p style="margin-bottom:0"><b>什么时候再回来补：</b>当你发现目标用了 OLLVM（回第 19 章）、或者算法跑在 VMP 里（回第 20 章）。' +
         '<span class="muted">带着具体问题去学，比按顺序啃效率高得多。</span></p>'
     },
     unpack: {
-      chs: [1, 2, 4, 10, 12],
+      chs: [15, 16, 18, 24, 26],
       title: '📦 路线：脱壳 / 加固对抗',
       body: '<p style="margin-top:0"><b>适合谁：</b>需要把加壳 App 的原始 dex/so 完整还原出来，做二次分析的人。</p>' +
-        '<p><b>这条路的难点在第 4 章，不在第 2 章：</b></p><ol style="margin-bottom:8px">' +
-        '<li><b>第 2 章</b>教你 FART 怎么用——但那是别人的工具，只能打别人打过的壳。</li>' +
-        '<li><b>第 4 章</b>教你读 ART 源码、自己定位脱壳点——<span class="hit">这才是分水岭</span>。' +
+        '<p><b>这条路的难点在第 18 章，不在第 16 章：</b></p><ol style="margin-bottom:8px">' +
+        '<li><b>第 16 章</b>教你 FART 怎么用——但那是别人的工具，只能打别人打过的壳。</li>' +
+        '<li><b>第 18 章</b>教你读 ART 源码、自己定位脱壳点——<span class="hit">这才是分水岭</span>。' +
         '每个安卓大版本 ART 内部结构都会变，脱壳点必须重新找。</li>' +
-        '<li><b>第 10、12 章</b>是版本演进的实战：从 fdex2 到高版本适配，从 Android 10 到 Android 14 打 DexProtector。</li></ol>' +
+        '<li><b>第 24、26 章</b>是版本演进的实战：从 fdex2 到高版本适配，从 Android 10 到 Android 14 打 DexProtector。</li></ol>' +
         '<p style="margin-bottom:0"><b>一句话：</b>会用 FART 是入门，能自己给新版本移植 FART 才是能力。</p>'
     },
     anti: {
-      chs: [6, 11, 13, 15, 18],
+      chs: [20, 25, 27, 29, 32],
       title: '🛡️ 路线：反检测 / 环境对抗',
       body: '<p style="margin-top:0"><b>适合谁：</b>分析环境老是被检测、或者需要识别对方环境检测手段的人。</p>' +
         '<p><b>贯穿这条路的唯一思想是"降维"：</b>把观测点放到比对手更低的层级。</p><ol style="margin-bottom:8px">' +
-        '<li><b>第 13 章</b>——内核层。硬件断点不改内存，所有"检测内存改写"的手段全部失效。</li>' +
-        '<li><b>第 6 章</b>——Hypervisor 层（EL2）。比内核还低，guest 完全看不见。这是当前对抗的天花板。</li>' +
-        '<li><b>第 11 章</b>——eBPF。在内核里安全地跑观测程序，比用户态 Frida 隐蔽。</li>' +
-        '<li><b>第 15、18 章</b>——反过来，理解云手机/容器的检测点，才能伪装得更像真机。</li></ol>' +
+        '<li><b>第 27 章</b>——内核层。硬件断点不改内存，所有"检测内存改写"的手段全部失效。</li>' +
+        '<li><b>第 20 章</b>——Hypervisor 层（EL2）。比内核还低，guest 完全看不见。这是当前对抗的天花板。</li>' +
+        '<li><b>第 25 章</b>——eBPF。在内核里安全地跑观测程序，比用户态 Frida 隐蔽。</li>' +
+        '<li><b>第 29、32 章</b>——反过来，理解云手机/容器的检测点，才能伪装得更像真机。</li></ol>' +
         '<p style="margin-bottom:0"><b>注意：</b>这条路的技术门槛最高（要懂内核、虚拟化），但一旦掌握，' +
         '对手的检测手段基本就对你无效了。</p>'
     },
     zero: {
-      chs: [26, 27, 28, 29, 30, 31, 32],
-      title: '🌱 路线：1w 入门模块（完全零基础）',
+      chs: [1, 2, 3, 5, 8, 9, 12],
+      title: '🌱 路线：零基础完整路线',
       body: '<p style="margin-top:0"><b>适合谁：</b>一行逆向经验都没有，或者做过但总觉得"悬空"的人。' +
-        '这 7 章对应 <b>1w 计划班</b>的目录，补的是<b>"安卓自己的模型"</b>——不是逆向技巧，是逆向之前你必须知道的东西。</p>' +
+        '先读第 1–7 章（入门地基），补的是<b>"安卓自己的模型"</b>——不是逆向技巧，是逆向之前你必须知道的东西。</p>' +
         '<p><b>顺序是有理由的：</b></p><ol style="margin-bottom:8px">' +
-        '<li><b>第 26 章 安卓应用基础模型</b>——四大组件、生命周期、Handler 消息循环、Binder IPC、存储沙箱、动态加载。' +
+        '<li><b>第 1 章 安卓应用基础模型</b>——四大组件、生命周期、Handler 消息循环、Binder IPC、存储沙箱、动态加载。' +
         '<span class="hit">这是全站最底层的坐标系</span>：不学它，你连"该 hook 哪里"都没法系统性地想。</li>' +
-        '<li><b>第 27 章 Smali 与重打包</b>——改包的基础。改一行代码让校验恒真，是很多人第一次"真的改动了别人程序"的经历。</li>' +
-        '<li><b>第 28 章 APK / DEX / ELF 格式</b>——把三种容器拆到字节级。脱壳、修 so、看节表都建立在这上面。</li>' +
-        '<li><b>第 29 章 应用安全风险与审计</b>——换个视角看 App：它的组件、存储、WebView 有哪些缺陷。' +
+        '<li><b>第 2 章 Smali 与重打包</b>——改包的基础。改一行代码让校验恒真，是很多人第一次"真的改动了别人程序"的经历。</li>' +
+        '<li><b>第 3 章 APK / DEX / ELF 格式</b>——把三种容器拆到字节级。脱壳、修 so、看节表都建立在这上面。</li>' +
+        '<li><b>第 4 章 应用安全风险与审计</b>——换个视角看 App：它的组件、存储、WebView 有哪些缺陷。' +
         '<b>这份攻击面清单同时也是你的入口清单。</b></li>' +
-        '<li><b>第 30 章 环境配置与关键代码定位</b>——先搭环境，再学"怎么找到那段代码"的七条线索。' +
+        '<li><b>第 5 章 环境配置与关键代码定位</b>——先搭环境，再学"怎么找到那段代码"的七条线索。' +
         '<span class="hit">这一章是把前面几章变成可操作能力的地方。</span></li>' +
-        '<li><b>第 31 章 算法地图与 RSA</b>——补齐密码学地图。第 8、9 章讲了 MD5/AES/Base64，但 RSA 和"该往哪一类想"一直没人给。</li>' +
-        '<li><b>第 32 章 AI 辅助逆向</b>——最新的一块：把反编译器接入大模型能做什么、以及它会在哪里骗你。</li></ol>' +
-        '<p style="margin-bottom:0"><b>走完之后：</b>接着走 <b>2w 基础模块（19 → 20 → 23）</b>，再进 <b>算法还原最短路径（1 → 3 → 7 → 8 → 9）</b>。' +
-        '这条路看着长，但每一步都在给下一步铺路——<b>比你直接啃第 5 章 OLLVM 然后卡住要快得多。</b></p>'
+        '<li><b>第 6 章 算法地图与 RSA</b>——补齐密码学地图。第 22、23 章讲了 MD5/AES/Base64，但 RSA 和"该往哪一类想"一直没人给。</li>' +
+        '<li><b>第 7 章 AI 辅助逆向</b>——最新的一块：把反编译器接入大模型能做什么、以及它会在哪里骗你。</li></ol>' +
+        '<p style="margin-bottom:0"><b>走完之后：</b>接着走 <b>第 8–14 章（基础技能补遗，8 → 9 → 12）</b>，' +
+        '再进 <b>算法还原最短路径（15 → 17 → 21 → 22 → 23）</b>。' +
+        '这条路看着长，但每一步都在给下一步铺路——<b>比你直接啃第 8 章 OLLVM 然后卡住要快得多。</b></p>'
     },
     basic: {
-      chs: [19, 20, 21, 22, 23, 24, 25],
-      title: '🧱 路线：2w 基础模块（新手从这里开始）',
+      chs: [8, 9, 10, 11, 12, 13, 14],
+      title: '🧱 路线：基础技能补遗（第 8–14 章）',
       body: '<p style="margin-top:0"><b>适合谁：</b>还没系统做过逆向、或者做的时候总觉得"少了点什么"的人。' +
-        '这 7 章对应 <b>2w 计划班</b>的目录，是第 1–18 章默认你已经会的前置。</p>' +
+        '这 7 章是第 15–32 章默认你已经会的前置。</p>' +
         '<p><b>按这个顺序走，每一步都在给下一步铺路：</b></p><ol style="margin-bottom:8px">' +
-        '<li><b>第 19 章 加固技术全景</b>——先知道敌人有哪几代。不学这章，你在第 2 章会看不懂"为什么 dump 出来方法体是空的"。</li>' +
-        '<li><b>第 20 章 JNI / NDK 开发</b>——自己写一遍才知道 Java 和 native 怎么互相找到对方。' +
-        '<span class="hit">这是全站最基础的一章</span>：第 4、7、13 章的"动态注册"全靠它。</li>' +
-        '<li><b>第 23 章 抓包与协议分析</b>——大多数分析是从一份请求样本开始的。抓不到包，第 8、9 章的算法还原就没有靶子。</li>' +
-        '<li><b>第 21 章 Frida 自动化</b>——objection / r0capture / r0tracer 三件套，把重复劳动去掉；再去特征。</li>' +
-        '<li><b>第 22 章 Xposed / LSPosed</b>——与 Frida 并列的另一条主线，工作方式完全不同（常驻 vs 按需）。</li>' +
-        '<li><b>第 24 章 自吐沙箱</b>——让算法自己把密钥和明文吐出来。<span class="hit">学会了它，"还原算法"这件事的难度会掉一个数量级。</span></li>' +
-        '<li><b>第 25 章 白盒密码</b>——最极端的情况：算法还在，但密钥被融进了实现里。DFA 是唯一的出路。</li></ol>' +
-        '<p style="margin-bottom:0"><b>走完之后：</b>回到第 1 章开始按顺序看。' +
+        '<li><b>第 8 章 加固技术全景</b>——先知道敌人有哪几代。不学这章，你在第 16 章会看不懂"为什么 dump 出来方法体是空的"。</li>' +
+        '<li><b>第 9 章 JNI / NDK 开发</b>——自己写一遍才知道 Java 和 native 怎么互相找到对方。' +
+        '<span class="hit">这是全站最基础的一章</span>：第 18、21、27 章的"动态注册"全靠它。</li>' +
+        '<li><b>第 12 章 抓包与协议分析</b>——大多数分析是从一份请求样本开始的。抓不到包，第 22、23 章的算法还原就没有靶子。</li>' +
+        '<li><b>第 10 章 Frida 自动化</b>——objection / r0capture / r0tracer 三件套，把重复劳动去掉；再去特征。</li>' +
+        '<li><b>第 11 章 Xposed / LSPosed</b>——与 Frida 并列的另一条主线，工作方式完全不同（常驻 vs 按需）。</li>' +
+        '<li><b>第 13 章 自吐沙箱</b>——让算法自己把密钥和明文吐出来。<span class="hit">学会了它，"还原算法"这件事的难度会掉一个数量级。</span></li>' +
+        '<li><b>第 14 章 白盒密码</b>——最极端的情况：算法还在，但密钥被融进了实现里。DFA 是唯一的出路。</li></ol>' +
+        '<p style="margin-bottom:0"><b>走完之后：</b>回到第 15 章开始按顺序看。' +
         '你会发现之前"看不懂的章节"突然都能读了——因为你补齐的不是知识点，是<b>它们默认你已有的那套语言</b>。</p>'
     }
   };

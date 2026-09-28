@@ -1,2088 +1,1037 @@
-/* 第 26 章数据 —— 安卓应用基础模型：组件、生命周期与 IPC */
+/* 第 26 章 · FART 10 & 12 版本演进
+   分多次写入：本文件由 write + 多次 edit 拼装而成。
+   注意：不确定的 ART 源码细节一律标注「待核实」，绝不编造函数名/字段名/编译命令。 */
+
+/* 时间轴 stage 用的选取助手：清空 → 标记已完成 → 高亮当前 → 写三栏详情 */
+function fartPick(cur, done, cols) {
+  ['tl5', 'tl6', 'tl8', 'tl9', 'tl10', 'tl11', 'tl12'].forEach(function (i) { S(i, ''); });
+  (done || []).forEach(function (i) { S(i, 'done'); });
+  if (cur) S(cur, 'active');
+  SET('tla', cols[0]); SET('tlb', cols[1]); SET('tlc', cols[2]);
+}
+
 window.CHAPTER = {
   no: 26,
-  title: '安卓应用基础模型：组件、生命周期与 IPC',
-  lede: '前面二十多章讲的都是"怎么突破防护"，但有一个更基础的问题始终没被系统回答过：' +
-        '<strong>一个 App 到底是怎么被系统拉起来的，它凭什么能活着、能被别人唤起、能和别的进程说话？</strong>' +
-        '这一章补的就是这个坐标系——<b>不知道组件与 IPC 的模型，你后面所有的"hook 哪里""为什么这里能触发"都只能靠试。</b>',
+  title: 'FART 10 & 12 版本演进',
+  lede: '上一章你学会了写一个脱壳工具；这一章要告诉你一个更残酷的事实：<strong>那个工具明年就会失效</strong>。ART 的内部结构每个大版本都在变，插在里面的脱壳点必须重新定位——FART 不是一个成品，而是一个要持续维护的项目。本章用 FART 移植到 Android 10、以及用 FART14 秒脱 DexProtector 两个实战，把「读懂 ART 源码 → 重新定位脱壳点 → 适配编译 → 真机验证」这条链路走完，最后沉淀成一套<strong>遇到任何新壳都能用的决策框架</strong>。',
   meta: [
-    '核心问题：<b>一个 App 是"一个程序"还是"一组被系统随时唤起的组件"？</b>',
-    '关键机制：<b>四大组件 / 生命周期 / Handler 消息循环 / Binder IPC</b>',
-    '对手：<b>把入口藏在组件回调里的加固壳，和把逻辑拆到别的进程里的风控</b>'
+    '核心问题：<b>为什么同一个脱壳工具，换一个安卓大版本就不能用了？</b>',
+    '关键能力：<b>读对应版本 AOSP 源码 → 找到 dex 加载与 code item 回填点 → 重新插桩</b>',
+    '实战目标：<b>Android 10 上移植 FART；Android 14 上用 FART 秒脱 DexProtector</b>',
+    '最重要的一句话：<b>逆向的护城河是原理理解，不是工具收藏</b>'
   ],
 
   sections: [
-    /* ============================================================ 26.1 */
+    /* ================= 26.1 ================= */
     {
-      h: '26.1', title: '先纠正一个直觉：App 不是"一个程序"',
+      h: '26.1',
+      title: '为什么 FART 必须跟着安卓版本一起走',
       intuition: {
-        tag: '直觉模型 · 不是一家公司，而是一排服务窗口',
-        body:
-          '<p>如果你写惯了 C 程序，你脑子里的模型是：<b>一个 main() 从头跑到尾，程序自己决定什么时候结束。</b></p>' +
-          '<p>安卓完全不是这样。更准确的类比是：<b>你的 App 是一排"服务窗口"，而系统是那个发号的大厅经理。</b></p>' +
-          '<ul>' +
-          '<li>窗口什么时候开、什么时候关，<b>不是你说了算，是经理说了算</b>（系统按内存压力随时杀你）；</li>' +
-          '<li>每个窗口有自己的"上班流程"（生命周期回调），经理会在特定时刻敲你：<b>客人来了</b>（onCreate）、' +
-          '<b>客人看不见你了</b>（onStop）、<b>下班</b>（onDestroy）；</li>' +
-          '<li>你的 App <b>可以没有 main()</b>——严格说它有一个（<span class="mono">ActivityThread.main</span>），' +
-          '但那是系统给的，不是你写的，而且它跑起来之后<b>立刻就进入了一个"等消息"的循环</b>，不是在执行你的逻辑；</li>' +
-          '<li>你的代码是<b>被回调驱动的</b>：没人敲门，你一行代码都不跑。</li>' +
-          '</ul>' +
-          '<p><span class="hit">这个模型一旦建立，很多逆向里的困惑会自己消失：' +
-          '为什么断点要下在 onCreate 而不是 main、为什么"启动后什么都不做"的 App 也在耗电、' +
-          '为什么加固壳第一件事就是覆写 <span class="mono">attachBaseContext</span>。</span></p>'
+        tag: '直觉模型 · 每年换一次锁芯的房东',
+        body: '<p>你花三个月配出一把万能钥匙（FART），能开房东家的锁（某个版本的 ART）。可这位房东有个习惯：<b>每到一个大版本就换一次锁芯</b>——锁的位置没变，钥匙也还能插进去，但里面的弹子结构已经完全不同，齿形对不上了。</p>' +
+              '<p>绝大多数人第一次移植失败，不是技术不行，而是心里默认了「脱壳工具是一次性投入」。真相是：<b>ART 是活的代码，每个大版本都在动</b>；而 FART 是插进 ART 内部的一根探针，探针插在哪里，是由 ART 的内部结构决定的。<b>结构一变，探针就得重新找位置。</b></p>' +
+              '<p>所以本章真正要教的不是「FART 10 怎么改」，而是两件不会过期的事：<b>为什么必须持续维护</b>，以及<b>遇到新壳时的决策框架</b>。</p>'
       },
-      html:
-        T.note('key', '🔑 本章要建立的三个坐标系',
-          '<p style="margin-bottom:0">' +
-          '① <b>组件坐标系</b>——App 由哪四种东西组成，每一种<b>什么时候被系统唤起</b>（26.3–26.6）；<br>' +
-          '② <b>线程坐标系</b>——主线程在干嘛、消息循环是怎么转的、为什么你的代码必须在特定线程上跑（26.8–26.9）；<br>' +
-          '③ <b>进程坐标系</b>——你的 App 怎么和系统服务、和别的 App 说话（26.10–26.12）。<br>' +
-          '而最后 26.13 会把这三套坐标系<b>翻译成逆向视角的观测点清单</b>。</p>') +
-        '<p>先说一件很多人搞混的事：<b>进程 ≠ App。</b>' +
-        '一个 App 可以配置成跑在多个进程里，一个进程里也可以只有 App 的一部分。' +
-        '你在 <span class="mono">ps</span> 里看到的 <span class="mono">com.example.app:remote</span> 这种带冒号后缀的，' +
-        '就是同一个 App 的另一个进程。</p>' +
-        T.tbl(['概念', '谁决定', '逆向时的意义'],
-          [
-            ['<b>进程</b>', '系统（zygote fork）', '你的 hook 要注入到<b>正确的那个进程</b>——多进程 App 里，主进程 hook 不到 :remote 里的代码'],
-            ['<b>组件</b>', '系统按请求唤起', '<b>每个组件入口都是一个可能的下钩点</b>，也是一个攻击面'],
-            ['<b>线程</b>', '代码自己（主线程由系统起）', 'Hook 时要关心"这段代码跑在哪个线程上"——第 20.8 节讲过这个坑'],
-            ['<b>生命周期回调</b>', '系统', '加固壳最爱的介入点，因为它比你的业务代码<b>更早</b>']
-          ])
-    },
-
-    /* ============================================================ 26.2 */
-    {
-      h: '26.2', title: '点一下图标，系统到底做了什么',
-      html:
-        '<p>这是本章最重要的一条主线。很多"为什么"（为什么加固要抢在那一步、为什么 hook 早了没用）' +
-        '都要靠它来回答。<b>下面这九步值得逐字看一遍。</b></p>' +
-        T.note('warn', '⚠️ 一个反直觉的事实：你的代码不是"从头开始执行"的',
-          '<p style="margin-bottom:0">App 进程是<b>被 fork 出来的</b>，不是被 <span class="mono">exec</span> 起来的。' +
-          '这意味着它<b>生来就带着一大堆已经加载好的东西</b>——Zygote 进程里预加载的系统类和资源，子进程直接继承。<br>' +
-          '<span class="hit">这就是为什么安卓能"秒开"一个 App，也是为什么 <span class="mono">.init_array</span>、' +
-          '<span class="mono">attachBaseContext</span> 这些早期时机对加固方这么有价值：' +
-          '它们比你想象的要早得多。</span></p>'),
-
-      stepper: {
-        title: '从点击图标到首帧显示：九步',
-        lines: [
-          { code: '<span class="c">// ① Launcher 收到点击</span>\nstartActivity(<span class="k">new</span> Intent(ACTION_MAIN, ...));',
-            note: '<b>发起方是 Launcher，不是你的 App。</b>Launcher 也是一个普通 App，它只是调用了 <span class="mono">startActivity</span>。<br>' +
-              '<b>注意这一步已经跨进程了</b>：Launcher 要通过 Binder 把请求交给系统服务，而不是直接启动你的 App。',
-            state: { '步骤': '发起', '在哪个进程': 'Launcher', '跨进程？': '是（Binder）' } },
-          { code: '<span class="c">// ② 请求到达 ATMS</span>\nActivityTaskManagerService.startActivity(...)',
-            note: '<b>ATMS 是系统服务，跑在 system_server 进程里。</b>它负责"哪个 Activity 该在哪个任务栈、哪个进程里显示"。<br>' +
-              '<b>逆向意义：</b>所有 Activity 启动都要过这里——所以你 <span class="mono">hook startActivity</span> 看到的是"意图"，' +
-              '而真正的调度发生在 system_server 里（你通常没有权限注入那个进程）。',
-            state: { '步骤': '调度', '在哪个进程': 'system_server', '跨进程？': '是' } },
-          { code: '<span class="c">// ③ 需要新进程？通过 Zygote socket 请求 fork</span>\n<span class="c">// zygote 收到请求 → fork() → 返回子进程 pid</span>',
-            note: '<b>关键：<span class="mono">fork</span> 而不是 <span class="mono">exec</span>。</b>' +
-              'Zygote 预先加载了系统类库与资源，<b>fork 出来的子进程直接继承这些内存</b>——这是安卓启动速度的结构性原因。<br>' +
-              '<span class="hit">这条机制有一个直接的逆向后果：<b>Zygote 是所有 App 的"共同祖先"</b>，' +
-              '所以在 Zygote 里注入代码（第 22 章的 LSPosed 就是这么做的），就能对<b>之后启动的每一个 App 生效</b>。</span>',
-            state: { '步骤': '起进程', '在哪个进程': 'zygote → 新进程', '跨进程？': 'socket' } },
-          { code: '<span class="c">// ④ 子进程进入 ActivityThread.main()</span>\nLooper.prepareMainLooper();\n<span class="c">// ……注册 ApplicationThread、attach 到 AMS……</span>\nLooper.loop();   <span class="c">// ← 从此开始"等消息"</span>',
-            note: '<b>这就是你的 App 唯一的 main()。</b>注意它做了什么：准备主线程的 Looper（26.8 节的主角），把 ' +
-              '<span class="mono">ApplicationThread</span> 这个 Binder 对象注册给 AMS，然后<b>立刻进入死循环等消息</b>。<br>' +
-              '<span class="hit">"App 的 main 就是一句 Looper.loop()"——这句话能解释很多疑惑：' +
-              '为什么主线程不能被阻塞（它一旦被占住，谁的消息都处理不了）、为什么你的所有代码都是"被调度进来的"。</span>',
-            state: { '步骤': '进入主循环', '在哪个进程': 'App 新进程', '跨进程？': '—' } },
-          { code: '<span class="c">// ⑤ AMS 通过 ApplicationThread 回调 bindApplication</span>\n<span class="c">// （ApplicationThread 是 App 进程里的 Binder 服务端）</span>\nhandleBindApplication(...)',
-            note: '<b>注意方向反过来了。</b>App 把自己的 <span class="mono">ApplicationThread</span> 交给 AMS 之后，' +
-              'AMS 就能<b>反过来调用 App</b>。<br>' +
-              '<b>这是安卓 IPC 的典型双向模式：</b>你调系统服务，系统服务也调你（通过你注册进去的回调）。' +
-              '<span class="hit">逆向视角：如果你只盯着"App → 系统"这一个方向，就会漏掉一半的调用链。</span>',
-            state: { '步骤': '回调 App', '在哪个进程': 'system_server → App', '跨进程？': 'Binder' } },
-          { code: '<span class="c">// ⑥ 创建 ContentProvider（注意：早于 Application.onCreate！）</span>\ninstallContentProviders(app, providers);',
-            note: '<b>这是本章最值钱的一个冷知识。</b>ContentProvider 的 <span class="mono">onCreate</span> 在 ' +
-              '<span class="mono">Application.onCreate</span> <b>之前</b>执行。<br>' +
-              '<span class="hit">所以：<b>如果你的初始化代码放在 Application.onCreate 里，而某个 Provider 已经依赖了它，就会拿到 null。</b>' +
-              '这也是很多加固/风控把初始化逻辑塞进 ContentProvider 的原因——它能抢到更早的时机。</span>',
-            state: { '步骤': '建 Provider', '在哪个进程': 'App', '跨进程？': '—' } },
-          { code: '<span class="c">// ⑦ Application 登场</span>\napp.attachBaseContext(base);\napp.onCreate();',
-            note: '<b><span class="mono">attachBaseContext</span> 是加固壳的标准介入点</b>——此时 <span class="mono">Context</span> 刚拿到手，' +
-              '业务代码一行没跑，壳可以在这里解密 dex、造 ClassLoader、替换类加载器。<br>' +
-              '第 19 章把"<span class="mono">attachBaseContext</span> 被覆写"列为"加固存在的第二强证据"，原因就在这里。',
-            state: { '步骤': 'Application', '在哪个进程': 'App', '跨进程？': '—' } },
-          { code: '<span class="c">// ⑧ 创建并驱动 Activity</span>\nactivity.attach(...);\nactivity.onCreate(savedInstanceState);\nactivity.onStart();\nactivity.onResume();',
-            note: '<b>这才轮到"你写的代码"。</b>注意 <span class="mono">onCreate</span> 的入参 <span class="mono">savedInstanceState</span>' +
-              '——它是"上次被杀之前的现场"，26.4 节会讲它为什么重要。<br>' +
-              '<b>逆向抓手：</b>想找某个界面的业务逻辑，<span class="mono">onCreate</span> 是最自然的起点。' +
-              '但要注意——<b>加固可能把 onCreate 也 Native 化了</b>（第 20.11 节）。',
-            state: { '步骤': 'Activity', '在哪个进程': 'App', '跨进程？': '—' } },
-          { code: '<span class="c">// ⑨ 首帧绘制 → 你看到界面</span>\n<span class="c">// measure → layout → draw → surface 合成 → 上屏</span>',
-            note: '<b>到这一步之前，界面一直是"黑的"。</b>这条链上有一步很有逆向价值：' +
-              '<span class="mono">View</span> 树的构建发生在 <span class="mono">onCreate</span>（<span class="mono">setContentView</span>）里，' +
-              '所以<b>从资源 id 反查监听器</b>这条线索（26.13 与第 30 章）永远走得通。<br>' +
-              '如果启动很慢，"卡在哪一步"本身就是线索——第 19 章讲过"<b>加固的代价就是它的特征</b>"。',
-            state: { '步骤': '上屏', '在哪个进程': 'App + SurfaceFlinger', '跨进程？': '是（BufferQueue）' } }
-        ]
-      },
-
-      after:
-        T.note('ok', '✅ 这九步里，哪些是"逆向的必经之路"',
-          '<p style="margin-bottom:0">' +
-          '· <b>第 ④ 步</b>（Looper.loop）——解释了主线程的一切行为；<br>' +
-          '· <b>第 ⑥ 步</b>（Provider 早于 Application）——解释了初始化顺序的坑，也是加固的藏身点；<br>' +
-          '· <b>第 ⑦ 步</b>（attachBaseContext）——加固的第一现场；<br>' +
-          '· <b>第 ⑤ 与第 ② 步</b>——解释了"为什么调用链是双向的"。<br>' +
-          '<span class="hit">剩下的步骤你不需要背；你需要的是建立一个印象：<b>App 是"被系统一步步推着走"的，' +
-          '每一步都有一个系统回调可以下钩子。</b></span></p>')
-    },
-
-    /* ============================================================ 26.3 */
-    {
-      h: '26.3', title: '四大组件：系统眼里的 App 长什么样',
-      html:
-        '<p>对系统来说，你的 App <b>不是一堆类，而是清单里声明的若干个组件</b>。' +
-        '系统不认识你的业务逻辑，它只认识"这个 App 能提供哪些可被唤起的东西"。</p>' +
-        T.tbl(['组件', '一句话职责', '谁唤起它', '它的入口回调', '逆向视角'],
-          [
-            ['<b>Activity</b>', '一块可见的界面', '<span class="mono">startActivity</span> / 通知点击 / 其他 App 唤起', '<span class="mono">onCreate</span> / <span class="mono">onNewIntent</span>',
-             '<b>业务逻辑最集中的地方</b>；导出的 Activity 是攻击面（第 29 章）'],
-            ['<b>Service</b>', '没有界面的后台工作', '<span class="mono">startService</span> / <span class="mono">bindService</span>', '<span class="mono">onStartCommand</span> / <span class="mono">onBind</span>',
-             '常驻逻辑、心跳、上报；<b>注意它默认跑在主线程上</b>'],
-            ['<b>BroadcastReceiver</b>', '接收"广播"这种系统级事件', '<span class="mono">sendBroadcast</span> / 系统事件（开机、网络变化）', '<span class="mono">onReceive</span>',
-             '<b>静默触发点</b>——不需要界面就能跑代码，风控喜欢用它做环境检测'],
-            ['<b>ContentProvider</b>', '把自己的数据开放给别的进程', '别的进程 <span class="mono">ContentResolver</span> 查询', '<span class="mono">onCreate</span> / <span class="mono">query</span> / <span class="mono">call</span>',
-             '<b>启动最早</b>；也是目录遍历漏洞的高发地（第 29 章）']
-          ]) +
-        T.note('key', '🔑 把"组件"理解成"攻击面 + 观测点"',
-          '<p style="margin-bottom:0">同一个东西有两面：<br>' +
-          '· <b>对攻击者/审计者</b>——导出的组件是<b>可以绕过界面直接调的入口</b>。' +
-          '一个 App 的界面只暴露了它想让你看到的功能，而组件清单暴露了<b>它所有能被唤起的地方</b>。<br>' +
-          '· <b>对逆向者</b>——每个组件入口都是<b>一个稳定的下钩点</b>。' +
-          '比起在几十万行代码里找"哪里是登录逻辑"，直接 hook <span class="mono">LoginActivity.onCreate</span> 要便宜得多。<br>' +
-          '<span class="hit">而这两件事之所以成立，都是因为组件必须在 <span class="mono">AndroidManifest.xml</span> 里<b>显式声明</b>——' +
-          '清单文件本身就是一份地图。</span></p>'),
-
-      term: {
-        title: '组件相关术语速查',
-        lines: [
-          { t: 'd', s: '# ── 声明与可见性 ──' },
-          { t: 'o', s: 'android:exported="true|false"', note: '<b>决定"别的 App 能不能唤起这个组件"。</b>注意 Android 12（API 31）起<b>凡带 intent-filter 的组件必须显式写这个属性</b>，否则装不上——这本身就是一条可观测的版本线索。' },
-          { t: 'o', s: '<intent-filter>', note: '<b>声明"我能响应什么意图"。</b>历史规则是"有 intent-filter 就默认 exported=true"，这也是很多越权漏洞的来源。' },
-          { t: 'o', s: 'android:permission', note: '<b>给组件加一道权限门。</b>有它保护时外部调用方必须持有对应权限——所以判断攻击面时<b>必须把权限一起看</b>，只看 exported 会误判。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 与生命周期有关的声明 ──' },
-          { t: 'o', s: 'android:process=":remote"', note: '<b>把这个组件放到独立进程。</b>带冒号是"App 私有进程"，不带冒号是全局进程名。<b>逆向时最容易踩的坑：hook 注入了主进程，而目标逻辑在 :remote 里。</b>' },
-          { t: 'o', s: 'android:configChanges', note: '<b>声明"这些配置变化我自己处理，别重建我"。</b>声明了之后旋转屏幕不会走销毁重建流程——这会改变你观察到的生命周期序列。' },
-          { t: 'o', s: 'android:launchMode', note: '<b>standard / singleTop / singleTask / singleInstance。</b>它决定"再启动一次是新建实例还是复用"，直接影响 <span class="mono">onCreate</span> 会不会被调用、以及 <span class="mono">onNewIntent</span> 会不会被触发。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 权限与存储 ──' },
-          { t: 'o', s: '<uses-permission android:name="..."/>', note: '静态申请权限。<b>但声明 ≠ 授予</b>——运行时权限（API 23+）还要用户同意，逆向时看到声明就假定"有这个权限"是错的。' },
-          { t: 'w', s: 'android:allowBackup="true"', note: '<b>允许 adb backup 导出应用数据</b>（含 SharedPreferences、数据库）。<b>这是第 29 章"明文保存"风险的放大器</b>，也是一个很常见的配置疏漏。' }
-        ]
-      },
-
-      quiz: {
-        id: 'q26-1', chapter: 26, answer: 1,
-        stem: '一个 App 里有个 <span class="mono">ContentProvider</span>，同时 <span class="mono">Application</span> 里也有一段初始化代码。' +
-          '下面关于执行顺序的说法，哪个是对的？',
-        options: [
-          { t: 'Application.onCreate 先执行，因为它是整个 App 的入口', why: '❌ 这是最符合直觉、也最常见的错答。<b>Provider 比 Application 更早。</b>' },
-          { t: 'ContentProvider.onCreate 先执行，Application.onCreate 在后', why: '✅ 正确。在 <span class="mono">ActivityThread.handleBindApplication</span> 里，<b>安装 ContentProvider 发生在调用 Application.onCreate 之前</b>。这是本章最值钱的一个细节。' },
-          { t: '两者的顺序由 AndroidManifest 里的声明顺序决定', why: '❌ 清单顺序不影响这个。Provider 的创建时机是框架写死的（早于 Application）。' },
-          { t: '取决于 Provider 是否被导出（exported）', why: '❌ 导出与否只影响"别的 App 能不能访问它"，不影响它自己的创建时机。' }
-        ],
-        explain: '<b>顺序是：<span class="mono">attachBaseContext</span> → <span class="mono">ContentProvider.onCreate</span> → ' +
-          '<span class="mono">Application.onCreate</span> → <span class="mono">Activity.onCreate</span>。</b><br><br>' +
-          '为什么会这样？因为 Provider 是"<b>App 对外提供的能力</b>"，而 <span class="mono">Application</span> 只是"App 自己的容器"。' +
-          '系统需要先把"对外能力"装好，才有资格说这个进程准备好了。<br><br>' +
-          '<b>这个顺序在实战里的三个后果：</b><br>' +
-          '① <b>初始化顺序 bug</b>：把初始化放在 <span class="mono">Application.onCreate</span>，而 Provider 已经依赖它 → 拿到 null。' +
-          '正确做法是用 <span class="mono">ContentProvider</span> 做初始化（这也是很多 SDK 自动初始化的手法），或者用 <span class="mono">attachBaseContext</span>。<br>' +
-          '② <b>加固与风控的藏身点</b>：想抢更早的时机，就注册一个 Provider。<span class="hit">你在 <span class="mono">Application.onCreate</span> 里下钩子，' +
-          '可能已经晚了一步。</span><br>' +
-          '③ <b>观测顺序</b>：如果你在排查"某个全局状态没准备好"，<b>先确认 Provider 有没有被提前创建</b>——' +
-          '很多"莫名其妙"的空指针都是这个顺序造成的。'
-      }
-    },
-
-    /* ============================================================ 26.4 */
-    {
-      h: '26.4', title: 'Activity 生命周期：系统在什么时候敲你的门',
-      intuition: {
-        tag: '直觉模型 · 一个随时会被打断的会面',
-        body:
-          '<p>把 Activity 想成<b>你和用户的一次会面</b>。问题是：<strong>这次会面随时可能被打断</strong>——' +
-          '电话来了、用户按了 Home、你把手机转了个方向、系统内存不够把你赶走。</p>' +
-          '<p>生命周期回调就是<b>系统在每次状态变化时敲你的门，告诉你"现在是什么情况"</b>：</p>' +
-          '<ul>' +
-          '<li><span class="mono">onCreate</span>：<b>会面开始了，先把材料准备好</b>（只发生一次）；</li>' +
-          '<li><span class="mono">onStart</span>：<b>你出现了，但用户还没法跟你说话</b>（界面可见但不在前台）；</li>' +
-          '<li><span class="mono">onResume</span>：<b>用户开始跟你说话</b>（可交互，这是"前台"）；</li>' +
-          '<li><span class="mono">onPause</span>：<b>有人插话了</b>（另一个界面盖上来，但你还能看见一部分）——<b>赶紧保存关键状态</b>；</li>' +
-          '<li><span class="mono">onStop</span>：<b>你完全被挡住了</b>；</li>' +
-          '<li><span class="mono">onDestroy</span>：<b>会面彻底结束</b>。</li>' +
-          '</ul>' +
-          '<p><span class="hit">记住一条：<b>onPause 和 onStop 的区别是"还看得见"和"看不见"。</b>' +
-          '而 Android 的设计意图是让 App 在 onStop 之后<b>随时可以被无声杀掉而不需要更多回调</b>——' +
-          '所以你保存状态的动作必须发生在 onStop 之前。</span></p>'
-      },
-      html:
-        '<p>生命周期最容易被误解的一点是：<b>它不是一条直线，而是一个可以被系统任意打断、任意重入的状态机。</b></p>' +
-        T.tbl(['回调', '什么时候来', '此时能不能交互', '你该做什么'],
-          [
-            ['<span class="mono">onCreate</span>', 'Activity 对象被创建', '不能（还没显示）', '<b>只做一次的事</b>：setContentView、绑定 ViewModel、读 Intent'],
-            ['<span class="mono">onStart</span>', '即将可见', '不能', '注册只需要"可见期间有效"的资源'],
-            ['<span class="mono">onResume</span>', '可见且可交互', '<b>能</b>', '开启动画、申请定位、注册传感器'],
-            ['<span class="mono">onPause</span>', '失去前台（但仍可能可见）', '<b>不能</b>', '<b>尽快</b>：提交未保存的数据、停掉动画。<b>这个回调必须快</b>'],
-            ['<span class="mono">onStop</span>', '完全不可见', '不能', '释放重资源、注销监听'],
-            ['<span class="mono">onRestart</span>', '从 onStop 回到 onStart 之前', '不能', '重新准备（注意：<b>这是"回来"与"新建"的分界</b>）'],
-            ['<span class="mono">onDestroy</span>', '销毁前（主动 finish 或被系统回收）', '不能', '释放一切。<b>但它不保证一定被调用</b>']
-          ]) +
-        T.note('warn', '⚠️ 三个必须知道的"反直觉"',
-          '<p style="margin-bottom:0">' +
-          '① <b>onDestroy 不保证被调用。</b>进程被系统直接杀掉时，不会有任何回调。' +
-          '<span class="hit">所以任何"必须在退出时执行"的逻辑，</span>放在 onDestroy 里都是不可靠的。<br>' +
-          '② <b>旋转屏幕默认会销毁重建 Activity。</b>这是新手最常见的"我的状态没了"的原因；' +
-          '声明 <span class="mono">configChanges</span> 或使用 <span class="mono">ViewModel</span> / <span class="mono">onSaveInstanceState</span> 才能挺过去。<br>' +
-          '③ <b>onSaveInstanceState 与 onStop 的先后是随版本变的。</b>' +
-          '<span class="pill warn">在较新的版本上它出现在 onStop 之后（这是一处有明确版本分界的行为变更），' +
-          '具体分界版本请以官方文档为准</span>。<b>所以不要写"依赖两者顺序"的代码。</b></p>'),
-
+      html: T.note('key', '🔑 一句话抓住主线', '<p>FART 的每一次版本移植，本质都是同一个动作：<b>读那一版的 AOSP 源码 → 找到 dex 加载与 code item 回填的那个点 → 把插桩代码挪过去 → 重新编译刷入</b>。系统版本会变、函数名会变、字段布局会变，但「找脱壳点」这件事的方法论不变。<b>会读 ART 源码的人，永远能在新版本上重建 FART。</b></p>') +
+            '<p>先把版本演进的时间轴摊开。下面这条轴上的每一格，都代表「FART 又得改一次」，注意看三栏分别发生了什么变化。<span class="small muted">（这一节会反复出现两个词，先把它们的意思钉死：' + T.term('脱壳点', '插桩代码所依附的 ART 内部位置。关键：它不是某个固定函数名，而是一个语义事件——例如「dex 加载完成」「方法体 code item 回填完成」。函数名随版本变，语义事件不变。') + '：FART 把插桩代码插在 ART 内部的哪个位置；' + T.term('ART 移植', '把为某个安卓版本编写的 ART 内部插桩代码，适配到另一个版本上的过程。本质工作 = 读对应版本 AOSP 源码 + 重新定位脱壳点 + 对齐接口与结构 + 重新编译刷入。') + '：把旧版本的 FART 改成能在新版本上跑的过程。后面所有讨论都建立在这两个概念上。）</span></p>',
       stage: {
-        title: '生命周期状态机：把一个 Activity 走一遍（含"被旋转屏幕打断"）',
-        speed: 1400,
+        title: 'Android 版本 × ART 结构变化 × 脱壳点 演进图',
+        speed: 2200,
         render:
-          '<div class="card">' +
-            '<div class="flex" style="gap:6px;flex-wrap:wrap;margin-bottom:10px">' +
-              '<span class="blk" id="lc-create">onCreate</span>' +
-              '<span class="arrow">→</span>' +
-              '<span class="blk" id="lc-start">onStart</span>' +
-              '<span class="arrow">→</span>' +
-              '<span class="blk" id="lc-resume">onResume</span>' +
-              '<span class="arrow">→</span>' +
-              '<span class="blk" id="lc-pause">onPause</span>' +
-              '<span class="arrow">→</span>' +
-              '<span class="blk" id="lc-stop">onStop</span>' +
-              '<span class="arrow">→</span>' +
-              '<span class="blk" id="lc-destroy">onDestroy</span>' +
-            '</div>' +
-            '<div class="flex" style="gap:6px;flex-wrap:wrap">' +
-              '<span class="blk" id="lc-restart">onRestart（从 Stop 回来时才走）</span>' +
-              '<span class="blk" id="lc-save">onSaveInstanceState</span>' +
-            '</div>' +
+          '<div class="flow-row" style="flex-wrap:wrap;gap:8px">' +
+            '<span class="blk" id="tl5">Android 5</span>' +
+            '<span class="blk" id="tl6">Android 6</span>' +
+            '<span class="blk" id="tl8">Android 8</span>' +
+            '<span class="blk" id="tl9">Android 9</span>' +
+            '<span class="blk" id="tl10">Android 10</span>' +
+            '<span class="blk" id="tl11">Android 11+</span>' +
+            '<span class="blk" id="tl12">Android 12/13/14</span>' +
           '</div>' +
-          '<div class="card" style="margin-top:12px"><div class="card-title">当前状态</div>' +
-            '<div id="lc-state" class="mono" style="font-size:13px">（未开始）</div>' +
-            '<div id="lc-log" class="small" style="margin-top:8px;line-height:1.9"></div>' +
-          '</div>',
-        reset: () => {
-          ['lc-create', 'lc-start', 'lc-resume', 'lc-pause', 'lc-stop', 'lc-destroy', 'lc-restart', 'lc-save']
-            .forEach(id => S(id, ''));
-          SET('lc-state', '（未开始）');
-          SET('lc-log', '');
+          '<div class="grid3" style="margin-top:12px">' +
+            '<div class="card"><div class="card-title">ART 结构变化</div><div id="tla" class="small">点「播放」或「下一步」开始</div></div>' +
+            '<div class="card"><div class="card-title">脱壳点要怎么调</div><div id="tlb" class="small">—</div></div>' +
+            '<div class="card"><div class="card-title">FART 移植要改什么</div><div id="tlc" class="small">—</div></div>' +
+          '</div>' +
+          '<div style="margin-top:10px"><span class="pill" id="tlstat">维护状态：待观察</span></div>',
+        reset: function () {
+          fartPick(null, [], ['点「播放」或「下一步」开始', '—', '—']);
+          CLS('tlstat', 'pill');
+          SET('tlstat', '维护状态：待观察');
         },
         steps: [
-          { run: () => { S('lc-create', 'active'); S('lc-start', 'active'); S('lc-resume', 'active'); SET('lc-state', 'RESUMED（前台，可交互）'); },
-            note: '<b>① 首次启动：onCreate → onStart → onResume。</b>三步一气呵成，中间没有停顿——因为界面一准备好就直接进前台了。<br>' +
-              '<b>观测点：</b>如果你的 hook 只打了 onResume，你会漏掉 onCreate 里那些"只做一次"的初始化（读取 Intent、解密配置）。' },
-          { run: () => { S('lc-resume', 'done'); S('lc-pause', 'hot'); SET('lc-state', 'PAUSED（失去前台，可能仍可见）'); SET('lc-log', '另一界面盖上来 → onPause 先执行'); },
-            note: '<b>② 被另一个界面盖住：onPause。</b><b>注意顺序：是先让旧界面 onPause，再让新界面 onResume</b>——' +
-              '所以 onPause 里做重活会直接拖慢界面切换的体感。<br>' +
-              '<span class="hit">逆向意义：onPause 里常常有"上报埋点""保存草稿"这类逻辑，' +
-              '因为它是"用户可能再也不回来"之前最后一次可靠的机会。</span>' },
-          { run: () => { S('lc-pause', 'done'); S('lc-stop', 'hot'); SET('lc-state', 'STOPPED（完全不可见）'); SET('lc-log', '界面被完全挡住 → onStop'); },
-            note: '<b>③ 完全不可见：onStop。</b>到这里，系统已经认为<b>"这个 Activity 随时可以被回收，不需要再通知你"</b>。<br>' +
-              '<b>所以所有必须落盘的东西都该在 onStop 之前完成。</b>' },
-          { run: () => { S('lc-stop', 'done'); S('lc-restart', 'active'); S('lc-start', 'active'); S('lc-resume', 'active'); SET('lc-state', 'RESUMED（从后台回来）'); SET('lc-log', '用户切回来 → onRestart → onStart → onResume'); },
-            note: '<b>④ 用户切回来：onRestart → onStart → onResume。</b><b>注意 onCreate 没有再被调用</b>——对象还在，状态还在。<br>' +
-              '<span class="hit">这就是 onRestart 存在的意义：它让你把"回到前台"和"首次创建"分开处理。' +
-              '反过来，如果你看到 onCreate 被调用了第二次，说明这个 Activity 之前被销毁过（或 launchMode 导致了新实例）。</span>' },
-          { run: () => { S('lc-restart', 'done'); S('lc-save', 'warn'); SET('lc-log', '旋转屏幕 → onPause → onStop → onSaveInstanceState → onDestroy → onCreate → onStart → onResume'); },
-            note: '<b>⑤ 旋转屏幕：整个销毁重建。</b>序列是 <span class="mono">onPause → onStop → onSaveInstanceState → onDestroy → onCreate → onStart → onResume</span>。<br>' +
-              '<b>这一步是本章最值得记住的"陷阱"</b>：<br>' +
-              '· 你的 Hook 如果在 onCreate 里装了一次性的桩，<b>旋转一次就装了两遍</b>；<br>' +
-              '· 你观察到的"某个方法被调用了两次"，可能只是屏幕转了一下；<br>' +
-              '· <span class="pill warn">onSaveInstanceState 与 onStop 的先后在较新版本上发生过变化，不要依赖这个顺序</span>。' },
-          { run: () => { S('lc-save', 'done'); ['lc-create', 'lc-start', 'lc-resume', 'lc-pause', 'lc-stop', 'lc-restart'].forEach(id => S(id, '')); S('lc-destroy', 'bad'); SET('lc-state', 'DESTROYED'); SET('lc-log', ''); },
-            note: '<b>⑥ 销毁：onDestroy。</b>但请记住前面那条警告——<b>被系统直接杀进程时，这个回调根本不会来</b>。<br>' +
-              '<span class="hit">所以"退出时清理"这种设计在安卓上天生不可靠，必须改成"关键节点增量保存"。</span>' }
-        ]
-      },
-
-      quiz: {
-        id: 'q26-2', chapter: 26, answer: 2,
-        stem: '你写了一个 Frida 脚本，在目标 App 的某个 <span class="mono">Activity.onCreate</span> 里替换了一个方法的实现，' +
-          '并且用了一个全局标志位保证"只替换一次"。测试时你发现<b>替换确实生效了，但日志里能看到初始化代码跑了两次</b>。最可能的原因是？',
-        options: [
-          { t: 'Frida 的 hook 被重复注入了', why: '❌ 如果真的重复注入，你通常会看到更明显的异常（比如脚本报错、hook 冲突），而不是"业务初始化跑了两次"。' },
-          { t: '目标 App 有两个同名的 Activity 在不同进程', why: '❌ 有可能，但这是比较少见的结构；而且在多进程情况下，你通常会先注意到"另一个进程完全没被 hook 到"，而不是"跑了两次"。' },
-          { t: 'Activity 经历了销毁重建（比如屏幕旋转、或配置变化），onCreate 被系统重新调用了一次', why: '✅ 最可能。**onCreate 被调用两次是 Activity 重建的典型标志**，而重建最常见的原因就是配置变化（旋转屏幕、切换深色模式、字体大小变化…）。' },
-          { t: 'App 使用了 launchMode="singleTask"，这会导致 onCreate 执行两次', why: '❌ 方向反了。<b>singleTask 的作用恰恰是"复用已有实例"</b>，它会让系统优先走 <span class="mono">onNewIntent</span> 而不是再次 <span class="mono">onCreate</span>。' }
-        ],
-        explain: '<b>先把"onCreate 跑两次"这件事读对：它几乎总是在说"这个 Activity 被销毁重建了"。</b><br><br>' +
-          '<b>重建的常见触发：</b><br>' +
-          '· <b>配置变化</b>——旋转、深色模式切换、语言/字体变化、外接键盘插拔……<b>这是最常见的</b>；<br>' +
-          '· <b>进程被回收后再回来</b>——系统杀掉进程，用户从最近任务切回，会重建；<br>' +
-          '· <b>主动 recreate()</b>——有些 App 用它来应用主题切换。<br><br>' +
-          '<b>为什么这对逆向的人特别重要（三条实战影响）：</b><br>' +
-          '① <b>Hook 的幂等性。</b>在 <span class="mono">onCreate</span> 里装的桩，重建后会再装一次。' +
-          '如果桩本身不幂等（比如往列表里 push 数据、或者重新注册了一个全局监听器），你会得到重复行为。' +
-          '<span class="hit">正确做法是：要么用 <span class="mono">Java.use</span> 在类层面替换（天然只生效一次），' +
-          '要么在运行时维护一个"已处理实例"的集合。</span><br>' +
-          '② <b>观测噪声。</b>你看到的"初始化跑了两次"很可能根本不是重复调用，而是两次独立的生命周期。' +
-          '<b>分不清这两者，你会去改一个根本不存在的 bug。</b><br>' +
-          '③ <b>状态丢失类问题的根源。</b>如果作者把状态只存在 Activity 字段上，重建就丢——' +
-          '这类"偶发 bug"在用户那里表现为"转个屏幕就白屏了"。<br><br>' +
-          '<b>怎么快速确认是哪一个原因：</b>在 <span class="mono">onCreate</span> 里把 ' +
-          '<span class="mono">savedInstanceState == null</span> 以及 <span class="mono">hashCode()</span>（对象实例标识）打出来。' +
-          '<b>实例标识不同 + savedInstanceState 不为 null = 重建</b>；实例标识相同 = 那才叫重复调用。'
-      }
-    },
-
-    /* ============================================================ 26.5 */
-    {
-      h: '26.5', title: 'Service：它不是你想要的"后台线程"',
-      html:
-        '<p>这是新手最容易误解的组件。名字叫 Service、文档说"后台工作"，于是很多人以为它跑在后台线程上。</p>' +
-        T.note('bad', '☠️ 最重要的一个纠正：Service 默认跑在主线程上',
-          '<p style="margin-bottom:0"><span class="mono">Service</span> 的所有生命周期回调' +
-          '（<span class="mono">onCreate</span> / <span class="mono">onStartCommand</span> / <span class="mono">onBind</span>）' +
-          '<b>都由主线程的 Looper 调度执行</b>——和 Activity 一模一样。<br>' +
-          '<span class="hit">所以"在 Service 里做耗时操作"和"在 Activity 里做耗时操作"一样会导致 ANR。' +
-          'Service 解决的是"生命周期长"，不是"线程问题"。</span><br>' +
-          '<b>逆向意义：</b>如果你怀疑某段逻辑跑在主线程上，<b>不要因为它在 Service 里就排除它</b>。' +
-          '第 20.8 节讲过"native 自建线程"的排查，这里补上另一半：<b>Java 层的 Service 不等于子线程。</b></p>') +
-        T.tbl(['启动方式', '生命周期', '什么时候结束', '典型用途'],
-          [
-            ['<b>startService</b>', '<span class="mono">onCreate</span> → <span class="mono">onStartCommand</span>（可多次）→ <span class="mono">onDestroy</span>',
-             '调用方 <span class="mono">stopService</span> 或 Service 自己 <span class="mono">stopSelf</span>；<b>与调用方的死活无关</b>',
-             '下载、播放、后台任务'],
-            ['<b>bindService</b>', '<span class="mono">onCreate</span> → <span class="mono">onBind</span> → <span class="mono">onUnbind</span> → <span class="mono">onDestroy</span>',
-             '<b>最后一个客户端解绑时自动销毁</b>',
-             '跨进程调用、给别的组件提供服务'],
-            ['<b>两者同时用</b>', '两套回调会混合', '<b>必须既 stop 又 unbind，才会销毁</b>',
-             '既要长期运行、又要被调用']
-          ]) +
-        T.note('warn', '⚠️ 两个必须知道的现实约束（都不是"最佳实践"，是硬限制）',
-          '<p style="margin-bottom:0">' +
-          '① <b>后台启动 Service 受限。</b>从 Android 8.0 起，处于后台的 App 不能随意 <span class="mono">startService</span>，' +
-          '要用 <span class="mono">startForegroundService</span> 并且<b>必须在几秒内显示一个通知</b>，否则会被系统杀并报错。' +
-          '<span class="hit">这条限制有一个逆向上的副作用：<b>如果一个 App 有常驻通知，它很可能就是在用前台 Service。</b>' +
-          '这条线索能帮你快速判断"它的后台逻辑是怎么活下来的"。</span>' +
-          '<span class="pill warn">具体的超时秒数与各版本的限制细节随时间变化，请以官方文档当期说明为准</span><br>' +
-          '② <b>前台 Service 需要通知，而通知是用户可见的。</b>所以大量风控/心跳逻辑转而去用 ' +
-          '<span class="mono">JobScheduler</span> / <span class="mono">WorkManager</span> / <span class="mono">AlarmManager</span>，' +
-          '或者干脆注册一个进程级的东西。<b>你找不到 Service，不代表它没有后台逻辑。</b></p>'),
-
-      stage: {
-        title: '两种启动方式的生命周期差异（以及"忘了 unbind"的后果）',
-        speed: 1300,
-        render:
-          '<div class="grid2">' +
-            '<div class="card"><div class="card-title">startService 路径</div>' +
-              '<div class="blk" id="sv-a1">onCreate</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-a2">onStartCommand</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-a3">（运行中，可再次 onStartCommand）</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-a4">stopService / stopSelf</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-a5">onDestroy</div>' +
-            '</div>' +
-            '<div class="card"><div class="card-title">bindService 路径</div>' +
-              '<div class="blk" id="sv-b1">onCreate</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-b2">onBind</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-b3">（客户端持有连接）</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-b4">onUnbind</div><div class="arrow">↓</div>' +
-              '<div class="blk" id="sv-b5">onDestroy</div>' +
-              '<div id="sv-note" class="small muted" style="margin-top:8px"></div>' +
-            '</div>' +
-          '</div>',
-        reset: () => {
-          ['sv-a1', 'sv-a2', 'sv-a3', 'sv-a4', 'sv-a5', 'sv-b1', 'sv-b2', 'sv-b3', 'sv-b4', 'sv-b5']
-            .forEach(id => S(id, ''));
-          SET('sv-note', '');
-        },
-        steps: [
-          { run: () => { S('sv-a1', 'active'); S('sv-b1', 'active'); }, note: '<b>① 两种方式都以 onCreate 开始，而且都只执行一次。</b>即使你调十次 <span class="mono">startService</span>，<span class="mono">onCreate</span> 也只跑一次——后面九次走的是 <span class="mono">onStartCommand</span>。<br><b>这个"只创建一次"的性质，是判断"某段初始化逻辑是否可靠"的关键。</b>' },
-          { run: () => { S('sv-a1', 'done'); S('sv-a2', 'active'); S('sv-b1', 'done'); S('sv-b2', 'active'); }, note: '<b>② 分岔点。</b>start 路径进 <span class="mono">onStartCommand</span>（<b>每次 start 都会调，且要通过返回值声明"被杀后要不要重启"</b>）；bind 路径进 <span class="mono">onBind</span>（<b>返回一个 IBinder，这就是 26.10 节的主角</b>）。<br><span class="hit">注意 onStartCommand 的返回值（START_STICKY / START_NOT_STICKY / START_REDELIVER_INTENT）决定系统杀进程后是否重建 Service——这是"为什么这个 App 杀不死"的一个常见答案。</span>' },
-          { run: () => { S('sv-a2', 'done'); S('sv-a3', 'cool'); S('sv-b2', 'done'); S('sv-b3', 'cool'); }, note: '<b>③ 运行中。</b>两条路径此刻看起来一样，但"谁决定它活着"完全不同：<br>· start 路径——<b>由 stop 决定</b>，跟调用方的死活无关；<br>· bind 路径——<b>由绑定者决定</b>，最后一个客户端解绑就自动销毁。' },
-          { run: () => { S('sv-a3', 'done'); S('sv-a4', 'warn'); SET('sv-note', '客户端 unbind 了，但 Service 还在跑——因为它是 start 起来的。'); },
-            note: '<b>④ 混合场景的坑（这是真实代码里最常见的泄漏源）。</b>如果一个 Service <b>既被 start 又被 bind</b>：' +
-              '客户端解绑了，它<b>不会销毁</b>——因为还有"start 起来"这个身份在。<br>' +
-              '<span class="hit">所以很多 App 会出现"Service 永远不退出"的现象，而作者自己也不知道为什么。</span>' +
-              '<b>逆向视角：这也意味着"你以为的清理时机"可能根本不会到来。</b>' },
-          { run: () => { S('sv-a4', 'done'); S('sv-a5', 'done'); S('sv-b3', 'done'); S('sv-b4', 'done'); S('sv-b5', 'done'); },
-            note: '<b>⑤ 两条路径最终都收敛到 onDestroy，但触发条件不同。</b>把这句话记住就够用了：' +
-              '<b>start 起来的不怕客户端走，bind 起来的跟着客户端走。</b>' }
-        ]
-      }
-    },
-
-    /* ============================================================ 26.6 */
-    {
-      h: '26.6', title: 'BroadcastReceiver 与 ContentProvider：两个"不起眼"的入口',
-      html:
-        '<p>这两个组件在业务开发里没那么显眼，但在<b>逆向与安全里权重很高</b>——原因就一个：' +
-        '<b>它们都能"在没有界面的情况下被执行"。</b></p>' +
-        T.card('BroadcastReceiver：无界面执行代码的标准手段',
-          '<p>它的入口只有 <span class="mono">onReceive(context, intent)</span> 一个回调，而这个回调有几个硬约束：</p>' +
-          T.tbl(['约束', '内容', '为什么重要'],
-            [
-              ['<b>跑在主线程</b>', '<span class="mono">onReceive</span> 由主线程调度', '在里面做耗时操作会 ANR——和 Service 同一个坑'],
-              ['<b>时间很短</b>', '超过限定时间会被系统判定为 ANR <span class="pill warn">具体超时值随版本与前后台状态变化</span>', '所以它只适合"触发一下"，不适合干活'],
-              ['<b>生命周期极短</b>', '回调返回后这个 Receiver 实例就不再有意义（静态注册的除外）', '不能依赖它的字段保存状态'],
-              ['<b>可以被外部触发</b>', '导出的 Receiver 能被任意 App 用 <span class="mono">sendBroadcast</span> 触发', '<b>这是第 29 章"BroadcastReceiver 导出漏洞"的根</b>']
-            ]) +
-          '<p style="margin-bottom:0"><b>静态注册 vs 动态注册</b>（这个区别在实战里很实用）：' +
-          '静态注册写在清单里，<b>App 没启动也能被唤起</b>（所以是很好的"冷启动入口"）；' +
-          '动态注册在代码里 <span class="mono">registerReceiver</span>，只在注册后有效，' +
-          '而且新版本对隐式广播有额外限制。<span class="hit">逆向时：想找"App 是怎么被静默唤起的"，先看清单里的 Receiver。</span></p>') +
-        T.card('ContentProvider：最早执行、也最容易出漏洞',
-          '<p>它的作用是"把数据开放给别的进程"，入口是几个标准方法：' +
-          '<span class="mono">query</span> / <span class="mono">insert</span> / <span class="mono">update</span> / ' +
-          '<span class="mono">delete</span> / <span class="mono">openFile</span> / <span class="mono">call</span>。</p>' +
-          '<p>三个要点：</p>' +
-          '<ul>' +
-          '<li><b>它的 onCreate 早于 Application.onCreate</b>（26.3 的 quiz 讲过）——这是它在逆向里最独特的价值：' +
-          '<span class="hit">想抢最早的执行时机，就注册一个 Provider。</span></li>' +
-          '<li><b>它通过 URI 暴露数据</b>：<span class="mono">content://authority/path/id</span>。' +
-          '而 URI 是<b>外部可控的字符串</b>——输入校验不到位就是目录遍历（第 29 章会专门讲 <span class="mono">openFile</span> 的路径拼接问题）。</li>' +
-          '<li><b><span class="mono">call</span> 方法是一个"后门式"的通用入口</b>：它允许用自定义方法名传参，' +
-          '很多 App 用它来做 IPC，而审计工具不一定认得出来。<b>看到一个导出的 Provider 带 call 实现，值得多看一眼。</b></li>' +
-          '</ul>') +
-        T.note('key', '🔑 把这两个组件收成一句话',
-          '<p style="margin-bottom:0"><b>Activity 和 Service 是"用户/开发者视角"的组件，' +
-          'BroadcastReceiver 和 ContentProvider 是"系统/其他 App 视角"的组件。</b><br>' +
-          '前两者的存在感来自界面与后台任务，后两者的存在感来自<b>"被别人找上门"</b>。<br>' +
-          '所以：<b>分析一个 App 的攻击面时，重点看后两个；分析它的业务逻辑时，重点看前两个。</b></p>')
-    },
-
-    /* ============================================================ 26.7 */
-    {
-      h: '26.7', title: 'Context 与存储沙箱：你的文件到底能放哪',
-      html:
-        '<p>"读写 sdcard"这件事在安卓上<b>不是一个 API 问题，而是一个版本问题</b>——' +
-        '过去十年里权限模型改过好几轮，很多教程和代码示例早就过期了。' +
-        '而它对逆向很直接：<b>你想让 App 读一个文件、或想找到它写到哪去了，必须知道当前的规则。</b></p>' +
-        T.tbl(['位置', '路径形态', '属于谁', '需要权限吗'],
-          [
-            ['<b>内部私有目录</b>', '<span class="mono">/data/data/&lt;pkg&gt;/</span>（新版本实际在 <span class="mono">/data/user/0/&lt;pkg&gt;/</span>）',
-             '<b>只有本 App</b>（+ root）', '<b>不需要</b>。<span class="mono">files/</span> / <span class="mono">cache/</span> / <span class="mono">databases/</span> / <span class="mono">shared_prefs/</span> 都在这里'],
-            ['<b>外部私有目录</b>', '<span class="mono">/sdcard/Android/data/&lt;pkg&gt;/</span>',
-             '本 App（但<b>其他 App 在旧版本上也能访问</b>）', '<b>不需要</b>（API 19 起免权限）'],
-            ['<b>共享媒体目录</b>', '<span class="mono">/sdcard/DCIM/</span>、<span class="mono">/sdcard/Pictures/</span>、<span class="mono">/sdcard/Download/</span>',
-             '所有 App 共享', '<b>看版本</b>——这正是本章实验要算的东西'],
-            ['<b>其他 App 的外部私有目录</b>', '<span class="mono">/sdcard/Android/data/&lt;别的包名&gt;/</span>',
-             '别的 App', '<b>新版本上禁止</b>（分区存储的默认行为）']
-          ]) +
-        T.note('warn', '⚠️ 权限模型的三次转折（这是最容易讲过时的部分）',
-          '<p style="margin-bottom:0">' +
-          '① <b>分区存储（Scoped Storage）之前</b>：申请 <span class="mono">READ/WRITE_EXTERNAL_STORAGE</span> 之后，' +
-          '基本等于"能读写整张 sdcard"——包括别的 App 的目录。<b>这是"SDCard 目录遍历"类作业诞生的时代背景。</b><br>' +
-          '② <b>Android 10（API 29）引入分区存储</b>：App 默认只能看到自己的目录和通过 MediaStore 管理的媒体；' +
-          '当年可以用 <span class="mono">requestLegacyExternalStorage</span> 临时退回旧行为。<br>' +
-          '③ <b>Android 11（API 30）起强制分区存储</b>：那个临时开关失效了。要访问共享目录，' +
-          '要么走 <b>MediaStore</b>，要么申请<b>「所有文件访问权限」</b>（<span class="mono">MANAGE_EXTERNAL_STORAGE</span>，' +
-          '需要在应用商店说明用途，属于敏感权限）。<br>' +
-          '<span class="pill warn">具体的 API 级别分界、各版本的行为差异、以及厂商 ROM 的额外改动，请以官方文档当期说明为准——' +
-          '这一块是本章最容易过期的内容。</span><br>' +
-          '<span class="hit">逆向视角：<b>看到 App 申请了「所有文件访问权限」，这条信息本身就很有价值</b>——' +
-          '它意味着这个 App 需要遍历共享目录（常见于文件管理、清理、备份、以及某些风控取证逻辑）。</span></p>'),
-
-      lab: {
-        title: '实验一：存储路径与权限判定器',
-        goal: '目标：算出"这个路径在当前版本上能不能读写"',
-        intro:
-          '<p>下面这个判定器按<b>真实的分层规则</b>工作：先判断路径属于哪一类存储，' +
-          '再看目标 API 级别与已声明/已授予的权限，最后给出结论与"正确做法"。</p>' +
-          '<p>建议你按这个顺序试几组：<br>' +
-          '① 保持默认，看一个普通的共享目录；<br>' +
-          '② 把 API 从 29 改成 30、31，观察结论怎么变；<br>' +
-          '③ 把路径改成 <span class="mono">/sdcard/Android/data/别的包名/</span>；<br>' +
-          '④ 试试带 <span class="mono">../</span> 的路径——看看它能不能"逃出"自己的沙箱。</p>' +
-          '<p><b>注意第 ④ 组</b>：这不是存储权限问题，而是<b>路径拼接漏洞</b>问题——' +
-          '很多 ContentProvider 目录遍历漏洞就是这么来的（第 29 章详讲）。</p>',
-        inputs: [
-          { key: 'path', label: '要访问的路径', hint: '可以带 ../ 试试', value: '/sdcard/Download/report.pdf' },
-          { key: 'api', label: '目标 API 级别（Android 版本对应：29=10, 30=11, 31=12, 33=13, 34=14）', ph: '30', value: '30' },
-          { key: 'perm', label: '已声明/已授予的权限（逗号分隔，可留空）',
-            hint: '例如 READ_EXTERNAL_STORAGE,WRITE_EXTERNAL_STORAGE,MANAGE_EXTERNAL_STORAGE',
-            value: 'READ_EXTERNAL_STORAGE' },
-          { key: 'pkg', label: '本 App 的包名', ph: 'com.example.app', value: 'com.example.app' }
-        ],
-        runLabel: '🔍 判定',
-        autorun: true,
-        run: v => ch26Storage(v),
-        hint:
-          '<b>判定的三步：</b>① 先看路径<b>属于哪一类存储</b>（内部私有 / 外部私有 / 共享媒体 / 别人的私有目录）；' +
-          '② 再看<b>目标 API 级别落在哪一段</b>（分区存储之前 / Android 10 / Android 11 及以后）；' +
-          '③ 最后看<b>权限够不够</b>（注意 MANAGE_EXTERNAL_STORAGE 是"所有文件访问"，与普通存储权限不是一个层级）。<br><br>' +
-          '<b>关于 <span class="mono">../</span>：</b>想一想——如果 App 在拼接路径时只做字符串拼接、' +
-          '不做规范化，那么 <span class="mono">../</span> 会把"沙箱内的一个子目录"变成"沙箱外的任意位置"。',
-        after:
-          T.note('ok', '✅ 实验一的收获',
-            '<p style="margin-bottom:0">你应该已经看到了：<b>同一行代码，换个 API 级别就完全不能用。</b><br>' +
-            '这就是为什么"照着两年前的教程写存储"会失败，也是为什么<b>逆向时看到一段可疑的文件访问逻辑，' +
-            '要先把它的目标版本搞清楚</b>——不然你会把"在新版本上必然失败"的代码当成"有效的攻击面"。<br>' +
-            '<span class="hit">而 <span class="mono">../</span> 那一组告诉的是另一件事：' +
-            '<b>存储权限管的是"能不能进这个目录"，路径规范化管的是"能不能出这个目录"——这是两个独立的问题，两个都要有。</b></span></p>')
-      },
-
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '起点',
-            scenario: '<b>情境：</b>你要分析一个文件管理类 App。你发现它在启动时会<b>遍历 <span class="mono">/sdcard</span> 下的目录</b>' +
-              '并把结果上报。你的设备是 Android 13。你想在 Frida 里复现它的遍历逻辑，看看它到底在找什么。' +
-              '你直接在 Frida 里调用了它自己的遍历函数，<b>结果返回空列表</b>。',
-            q: '最可能的原因是什么？',
-            choices: [
-              { t: 'A. 遍历函数被加固保护了，检测到 Frida 就返回空', next: 'na' },
-              { t: 'B. 目标 App 申请了「所有文件访问权限」并在真机上被授予，而你的 Frida 脚本运行的环境没有这个权限', next: 'nb' },
-              { t: 'C. Android 13 禁止任何 App 遍历 /sdcard，这个 App 在真机上也是空的', next: 'nc' },
-              { t: 'D. 遍历逻辑在 native 层，Java 层调用只是壳', next: 'nd' }
-            ]
-          },
-          na: {
-            label: '选A', terminal: true, verdict: 'bad', verdictTitle: '把一个权限问题归因给了对抗',
-            result: '<b>这个归因跳过了最关键的一步：先确认"在同样的条件下，它本来应该返回什么"。</b><br><br>' +
-              '有一个很便宜的办法可以排除掉你的怀疑：<b>在没注入 Frida 的情况下，用同样的权限去读同一个目录</b>' +
-              '（比如 <span class="mono">adb shell ls /sdcard</span>，再对比 App 自己的行为）。' +
-              '如果 App 在真机上能列出文件、而你的脚本不能，那问题在<b>权限上下文</b>，不在对抗。<br><br>' +
-              '<b>认知根源：</b>在"已知目标有防护"的前提下，人容易把一切异常都归到防护上。' +
-              '但<b>权限/环境差异导致的失败，和"被检测到"导致的失败，现象完全不同</b>——' +
-              '前者是"返回空/报错但进程正常"，后者通常是崩溃、退出、或后续行为异常。<br>' +
-              '<span class="hit">先排除环境和权限，再怀疑对抗。这个顺序能省掉大量无效的对抗分析。</span>'
-          },
-          nb: {
-            label: '选B', terminal: true, verdict: 'good', verdictTitle: '正确：先看权限上下文，再看代码逻辑',
-            result: '<b>这是最符合现象的解释。</b>理由：<br><br>' +
-              '① <b>Android 11（API 30）起，要遍历共享目录就必须有「所有文件访问权限」</b>' +
-              '（<span class="mono">MANAGE_EXTERNAL_STORAGE</span>）。这个权限<b>不是普通运行时权限</b>，' +
-              '它需要在设置里单独授予，而且 Google Play 对它有严格的用途审核。<br>' +
-              '② <b>你注入的 Frida 脚本，其代码运行在目标 App 的进程里，用的是目标 App 的 UID</b>——' +
-              '所以权限上下文<b>取决于目标 App 被授予了什么</b>，而不是你的 adb shell。<br>' +
-              '③ <b>但从 adb shell 手动跑同样的目录遍历，用的是 shell 的 UID</b>（在非 root 的 userdebug 上权限也不同）。' +
-              '<span class="hit">这两者的权限不是一回事，所以"adb 能列、App 不能列"是完全可能的。</span><br><br>' +
-              '<b>怎么验证：</b>查目标 App 的权限授予状态（<span class="mono">dumpsys package &lt;pkg&gt;</span> 看 ' +
-              '<span class="mono">MANAGE_EXTERNAL_STORAGE</span> 是否 granted），再看它有没有在代码里检查这个权限、' +
-              '拿不到时是否静默返回空。<b>如果是，那你在设备上补上这个权限，遍历就正常了。</b><br><br>' +
-              '<b>顺带一个更大的收获：</b>这条线索本身很有价值——<b>一个申请了「所有文件访问权限」的 App，' +
-              '它的业务里一定有"需要看全盘"的部分</b>（清理、备份、文件管理、或取证类风控）。这比你在代码里瞎找高效得多。'
-          },
-          nc: {
-            label: '选C', terminal: true, verdict: 'bad', verdictTitle: '把"受限"误读成了"完全禁止"',
-            result: '<b>分区存储是"限制默认行为"，不是"禁止访问"。</b>这个区别很关键。<br><br>' +
-              'Android 11 之后访问共享目录有<b>两条合法路径</b>：<br>' +
-              '· <b>MediaStore</b>——管理照片/视频/音频等媒体，不需要敏感权限，但<b>只能看到媒体文件</b>；<br>' +
-              '· <b>MANAGE_EXTERNAL_STORAGE</b>——「所有文件访问」，能看到全盘，但属于敏感权限，需要专门授予与审核。<br>' +
-              '<span class="hit">所以"文件管理类 App 在 Android 13 上依然能用"这件事，本身就说明存在合法通路。' +
-              '"禁止"和"需要专门授权"是完全不同的结论——前者意味着这条路不存在，后者意味着你要去找它拿到了什么授权。</span><br><br>' +
-              '<b>逆向意义：</b>把"受限"读成"禁止"，会让你错误地排除掉整条分析路径。' +
-              '正确的问法不是"这个版本还能不能做"，而是"<b>它必须拿到什么，才能做到这件事</b>"——' +
-              '而那个"什么"，往往就是它的关键权限声明，也是它的行为特征。'
-          },
-          nd: {
-            label: '选D', terminal: true, verdict: 'bad', verdictTitle: '在没有证据前就假设了实现层',
-            result: '<b>这个猜测本身不算离谱，但它现在是一个"没有证据的假设"，而且它解释不了最关键的一点。</b><br><br>' +
-              '<b>为什么它解释不了：</b>如果遍历逻辑在 native 层，那么"返回空列表"这个结果仍然需要解释——' +
-              'native 层同样受权限约束（它用的是同一个进程的同一个 UID）。' +
-              '<span class="hit">换句话说：<b>换成 native 实现，权限问题依然存在。</b>' +
-              '你提出的解释并不能解释现象，只是把它往后推了一层。</span><br><br>' +
-              '<b>更重要的方法论问题：</b>要验证"是不是 native 实现"，成本是多少？' +
-              '你需要 dump so、找导出、追调用——而验证"是不是权限问题"，成本是<b>一条 dumpsys 命令</b>。<br>' +
-              '<b>当两个假设都能解释现象时，先验证成本低的那个。</b>这不是"偷懒"，这是把有限的注意力花在能快速收敛的地方。<br><br>' +
-              '<b>什么情况下该怀疑实现层？</b>当权限确认没问题、行为却依然不符预期时——' +
-              '那时"它到底在哪一层做的"才成为真正需要回答的问题。'
-          }
-        }
-      }
-    },
-
-    /* ============================================================ 26.8 */
-    {
-      h: '26.8', title: 'Handler / Looper / MessageQueue：主线程在干什么',
-      intuition: {
-        tag: '直觉模型 · 一个只有一个人的前台，和一摞待办号牌',
-        body:
-          '<p>主线程（UI 线程）就是这个前台，<strong>而且只有一个</strong>。它一次只能办一件事。</p>' +
-          '<p>问题是：<b>所有人都想让它办事</b>——你的点击事件、系统的绘制信号、你自己 post 的任务、' +
-          '别的线程想把结果送回 UI……它们不能直接冲上去打断前台，只能<b>取一个号、排到队尾</b>。</p>' +
-          '<ul>' +
-          '<li><b>MessageQueue</b> = 那摞号牌（按"该在什么时间办"排序）；</li>' +
-          '<li><b>Looper</b> = 那个不停喊"下一位"的人（<span class="mono">loop()</span> 是一个死循环）；</li>' +
-          '<li><b>Handler</b> = 你手里的取号器 + 你的身份标识（号牌上写着"办完找谁"）；</li>' +
-          '<li><b>Message</b> = 一张号牌（带参数、带"什么时候办"、带"办完找谁"）。</li>' +
-          '</ul>' +
-          '<p><span class="hit">于是"主线程被卡住"这件事就有了精确的含义：' +
-          '<b>不是前台在忙，而是前台在办一件事的时候不肯放手，后面所有号牌都办不了。</b>' +
-          '这就是 ANR。</span></p>'
-      },
-      html:
-        '<p>这套机制是安卓最核心的并发模型。它值得你花时间，因为：' +
-        '<b>逆向时"代码跑在哪个线程上"这个问题，答案几乎总是要回到 Looper。</b></p>' +
-        T.tbl(['角色', '是什么', '关键性质'],
-          [
-            ['<span class="mono">Looper</span>', '一个线程的消息循环', '<b>每个线程最多一个</b>，存在 <span class="mono">ThreadLocal</span> 里。主线程的在 <span class="mono">ActivityThread.main</span> 里由 <span class="mono">prepareMainLooper()</span> 创建'],
-            ['<span class="mono">MessageQueue</span>', '消息队列', '内部是<b>按 <span class="mono">when</span> 排序的单链表</b>（不是普通队列，所以"队首"是按时间算的，不是按入队顺序）'],
-            ['<span class="mono">Handler</span>', '发送与处理消息', '构造时<b>绑定当前线程的 Looper</b>（或指定一个）。它同时是"发送者"和"接收者"——消息里带着 <span class="mono">target</span> 指回它自己'],
-            ['<span class="mono">Message</span>', '消息实体', '带 <span class="mono">what</span> / <span class="mono">arg1</span> / <span class="mono">arg2</span> / <span class="mono">obj</span> / <span class="mono">callback</span> / <span class="mono">when</span>；<b>有池化复用</b>（<span class="mono">obtainMessage</span>）']
-          ]) +
-        T.note('key', '🔑 三个最常被搞错的点',
-          '<p style="margin-bottom:0">' +
-          '① <b>post(Runnable) 和 sendMessage 走的是同一条路。</b><span class="mono">post</span> 只是把 Runnable ' +
-          '塞进 <span class="mono">Message.callback</span> 字段。所以它们的排队规则完全一样。<br>' +
-          '② <b>dispatchMessage 的顺序是固定的：</b>先看 <span class="mono">msg.callback</span>（Runnable）→ ' +
-          '再看 <span class="mono">Handler</span> 构造时传入的 <span class="mono">Callback</span> → ' +
-          '最后才是你重写的 <span class="mono">handleMessage</span>。' +
-          '<span class="hit">逆向时如果你 hook 了 handleMessage 却什么都没抓到，很可能消息是被 callback 分支消费掉了。</span><br>' +
-          '③ <b>延迟消息不是"定时器"。</b><span class="mono">postDelayed</span> 的语义是"<b>不早于</b>这个时间"——' +
-          '如果主线程正忙，它会晚得多。所以拿它做精确定时是不可靠的。</p>'),
-
-      stepper: {
-        title: '一条消息的完整旅行',
-        lines: [
-          { code: '<span class="c">// ① 在主线程里创建一个 Handler（隐式绑定主线程的 Looper）</span>\nHandler h = <span class="k">new</span> Handler(Looper.getMainLooper()) {\n    <span class="k">public void</span> handleMessage(Message msg) { <span class="c">/* … */</span> }\n};',
-            note: '<b>① Handler 一出生就"认领"了一个 Looper。</b>不传参数的构造器绑定<b>当前线程</b>的 Looper——' +
-              '这也是为什么"在子线程里 new Handler() 会崩"：那个线程没有 Looper。',
-            state: { '阶段': '创建', '在哪个线程': '主线程', '队列长度': '0' } },
-          { code: '<span class="c">// ② 从子线程发一条延迟消息（这是最常见的使用场景）</span>\nh.postDelayed(runnable, 100);\n<span class="c">// 内部：msg.callback = runnable; msg.when = now + 100</span>',
-            note: '<b>② 跨线程投递。</b>注意 <span class="mono">postDelayed</span> 是<b>线程安全</b>的——' +
-              '这正是它存在的意义：<b>让别的线程能安全地要求主线程干活。</b><br>' +
-              '<span class="hit">逆向视角：<b>一个 App 里所有"从子线程回到 UI"的动作都要经过这里</b>。' +
-              '所以 hook <span class="mono">Handler.post</span> 是一张很灵的网——第 22 章提到 JDex2 就是用 ' +
-              '<span class="mono">Handler(Looper.getMainLooper()).post()</span> 把某些调用丢回主线程的。</span>',
-            state: { '阶段': '投递', '在哪个线程': '子线程 → 主队列', '队列长度': '1' } },
-          { code: '<span class="c">// ③ 入队：MessageQueue.enqueueMessage</span>\n<span class="c">// 按 when 找到插入位置（不是简单追加到队尾！）</span>',
-            note: '<b>③ 入队时会按 <span class="mono">when</span> 排序。</b>这是 MessageQueue 与普通队列<b>最本质的区别</b>：' +
-              '一条延迟 100ms 的消息，会被插到所有"时间更早"的消息<b>后面</b>，而不是无条件排到队尾。<br>' +
-              '<span class="hit">所以"谁先执行"取决于<b>时间戳</b>，不取决于"谁先发"。</b>' +
-              '本章实验二就是让你亲手验证这件事。</span>',
-            state: { '阶段': '入队', '在哪个线程': '主队列', '队列长度': '1（按 when 有序）' } },
-          { code: '<span class="c">// ④ Looper.loop() 取消息（主线程一直在转这个循环）</span>\nMessage msg = queue.next();   <span class="c">// 必要时阻塞等待</span>',
-            note: '<b>④ 死循环取消息。</b>队列空的时候 <span class="mono">next()</span> 会阻塞（用 epoll 等待），' +
-              '<b>不消耗 CPU</b>——所以"App 停在那里"并不等于"在忙"。<br>' +
-              '这也是主线程唯一的"空闲时刻"：<span class="mono">IdleHandler</span> 就是在这时候被回调的。',
-            state: { '阶段': '取消息', '在哪个线程': '主线程', '队列长度': '0' } },
-          { code: '<span class="c">// ⑤ 分发：msg.target.dispatchMessage(msg)</span>\n<span class="c">// 顺序：msg.callback → Handler.mCallback → handleMessage</span>',
-            note: '<b>⑤ 分发的优先级是固定的。</b>这就是前面"三个最常被搞错的点"里的第 ② 条——' +
-              '<span class="mono">post</span> 进去的 Runnable 走的是 <span class="mono">callback</span> 分支，' +
-              '<b>根本不会进 handleMessage</b>。<br>' +
-              '<b>这对 hook 很重要：</b>你 hook <span class="mono">handleMessage</span> 能抓到的只是"用 sendMessage 发的"那一部分。',
-            state: { '阶段': '分发', '在哪个线程': '主线程', '队列长度': '0' } },
-          { code: '<span class="c">// ⑥ 执行完毕，回到 ④ 等下一张号牌</span>\n<span class="c">// 中间如果某条消息执行太久 → ANR</span>',
-            note: '<b>⑥ 回到循环。</b>整套机制就是这样转下去的。<br>' +
-              '<span class="hit">现在你应该能精确解释 ANR 了：<b>不是"主线程崩了"，而是"主线程在执行某一条消息时花了太久，' +
-              '后面的消息（包括用户的输入事件）都超时了"。</b><br>' +
-              '所以定位 ANR 的关键永远是同一个问题：<b>当时主线程正在执行哪一条消息、它的调用栈是什么。</b></span>',
-            state: { '阶段': '循环', '在哪个线程': '主线程', '队列长度': '按需' } }
-        ]
-      },
-
-      lab: {
-        title: '实验二：消息循环执行顺序推演器',
-        goal: '目标：算出真实的消息执行顺序',
-        intro:
-          '<p>下面是一个<b>真实的消息队列模拟</b>：它按每行的"投递时刻 + 延迟"算出 <span class="mono">when</span>，' +
-          '再按 MessageQueue 的真实规则排出执行顺序。</p>' +
-          '<p>每行格式：<span class="mono">&lt;类型&gt; &lt;名字&gt; t=&lt;投递时刻ms&gt; d=&lt;延迟ms&gt;</span>，类型有三种：<br>' +
-          '· <span class="mono">post</span>——普通投递（等同于 sendMessage）<br>' +
-          '· <span class="mono">postDelayed</span>——带延迟<br>' +
-          '· <span class="mono">front</span>——<span class="mono">sendMessageAtFrontOfQueue</span>，<b>插到队首</b>（相当于 when=0 且优先）</p>' +
-          '<p><b>先自己写出你预测的顺序，再点运行对照。</b>特别留意两件事：' +
-          '① 同 <span class="mono">when</span> 的消息谁先；② <span class="mono">front</span> 能插到多前面。</p>',
-        inputs: [
           {
-            key: 'ops',
-            label: '消息投递序列',
-            hint: '改一改、加几行试试',
-            type: 'textarea', rows: 7,
-            value:
-              'post        A  t=0 d=0\n' +
-              'postDelayed B  t=0 d=100\n' +
-              'front       C  t=0\n' +
-              'postDelayed D  t=0 d=50\n' +
-              'post        E  t=0 d=0'
+            run: function () { fartPick(null, [], ['点「播放」或「下一步」开始', '—', '—']); },
+            note: '<b>先看整体：这条轴上每一格都意味着一次重做。</b>注意一个规律——<b>Android 5 到 6 是「从无到有」，6 之后的每一格都是「结构变了、必须重新定位」</b>。这就是 FART 必须持续维护的全部理由。'
           },
-          { key: 'guess', label: '① 你预测的执行顺序（用逗号分隔，例如 C,A,E,D,B）', ph: 'C,A,E,D,B' },
-          { key: 'why', label: '② 为什么 front 能排到最前面？用一句话说清它的语义', type: 'textarea', rows: 2,
-            ph: '因为……' }
+          {
+            run: function () {
+              fartPick('tl5', [], [
+                'ART 正式取代 Dalvik：dex 的执行模型从「解释执行 + JIT」转为「AOT 编译 + 解释器兜底」。',
+                'FART 的脱壳点此时还不存在。但 ART 带来了一个关键前提：<b>运行时内存里一定存在结构完整的 dex</b>。',
+                '无。FART 不是从这一版起家的。'
+              ]);
+              CLS('tlstat', 'pill warn'); SET('tlstat', '维护状态：无工具可用');
+            },
+            note: '<b>Android 5.0 是分水岭，但不是 FART 的起点。</b>记住这条因果：<b>因为 ART 会在内存里把 dex 完整映射出来，脱壳才有物理基础</b>。Dalvik 时代也有脱壳，但内存布局与 ART 完全不同。'
+          },
+          {
+            run: function () {
+              fartPick('tl6', ['tl5'], [
+                'ART 的实现逐渐稳定，<code>DexFile</code>、<code>ClassLinker</code>、<code>ArtMethod</code> 这套骨架定型，成为后续所有版本的共同祖先。',
+                'FART 的原生脱壳点就在这一版被找到：<b>dex 加载完成处</b> + <b>方法体执行时的 code item 回填处</b>。',
+                '这是 FART 的<b>起点版本</b>。后面每一版的移植，都是把这一版的插桩逻辑挪到新结构里。'
+              ]);
+              CLS('tlstat', 'pill ok'); SET('tlstat', '维护状态：基线版本（FART 6.0）');
+            },
+            note: '<b>为什么一定要抓住「基线版本」这个概念？</b>因为移植不是从零发明，而是<b>把一份已知正确的实现，翻译到新的结构上</b>。你手上永远要有一份「逻辑基准」——知道它到底在哪两个点插了桩、插桩时读写了哪些字段。'
+          },
+          {
+            run: function () {
+              fartPick('tl8', ['tl5', 'tl6'], [
+                '<code>DexFile</code> 结构被重构，<code>ClassLinker</code> 的接口有较大调整，AOT 编译策略变得更激进。（<span class="pill warn">具体类名与字段差异待核实</span>）',
+                '原来 hook 的那个函数可能改名、换签名、甚至搬到别的文件里。脱壳点必须<b>按语义重新定位</b>，而不是按旧函数名去搜。',
+                '第一类真实移植工作出现了：<b>去读这一版的源码，找到「dex 加载完成」这个语义事件在新的哪一行代码上。</b>'
+              ]);
+              CLS('tlstat', 'pill warn'); SET('tlstat', '维护状态：首次大规模重定位');
+            },
+            note: '<b>这是移植心态的分界线。</b>Android 8 之前，很多人以为脱壳点是「一个固定的函数名」；Android 8 之后就明白了：<b>你要找的是语义事件（dex 何时加载完、方法体何时回填），函数名只是这一版对它的实现</b>。找语义，不要找名字。'
+          },
+          {
+            run: function () {
+              fartPick('tl9', ['tl5', 'tl6', 'tl8'], [
+                'Android 9 引入 <b>CompactDex</b>：一种为节省内存而优化的 dex 变体，<b>指令操作数被重新编码</b>；同时 <code>dex2oat</code> 的编译流程也有调整。',
+                '脱壳点仍要在 dex 加载路径上重新定位；同时<b>dump 出来的可能不是标准 dex</b>，如果不管这一点，产物用 jadx 打开会是一片乱码或报错。',
+                '修复组件要升级：<b>识别 CompactDex 并做额外转换/还原</b>，否则前两步全对、最后一步白干。'
+              ]);
+              CLS('tlstat', 'pill warn'); SET('tlstat', '维护状态：dump 产物格式变了');
+            },
+            note: '<b>Android 9 教会我们一件事：移植不只改「脱壳点」，还要改「产物处理」。</b>内存里躺着的那份 dex 未必是教科书上的标准 dex 格式。遇到 dump 出来打不开的文件，<b>先怀疑格式变体，再怀疑 dump 错了</b>。'
+          },
+          {
+            run: function () {
+              fartPick('tl10', ['tl5', 'tl6', 'tl8', 'tl9'], [
+                '<code>ArtMethod</code> 的结构为支持 <b>hidden API 策略</b>而调整，部分字段的访问方式发生变化，并引入了新的 dex 加载路径。（<span class="pill warn">具体字段名与访问器待核实</span>）',
+                '脱壳点要在新的加载路径上重新定位；<b>取方法体（code item）的方式也必须改写</b>，因为原来读字段的写法可能已经不成立。',
+                '本章第一个实战：<b>FART10 的移植</b>。第 26.3 节会把三个组件要改的地方逐个摊开。'
+              ]);
+              CLS('tlstat', 'pill'); SET('tlstat', '维护状态：本章实战（移植中）');
+            },
+            note: '<b>为什么 Android 10 的移植工作量特别大？</b>因为 <code>ArtMethod</code> 是「方法」这个概念的物理载体，而 FART 的第二步（遍历方法 + 主动调用 + dump code item）<b>每一步都要读 ArtMethod</b>。它一变，FART 最核心的那段循环就几乎要重写。'
+          },
+          {
+            run: function () {
+              fartPick('tl11', ['tl5', 'tl6', 'tl8', 'tl9', 'tl10'], [
+                '<code>ArtMethod</code> 进一步调整，<b>部分信息被移到 <code>CodeItemDataAccessor</code> 之类的辅助结构里</b>。（<span class="pill warn">具体访问器名称与职责待核实</span>）',
+                '「从方法拿到 code item」这个动作，从「直接读字段」变成了「通过一层访问器」。脱壳点要跟着换入口。',
+                '遍历与取方法体的代码要重写成新的访问方式。<b>逻辑没变，接口全变</b>——这正是移植的典型形态。'
+              ]);
+              CLS('tlstat', 'pill warn'); SET('tlstat', '维护状态：接口层再变');
+            },
+            note: '<b>注意这个趋势：ART 在不断把内部字段「藏起来」。</b>早期版本可以直接读结构体字段，后来要经过访问器、要经过辅助结构。<b>这既是难度来源，也是提示</b>：当你在新版本里找不到某个字段时，去搜索「谁提供了等价的访问接口」，而不是硬找旧字段名。'
+          },
+          {
+            run: function () {
+              fartPick('tl12', ['tl5', 'tl6', 'tl8', 'tl9', 'tl10', 'tl11'], [
+                '持续演进：Android 12 引入 <b>init_boot 分区</b>（ramdisk 搬家，刷机方式跟着变）；ART 的 GC、编译器、类链接器都在持续调整。',
+                '脱壳点在新版本上<b>照旧要重新定位</b>——注意这里的「照旧」两个字：这就是常态，不是意外。',
+                '第二个实战：<b>FART14 秒脱 DexProtector</b>。之所以能「秒脱」，正是因为这一版的重定位工作<b>已经提前做完了</b>。'
+              ]);
+              CLS('tlstat', 'pill ok'); SET('tlstat', '维护状态：持续维护中（FART14 就绪）');
+            },
+            note: '<b>走到时间轴末尾，回头看那个核心事实：</b>从 Android 6 到 14，ART 没有一年是「不变」的。所以「我的脱壳工具在 A 手机上好好的，换 B 手机就不行」不是玄学，<b>是版本结构差异的必然结果</b>。下一节把这七格逐条落成可对照的表格。'
+          }
+        ]
+      },
+      after: T.note('', '🧭 关于「待核实」', '<p>本节里凡是标注 <span class="pill warn">待核实</span> 的地方，都是<b>方向确定、但具体到某个函数名/字段名需要你打开对应版本源码确认</b>的点。这不是偷懒，而是本章要训练的态度：<b>版本相关的细节，永远以你手上那一版 AOSP 源码为准</b>。任何一份「永久有效的 ART 内部结构说明书」都是不可信的——包括本文。</p>')
+    },
+
+    /* ================= 26.2 ================= */
+    {
+      h: '26.2',
+      title: '逐版本对照：ART 变了什么，脱壳点怎么调',
+      html: '<p>把上一节的时间轴压成一张对照表。<b>这张表的价值不在于记住每一行，而在于看清「变化发生在哪一层」</b>——是加载路径变了、是结构布局变了、是产物格式变了，还是只剩刷机方式变了。不同层的变化，对应的移植工作量差一个数量级。</p>' +
+            T.tbl(
+              ['安卓版本', 'ART 发生了什么（大方向确定）', '脱壳点受到的影响', 'FART 移植要动的东西'],
+              [
+                ['<b>5.0</b>', 'ART 取代 Dalvik，执行模型改为 AOT + 解释器兜底', '尚无 FART 脱壳点；但内存中存在完整 dex 这一前提成立', '无（FART 从 6.0 起家）'],
+                ['<b>6.0</b>', '<code>DexFile</code> / <code>ClassLinker</code> / <code>ArtMethod</code> 骨架定型', '原生脱壳点在此版被确定：<b>dex 加载完成处</b> + <b>code item 回填处</b>', '这是<b>基线版本</b>，移植的参照物'],
+                ['<b>8.0</b>', '<code>DexFile</code> 结构重构、<code>ClassLinker</code> 接口调整、AOT 更激进', '旧函数名可能失效，必须<b>按语义事件重新定位</b>脱壳点', '重新读源码，找到「dex 加载完成」的新位置'],
+                ['<b>9</b>', '引入 <b>CompactDex</b>（省内存的 dex 变体，指令操作数被重编码）；<code>dex2oat</code> 流程调整', '脱壳点需重新定位；<b>dump 产物可能不是标准 dex</b>', '修复组件升级：识别并处理 CompactDex 变体'],
+                ['<b>10</b>', '<code>ArtMethod</code> 为支持 <b>hidden API 策略</b>而调整，字段访问方式变化，出现新的 dex 加载路径', '取方法体的方式必须改写，脱壳点要在新加载路径上重定位', '<b>本章实战</b>：三个组件逐项适配'],
+                ['<b>11+</b>', '<code>ArtMethod</code> 再调整，部分信息移到 <code>CodeItemDataAccessor</code> 一类辅助结构 <span class="pill warn">待核实</span>', '「方法 → code item」从直读字段变为经过访问器', '遍历与取方法体逻辑按新接口重写'],
+                ['<b>12/13/14</b>', 'Android 12 引入 <b>init_boot 分区</b>；GC / 编译器 / 类链接器持续演进', '脱壳点照旧要重新定位（这是常态）', '刷入方式随分区变化调整；<b>FART14 由此而来</b>']
+              ]
+            ) +
+            T.note('', '📌 读这张表的正确姿势', '<p>不要试图背下每一行。请只记住<b>四种变化类型</b>：</p><p>① <b>加载路径变了</b>（8.0 / 10）→ 去源码里重新找「dex 什么时候加载完」；② <b>结构布局变了</b>（8.0 / 10 / 11+）→ 去源码里重新找「怎么从方法拿到 code item」；③ <b>产物格式变了</b>（9）→ 改修复组件；④ <b>只有刷机/分区变了</b>（12）→ 改交付方式，插桩逻辑不动。</p><p>拿到任何一个新版本，先判断它属于哪一类，<b>你就已经知道这次移植大概要花几天、会卡在哪</b>。</p>'),
+      after: T.note('warn', '⚠️ 不要去找「标准答案」', '<p>市面上流传着各种「ART 结构对照表」，它们大多在半年内就会过时。<b>唯一可靠的做法是打开你手上那一版 AOSP 源码自己确认</b>：关键代码通常位于 <code>art/runtime/</code> 目录下，与 dex 加载、类链接、方法访问相关的几个源文件里（<span class="pill warn">具体文件名随版本差异较大，待核实</span>）。第 26.4 节会把「怎么在源码里找脱壳点」拆成可执行步骤。</p>')
+    },
+
+    /* ================= 26.3 ================= */
+    {
+      h: '26.3',
+      title: 'FART 的三根支柱：dump dex、主动调用、修复',
+      html: '<p>移植之前先要想清楚一件事：<b>你到底在移植什么？</b>FART 看起来是一大坨代码，实际上只有三块功能，每一块的适配点都不一样。把这三块分清楚，移植时才知道自己卡在哪一块。</p>' +
+            '<p>先明确这一节会用到的基本概念：' + T.term('code item', 'dex 中描述一个方法体的结构，指令数组（insns）就在里面。抽取壳抽走的正是它，因此它「有没有内容」是判断脱壳是否成功的关键。') + '是 dex 里承载方法体的结构，' + T.term('抽取壳', '加壳时把方法体从 dex 中抽走，只在方法真正执行前由壳解密填回。它的 dex 结构完整（类名、方法名都在），但方法体为空——因此必须先触发回填才能脱。') + '则是动了它的一种加固类型。这两者会在下面反复出现。</p>' +
+            T.grid(3, [
+              '<div class="card"><div class="card-title">① dex 文件 dump</div><p>在 <code>DexFile</code> 完成映射/加载的那个点，把内存里完整的 dex 落盘。<b>一次加载只做一次</b>，产物是 App 启动时解密的原始 dex。</p><p class="small muted">适配点：DexFile 的构造与 Open 系列方法，或这一版新的加载入口（<b>随版本变化</b>）。</p></div>',
+              '<div class="card"><div class="card-title">② code item dump（含主动调用）</div><p>遍历所有类、所有方法，<b>逐个触发调用以强制回填方法体</b>，再 dump 出方法体。这是抽取壳的克星。</p><p class="small muted">适配点：怎么遍历 DexFile 里的 ClassDef；怎么拿到 code_item；<b>ArtMethod 的字段布局（版本差异最大）</b>。</p></div>',
+              '<div class="card"><div class="card-title">③ 修复组件</div><p>把 dump 出来的方法体合并回 dex，修正文件头与 map 段，产出 jadx 能打开的成品。</p><p class="small muted">适配点：dex 格式本身相对稳定，但 <b>CompactDex 等变体需要额外处理</b>。</p></div>'
+            ]) +
+            T.note('key', '🔑 三块功能的「版本敏感度」完全不同', '<p>这是移植前最该建立的一张优先级表：</p>' +
+              '<p><b>③ 修复组件最稳</b>——dex 格式是公开规范，五年八年不怎么变；<b>① dex dump 中等</b>——加载路径会变，但语义事件（"dex 加载完成"）只有几个地方可能；<b>② 主动调用最脆</b>——它直接依赖 <code>ArtMethod</code> 的内存布局，而这个结构<b>几乎每个大版本都在动</b>。</p>' +
+              '<p>结论很实用：<b>移植时把 80% 的时间留给 ②</b>。看到有人移植失败，多半是卡在「我能 dump 出 dex 了，但方法体全是空的」。</p>'),
+      after: T.note('warn', '⚠️ 为什么「dump 出 dex」不等于脱壳成功', '<p>如果目标只是<b>一代壳</b>（整体加密、启动时一次性解密到内存），①就够用了：内存里那份 dex 结构完整，直接 dump 即可。</p>' +
+        '<p>但如果目标是<b>抽取壳</b>，① 拿到的 dex 是「空壳」——<b>结构完整、类和方法的名字都在，唯独方法体（code item）是空的或被 nop 填充</b>。因为加固厂商在加壳时就把方法体抽走了，只在真正要执行某个方法时才由壳的解密逻辑填回去。</p>' +
+        '<p>这就逼出了 FART 最核心也最独特的设计：<b>你不去等它回填，你主动触发它回填</b>。这正是下一节要拆解的那段循环。</p>')
+    },
+
+    /* ================= 26.4 ================= */
+    {
+      h: '26.4',
+      title: '主动调用的核心循环：FART 最独特的那段代码',
+      html: '<p>FART 相对其他脱壳工具最大的差别，就是<b>主动调用（invoke）</b>。它不去被动等待壳自己解密方法体，而是<b>用双重循环把 App 里每一个方法都调用一遍</b>，用「强制执行」逼 ART 把 code item 填回内存，然后再 dump。</p>' +
+            '<p>下面这段是主动调用循环的结构示意（伪代码）。<b>注意看它的嵌套层次——每一层在不同安卓版本上的稳定性是不一样的</b>，右边状态栏会跟着循环推进而变化。</p>',
+      stepper: {
+        title: 'FART 主动调用循环（结构示意 · 伪代码）',
+        lines: [
+          {
+            code: '<span class="c">// 目标：遍历所有 dex → 所有类 → 所有方法 → 强制调用 → dump 方法体</span>',
+            note: '<b>先把目标说清楚。</b>FART 的第二块功能不是为了「执行 App 逻辑」，而是为了<b>触发副作用</b>：只要方法被真正执行过一次，它的方法体就必须存在于内存中。<b>调用是手段，回填才是目的。</b>',
+            state: { '阶段': '准备', '已 dump 类': '0', '已 dump 方法': '0' },
+            mem: '/sdcard/fart/<包名>/\n  (空)'
+          },
+          {
+            code: '<span class="k">for</span> (<span class="k">auto</span>&amp; df : <span class="f">dex_files</span>) {   <span class="c">// 第 1 层：遍历 DexFile</span>',
+            note: '<b>最外层。</b>一个 App 运行时可能同时存在多个 DexFile（多 dex、动态加载的 dex、壳自己释放出来的 dex）。<b>适配点：怎么枚举到全部 DexFile——这一层的接口在不同版本里叫法不同</b>（<span class="pill warn">待核实</span>）。',
+            state: { '阶段': '遍历 DexFile', '当前 dex': 'classes.dex', '已 dump 类': '0', '已 dump 方法': '0' }
+          },
+          {
+            code: '  <span class="k">const</span> DexFile::Header&amp; hdr = df.<span class="f">GetHeader</span>();',
+            note: '<b>读 dex 头。</b>脱壳的第一手信息就在这里——尤其是 <code>class_defs_size</code>（类定义数量）与 <code>map_off</code>（段表偏移）。<b>dump 完整 dex 时，这份头信息决定了你要拷贝多大、拷贝哪几段</b>，这也是 ① 号功能的关键。',
+            state: { '阶段': '读 dex 头', 'class_defs_size': '3821（示例值）', '已 dump 类': '0' },
+            mem: 'header:\n  magic   dex\\n035\\0\n  map_off -> 段表'
+          },
+          {
+            code: '  <span class="k">for</span> (<span class="t">uint32_t</span> i = <span class="n">0</span>; i &lt; hdr.<span class="f">class_defs_size_</span>; ++i) {  <span class="c">// 第 2 层：遍历 ClassDef</span>',
+            note: '<b>第二层：遍历 DexFile 里的每一个类定义（ClassDef）。</b>ClassDef 描述「这个类叫什么、字段在哪、方法在哪、用哪个 class_data_item」。<b>适配点：怎么从 DexFile 里取出第 i 个 ClassDef——8.0 之后这部分结构被重构过</b>（<span class="pill warn">待核实</span>）。',
+            state: { '阶段': '遍历 ClassDef', '当前类': 'com/example/App;', '类进度': '1 / 3821', '已 dump 方法': '0' },
+            mem: 'class_defs[]\n [0] Lcom/example/App;\n [1] ...'
+          },
+          {
+            code: '    <span class="k">const</span> DexFile::ClassDef&amp; cd = df.<span class="f">GetClassDef</span>(<span class="n">i</span>);',
+            note: '<b>取出当前类的定义。</b>到这里你已经拿到了「类」这个维度的全部信息。<b>这一步通常要配合解析 class_data_item</b>——方法列表就在里面，而不是在 ClassDef 的定长字段里。',
+            state: { '阶段': '解析类数据', '当前类': 'com/example/App;', '方法数(本类)': '37' }
+          },
+          {
+            code: '    <span class="k">auto</span>* klass = <span class="f">class_linker</span>-&gt;<span class="f">FindClass</span>(df, cd.<span class="f">class_idx_</span>);',
+            note: '<b>把「dex 里的类」变成「运行时真正可调用的类」。</b>这一步不能省：只有拿到 ART 内部的类对象，才谈得上遍历它的方法、才谈得上调用。<b>适配点：ClassLinker 的接口在 Android 8.0 有较大调整</b>（<span class="pill warn">具体签名待核实</span>）。',
+            state: { '阶段': '解析类(ClassLinker)', '当前类': 'com/example/App;', '类状态': '已解析' }
+          },
+          {
+            code: '    <span class="k">for</span> (<span class="k">auto</span>&amp; m : <span class="f">klass</span>-&gt;<span class="f">GetMethods</span>()) {  <span class="c">// 第 3 层：遍历方法</span>',
+            note: '<b>第三层：遍历这个类的所有方法。</b>注意从这一层开始，<b>你面对的不再是 dex 格式，而是 ART 的运行时结构</b>——后面的每一步都直接踩在 <code>ArtMethod</code> 的布局上。<b>这就是移植时最容易崩的地方</b>。',
+            state: { '阶段': '遍历方法', '当前类': 'com/example/App;', '当前方法': 'onCreate', '方法进度': '1 / 37' }
+          },
+          {
+            code: '      <span class="t">ArtMethod</span>* am = m;   <span class="c">// 关键结构：版本差异最大的一环</span>',
+            note: '<b>整章最脆的一行。</b><code>ArtMethod</code> 描述一个方法：它在哪里、怎么执行、代码在哪。<b>Android 10 为支持 hidden API 策略调整过它；Android 11+ 又把部分信息移到 <code>CodeItemDataAccessor</code> 一类的辅助结构里</b>（<span class="pill warn">字段名与访问器待核实</span>）。<b>它在内存里长什么样，直接决定了你能不能拿到 code item。</b>',
+            state: { '阶段': '取方法体访问方式', '当前方法': 'onCreate', '取 code item 方式': '直读字段 / 经访问器？', '已 dump 方法': '0' },
+            mem: 'ArtMethod {\n  ...版本相关字段...\n  -> code item ?\n}'
+          },
+          {
+            code: '      <span class="f">Invoke</span>(am);   <span class="c">// 主动调用：强制执行，逼 ART 回填 code item</span>',
+            note: '<b>FART 的灵魂动作。</b>为什么一次调用就能让方法体出现？因为 ART 要执行一个方法，<b>必须先把它的方法体准备到位</b>——无论是解释执行时的指令数组，还是被抽取后由壳填回的内存区。<b>你不需要知道壳怎么解密的，你只需要让它不得不执行。</b>这就是主动调用比「找到解密函数再调它」更工程化的地方。',
+            state: { '阶段': '主动调用', '当前方法': 'onCreate', '调用结果': '已执行 → 方法体就位', '已 dump 方法': '0' },
+            mem: 'code_item:\n  空/被抽取 → 已回填'
+          },
+          {
+            code: '      <span class="f">dump_code_item</span>(am, ...);   <span class="c">// 把已回填的方法体落盘</span>',
+            note: '<b>趁热打铁：刚回填完就 dump。</b>这一步是 ② 号功能的产出。常见坑：<b>调用可能抛异常、可能因为参数不对而提前返回</b>，所以真实实现里要处理异常与调用失败的兜底——<b>失败的方法会被漏掉，这正是「脱完之后 App 还有几个方法反编译不出来」的典型原因</b>。',
+            state: { '阶段': 'dump code item', '当前方法': 'onCreate', '已 dump 方法': '1', 'dump 目录': '/sdcard/fart/<包名>/' }
+          },
+          {
+            code: '    } } <span class="c">// 三层循环闭合：方法 → 类 → dex</span>',
+            note: '<b>三层循环走完，才算「遍历完一遍」。</b>注意复杂度：<b>类数 × 每类方法数</b>，一个中等 App 就是几万次调用。所以 FART 的主动调用天然是慢的——这也解释了为什么「秒脱」这个词不是指这一过程快，而是指<b>你不用再花时间做适配工作了</b>（26.6 节详解）。',
+            state: { '阶段': '循环收尾', '已 dump 类': '3821', '已 dump 方法': '41872（示例值）' },
+            mem: '方法体合并 → 修复\n → 可反编译的 dex'
+          },
+          {
+            code: '<span class="f">LOG</span>(INFO) &lt;&lt; <span class="s">"fart run over"</span>;   <span class="c">// 标志：一轮脱壳结束</span>',
+            note: '<b>记住这个标志。</b>FART 系列跑完会打这一行日志，它是你验证「到底跑没跑完」最直接的信号：<code>adb logcat | grep fart</code> 看到它，再去查 <code>/sdcard/fart/&lt;包名&gt;/</code> 的产物。<b>看不到这行，后面所有验证都是空谈。</b>',
+            state: { '阶段': '完成', '日志': 'fart run over', '产物': '/sdcard/fart/<包名>/' },
+            mem: 'logcat:\n I/fart: fart run over\n/sdcard/fart/com.example/\n  *.dex  *.bin'
+          }
+        ]
+      },
+      after: T.note('key', '🔑 从这段循环里读出的移植地图', '<p>把上面 12 步按「依赖什么」重新归类，移植工作量一目了然：</p>' +
+        '<p><b>只依赖 dex 格式</b>（稳定）：读 header、取 ClassDef、解析 class_data_item。<b>依赖 ART 运行时接口</b>（半稳定）：枚举 DexFile、ClassLinker::FindClass。<b>依赖内存布局</b>（最不稳定）：<code>ArtMethod</code> 及「如何从中取得 code item」。</p>' +
+        '<p>所以移植时正确的顺序是：<b>先让编译通过（把接口层的新签名对齐）→ 再让循环跑起来（能遍历到类和方法）→ 最后打通取方法体（对齐新结构/新访问器）</b>。反过来做，你会同时面对三个未知问题，连日志都不知道该信哪一条。</p>')
+    },
+
+    /* ================= 26.5 ================= */
+    {
+      h: '26.5',
+      title: '移植的完整链路：六步走完 FART10 适配',
+      html: '<p>概念讲完了，落到手上就是六个动作。下面这条链路是<b>通用</b>的——把它里的「Android 10」换成任何版本，流程都一样。<b>每一步都标了难点在哪，卡住时对着难点查，比盲目搜索有效得多。</b></p>',
+      stage: {
+        title: 'FART 移植工作流：从 AOSP 源码到脱壳产物',
+        speed: 2100,
+        render:
+          '<div class="flow-row" style="flex-wrap:wrap;gap:6px">' +
+            '<span class="blk" id="w1">① 定版本</span><span class="arrow">→</span>' +
+            '<span class="blk" id="w2">② 读源码</span><span class="arrow">→</span>' +
+            '<span class="blk" id="w3">③ 插桩</span><span class="arrow">→</span>' +
+            '<span class="blk" id="w4">④ 编译</span><span class="arrow">→</span>' +
+            '<span class="blk" id="w5">⑤ 刷入</span><span class="arrow">→</span>' +
+            '<span class="blk" id="w6">⑥ 验证</span>' +
+          '</div>' +
+          '<div class="card" style="margin-top:12px"><div class="card-title" id="wtitle">点击「播放」开始</div><div id="wbody" class="small">六步链路：每一步都会告诉你在做什么、难点在哪、怎么判断这一步真的成功了。</div></div>' +
+          '<div style="margin-top:10px"><span class="pill" id="wphase">当前：未开始</span></div>',
+        reset: function () {
+          ['w1', 'w2', 'w3', 'w4', 'w5', 'w6'].forEach(function (i) { S(i, ''); });
+          SET('wtitle', '点击「播放」开始');
+          SET('wbody', '六步链路：每一步都会告诉你在做什么、难点在哪、怎么判断这一步真的成功了。');
+          CLS('wphase', 'pill'); SET('wphase', '当前：未开始');
+        },
+        steps: [
+          {
+            run: function () {
+              ['w1', 'w2', 'w3', 'w4', 'w5', 'w6'].forEach(function (i) { S(i, ''); });
+              S('w1', 'active');
+              SET('wtitle', '① 确定目标 Android 版本，拿到对应版本的 AOSP 源码');
+              SET('wbody', '<b>做什么：</b>先把「我要在哪个系统版本上脱壳」钉死——不是「大概 10 左右」，而是具体到 Android 10 的某一个源码版本。然后获取该版本的 AOSP 源码。' +
+                '<br><b>难点：</b>版本必须与真机严格对应。同一大版本的不同小版本之间，ART 也可能有差异，<b>源码与设备的版本错位 = 后面所有功夫白费</b>。' +
+                '<br><b>成功标志：</b>源码树就位，且你能明确说出「我要编译的 ART 对应设备上的哪一份二进制」。');
+              CLS('wphase', 'pill acc'); SET('wphase', '当前：① 定版本');
+            },
+            note: '<b>第一步就决定了成败概率。</b>移植失败最常见的根因不是技术难题，而是<b>源码版本与目标设备不匹配</b>——你在 A 版本源码上改了代码，编译产物丢到 B 版本的系统里，运行时的行为诡异到你怀疑人生。'
+          },
+          {
+            run: function () {
+              S('w1', 'done'); S('w2', 'active');
+              SET('wtitle', '② 读 ART 源码，定位 dex 加载流程与 code item 回填点');
+              SET('wbody', '<b>做什么：</b>找到两个语义事件在<b>这一版</b>代码里的确切位置：<b>（a）dex 何时加载/映射完成</b>（①号功能的插桩点）；<b>（b）方法体的 code item 何时被填入 ArtMethod</b>（②号功能的插桩点）。相关代码通常位于 <code>art/runtime/</code> 下与 dex 文件、类链接、方法相关的源文件里（<span class="pill warn">具体文件名随版本差异较大，待核实</span>）。' +
+                '<br><b>难点：</b>这是<b>整条链路真正的技术活</b>。你要在几十万行 C++ 里，凭语义而非函数名找到那两个点。' +
+                '<br><b>成功标志：</b>你能指着某一行说「dex 到这里就已经完整了」「方法体是在这里被填进去的」，并能说出为什么是这里。');
+              CLS('wphase', 'pill acc'); SET('wphase', '当前：② 读源码找点');
+            },
+            note: '<b>这一步才是「读懂 ART 源码」能力的实战检验，也是不会过期的那部分技能。</b>版本从 10 换到 14，函数名会变、目录会挪，但「dex 什么时候变完整」「方法体什么时候就位」这两个问题永远存在。<b>会问这两个问题的人，永远能重建 FART。</b>'
+          },
+          {
+            run: function () {
+              S('w2', 'done'); S('w3', 'active');
+              SET('wtitle', '③ 把 FART 的插桩代码嵌入到对应位置');
+              SET('wbody', '<b>做什么：</b>把三块功能接到刚找到的点上：dump dex 接到「加载完成」处；主动调用循环接到「方法可被调用」的时机；修复组件独立在设备侧/PC 侧运行。' +
+                '<br><b>难点：</b>ART 代码对<b>时序与线程状态</b>敏感。插桩位置不对，轻则 dump 到半成品，重则直接把 App 搞崩。' +
+                '<br><b>成功标志：</b>代码能编过（第一步的真正含义是接口对齐），且插桩点选得有理由。');
+              CLS('wphase', 'pill acc'); SET('wphase', '当前：③ 插桩');
+            },
+            note: '<b>插桩位置的三个经典坑：</b>① <b>太早</b>——dex 还没映射完就 dump，产物残缺；② <b>太晚</b>——壳已经清理过痕迹，或类已经被 AOT 编译成机器码、根本不需要回填方法体；③ <b>在错误的线程上下文里</b>——主动调用可能因为线程状态不对而失败。<b>「dump 出来是空的」这类问题，八成出在这里，而不是出在修复组件。</b>'
+          },
+          {
+            run: function () {
+              S('w3', 'done'); S('w4', 'active');
+              SET('wtitle', '④ 编译 ART 模块');
+              SET('wbody', '<b>做什么：</b>用 AOSP 的构建系统编译你改过的 ART 部分（AOSP 提供 <code>m</code> / <code>mmm</code> 一类的构建入口，<span class="pill warn">具体命令随源码版本与构建配置而变，待核实</span>）。' +
+                '<br><b>难点：</b>编译本身不难，<b>难的是环境</b>：源码树大小、依赖、构建配置、编译时长，都可能让你在这里耗掉一整天。这是移植过程中最「体力活」的一步。' +
+                '<br><b>成功标志：</b>产出对应架构的 ART 运行时库文件，且知道它对应设备上的哪个路径。');
+              CLS('wphase', 'pill acc'); SET('wphase', '当前：④ 编译');
+            },
+            note: '<b>把编译当体力活，把找脱壳点当脑力活</b>——这是合理的时间分配。很多人反过来了：在编译报错上死磕三天，却对「我插桩的那个点是不是对的」毫无把握。'
+          },
+          {
+            run: function () {
+              S('w4', 'done'); S('w5', 'active');
+              SET('wtitle', '⑤ 刷入设备：push 到系统库目录，或用完整 ROM 刷入');
+              SET('wbody', '<b>做什么：</b>把编译产物送进设备。常见做法是 push 到系统库目录（<code>/system/lib64/</code> 或对应的架构目录，<span class="pill warn">具体路径随设备与分区方案而变，待核实</span>），或者干脆编译完整 ROM 刷入。' +
+                '<br><b>难点：</b>分区与权限。<b>Android 12 引入 <code>init_boot</code> 分区后，ramdisk 的归属变了，老教程里的刷机路径可能整段失效</b>——这也是「版本演进」打在交付环节上的一记重拳。' +
+                '<br><b>成功标志：</b>设备能正常开机，且系统跑的是<b>你编译的那一份</b> ART。');
+              CLS('wphase', 'pill acc'); SET('wphase', '当前：⑤ 刷入');
+            },
+            note: '<b>改系统库是高风险动作。</b>务必先确认能回滚（有原厂镜像、有可进入的恢复途径）。真机调试的第一原则：<b>先保证变砖能救，再动手改系统</b>。'
+          },
+          {
+            run: function () {
+              S('w5', 'done'); S('w6', 'active');
+              SET('wtitle', '⑥ 验证：装 App → 启动 → 看日志 → 查产物');
+              SET('wbody', '<b>做什么：</b>按固定顺序验证：安装目标 App → 启动它 → 用 <code>adb logcat</code> 过滤 <code>fart</code> 相关日志，寻找跑完的标志（如 <code>fart run over</code>）→ 检查设备上的输出目录 <code>/sdcard/fart/&lt;包名&gt;/</code>。' +
+                '<br><b>难点：</b>「跑完了」不等于「脱干净了」。产物要拿去反编译验证：<b>方法体是真的指令，还是空的 / 全是 nop。</b>' +
+                '<br><b>成功标志：</b>日志有完成标志 + 目录里有产物 + <b>反编译能看到真实方法体的代码</b>。三者缺一不算成功。');
+              CLS('wphase', 'pill ok'); SET('wphase', '当前：⑥ 验证（链路闭环）');
+            },
+            note: '<b>把验证拆成两级：</b>一级验证「工具跑完了吗」（日志 + 目录），二级验证「脱出来的东西有用吗」（反编译看方法体）。<b>90% 的假成功都死在一级验证就收工</b>——目录里有文件、文件能打开，但打开是空的。'
+          }
+        ]
+      },
+      after: T.note('ok', '✅ 这条链路为什么值得背下来', '<p>因为它对<b>任何版本的 FART 移植</b>都成立，也对<b>任何「往 ART 里插桩」的需求</b>成立（不只是脱壳：动态插桩、API 监控、运行时数据采集，全是这套）。</p>' +
+        '<p>六步里只有 ② 需要真正的智力投入，其余五步是熟练度问题。<b>所以「移植 FART」这件事的核心竞争力，就是「能不能在 ART 源码里快速找到那个语义事件」</b>——这恰好就是本课程从第 17 章开始一直在练的能力。</p>')
+    },
+
+    /* ================= 26.6 ================= */
+    {
+      h: '26.6',
+      title: '「秒脱」的真相：前期投入与后期效率',
+      intuition: {
+        tag: '直觉模型 · 老猎人进山',
+        body: '<p>两个人同时进山打猎。第一个人背了二十件工具，每种猎物配一套家伙，进山先花半天挑工具；第二个人只带一把刀，但他知道<b>猎物什么时候喝水、走哪条路、脚印长什么样</b>。天黑了，第二个人扛着猎物回来，第一个人还在整理背包。</p>' +
+              '<p>「用 FART14 秒脱 DexProtector」听起来像神话，实际上它是<b>第二个人</b>：适配 Android 14 的工作早在几个月前就做完了（26.5 节那六步走了一遍），所以真正面对一个具体 App 时，剩下的动作只有三步——<b>装上去、跑一遍、看产物</b>。几分钟。</p>' +
+              '<p>但请注意：<b>这把刀之所以快，是因为握刀的人知道猎物在哪。</b>如果你不知道 dex 在哪里解密、方法体什么时候回填，那么「秒脱」这件事永远不会发生在你身上——你只会有二十件工具和一片空山。</p>'
+      },
+      html: T.tbl(
+        ['对比维度', '前期投入（会过期，但能迁移）', '后期效率（看起来很像神话）'],
+        [
+          ['时间分布', '读 AOSP 源码、找脱壳点、适配接口、编译刷入验证——<b>以天/周计</b>', '装 App、触发、看日志、取产物——<b>以分钟计</b>'],
+          ['面对新壳', '建立一个已经适配好当前系统的工具底座', '把新 App 丢进去跑一遍即出结果'],
+          ['失败代价', '失败只是「这次没找到点」，认知在累积', '失败说明底座不适配，要回到前期投入'],
+          ['会过期吗', '<b>工具会过期</b>（下个安卓版本就废），<b>找脱壳点的能力不会</b>', '随版本必然失效，属于消耗品'],
+          ['护城河', '<b>原理理解 = 真护城河</b>', '工具收藏 = 假安全感']
+        ]
+      ) +
+      T.note('key', '🔑 本章最该带走的一句话', '<p><b>逆向的护城河在于原理理解，不在于工具收藏。</b></p>' +
+        '<p>工具会随版本失效——FART 6.0 的二进制不能用在 Android 10 上，FART 10 的也不能直接用在上 14。但「知道 dex 在哪里被解密、方法体什么时候回填、脱壳点该往哪插」这套认知，从 Android 6 到 14 一直在用，往后十年大概也还能用。</p>' +
+        '<p>所以看到别人「秒脱」时，不要问「他用的是哪个工具」，要问「他为这个工具提前做了什么」。<b>前者是收藏家的问题，后者是工程师的问题。</b></p>') +
+      T.note('warn', '⚠️ 三个关于「秒脱」的误读', '<p><b>误读一：秒脱 = 脱壳技术简单。</b>不是。秒脱的前提是有人已经把最难的部分（找脱壳点 + 适配结构）做完了，而这件事没有任何捷径。</p>' +
+        '<p><b>误读二：秒脱 = 一次适配永久有效。</b>不是。FART14 只对 Android 14 那一档系统有效，换到 Android 15 或换一个改动过 ART 的 ROM，可能立刻回到「跑不起来」的状态。</p>' +
+        '<p><b>误读三：秒脱 = 能脱一切。</b>不是。<b>遇到 VMP（关键方法虚拟化），FART 这类基于 dex 的脱壳工具会直接失效</b>——因为那些方法的「方法体」根本不再是 dex 指令，你 dump 出来的 code item 里没有可还原的东西。这时候要换第 20 章的思路，或者干脆不脱壳、改走动态 Trace / 黑盒调用。</p>')
+    },
+
+    /* ================= 26.6L 动手实验 ================= */
+    {
+      h: '26.6L', title: '动手实验：判断你的脚本为什么在某个安卓版本上失效',
+      html:
+        '<p>本章最核心的认知是：<b>每个安卓大版本，ART 内部结构都会变，脱壳点必须重新定位</b>。' +
+        '这个实验让你把"版本"和"失效原因"对应起来。</p>',
+      lab: {
+        title: '实验：ART 版本演进与脚本失效诊断',
+        goal: '目标：按版本定位失效原因',
+        intro:
+          '<p>你手上有一份在<b>某个安卓版本上验证可用</b>的 FART 脱壳脚本。' +
+          '现在换到另一台设备上，脚本报错或脱不出东西。</p>' +
+          '<p><b>任务：输入目标安卓版本，查出这一代的 ART 关键变化，判断你的脚本最可能踩到哪个坑。</b></p>',
+        inputs: [
+          { key: 'ver', label: '① 目标设备的 Android 版本（填数字）',
+            hint: '例如 5 7 8 9 10 11 12 13 14', ph: '9', value: '9' },
+          { key: 'guess', label: '② 你觉得最可能的原因是什么？',
+            hint: '想想"结构变了"还是"权限变了"还是"格式变了"', ph: '可能是……', type: 'textarea', rows: 2 }
         ],
-        runLabel: '▶ 模拟执行',
+        runLabel: '🔍 查询该版本变化',
         autorun: true,
-        run: v => {
-          const S = ch26SimQueue(v.ops || '');
-          if (S.err) return '<div class="lab-msg warn">解析失败：' + S.err + '</div>';
-          let html = '<table class="lab-tbl"><tr><th>#</th><th>类型</th><th>名字</th><th>投递 t</th><th>延迟 d</th><th>计算出 when</th></tr>' +
-            S.ops.map((o, i) =>
-              '<tr><td>' + (i + 1) + '</td><td><code>' + o.kind + '</code></td><td><code>' + ch26esc(o.name) + '</code></td>' +
-              '<td>' + o.t + '</td><td>' + o.d + '</td>' +
-              '<td><code>' + (o.kind === 'front' ? '-1（强制队首）' : o.when) + '</code></td></tr>').join('') +
-            '</table>';
-          html += '<div class="lab-msg key"><b>🔑 真实执行顺序</b><div class="lab-note">' +
-            '<div class="lab-answer" style="font-size:16px">' + S.order.join(' → ') + '</div>' +
-            '<b>最终队列（按 when 排序后的顺序）：</b><code>' + S.order.join(', ') + '</code></div></div>';
-          html += '<div class="lab-msg model"><b>💡 规则说明</b><div class="lab-note">' +
-            '<b>① 排序依据是 when，不是投递顺序。</b>所以一条"延迟 50ms 的消息"会排在"延迟 100ms 的消息"前面，' +
-            '哪怕它是后发的。<br>' +
-            '<b>② when 相同的消息，按投递先后（FIFO）。</b>' + (S.sameWhen.length
-              ? '本例里有同 when 的一组：<code>' + S.sameWhen.join(' / ') + '</code>——注意它们的相对顺序。'
-              : '本例里没有 when 相同的消息，你可以自己加一行 <code>post F t=0 d=0</code> 看看。') + '<br>' +
-            '<b>③ <code>sendMessageAtFrontOfQueue</code> 的语义是"插到队首"</b>——' +
-            '源码上它是把 when 设为 0 并在入队时直接插到链表头，<b>所以它永远最先执行，且会抢在"同为 0 但先入队的消息"之前。</b><br>' +
-            '<span class="hit">这也解释了它的危险性：<b>它是唯一能"插队"的手段。</b>' +
-            '框架内部用它来保证"同步屏障/异步消息"的优先级（比如 Choreographer 的 vsync 回调），' +
-            '而滥用它会饿死正常消息。</span></div></div>';
+        run: (v) => {
+          const L = window.LABX;
+          const era = L.artEra(v.ver);
+          if (!era) {
+            return '<div class="lab-msg warn">未识别该版本。可填 5 / 7 / 8 / 9 / 10 / 11 / 12 / 13 / 14。<br>' +
+              '（本表只收录了 ART 结构有<b>显著变化</b>的版本；其余版本变化较小。）</div>';
+          }
+
+          let html = '<div class="lab-kv"><span>版本 <b>' + era.label + '</b></span>'
+            + '<span>年份 <b>' + era.years + '</b></span></div>';
+
+          html += '<table class="lab-tbl"><tr><th>这一代的关键变化</th></tr>';
+          era.keys.forEach(k => { html += '<tr class="diff"><td>' + k + '</td></tr>'; });
+          html += '</table>';
+
+          if (era.note) {
+            html += '<div class="lab-msg key"><b>💡 对脱壳的影响</b><div class="lab-note">' + era.note + '</div></div>';
+          }
+
+          // 版本特有的诊断提示
+          const DIAG = {
+            5:  '这一代结构相对简单，绝大多数老脚本能直接跑。如果失效，优先怀疑<b>壳的强度</b>而不是系统版本。',
+            7:  '<b>VDex 是关键。</b>同一个 dex 可能存在两份（原始 + 验证副本），dump 时要确认你脱的是哪一份。搞错了会得到一个"看起来完整但缺失部分方法"的 dex。',
+            8:  '<b>这是最经典的分水岭。</b>DexFile 结构重构 + ClassLinker 接口调整，意味着针对 Android 7 及更早写的脱壳点<b>全部失效</b>。如果你手上的脚本是 2017 年前的，几乎必然在这一代挂掉。',
+            9:  '<b>CompactDex 是核心难点。</b>dex 被拆成"指令 + 共享数据"两部分，脱壳时<b>必须同时处理两者</b>，只 dump 指令部分会得到不完整的 dex。而且这种情况从文件头就能看出来（magic 是 039 但结构不同）。',
+            10: '<b>hidden API 策略。</b>如果你用的方案里有 Java 层反射调用（比如主动调用某些方法），可能被灰/黑名单拦住。表现为"某些方法调用不生效"而非崩溃。',
+            11: '<b>访问方式变了。</b>原来直接读 ArtMethod 字段的代码，现在要改成通过 <code>CodeItemDataAccessor</code> 之类的访问器。表现为<b>编译不过或读出垃圾值</b>。',
+            12: '<b>最大的认知陷阱：ART 变成 APEX 模块了。</b>这意味着 <b>Android 版本不再等同于 ART 版本</b>——同一台 Android 12 设备，ART 模块可能被单独升级过。你的"版本对应表"从这里开始不可靠了。',
+            13: 'ART 继续模块化。延续 Android 12 的结论：<b>以 ART 模块版本为准，而不是系统版本</b>。',
+            14: '<b>init_boot 分区引入</b>会影响刷机方式（不只是脱壳）。另外延续模块化的结论：一定要查实际的 ART 版本。'
+          };
+          html += '<div class="lab-msg fail"><b>🎯 最可能的失效点</b>'
+            + '<div class="lab-note">' + (DIAG[era.v] || '这一代变化较小，按通用流程排查。') + '</div></div>';
+
+          // 通用排查顺序
+          html += '<div class="lab-msg model"><b>📋 遇到"换版本就失效"的通用排查顺序</b>'
+            + '<div class="lab-note"><b>① 先确认 ART 版本，不是 Android 版本</b><br>'
+            + '&nbsp;&nbsp;&nbsp;<code>adb shell getprop ro.bootimage.build.fingerprint</code><br>'
+            + '&nbsp;&nbsp;&nbsp;Android 12+ 尤其要看 APEX 里的 ART 模块版本<br><br>'
+            + '<b>② 再确认失败形态</b>——不同形态指向不同原因：<br>'
+            + '&nbsp;&nbsp;&nbsp;• <b>编译不过</b> → 结构/字段名变了（如 Android 11 的访问器）<br>'
+            + '&nbsp;&nbsp;&nbsp;• <b>编译过但读出垃圾</b> → 字段偏移变了<br>'
+            + '&nbsp;&nbsp;&nbsp;• <b>能跑但脱不出内容</b> → 脱壳点时机不对，或格式变了（如 CompactDex）<br>'
+            + '&nbsp;&nbsp;&nbsp;• <b>部分方法缺失</b> → 可能脱错了副本（如 VDex）<br><br>'
+            + '<b>③ 最后回源码</b>——不要在错误的版本上瞎试，去读目标版本的 AOSP 里那个结构体的定义。</div></div>';
           return html;
         },
-        expected: v => {
-          const S = ch26SimQueue(v.ops || '');
-          if (S.err) return { ok: false, detail: '解析失败：' + S.err };
-          const norm = s => String(s || '').replace(/[\s，、;；]+/g, ',').replace(/,+/g, ',').replace(/^,|,$/g, '').toUpperCase();
-          const ok1 = norm(v.guess) === norm(S.order.join(','));
-          const ok2 = window.AKKC_hasConcept(v.why || '',
-            ['队首', '最前', '插队', '头部', 'front', 'first', 'when=0', '0', '优先', '抢先', '立即', '链表头', '插入到最前']);
+        expected: (v) => {
+          const L = window.LABX;
+          const era = L.artEra(v.ver);
+          const guess = String(v.guess || '').trim();
+          if (!era) return { ok: false, detail: '先填一个有效版本（5/7/8/9/10/11/12/13/14）。' };
+          const hitStruct = window.AKKC_hasConcept(guess, ['结构', '字段', '偏移', '访问器', '接口', '变了', '重构']);
+          const hitFormat = window.AKKC_hasConcept(guess, ['格式', 'compact', 'cdex', 'vdex', 'dex 格式', '拆分']);
+          const hitPerm = window.AKKC_hasConcept(guess, ['权限', 'hidden', 'selinux', '策略', '限制']);
+          const any = hitStruct || hitFormat || hitPerm;
           return {
-            ok: ok1 && ok2,
-            detail:
-              (ok1 ? '✅ 顺序正确：<code>' + S.order.join(' → ') + '</code>'
-                   : '❌ 顺序不对。<br>你写的：<code>' + (v.guess || '（空）') + '</code><br>' +
-                     '正确是：<code>' + S.order.join(' → ') + '</code><br>' +
-                     '对照上面的表格看 <code>when</code> 列：<b>执行顺序就是 when 从小到大；' +
-                     '<code>front</code> 是强制 -1，所以永远第一。</b>') +
-              '<br>' +
-              (ok2 ? '✅ 语义说对了：<b>front 就是"插到队首"</b>，它绕过正常的 when 排序。'
-                   : '❌ 语义还没说清。<b>要点是"插到队首/链表头"，而不是"设了个更小的 when"</b>——' +
-                     '虽然效果相似，但它的实现是入队时直接插头，<b>因此能抢在同样 when 的消息之前</b>。'),
+            ok: any,
+            detail: any
+              ? '<b>方向对了。</b>版本失效的原因基本落在这三类：<br>' +
+                '① <b>结构变了</b>（字段名/偏移/访问方式）→ 编译不过或读出垃圾<br>' +
+                '② <b>格式变了</b>（CompactDex / VDex）→ 能跑但脱出的内容不对<br>' +
+                '③ <b>权限/策略变了</b>（hidden API / SELinux）→ 特定调用不生效<br><br>' +
+                '本实验里 ' + era.label + ' 的主要变化是：' + era.keys.join('、') + '。'
+              : '<b>还没落到具体机制上。</b>试着从这三类里选：<b>结构变了</b> / <b>格式变了</b> / <b>权限策略变了</b>。<br>' +
+                era.label + ' 这一代的关键变化是：' + era.keys.join('、') + '。'
           };
         },
         showAnswer:
-          '【默认样例的执行顺序】\n' +
-          '  输入：\n' +
-          '    post        A  t=0 d=0     → when=0\n' +
-          '    postDelayed B  t=0 d=100   → when=100\n' +
-          '    front       C  t=0         → 插队首（等价 when=-1）\n' +
-          '    postDelayed D  t=0 d=50    → when=50\n' +
-          '    post        E  t=0 d=0     → when=0\n\n' +
-          '  按 when 排序：0(A,E) → 50(D) → 100(B)\n' +
-          '  再把 C 插到队首：C → A → E → D → B\n\n' +
-          '  所以答案是： C, A, E, D, B\n\n' +
-          '【三条规则】\n' +
-          '  1) 排序依据是 when（绝对时间戳），不是投递顺序。\n' +
-          '  2) when 相同的按投递先后（FIFO）。A 和 E 都是 when=0，A 先投所以 A 先执行。\n' +
-          '  3) sendMessageAtFrontOfQueue 入队时直接插链表头，\n' +
-          '     所以它排在所有消息之前——包括同样 when=0 的。\n\n' +
-          '【为什么这个语义重要】\n' +
-          '  它是消息队列里唯一能"插队"的手段。框架用它保证高优先级事件\n' +
-          '  （如同步屏障之后的异步消息、vsync 回调）不被普通消息饿死。\n' +
-          '  滥用它会让正常消息一直排不上队。\n\n' +
-          '【一个常见误解】\n' +
-          '  postDelayed(x, 100) 不等于"100ms 后一定执行"，它的语义是"不早于 100ms"。\n' +
-          '  如果主线程在忙，实际执行时间会晚得多。所以它不能当精确定时器用。',
+          '【ART 版本演进速查表】\n\n' +
+          '  Android 5.0 (2014)  ART 取代 Dalvik\n' +
+          '    · DexFile 结构初次定型 / oat 为主\n' +
+          '    · 早期脱壳方案多基于这一代\n\n' +
+          '  Android 7.x (2016)\n' +
+          '    · JIT + AOT 混合 / 引入 VDex\n' +
+          '    · VDex 意味着同一 dex 可能有两份，注意别脱错\n\n' +
+          '  Android 8.0 (2017)  ★ 结构大重构\n' +
+          '    · DexFile 重构 / ClassLinker 接口调整\n' +
+          '    · 2017 年前写的脱壳点几乎全部失效\n\n' +
+          '  Android 9 (2018)\n' +
+          '    · 引入 CompactDex（cdex）/ 数据与指令分离\n' +
+          '    · 必须同时处理两部分，否则 dex 不完整\n\n' +
+          '  Android 10 (2019)\n' +
+          '    · hidden API 灰/黑名单\n' +
+          '    · 反射型 hook 脚本可能被拦\n\n' +
+          '  Android 11 (2020)\n' +
+          '    · CodeItemDataAccessor 等访问器抽象\n' +
+          '    · 直接读字段的代码要改成通过访问器\n\n' +
+          '  Android 12 (2021)  ★ 认知转折点\n' +
+          '    · ART 模块化（APEX）\n' +
+          '    · 【系统版本不再等同于 ART 版本】\n\n' +
+          '  Android 13 / 14\n' +
+          '    · 延续模块化；14 引入 init_boot 分区\n\n' +
+          '【通用排查顺序】\n' +
+          '  ① 查 ART 版本（不是 Android 版本）\n' +
+          '  ② 按失败形态定位：\n' +
+          '     编译不过   → 结构/字段名变了\n' +
+          '     读出垃圾   → 字段偏移变了\n' +
+          '     脱不出内容 → 脱壳点时机 或 格式变了\n' +
+          '     部分缺失   → 可能脱错了副本\n' +
+          '  ③ 回目标版本 AOSP 源码看结构体定义',
         hint:
-          '<b>三步走：</b>① 给每一行算出 <span class="mono">when = t + d</span>；' +
-          '② 按 <span class="mono">when</span> 从小到大排（<b>相同 when 的按投递先后</b>）；' +
-          '③ 最后处理 <span class="mono">front</span>——它是插队，不是"算一个更小的 when"。<br><br>' +
-          '<b>第 ② 问的关键词是"队首"。</b>想想 <span class="mono">sendMessageAtFrontOfQueue</span> ' +
-          '这个名字里的 <span class="mono">FrontOfQueue</span> 字面意思是什么。',
+          '先想一个问题：<b>"失效"有很多种形态</b>，不同形态指向不同原因。<br>' +
+          '• 代码<b>编译不过</b> → 说明字段名或接口变了<br>' +
+          '• 编译过但<b>读出垃圾值</b> → 说明字段偏移变了<br>' +
+          '• 能跑但<b>脱不出内容</b> → 说明脱壳点时机不对，或者 dex 格式变了<br><br>' +
+          '再想：Android 8 为什么被称为"分水岭"？Android 9 引入了什么新的 dex 格式？',
         after:
-          T.note('ok', '✅ 实验二的收获',
-            '<p style="margin-bottom:0">你现在能精确回答"为什么这条消息先执行"了。<br>' +
-            '这个能力在实战里有两个用处：<br>' +
-            '① <b>判断时序型 bug</b>——"为什么我的 hook 在 onResume 之后才生效"这类问题，' +
-            '本质就是消息顺序问题；<br>' +
-            '② <b>判断延迟是否可靠</b>——很多风控/心跳用 <span class="mono">postDelayed</span> 做定时，' +
-            '而它<b>不保证准时</b>。所以"检测在 N 秒后触发"这种假设本身就不严谨。' +
-            '<span class="hit">反过来，这也解释了为什么加固方更爱用 <span class="mono">AlarmManager</span> ' +
-            '或独立的 native 线程来做真正的定时。</span></p>')
-      },
-
-      after:
-        T.note('warn', '⚠️ 由此得到的一条 Hook 纪律',
-          '<p style="margin-bottom:0"><b>Hook 之前先问：这段代码跑在哪条线程上？</b><br>' +
-          '· 如果是主线程 → 它一定通过上面这个循环被调度，你的 hook 可能在消息分发之后才生效；<br>' +
-          '· 如果是 native 自建线程 → 主线程的 hook 完全看不到它（第 20.8 节）；<br>' +
-          '· 如果是 Binder 线程 → 那是系统给你的线程池（26.10 节）。<br>' +
-          '<span class="hit">"我的 hook 装上了但没命中"这个问题，一半的答案在这三种线程里。</span></p>')
-    },
-
-    /* ============================================================ 26.9 */
-    {
-      h: '26.9', title: '主线程为什么不能阻塞：把 ANR 讲清楚',
-      html:
-        '<p>现在你已经有了足够的零件，可以把 ANR 讲准了。它不是一个模糊的"卡了"，而是一个<b>可观测的因果</b>。</p>' +
-        T.card('ANR 的机制（精确版）',
-          '<p>主线程在跑 <span class="mono">Looper.loop()</span>。它一次处理一条消息。' +
-          '系统在很多地方会<b>往主线程投递消息并等它被处理</b>——最典型的是用户的输入事件（触摸、按键）。</p>' +
-          '<p>如果主线程被一条耗时消息占住超过阈值，后面的输入事件就迟迟得不到处理，' +
-          '系统的看门狗就会判定 <b>ANR（Application Not Responding）</b>，弹出"应用无响应"。</p>' +
-          '<p style="margin-bottom:0"><b>所以"ANR 的根因"永远可以归结为同一个句式：</b>' +
-          '<span class="hit">某个回调在主线程上执行了太久——是哪个回调、为什么久，这才是要查的东西。</span></p>') +
-        T.tbl(['常见的 ANR 触发面', '典型元凶', '逆向/排查时的观测点'],
-          [
-            ['<b>输入事件超时</b>', '主线程在做 IO、在等锁、在做大量计算', '<span class="mono">/data/anr/traces.txt</span> 里主线程的调用栈（<b>这是最有价值的证据</b>）'],
-            ['<b>BroadcastReceiver 超时</b>', '<span class="mono">onReceive</span> 里做了耗时操作（它是主线程回调）', '广播的 action 与 <span class="mono">onReceive</span> 栈'],
-            ['<b>Service 超时</b>', '<span class="mono">onCreate</span> / <span class="mono">onStartCommand</span> 里阻塞太久', 'Service 生命周期栈'],
-            ['<b>ContentProvider 超时</b>', 'Provider 初始化太慢（<b>它还在 Application 之前</b>，所以影响启动）', 'Provider 的 <span class="mono">onCreate</span> 栈']
-          ]) +
-        T.note('key', '🔑 为什么"ANR 的 traces 文件"对逆向的人特别有用',
-          '<p style="margin-bottom:0">因为它是一份<b>带调用栈的、真实运行时的快照</b>。<br>' +
-          '当你要找"某个功能到底走了哪条代码路径"时，<b>制造一次 ANR 或直接从 traces 里读</b>，' +
-          '往往比静态分析快得多——你直接看到了方法调用链。<br>' +
-          '<span class="hit">这与第 30 章"调用栈定位关键代码"是同一个方法论：' +
-          '<b>让程序自己在栈上把答案写出来。</b></span><br>' +
-          '<span class="pill warn">traces 的路径与可读性随 Android 版本与权限变化（新版本上普通 App 往往读不到），' +
-          '请以你目标设备的实际情况为准</span></p>'),
-
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '起点',
-            scenario: '<b>情境：</b>你在分析一个 App 的签名算法。静态分析发现签名逻辑分布在一个 <span class="mono">SignUtil.sign()</span> 里，' +
-              '它被 <span class="mono">NetworkHelper.buildRequest()</span> 调用。你 hook 了 <span class="mono">SignUtil.sign</span>，' +
-              '<b>确认它被调用了、参数也对</b>。但你想进一步知道"<b>是谁在什么时机触发了这次网络请求</b>"，' +
-              '于是你在 <span class="mono">SignUtil.sign</span> 里打印了 <span class="mono">Java.use(\'android.util.Log\').getStackTraceString(...)</span>，' +
-              '<b>结果栈里只有几帧框架代码，看不到任何业务方法名</b>。',
-            q: '最可能的原因是什么？',
-            choices: [
-              { t: 'A. 调用方用了反射，所以栈上不留业务方法名', next: 'na' },
-              { t: 'B. 调用发生在子线程，主线程的 hook 抓不到业务栈', next: 'nb' },
-              { t: 'C. 栈被截断或过滤了——要么打印方式不对，要么中间隔着一个"通用转发/线程切换"的边界', next: 'nc' },
-              { t: 'D. 该 App 用了 OLLVM 把调用关系混淆掉了', next: 'nd' }
-            ]
-          },
-          na: {
-            label: '选A', terminal: true, verdict: 'bad', verdictTitle: '混淆了一个常见但不成立的推论',
-            result: '<b>反射和"栈上看不到业务名"是两件不同的事。</b><br><br>' +
-              '反射的特征是：<b>在 <span class="mono">Method.invoke</span> 那一帧上，你看不到"被调用的方法名"</b>，' +
-              '但<b>"谁调用了 invoke"这一帧仍然是业务方法</b>——也就是说，栈上依然会出现 <span class="mono">invoke</span> 的调用者。<br>' +
-              '<span class="hit">反射会隐藏"目标"，不会隐藏"调用者"。</span>' +
-              '而你现在的现象是<b>连调用者都看不到</b>——所以问题不在这里。<br><br>' +
-              '<b>不过 A 的思路方向是对的</b>（先想"什么机制会让栈变得不可读"），只是候选选错了。' +
-              '同样会让栈变短的机制还有：<b>线程切换</b>（跨线程后栈是断的）、' +
-              '<b>消息循环</b>（投递出去之后栈就断了，26.8 节刚讲过）、' +
-              '<b>native 回调</b>（从 native 调回 Java 时栈的起点变了）。'
-          },
-          nb: {
-            label: '选B', terminal: true, verdict: 'bad', verdictTitle: '方向对了一半，但结论下得太快',
-            result: '<b>"子线程"确实是一个很常见的原因，但它解释不了你现在这个现象。</b><br><br>' +
-              '关键在于：<b>你是在 <span class="mono">SignUtil.sign</span> 内部打印栈的</b>——' +
-              '也就是说，打印的动作<b>就发生在调用它的那条线程上</b>。' +
-              '所以不管是主线程还是子线程，<b>栈上都应该能看到调用它的业务方法</b>。' +
-              '<span class="hit">"子线程"会影响"你 hook 的方式对不对"，但不会让"当前线程的栈"本身变空。</span><br><br>' +
-              '<b>真正与"跨线程"有关的现象是另一种：</b>' +
-              '如果你 hook 的是<b>主线程上某个入口</b>（比如按钮点击），而签名在子线程里算，' +
-              '那么"从点击到签名"这条链<b>在栈上是断开的</b>——因为它中间经过了 ' +
-              '<span class="mono">Handler.post</span> 或线程池投递。' +
-              '<b>这才是跨线程带来的真正困难：栈只能看到"当前这一段"。</b>'
-          },
-          nc: {
-            label: '选C', terminal: true, verdict: 'good', verdictTitle: '正确：栈只覆盖"当前这一段执行"',
-            result: '<b>这是唯一能完整解释现象的方向，而且它包含两种很常见的具体情况：</b><br><br>' +
-              '<b>① 栈本身被"边界"截断了。</b>栈的语义是"当前的调用链"，而下面几种情况都会让它断开：<br>' +
-              '· <b>线程切换</b>——消息投递（<span class="mono">post</span> / <span class="mono">Handler</span>）、线程池、' +
-              '<span class="mono">AsyncTask</span>，投递之后新线程的栈<b>重新从线程入口开始</b>，看不到发起者；<br>' +
-              '· <b>native 回调</b>——从 so 里回调 Java 时，栈的底部是 native 帧，中间的业务关系可能不在 Java 栈上；<br>' +
-              '· <b>Binder 调用</b>——跨进程之后，栈在<b>另一个进程</b>里，你只能看到本进程的这一侧。<br>' +
-              '<span class="hit">所以正确的预期不是"栈能告诉我整条链"，而是"栈能告诉我<b>当前这一段的起点</b>"。</span><br><br>' +
-              '<b>② 打印方式本身有问题。</b>这类坑非常具体：<br>' +
-              '· Frida 里 <span class="mono">getStackTraceString</span> 需要传一个 <span class="mono">Throwable</span> 实例，' +
-              '而 <span class="mono">Java.use("java.lang.Throwable").$new()</span> 拿到的栈是"创建它那一刻"的——<b>位置不对就什么都看不到</b>；<br>' +
-              '· 打印得太深会被系统截断；<br>' +
-              '· 有些加固会 hook 或过滤栈相关 API。<br>' +
-              '<b>验证方法：先打印一个你自己造的、肯定有业务帧的栈</b>（比如在同一处调用 ' +
-              '<span class="mono">Thread.currentThread().getStackTrace()</span>），确认打印机制本身是通的。' +
-              '<b>把"工具坏了"和"事实如此"分开，永远是第一步。</b><br><br>' +
-              '<b>那正确的做法是什么？</b>既然栈只能看到一段，就要<b>顺着"边界"一段一段接起来</b>：<br>' +
-              '· 在投递点（<span class="mono">Handler.post</span> / 线程池提交）也打一个栈，' +
-              '这样"谁发起的"和"谁执行的"两段就都有了；<br>' +
-              '· 或者换个思路：<b>不要在 sync 里往上找，而是在"可能的发起者"那里往下找</b>——' +
-              'hook 网络层（<span class="mono">OkHttp</span> / <span class="mono">HttpURLConnection</span>），' +
-              '看是谁调了它。<span class="hit">这与第 30 章"七条线索"里"从数据流反推调用点"是同一种手法。</span>'
-          },
-          nd: {
-            label: '选D', terminal: true, verdict: 'bad', verdictTitle: '把 Java 层的问题归因给了 native 混淆',
-            result: '<b>OLLVM 是 native 层的编译器混淆（第 5 章），它根本不作用于 Java 字节码。</b><br><br>' +
-              'Java 方法的调用关系在 dex 里、由 ART 在运行时维护，' +
-              '<b>OLLVM 改的是 C/C++ 编译出来的机器码控制流</b>——两者不在一个层面上。' +
-              '<span class="hit">"Java 栈上没有业务方法名"这件事，OLLVM 不背这个锅。</span><br><br>' +
-              '<b>不过这个选项背后有一个值得正视的直觉：</b>确实存在"Java 层看起来干干净净、其实逻辑全在 native"的情况' +
-              '（第 20.11 节的 Native 化）。<b>但那时的现象是"Java 层根本没有这个方法体"</b>，' +
-              '而不是"方法有、栈上没有调用者"。<br><br>' +
-              '<b>怎么快速区分这两者：</b>看你 hook 的那个方法——' +
-              '如果它是 <span class="mono">native</span> 声明，那逻辑在 so 里，要按第 20 章的路线走；' +
-              '如果它有正常的 Java 方法体（你能读到它的字节码），那它就是 Java 实现的，' +
-              '栈上的问题属于"调用链被边界截断"，与 native 无关。'
-          }
-        }
-      },
-
-      quiz: {
-        id: 'q26-3', chapter: 26, answer: [0, 2],
-        stem: '（多选）关于安卓的主线程与消息机制，下面哪些说法是<b>正确</b>的？',
-        options: [
-          { t: 'Service 的生命周期回调默认在主线程执行，所以在 Service 里做耗时操作同样会 ANR', why: '✅ 正确。Service 解决的是"生命周期长"，不是"跑在哪个线程"。它和 Activity 一样由主线程 Looper 调度。' },
-          { t: 'postDelayed(r, 100) 保证 r 会在 100 毫秒后准时执行', why: '❌ 它的语义是"<b>不早于</b> 100ms"。主线程忙的时候会晚得多，所以不能当精确定时器。' },
-          { t: 'post(Runnable) 与 sendMessage 最终都进入同一个 MessageQueue，按 when 排序', why: '✅ 正确。post 只是把 Runnable 放进 Message.callback 字段，排队规则完全一致。' },
-          { t: '主线程被阻塞时，系统的做法是再起一个线程来处理输入事件', why: '❌ 不是。输入事件也必须由主线程处理，这正是 ANR 发生的原因——<b>它不能绕过你的阻塞</b>。' }
-        ],
-        explain: '<b>把这四条串起来看，你会得到一张完整的图：</b><br><br>' +
-          '<b>① 只有一个主线程，所有 UI 与大部分组件回调都在它上面。</b>' +
-          'Activity 的生命周期、Service 的生命周期、<span class="mono">BroadcastReceiver.onReceive</span>——' +
-          '全都由主线程 Looper 调度。<span class="hit">所以"挂在主线程上"这件事与组件类型无关，只与它跑在哪个线程有关。</span><br><br>' +
-          '<b>② 想让它干活，只能投递消息。</b>其他线程通过 <span class="mono">Handler</span> 把任务放进队列，' +
-          '这是唯一安全的跨线程方式。消息按 <span class="mono">when</span> 排序，' +
-          '<b>所以"谁先执行"是时间问题，不是先来后到问题。</b><br><br>' +
-          '<b>③ 延迟不等于定时。</b>队列是"尽力而为"的——前面有长任务就会推迟。' +
-          '这一点在逆向里很实用：<b>任何"N 秒后触发"的检测逻辑，都不能假定它精确在 N 秒触发</b>；' +
-          '而反过来，<b>"过了 N 秒还没触发"也不能证明它不存在</b>。<br><br>' +
-          '<b>④ ANR 是这个模型的必然产物，不是 bug。</b>单线程 + 消息队列，就必然存在' +
-          '"某条消息超时导致后续消息得不到处理"的可能。<span class="hit">理解了机制，你对 ANR 的态度会从"讨厌的错误"' +
-          '变成"一个能提供调用栈快照的诊断工具"。</span>'
+          T.note('key', '🔑 这个实验的真正目的',
+            '<p style="margin-bottom:0">不是让你背这张版本表——<b>它一定会过期</b>（Android 15、16 还会有新变化）。<br>' +
+            '它要建立的是<b>一个诊断框架</b>：<br><br>' +
+            '<b>看到"换版本就失效"，先按形态分类：</b><br>' +
+            '编译不过 / 读出垃圾 / 脱不出内容 / 部分缺失 —— ' +
+            '这四种形态各自指向不同的根因，排查方向完全不同。<br><br>' +
+            '然后再问"这个版本改了什么"。<br><br>' +
+            '<span class="hit">还有一个必须记住的转折点：' +
+            '<b>从 Android 12 起，ART 变成 APEX 模块，系统版本不再等同于 ART 版本。</b>' +
+            '"我这是 Android 12" 这句话从此不足以定位 ART 结构——必须查实际的 ART 模块版本。' +
+            '这是本章最容易被忽略、但最容易导致"版本对应表全错"的一点。</span></p>')
       }
     },
 
-    /* ============================================================ 26.10 */
+    /* ================= 26.7C 实战案例 ================= */
     {
-      h: '26.10', title: 'Binder：一次跨进程调用的完整链路',
-      html:
-        '<p>这是本章技术含量最高的一节，也是最值得花时间的一节。' +
-        '因为在安卓里，<b>"跨进程"不是特例而是常态</b>——你几乎每一个稍微重要一点的操作，都要穿过 Binder。</p>' +
-        T.note('key', '🔑 先记住一句话：Binder 调用在底层是 <span class="mono">ioctl</span>，不是文件读写',
-          '<p style="margin-bottom:0">这一点在第 24 章的一个真实案例里已经出现过一次：' +
-          '<b>某个安全 SDK 通过 Binder 查询已安装应用，而 seccomp 拦不到它——因为它走的是 <span class="mono">ioctl</span>，' +
-          '不经过文件系统相关的 syscall。</b><br>' +
-          '<span class="hit">这是 Binder 在对抗层面最重要的性质：<b>你如果只在 open/read/write 上做监控，就看不到 Binder 上跑的任何东西。</b>' +
-          '反过来，想观测 Binder，就必须在 <span class="mono">ioctl</span> 或者更上层下手。</span></p>'),
-      stepper: {
-        title: '一次跨进程调用的旅行（客户端 → 内核 → 服务端 → 回来）',
-        lines: [
-          { code: '<span class="c">// ① 客户端：从 ServiceManager 拿到服务的"句柄"</span>\nIBinder b = ServiceManager.<span class="f">getService</span>(<span class="s">"package"</span>);',
-            note: '<b>① 先找"总机"。</b><span class="mono">ServiceManager</span> 是所有系统服务的登记处，' +
-              '它自己有一个特殊的句柄（<b>0 号</b>）。你拿到的 <span class="mono">IBinder</span> 不是真正的服务对象，' +
-              '而是<b>一个"引用"</b>——在客户端这一侧，它具体是 <span class="mono">BinderProxy</span> 的实例。<br>' +
-              '<span class="hit">这个"句柄/引用"的概念是理解 Binder 的关键：<b>跨进程传不了对象，只能传"指向对象的编号"。</b></span>',
-            state: { '步骤': '取句柄', '在哪': '客户端进程', '跨进程？': '是' } },
-          { code: '<span class="c">// ② AIDL 生成的 Proxy：把方法调用翻译成"事务"</span>\n<span class="k">public</span> ApplicationInfo <span class="f">getApplicationInfo</span>(...) {\n    Parcel data = Parcel.obtain(), reply = Parcel.obtain();\n    data.writeInterfaceToken(DESCRIPTOR);\n    data.writeString(packageName);\n    mRemote.<span class="f">transact</span>(TRANSACTION_getApplicationInfo, data, reply, <span class="n">0</span>);\n    <span class="c">// ……从 reply 里读返回值……</span>\n}',
-            note: '<b>② "接口调用"在这里被降维成了"打包 + 编号 + 发送"。</b>注意三样东西：<br>' +
-              '· <b>DESCRIPTOR</b>——接口的唯一标识字符串（防止串号）；<br>' +
-              '· <b>TRANSACTION_xxx</b>——<b>一个整数编号</b>，服务端靠它 switch 到对应方法；<br>' +
-              '· <b>Parcel</b>——序列化容器，参数按顺序写进去。<br>' +
-              '<span class="hit">逆向意义：<b>你在 Binder 层看到的东西就是"编号 + 字节流"。</b>' +
-              '想知道编号对应哪个方法，要么拿到 AIDL 生成的类，要么从服务端的 switch 里反查。</span>',
-            state: { '步骤': '打包事务', '在哪': '客户端进程', '跨进程？': '否' } },
-          { code: '<span class="c">// ③ 进入 native 层，最终落到一次 ioctl</span>\nBpBinder::transact()\n  → IPCThreadState::transact()\n  → talkWithDriver()\n  → <span class="f">ioctl</span>(fd, BINDER_WRITE_READ, &amp;bwr);   <span class="c">// fd = /dev/binder</span>',
-            note: '<b>③ 这一行是整个机制的物理落点。</b><span class="mono">/dev/binder</span> 是一个字符设备，' +
-              '所有 Binder 通信都是对它做 <span class="mono">ioctl</span>。<br>' +
-              '<b>为什么这一步如此重要：</b>它是<b>客户端侧唯一必须经过的、且可以下钩子的位置</b>。' +
-              '本章最后的实战案例做的就是这件事——<b>GOT Hook 掉 libbinder.so 里的 ioctl，就能看到全部 Binder 事务。</b>',
-            state: { '步骤': 'ioctl', '在哪': '客户端 native', '跨进程？': '即将' } },
-          { code: '<span class="c">// ④ Binder 驱动：找到目标进程，把事务挂进它的待办队列</span>\n<span class="c">// 依据是事务里的 handle（句柄数）</span>\n<span class="c">// 内核在这里还会填入调用方的 UID/PID</span>',
-            note: '<b>④ 内核是"中介"，也是"公证人"。</b>驱动按句柄找到目标进程，把事务放进它的 todo 队列，' +
-              '然后唤醒目标进程的一个 Binder 线程。<br>' +
-              '<span class="hit">关键安全性质：<b>调用方的 UID/PID 是内核填进去的，不能伪造。</b>' +
-              '这就是为什么"Binder 比其它 IPC 安全"——被调用方可以确信"你是谁"。</span>' +
-              '逆向意义：<b>风控可以用它来确认"到底是不是这个 App 在调我"</b>，而你想伪造身份就没那么容易了。',
-            state: { '步骤': '驱动转发', '在哪': '内核', '跨进程？': '是' } },
-          { code: '<span class="c">// ⑤ 服务端：Binder 线程从队列取出事务</span>\nBBinder::transact() → <span class="f">onTransact</span>(code, data, reply, flags)\n<span class="k">switch</span> (code) {\n  <span class="k">case</span> TRANSACTION_getApplicationInfo: <span class="c">/* 真正干活 */</span>\n}',
-            note: '<b>⑤ 服务端在"Binder 线程"里执行。</b>注意：<b>不是服务端的主线程</b>，' +
-              '而是一个由 Binder 驱动唤醒的线程池里的线程（默认池子有上限，<span class="pill warn">具体线程数上限是实现细节，随版本变化</span>）。<br>' +
-              '<span class="hit">这解释了一个常见困惑："为什么系统服务的代码不在它的主线程上跑？"<b>因为它是被 Binder 线程承载的。</b>' +
-              '这也意味着——<b>你在服务端 hook 时，永远要记得自己在 Binder 线程上。</b></span>',
-            state: { '步骤': '处理', '在哪': '服务端 Binder 线程', '跨进程？': '—' } },
-          { code: '<span class="c">// ⑥ 回复：BC_REPLY → BR_REPLY，客户端被唤醒</span>\n<span class="c">// 返回值从 reply Parcel 里读出来</span>\nresult = reply.readTypedObject(ApplicationInfo.CREATOR);\nreply.recycle(); data.recycle();',
-            note: '<b>⑥ 原路返回。</b>客户端阻塞在 <span class="mono">transact</span> 上的那条线程被唤醒，' +
-              '从 <span class="mono">reply</span> 里读出返回值。<br>' +
-              '<b>注意"同步"这件事：</b>默认的 Binder 调用是<b>同步阻塞</b>的——' +
-              '客户端线程会一直等到服务端返回。' +
-              '<span class="hit">所以"主线程调了一个慢的系统服务"同样会 ANR——<b>Binder 调用是主线程阻塞的一大来源，而且它非常隐蔽，因为你在自己的代码里看不到任何耗时操作。</b></span>',
-            state: { '步骤': '返回', '在哪': '内核 → 客户端', '跨进程？': '是' } },
-          { code: '<span class="c">// ⑦ 可选：oneway（异步）</span>\n<span class="c">// flags |= IBinder.FLAG_ONEWAY  → 立即返回，不等回复</span>',
-            note: '<b>⑦ oneway：不等待的调用。</b>用 <span class="mono">oneway</span> 修饰的 AIDL 方法会立即返回，' +
-              '不阻塞客户端。<br>' +
-              '<b>它的代价：</b>没有返回值、不保证顺序（同一进程内的 oneway 是有序的，跨进程不一定）、不保证送达。' +
-              '<span class="hit">所以"为什么我调了这个方法，但它的效果没出现"——先确认它是不是 oneway。</span>',
-            state: { '步骤': '（变体）', '在哪': '—', '跨进程？': '是' } }
-        ]
-      },
-
-      after:
-        T.note('ok', '✅ Binder 这一节，逆向时真正要带走的三条',
-          '<p style="margin-bottom:0">' +
-          '① <b>物理落点是 <span class="mono">ioctl(/dev/binder)</span></b>——所以基于文件 syscall 的监控看不到 Binder（第 24 章案例）；' +
-          '想观测 Binder，要么 hook <span class="mono">ioctl</span>，要么在 Java 层的 <span class="mono">transact</span> 上下手。<br>' +
-          '② <b>客户端侧看到的是"编号 + Parcel"</b>——没有方法名。想知道编号对应什么，靠 AIDL 生成类或服务端 switch。<br>' +
-          '③ <b>服务端在 Binder 线程上执行</b>——不是主线程。这条决定了你在服务端下钩子时对线程的预期。<br>' +
-          '<span class="hit">再补一条最实用的：<b>Binder 调用是同步阻塞的，它是主线程卡顿的一个隐蔽来源。</b>' +
-          '你在代码里看不到任何耗时操作，但主线程就是卡住了——因为它卡在 <span class="mono">transact</span> 上等对方。</span></p>')
-    },
-
-    /* ============================================================ 26.11 */
-    {
-      h: '26.11', title: 'AIDL 与系统服务：Binder 在工程里长什么样',
-      html:
-        '<p>上一节讲的是机制。这一节讲"它在真实代码里长什么样"——因为<b>你在逆向时看到的不是机制，而是 AIDL 生成的类</b>。</p>' +
-        T.card('AIDL 帮你生成了什么',
-          '<p>写一个 <span class="mono">.aidl</span> 文件之后，构建工具会生成一个 Java 类，里面有<b>两个内部类</b>：</p>' +
-          T.tbl(['生成物', '跑在哪一侧', '它做什么'],
-            [
-              ['<span class="mono">Stub</span>', '<b>服务端</b>', '继承 <span class="mono">Binder</span>，实现 <span class="mono">onTransact</span>：<b>按 code 分发到你的方法</b>'],
-              ['<span class="mono">Stub.Proxy</span>', '<b>客户端</b>', '实现接口，方法体就是<b>打包参数 + 调 <span class="mono">transact</span> + 解包返回值</b>'],
-              ['<span class="mono">asInterface(IBinder)</span>', '两侧', '<b>关键的分叉函数</b>：同进程返回本地对象（<span class="mono">Stub</span>），跨进程返回 <span class="mono">Proxy</span>']
-            ]) +
-          '<p style="margin-bottom:0"><b><span class="mono">asInterface</span> 这个分叉是逆向时的一个关键路标</b>：' +
-          '<span class="hit">它决定了"这个调用到底走不走 Binder"。</span>' +
-          '如果返回的是本地 Stub，那这次调用<b>根本不跨进程，也没有 ioctl</b>——' +
-          '这意味着你在 Binder 层的 hook 抓不到它。' +
-          '<b>"为什么我只抓到了一部分调用"，答案经常就在这里。</b></p>') +
-        T.tbl(['系统服务', '接口', '它管什么', '逆向时为什么关心'],
-          [
-            ['<b>ActivityTaskManagerService</b>', '<span class="mono">IActivityTaskManager</span>', 'Activity 的启动与任务栈', '所有界面跳转的必经之路'],
-            ['<b>PackageManagerService</b>', '<span class="mono">IPackageManager</span>', '包信息、组件信息、权限', '<b>风控最爱查这里</b>（已安装应用列表、签名、是否 debug）'],
-            ['<b>ActivityManagerService</b>', '<span class="mono">IActivityManager</span>', '进程与运行状态', '进程管理、被杀/拉起'],
-            ['<b>WindowManagerService</b>', '<span class="mono">IWindowManager</span>', '窗口与输入', '界面结构、触摸事件'],
-            ['<b>ServiceManager</b>', '<span class="mono">IServiceManager</span>', '<b>所有服务的登记处（句柄 0）</b>', '想找某个系统服务，先问它']
-          ]) +
-        T.note('key', '🔑 两条能立刻用上的观察',
-          '<p style="margin-bottom:0">' +
-          '① <b>查"已安装应用列表"是风控的高频动作</b>，而它必然经过 <span class="mono">IPackageManager</span>。' +
-          '第 24 章的案例里，那个 SDK 就是用 <span class="mono">PackageManager</span> 做全量扫描的——' +
-          '<span class="hit">所以在 <span class="mono">PackageManager</span> 相关的 Binder 调用上布点，等于直接看到"它在查什么"。</span><br>' +
-          '② <b>系统服务的名字是稳定的字符串</b>（<span class="mono">"package"</span>、<span class="mono">"activity"</span>…），' +
-          '而 Binder 事务里带着服务名与接口描述符。<b>这意味着即使方法名被混淆，服务名仍然是明文的</b>——' +
-          '它是你在 Binder 层定位目标的一条可靠线索。</p>'),
-
-      term: {
-        title: 'Binder 相关术语速查',
-        lines: [
-          { t: 'd', s: '# ── 接口与实现 ──' },
-          { t: 'o', s: 'IBinder', note: '<b>"一个可以被跨进程引用的对象"的抽象。</b>客户端拿到的基本都是 <span class="mono">BinderProxy</span>。' },
-          { t: 'o', s: 'Binder / BBinder', note: '<b>服务端的实现基类。</b>Java 层的 <span class="mono">Binder</span> 与 native 层的 <span class="mono">BBinder</span> 对应。' },
-          { t: 'o', s: 'BinderProxy / BpBinder', note: '<b>客户端的代理。</b>Java 层 <span class="mono">BinderProxy</span>，native 层 <span class="mono">BpBinder</span>。它的 <span class="mono">transact</span> 是下钩子的热门位置。' },
-          { t: 'o', s: 'IInterface', note: '业务接口。<span class="mono">asInterface</span> 返回的就是它。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 事务与数据 ──' },
-          { t: 'o', s: 'transact(code, data, reply, flags)', note: '<b>客户端发起调用。</b><span class="mono">code</span> 是方法编号；<span class="mono">flags</span> 里置 <span class="mono">FLAG_ONEWAY</span> 就是异步。' },
-          { t: 'o', s: 'onTransact(code, data, reply, flags)', note: '<b>服务端的入口。</b>按 <span class="mono">code</span> 分发——<b>这里就是那个"编号到方法"的映射表</b>。' },
-          { t: 'o', s: 'Parcel', note: '<b>序列化容器。</b>参数按写入顺序读出。注意它有位置指针（<span class="mono">setDataPosition</span>），读写顺序必须严格一致。' },
-          { t: 'o', s: 'writeInterfaceToken / DESCRIPTOR', note: '<b>接口身份校验。</b>防止 A 接口的事务被发到 B 服务上。在 Binder 层看到的就是一个明文字符串。' },
-          { t: 'o', s: 'handle（句柄）', note: '<b>指向某个进程里的 Binder 对象的编号</b>，由驱动维护。0 号是 ServiceManager。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 通道与线程 ──' },
-          { t: 'o', s: '/dev/binder', note: '<b>物理通道。</b>所有通信都是对它做 <span class="mono">ioctl</span>。' },
-          { t: 'o', s: 'Binder 线程池', note: '服务端处理事务的线程来自这里，<b>不是主线程</b>。<span class="pill warn">默认上限随版本变化，请以实际实现为准</span>' },
-          { t: 'o', s: 'oneway', note: '<b>不等待回复的调用。</b>没有返回值、跨进程不保证顺序、不保证送达。' },
-          { t: 'w', s: 'transaction too large', note: '<b>Binder 事务有大小上限</b>（约 1MB 量级，且是<b>整个进程共享</b>的缓冲区）。超了会抛 <span class="mono">TransactionTooLargeException</span>——<b>这是"传大对象崩溃"的经典原因</b> <span class="pill warn">具体上限值随版本变化</span>' }
-        ]
-      },
-
-      quiz: {
-        id: 'q26-4', chapter: 26, answer: 1,
-        stem: '你在 <span class="mono">libbinder.so</span> 的 <span class="mono">ioctl</span> 上下了一个钩子，想看看目标 App 都调了哪些系统服务。' +
-          '结果你发现<b>有一类调用完全抓不到</b>：某个接口明明被调用了（你在 Java 层 hook 它的方法确认过），但 ioctl 里没有对应的记录。' +
-          '最可能的原因是？',
-        options: [
-          { t: 'ioctl 的钩子装晚了，漏掉了早期的调用', why: '❌ 如果只是"漏掉了部分"，通常是时序问题。但这里你的观察是<b>某个具体接口一次都没出现过</b>，这更像结构性问题而不是时序问题。' },
-          { t: '这个接口在同一个进程内被调用，asInterface 返回的是本地 Stub，根本没走 Binder', why: '✅ 正确。<b>同进程调用不走 Binder</b>——<span class="mono">asInterface</span> 发现 <span class="mono">queryLocalInterface</span> 有结果时，直接返回本地对象，<span class="mono">transact</span> 和 <span class="mono">ioctl</span> 都不会发生。' },
-          { t: 'Binder 事务在 native 层被加密了，所以你看不到', why: '❌ Binder 不做加密。Parcel 是明文二进制（这也是它能被分析和修改的原因）。' },
-          { t: 'Android 新版本改用别的 IPC 机制了，不再用 /dev/binder', why: '❌ Binder 依然是安卓的核心 IPC 机制。新版本加的是"内核里怎么实现"的变化（如 binderfs），不是把它换掉。' }
-        ],
-        explain: '<b>"某个接口明明被调了，但 ioctl 里没有记录"——这句话本身就排除了大部分可能性。</b><br><br>' +
-          '<b>先看它排除了什么：</b>如果只是"漏了一部分"，那多半是时序问题（钩子装晚了）。' +
-          '但你的观察是<b>某个具体接口一次都没出现过</b>——这是<b>结构性问题</b>的特征，不是时序问题。<br><br>' +
-          '<b>正确解释：同进程调用不走 Binder。</b><br>' +
-          'AIDL 生成的代码里有一个关键函数 <span class="mono">asInterface(IBinder)</span>，' +
-          '它内部会先调 <span class="mono">queryLocalInterface(DESCRIPTOR)</span>：<br>' +
-          '· <b>有结果</b> → 说明服务就在<b>本进程</b>，直接返回那个本地对象，' +
-          '后续方法调用就是<b>普通的 Java 方法调用</b>——<span class="mono">transact</span> 不会执行，' +
-          '<span class="mono">ioctl</span> 自然也不会发生；<br>' +
-          '· <b>没有结果</b> → 返回 <span class="mono">Stub.Proxy</span>，走真正的跨进程路径。<br>' +
-          '<span class="hit">这就是那个"分叉点"。它同时解释了为什么你在 Java 层能看到方法被调用，' +
-          '而 Binder 层毫无记录——<b>因为这次调用压根没出过这个进程。</b></span><br><br>' +
-          '<b>为什么这件事在实战里很重要：</b><br>' +
-          '① <b>决定你的观测点选在哪一层。</b>如果你的目标是"看到这两个组件之间传了什么"，' +
-          '在 Binder 层下钩子是<b>无用的</b>（同进程不走 Binder）；正确做法是在 Java 层直接 hook 那个方法，' +
-          '或者 hook <span class="mono">asInterface</span> 先确认它到底走不走 Binder。<br>' +
-          '② <b>解释了"为什么只抓到一部分调用"。</b>同一个接口，' +
-          '在某些调用路径上是同进程（不走 Binder），在另一些路径上是跨进程（走 Binder）——' +
-          '于是你的 Binder 钩子<b>时灵时不灵</b>。<br>' +
-          '③ <b>它也是"为什么有些优化能生效"的原因。</b>' +
-          '同进程调用省掉打包、拷贝、线程切换，成本低一个数量级——' +
-          '所以框架会尽量把相关组件放在同一进程，或者用 <span class="mono">asInterface</span> 的本地分支做快速路径。<br><br>' +
-          '<b>顺带把另外两个选项也钉死：</b><br>' +
-          '· <b>Binder 不加密。</b>Parcel 是明文二进制——这正是它能被解析、能被修改的原因' +
-          '（本章 26.14 的案例就是改 Parcel）。如果 Binder 加密了，那类工具根本不可能存在。<br>' +
-          '· <b>/dev/binder 依然是核心通道。</b>新版本的变化是"内核侧怎么实现"（比如引入 binderfs 做设备节点管理），' +
-          '而不是换掉这套 IPC。<b>把"实现方式演进"误读成"机制被替换"，会让你错误地放弃整条 Binder 分析路线。</b>'
-      }
-    },
-
-    /* ============================================================ 26.12 */
-    {
-      h: '26.12', title: '动态加载：为什么是 dex 而不是 jar',
-      html:
-        '<p>这一节回答 1w 目录里那两个非常具体的问题：<b>"怎么生成安卓能动态加载的 jar 包"</b>和' +
-        '<b>"怎么动态加载 sdcard 上的可执行文件"</b>。它们背后是同一个事实：<b>安卓不认 Java 字节码。</b></p>' +
-        T.note('bad', '☠️ 最核心的一条：Android 的类加载器只认 dex',
-          '<p style="margin-bottom:0">你 <span class="mono">javac</span> 编出来的是 <b>JVM 字节码</b>（<span class="mono">.class</span>），' +
-          '它<b>不能被 Android 加载</b>。<br>' +
-          'Android 的执行格式是 <b>dex</b>，需要再经过一步转换：<b><span class="mono">d8</span></b>（旧版是 <span class="mono">dx</span>）' +
-          '把 <span class="mono">.class</span> 转成 <span class="mono">classes.dex</span>。<br>' +
-          '<span class="hit">所以"生成一个 Android 能动态加载的 jar"，实质是：' +
-          '<b>javac 编出 .class → d8 转成 dex → 把 dex 打包进一个 zip 并命名为 .jar</b>。' +
-          '这个 jar 里装的<b>不是 class，而是 dex</b>——这就是它和普通 Java jar 的本质区别。</span></p>') +
-        T.tbl(['加载器', '加载什么', '典型用途', '逆向视角'],
-          [
-            ['<span class="mono">PathClassLoader</span>', '已安装 APK 里的 dex', '<b>App 的默认加载器</b>', '你 <span class="mono">Java.use</span> 默认用它——所以找不到壳加载的类（第 2 章）'],
-            ['<span class="mono">DexClassLoader</span>', '任意路径的 dex / jar / apk（可指定优化目录与 so 搜索路径）', '<b>插件化、加固壳</b>', '<b>加固的核心动作</b>——它解密 dex 到一个私有路径，再用它加载'],
-            ['<span class="mono">InMemoryDexClassLoader</span>', '<b>内存里的 dex</b>（<span class="mono">ByteBuffer</span>）', '不想落盘的场景', '<b>不落地就加载</b>——所以"去文件系统里找解密后的 dex"这条路会失败，要 dump 内存'],
-            ['<span class="mono">BaseDexClassLoader</span>', '上面几个的公共父类', '—', '要 hook 类加载行为，<b>这是覆盖面最广的位置</b>']
-          ]) +
-        T.tbl(['加载 so', '怎么用', '限制'],
-          [
-            ['<span class="mono">System.loadLibrary("name")</span>', '按名字在 App 的 native 库目录里找', '只找 App 自己的 lib 目录'],
-            ['<span class="mono">System.load("/abs/path/libx.so")</span>', '按绝对路径加载', '<b>路径必须可读</b>；且受下面的"可执行限制"约束'],
-            ['<span class="mono">dlopen</span> / <span class="mono">android_dlopen_ext</span>', 'native 层直接加载', '加固壳走这条，可加载它自己解密出来的 so']
-          ]) +
-        T.note('warn', '⚠️ 一个真实的硬限制：从可写目录加载可执行代码被禁止',
-          '<p style="margin-bottom:0">历史上"把 so 放到 sdcard 上再加载"是可行的，' +
-          '所以 1w 目录里才有"动态加载 SDCard 可执行文件"这个课时。<br>' +
-          '但<b>较新的 Android 版本禁止了"从可写目录执�行本地代码"</b>（W^X 策略）——' +
-          'App 私有目录里的文件默认不能再被 <span class="mono">dlopen</span>。' +
-          '<span class="pill warn">具体从哪个版本、以什么范围生效，随版本演进有过调整，请以官方文档当期说明为准。</span><br>' +
-          '<span class="hit">逆向意义：<b>如果你看到"这个 so 从 sdcard 加载"的方案，先确认它的目标版本还允许。</b>' +
-          '很多老教程里的做法在新系统上会直接失败——把"必然失败的做法"当成有效攻击面，是分析里的一种典型浪费。</span></p>'),
-
-      stepper: {
-        title: '生成并加载一个"能被安卓动态加载的 jar"：五步',
-        lines: [
-          { code: '<span class="c">// ① 写 Java 源码，用 javac 编成 .class</span>\njavac -source 8 -target 8 -d out/ src/com/example/plugin/*.java\n<span class="c">// out/com/example/plugin/Plugin.class</span>',
-            note: '<b>① 产出 JVM 字节码。</b>注意这一步和普通 Java 完全一样——<b>问题出在下一步</b>。<br>' +
-              '<span class="pill warn">字节码版本要与目标环境兼容（Android 支持到哪个 Java 版本随工具链演进），具体以你的 d8 版本为准</span>',
-            state: { '产出': '.class（JVM 字节码）', 'Android 能加载？': '<b>不能</b>' } },
-          { code: '<span class="c">// ② 用 d8（旧版 dx）转成 dex</span>\nd8 --output out-dex/ out/com/example/plugin/*.class\n<span class="c">// out-dex/classes.dex</span>',
-            note: '<b>② 这一步是"安卓化"的关键。</b>d8 会把一批 <span class="mono">.class</span> 合并成<b>一个</b> dex，' +
-              '并完成 dex 格式特有的处理（寄存器分配、字符串与类型索引去重等）。<br>' +
-              '<span class="hit">"为什么 dex 比同等的 class 集合小"——因为 dex 有全局的索引区去重（第 28 章会拆它的结构）。</span>',
-            state: { '产出': 'classes.dex', 'Android 能加载？': '<b>能</b>' } },
-          { code: '<span class="c">// ③ 打包成 zip，并命名成 .jar</span>\nzip -j plugin.jar out-dex/classes.dex\n<span class="c">// ⚠️ 里面装的是 classes.dex，不是 .class</span>',
-            note: '<b>③ "jar"在这里只是一个容器格式（zip）。</b>类加载器会去容器里找 ' +
-              '<b><span class="mono">classes.dex</span></b> 这个名字。<br>' +
-              '<b>所以"安卓能动态加载的 jar"的定义是：</b><span class="hit">一个 zip，根目录下有 <span class="mono">classes.dex</span>。</span>' +
-              '名字叫 .jar 还是 .apk 都不重要，重要的是里面的东西。<br>' +
-              '<span class="pill warn">多 dex（classes2.dex…）的支持情况与加载器版本有关，以官方文档为准</span>',
-            state: { '产出': 'plugin.jar（内含 classes.dex）', 'Android 能加载？': '能' } },
-          { code: '<span class="c">// ④ 运行时用 DexClassLoader 加载</span>\nDexClassLoader loader = <span class="k">new</span> DexClassLoader(\n    jarPath,          <span class="c">// jar/dex/apk 的路径</span>\n    optimizedDir,     <span class="c">// 优化产物目录（新版本已忽略，见下）</span>\n    libSearchPath,    <span class="c">// so 的搜索路径</span>\n    parentLoader);    <span class="c">// 父加载器</span>',
-            note: '<b>④ 加载。</b>四个参数都要留意：<br>' +
-              '· <b><span class="mono">optimizedDir</span></b>——历史上用来放 odex，' +
-              '<span class="pill warn">在较新版本上这个参数已被忽略（系统有自己的优化产物管理），传 null 也常见</span>；<br>' +
-              '· <b><span class="mono">libSearchPath</span></b>——<b>插件自己的 so 目录</b>，不传的话插件里的 so 加载会失败；<br>' +
-              '· <b><span class="mono">parentLoader</span></b>——决定双亲委派链，' +
-              '<span class="hit">这也是第 2 章"类找不到该切哪个加载器"的核心。</span>',
-            state: { '产出': '可用的 ClassLoader', 'Android 能加载？': '能' } },
-          { code: '<span class="c">// ⑤ 用反射调用插件里的类</span>\nClass&lt;?&gt; c = loader.loadClass(<span class="s">"com.example.plugin.Plugin"</span>);\nObject o = c.newInstance();\nc.getMethod(<span class="s">"run"</span>).invoke(o);',
-            note: '<b>⑤ 用反射调。</b>因为宿主编译期<b>没有</b>插件的类，只能用反射（或统一接口 + 强制转换）。<br>' +
-              '<span class="hit">这解释了一个逆向现象：<b>为什么插件化/加固的代码里到处是反射？</b>' +
-              '不是作者喜欢反射，而是编译期根本拿不到那个类型。<br>' +
-              '反过来说——<b>你在 Java 栈上看到大量反射调用时，往往说明"这里有一个动态加载的模块边界"</b>（第 20.10 节、第 26.9 节都用到过这个判断）。</span>',
-            state: { '产出': '插件代码被执行', 'Android 能加载？': '能' } }
-        ]
-      },
-
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '起点',
-            scenario: '<b>情境：</b>你在分析一个插件化 App。你发现宿主在运行时从服务端下载了一个 <span class="mono">plugin.jar</span>，' +
-              '存到 App 私有目录，然后用 <span class="mono">DexClassLoader</span> 加载它。' +
-              '你想把 <span class="mono">plugin.jar</span> 拉出来静态分析，于是 <span class="mono">adb pull</span> 了整个目录。' +
-              '结果你 <b>在私有目录里找不到这个文件</b>——目录里只有一些名字很奇怪的 <span class="mono">.dat</span> 文件。',
-            q: '你的下一步最应该做什么？',
-            choices: [
-              { t: 'A. 认定它用了内存加载（InMemoryDexClassLoader），改去 dump 内存', next: 'na' },
-              { t: 'B. 先确认 DexClassLoader 的第一个参数到底指向哪个路径——很可能你看到的那几个 .dat 就是它', next: 'nb' },
-              { t: 'C. 认为文件被删除了，去 hook 文件删除相关的 API 看它删了什么', next: 'nc' },
-              { t: 'D. 静态搜索宿主代码里对 "plugin.jar" 这个字符串的引用，看它从哪来的', next: 'nd' }
-            ]
-          },
-          na: {
-            label: '选A', terminal: true, verdict: 'bad', verdictTitle: '跳过了一个更便宜的验证',
-            result: '<b>"找不到文件"和"没有文件"是两件事，而你把它们当成了同一件。</b><br><br>' +
-              '<b>现象其实强烈暗示文件就在眼前：</b>目录里有几个名字奇怪的 <span class="mono">.dat</span>——' +
-              '<b>这恰恰是"文件被改名以躲避静态搜索"的典型做法</b>，而不是"文件不存在"。<br>' +
-              '<span class="hit">文件名混淆是一个非常廉价、也非常常见的混淆手段：<b>内容一个字没改，只把名字换掉。</b>' +
-              '它的成本几乎为零，但能挡住"按名字找文件"这一整类分析。</span><br><br>' +
-              '<b>验证"是不是内存加载"的成本对比：</b>内存加载的判断依据是——' +
-              '<b>你能 hook 到 DexClassLoader 的构造，但它的第一个参数指向的文件不存在或读不出来</b>。' +
-              '而现在你还没确认这个参数是什么，就直接跳到"dump 内存"，' +
-              '等于<b>用一个昂贵的手段去解决一个还没被确认的问题</b>。<br><br>' +
-              '<b>还有一个更关键的区别：</b>内存加载的 dex <b>从来不以文件形式存在</b>，' +
-              '所以"目录里有几个可疑的 .dat"这个现象本身就不支持内存加载的假设——' +
-              '<b>如果是内存加载，你不会看到任何可疑的落盘文件。</b>'
-          },
-          nb: {
-            label: '选B', terminal: true, verdict: 'good', verdictTitle: '正确：先问"它到底在读哪个文件"',
-            result: '<b>这是唯一能一步收敛的动作，而且它有明确的做法：</b><br><br>' +
-              '<b>hook <span class="mono">DexClassLoader</span> 的构造函数，把四个参数都打出来。</b>' +
-              '第一个参数（<span class="mono">dexPath</span>）就是答案。<br>' +
-              '<span class="hit">这一个 hook 同时回答三个问题：</span><br>' +
-              '① <b>文件在哪</b>——拿到真实路径，直接去 pull；<br>' +
-              '② <b>是不是内存加载</b>——如果 <span class="mono">dexPath</span> 指向一个不存在的文件，才轮到内存加载的假设；<br>' +
-              '③ <b>有几个</b>——传进来的是单个路径还是用 <span class="mono">:</span> 分隔的多个路径。<br><br>' +
-              '<b>为什么这个动作排第一：</b>它把"猜测文件叫什么"变成了"读一个已知的值"。' +
-              '<b>成本是几十行 Frida 脚本，收益是消除全部不确定性。</b><br><br>' +
-              '<b>顺带一提：</b>那几个 <span class="mono">.dat</span> 很可能就是答案。' +
-              '你在 hook 里看到 <span class="mono">dexPath</span> 指向某个 <span class="mono">.dat</span> 之后，' +
-              '把它的扩展名改成 <span class="mono">.dex</span> 或直接拖进 jadx，通常就能打开了——' +
-              '<b>因为改名不改内容。</b>'
-          },
-          nc: {
-            label: '选C', terminal: true, verdict: 'bad', verdictTitle: '在验证"文件是否存在"之前就假设了"它被删了"',
-            result: '<b>"被删除"是一个需要证据的假设，而你现在没有任何证据。</b><br><br>' +
-              '<b>更实际的判断是：</b>如果它加载完就把文件删了，那你应该能观察到"文件曾经存在过"的痕迹——' +
-              '而且<b>卸载后重新启动，它必须重新下载一次</b>（因为本地已经没有了）。' +
-              '<span class="hit">这两个都是可观测的：<b>看它有没有反复下载同一个资源，就能验证"删除了"这个假设。</b></span><br><br>' +
-              '<b>而"去 hook 删除相关 API"这个动作的性价比很低：</b><br>' +
-              '· 删除 API 有很多种（<span class="mono">File.delete</span> / <span class="mono">unlink</span> / ' +
-              '<span class="mono">remove</span> / <span class="mono">rename</span>…），你要先猜它用哪个；<br>' +
-              '· 就算抓到了，你也只能知道"它删了某个文件"，<b>拿不到文件内容</b>；<br>' +
-              '· 而与它相比，hook 一个<b>已知会被调用</b>的构造函数（<span class="mono">DexClassLoader</span>）是确定能拿到结果的。<br><br>' +
-              '<b>选择动作的判断标准：这个动作成功时我能得到什么？</b>' +
-              '"hook 删除 API"成功时得到的是"一个被删的路径"，"hook DexClassLoader"成功时得到的是' +
-              '"<b>它到底加载了什么</b>"——后者的信息量高一个数量级。'
-          },
-          nd: {
-            label: '选D', terminal: true, verdict: 'bad', verdictTitle: '静态搜索在这个场景里信息量很低',
-            result: '<b>搜字符串不是错的，但在这里它几乎注定一无所获——而且原因值得说清楚。</b><br><br>' +
-              '<b>为什么搜不到：</b><br>' +
-              '① <b>路径是运行时拼出来的。</b>真实代码通常是 <span class="mono">getFilesDir() + "/" + name</span>，' +
-              '字符串常量里根本没有完整路径；<br>' +
-              '② <b>名字可能是下载后决定的。</b>服务端返回的元数据里带文件名，客户端只是照着用；<br>' +
-              '③ <b>那就更容易连 "plugin.jar" 这个字符串都不存在</b>——' +
-              '<span class="hit">你按一个自己想象出来的名字去搜，当然搜不到。</span><br><br>' +
-              '<b>更重要的方法论问题：</b>你要找的不是"这个字符串在哪"，而是"<b>它实际加载了什么</b>"。' +
-              '前者的答案可能是一堆拼接代码（你还得继续往下追），后者的答案是一个<b>具体的路径值</b>。<br>' +
-              '<span class="hit">凡是"运行时才能确定的值"，都不要试图静态穷举——去运行时读它。</span>' +
-              '这与第 8 章"动态 dump 常量"、第 30 章"七条线索"里"从行为反推"是同一条原则：' +
-              '<b>让程序自己把值算出来给你看。</b>'
-          }
-        }
-      }
-    },
-
-    /* ============================================================ 26.13 */
-    {
-      h: '26.13', title: '收口：把基础模型翻译成逆向观测点',
-      html:
-        '<p>这一章讲的都是"安卓怎么运作"。最后这一节做一件更有用的事：' +
-        '<b>把每个基础概念翻译成"遇到它时，我该在哪里下钩子、该注意什么"。</b></p>' +
-        T.tbl(['基础概念', '它在逆向里对应的观测点', '最容易踩的坑'],
-          [
-            ['<b>四大组件</b>', '清单文件是地图；每个组件入口都是稳定下钩点', '只看 Activity，漏掉 Receiver/Provider 这些<b>无界面入口</b>'],
-            ['<b>生命周期</b>', '<span class="mono">attachBaseContext</span> / <span class="mono">onCreate</span> 是加固的介入点；也是你找业务逻辑的起点', '<b>销毁重建</b>让 onCreate 跑两次；onDestroy <b>不保证被调用</b>'],
-            ['<b>ContentProvider 早于 Application</b>', '想抢最早的时机，看这里', '在 Application 里做的初始化，Provider 可能<b>已经依赖过了</b>'],
-            ['<b>Service 在主线程</b>', 'Service 回调里的耗时操作同样会 ANR', '以为 Service = 后台线程'],
-            ['<b>Handler / Looper</b>', 'hook <span class="mono">Handler.post</span> 能看到"从子线程回到 UI"的所有动作；<span class="mono">handleMessage</span> 抓不到 post 进去的 Runnable', '<b>线程判断错误</b>导致 hook 装上了不命中'],
-            ['<b>消息按 when 排序</b>', '判断"为什么这条先执行"；判断延迟是否可靠', '把 <span class="mono">postDelayed</span> 当精确定时器'],
-            ['<b>Binder = ioctl</b>', '在 <span class="mono">libbinder.so</span> 的 <span class="mono">ioctl</span> 或 Java 层 <span class="mono">transact</span> 上下钩子', '<b>基于文件 syscall 的监控看不到 Binder</b>'],
-            ['<b>同进程不走 Binder</b>', '<span class="mono">asInterface</span> 是分叉点', '"为什么只抓到一部分调用"'],
-            ['<b>Binder 线程池</b>', '服务端代码跑在 Binder 线程上', '在服务端下钩子时对线程的预期搞错'],
-            ['<b>存储沙箱与版本</b>', '权限声明本身就是行为特征（如「所有文件访问」）', '<b>把"新版本上必然失败"的做法当成有效攻击面</b>'],
-            ['<b>动态加载只认 dex</b>', 'hook <span class="mono">DexClassLoader</span> 构造拿真实路径', '按自己想象的文件名去静态搜索'],
-            ['<b>类加载器可换</b>', '<span class="mono">BaseDexClassLoader</span> 是覆盖面最广的钩子位置', '用默认加载器找不到壳加载的类（第 2 章）']
-          ]) +
-        T.note('key', '🔑 一条贯穿全章的心法',
-          '<p style="margin-bottom:0">这一章的所有内容，最后都可以收成一句话：' +
-          '<b>安卓不是"一个跑起来的程序"，而是"一台被系统反复调用的状态机 + 一张进程间的电话网"。</b><br>' +
-          '所以逆向时的两个基本问题永远是：<br>' +
-          '① <b>这段代码是在哪个回调里被系统调起来的？</b>（组件 + 生命周期 + 线程）<br>' +
-          '② <b>它是怎么知道要干这件事的？</b>（Binder + 动态加载 + 存储）<br>' +
-          '<span class="hit">把这两个问题问出来，你就不会再有"不知道该从哪下手"的情况——' +
-          '因为在安卓里，<b>代码永远不会"自己开始跑"，它总是被某个人、通过某个入口、在某个线程上调起来的。</b></span></p>'),
-
-      quiz: {
-        id: 'q26-5', chapter: 26, answer: [1, 3],
-        stem: '（多选）你要 hook 的目标代码"装上了但一次都没命中"。结合本章内容，下面哪些解释是<b>成立的</b>？',
-        options: [
-          { t: '你的 hook 注入到了主进程，而目标逻辑跑在一个 android:process=":remote" 的独立进程里', why: '✅ 成立。<b>多进程是本项目里的高频坑</b>——每个进程有独立的地址空间，注入必须针对正确的那一个。' },
-          { t: '这段代码跑在系统服务进程里，你的 hook 在 App 进程里当然命中不了', why: '✅ 成立。Binder 调用跨越进程边界，<b>调用链的另一半在 system_server 里</b>——你只能看到本进程这一侧。' },
-          { t: '目标函数通过 Binder 调用了系统服务，所以它在本地一定没有执行', why: '❌ 不成立。Binder 调用是<b>客户端先执行自己的打包代码</b>，再去 transact 的。所以"发起 Binder 调用的那段本地代码"是会被执行的。' },
-          { t: '代码在 ContentProvider.onCreate 里执行，而你的 hook 是在 Application.onCreate 里装的', why: '✅ 成立。<b>Provider 早于 Application</b>——你在 Application 里装钩子时，Provider 的初始化已经跑完了。' }
-        ],
-        explain: '<b>"装上了但零命中"，本章给了你四个新的候选解释——这正是这一章的价值所在。</b><br><br>' +
-          '<b>① 进程不对。</b>组件可以被声明到独立进程（<span class="mono">android:process</span>），' +
-          '而<b>进程之间不共享内存</b>。风控、推送、插件化都爱用多进程，' +
-          '<span class="hit">而多进程的一个副作用是：<b>你的 Frida 脚本只注入了一个进程，另一个进程完全不受影响。</b>' +
-          '排查方法很直接——<span class="mono">frida-ps -U</span> 里看进程列表，有没有带冒号后缀的。</span><br><br>' +
-          '<b>② 代码在别的进程里（Binder 的另一侧）。</b>你在 App 进程里 hook"某个系统服务的方法"，' +
-          '那个方法的实现根本不在 App 进程——它在 <span class="mono">system_server</span> 里。' +
-          '<b>你能影响的是"客户端这一侧"</b>（比如 hook <span class="mono">BinderProxy.transact</span> 改参数），' +
-          '而不是服务端的实现。<br><br>' +
-          '<b>③ 时机不对（Provider 早于 Application）。</b>这是本章最冷门但最实用的一条。' +
-          '如果你的钩子装在 <span class="mono">Application.onCreate</span>，而目标在 ' +
-          '<span class="mono">ContentProvider.onCreate</span> 里，<b>那你就慢了整整一步</b>。' +
-          '正确的做法是把钩子提前到 <span class="mono">attachBaseContext</span>，或者干脆用 spawn 模式。<br><br>' +
-          '<b>关于第 3 个选项为什么不成立：</b>Binder 调用<b>不是"把执行权交出去"</b>，' +
-          '而是"本地打包 → 进内核 → 对方执行 → 返回"。所以<b>发起调用的本地代码一定会执行</b>，' +
-          '你 hook 它是有效的。<span class="hit">真正会"本地不执行"的是 <b>native 化</b>（第 20.11 节）——' +
-          '那时代码根本不在 Java 层，而不是"因为走了 Binder"。</span>'
-      }
-    },
-
-    /* ============================================================ 26.14 实战案例 */
-    {
-      h: '26.14', title: '实战案例：用 GOT Hook 劫持 libbinder 的 ioctl 拦截全部 Binder 事务',
+      h: '26.7C', title: '实战案例：Android 16 上 FART 为什么会失效——一次工具迁移的完整记录',
       case: {
-        source: 'github',
-        title: 'AndProxy – Android Binder 与系统调用拦截库',
-        date: '2026-03-26',
-        author: 'ggggmllll',
-        target: 'Android · ARM64 · Linux 内核 ≥ 5.10（Seccomp 用户态通知）· NDK r25+ / CMake 3.22+ · GPL-2.0 · C++',
+        source: 'kanxue',
+        title: '[原创] 使用 Kimi K3 进行脱壳工具迁移开发：R0DUMP —— 将 FART 迁移到 Android 16',
+        date: '2026-7-21',
+        author: 'Ivory0',
+        target: 'FART / FART 6.0 → LineageOS 23.2 / Android 16；一加 9（代号 lemonade）；三个 DexProtector 样本 com.vietinbank.ipay / com.vnpay.bidv / com.VCB',
         background:
-          '<p>这个项目把本章 26.10 节那条"<b>Binder 的物理落点是 <span class="mono">ioctl(/dev/binder)</span></b>"' +
-          '从一个知识点变成了一个可运行的工具。</p>' +
-          '<p>它的做法非常直接：<b>用 GOT Hook 劫持 <span class="mono">libbinder.so</span> 里的 <span class="mono">ioctl</span> 调用</b>，' +
-          '从而捕获<b>全部</b> Binder 读写；同时用 <b>Seccomp 用户态通知</b>机制拦截指定系统调用，' +
-          '并在 Java 层提供统一的回调接口。</p>' +
-          '<p>README 自述的核心能力包括：解析 <span class="mono">BR_TRANSACTION</span> / ' +
-          '<span class="mono">BC_TRANSACTION</span> 等命令、<b>自动提取服务名与方法名</b>、' +
-          '支持在请求前（<span class="mono">before</span>）与回复后（<span class="mono">after</span>）注入 Java 回调并修改事务数据。</p>' +
-          '<p><b>为什么它值得作为本章的案例：</b>它正好落在"组件 / IPC / 观测点"这三件事的交点上——' +
-          '它不关心某个具体 App 的业务，而是<b>把"进程间通信"这一层变成可观测、可修改的</b>。' +
-          '这正是本章想建立的视角。</p>',
+          '<p><b>这个案例在第 16 章已经出现过一次（16.5C），那里看的是「怎么迁移」；这里换一个角度，把同一份材料当作「ART 版本演进的证据」重看一遍。</b></p>' +
+          '<p>作者把 FART / FART 6.0 的主动调用链路搬到 <b>LineageOS 23.2 / Android 16</b> 上，重做了一套工具并取名 <b>R0DUMP</b>，' +
+          '在<b>一加 9（代号 lemonade）</b>上用三个 DexProtector 样本（<code>com.vietinbank.ipay</code>、<code>com.vnpay.bidv</code>、<code>com.VCB</code>）验证。</p>' +
+          '<p>本章 26.6 节的版本表列了「每一代 ART 改了什么」，但表格容易背下来也容易忘掉。' +
+          '这次我们要盯住的是一个<b>具体的失效点</b>：<b>copied / obsolete 的 ArtMethod 身上没有有效的 DexFile</b>——' +
+          '看清楚这一处是怎么把旧代码打死的，比记住十行版本摘要都有用。</p>',
         points: [
-          '<b>拦截点选在 <code>libbinder.so</code> 的 <code>ioctl</code> 上</b>——对应本章 26.10 节第 ③ 步："所有 Binder 通信都是对 <code>/dev/binder</code> 做 <code>ioctl</code>"。',
-          '<b>手段是 GOT Hook</b>：改写导入函数在 GOT 表里的地址，从而在不改动代码段的前提下接管调用（这一点与第 7 章 unidbg 补环境里的"改写 GOT 让指针指向自己的实现"是同一套机制）。',
-          '<b>解析 Binder 协议命令</b>：<code>BR_TRANSACTION</code>（服务端收）/ <code>BC_TRANSACTION</code>（客户端发）等，并<b>自动提取服务名与方法名</b>——这解决了 26.10 节第 ② 步留下的问题："客户端侧看到的只是编号 + Parcel，方法名从哪来"。',
-          '<b>提供 before / after 两个注入时机</b>：before 可以改请求，after 可以改回复。README 给的示例正是<b>修改 <code>IPackageManager.getApplicationInfo</code> 的返回值、清掉 <code>FLAG_DEBUGGABLE</code></b>——一个"隐藏应用可调试状态"的真实用途。',
-          '<b>第二条线是 Seccomp 用户态通知</b>：拦截任意系统调用，回调里可以拿到<b>完整寄存器上下文与参数</b>，并<b>修改返回值或设置错误码</b>；内存读写走 <code>process_vm_readv</code> / <code>process_vm_writev</code>。',
-          '<b>Java 层 API 做了封装</b>：README 自述"无需理解底层 Binder 协议或 Seccomp 细节"，<code>BinderDispatcher.registerAfter(接口名, 方法名, 回调)</code> 即可注册，事务数据会自动转成 Java 对象。'
+          'FART 原版依赖的引用链：<code>ActivityThread.fartthread()</code> → <code>dexElements</code> → <code>DexFile.getClassNameList(mCookie)</code> → loadClass → <code>DexFile.dumpMethodCode()</code>。',
+          '<b>Android 16 的失效点</b>：<b>copied / obsolete 的 ArtMethod 没有有效的 DexFile</b>——旧代码默认「拿到 ArtMethod 就能顺着它摸到 DexFile」，这条链在新版本断了。',
+          '作者的适配手段：改用<b>带 cookie 的 <code>dumpMethodCode()</code> 重载</b>，并用 <b>cookie / class descriptor 选 fallback DexFile</b> 兜底。',
+          '受控配置走 <code>Settings.Global</code> 的 <code>r0dump.dump.*</code>。',
+          '默认策略是 <code>CLASS_WALK|APP_CREATE|ACTIVITY_CREATE|IN_MEMORY_DEX|DEFINE_CLASS</code>，ART 策略位扩到 <b>32 个</b>。',
+          '产物经 MediaStore 写到 <code>Download/R0DUMP/&lt;process&gt;</code>，含 <code>methods_&lt;pid&gt;.jsonl</code>、<code>_r0dump_status.json</code>、<code>dexfixed_*.dex</code>。',
+          '验证方式：<b>三组样本 repair 后 JADX 可正常加载</b>——证明迁移链路是通的，而不只是「能编译」。'
         ],
         method: [
-          '先在 <code>libbinder.so</code> 里定位 <code>ioctl</code> 的 GOT 条目，替换为代理函数（<b>这是整个方案的立足点：找对拦截位置</b>）。',
-          '在代理函数里转发真正的 ioctl，同时解析 <code>binder_write_read</code> 里的事务命令。',
-          '按服务名与方法名匹配注册的回调——这一步把"字节流"翻译成了"可读的调用"。',
-          '在 before / after 两个时机回调 Java 层，允许修改 Parcel 数据或回复。',
-          '另一条独立线路：用 Seccomp 用户态通知拦系统调用，通过 <code>process_vm_readv</code> / <code>process_vm_writev</code> 安全读写目标进程内存。',
-          '把上面两套能力统一暴露成 Java API，降低使用成本。'
+          '先复述旧链路，确认它到底依赖什么：<code>fartthread()</code> 从 <code>dexElements</code> 取 DexFile，用 <code>getClassNameList(mCookie)</code> 列类，loadClass 触发回填，最后 <code>dumpMethodCode()</code> 落地。',
+          '带着这条链去 Android 16 上跑，观察它断在哪一步——断点不是函数改名，而是 <b>copied / obsolete 的 ArtMethod 取不到有效 DexFile</b>。',
+          '顺着新版本的接口改，而不是硬扛旧写法：换成带 cookie 的 <code>dumpMethodCode()</code> 重载。',
+          '再补一层兜底：用 cookie / class descriptor 选 fallback DexFile，保证拿不到直接线索时还能反查回正确的 DexFile。',
+          '把开关收进 <code>Settings.Global</code> 的 <code>r0dump.dump.*</code>，策略位扩到 32 个，默认 <code>CLASS_WALK|APP_CREATE|ACTIVITY_CREATE|IN_MEMORY_DEX|DEFINE_CLASS</code>。',
+          '产物改成经 MediaStore 落到 <code>Download/R0DUMP/&lt;process&gt;</code>，并留下 <code>methods_&lt;pid&gt;.jsonl</code> 与 <code>_r0dump_status.json</code> 供回溯。',
+          '验证：三个样本产出的 <code>dexfixed_*.dex</code> 经 repair 之后，用 JADX 加载确认可用。'
         ],
         result:
-          '<p>项目实现了一个<b>可用的 Binder 事务拦截与修改框架</b>：能够捕获全部 Binder 读写、' +
-          '提取服务名与方法名、在请求前后注入回调并修改事务数据；' +
-          '同时提供基于 Seccomp 的系统调用拦截能力。README 给出了完整的使用示例与 API 说明表。</p>' +
-          '<p>仓库信息（截至本次核实）：<b>GPL-2.0 许可、C++ 实现、114 star、未归档</b>，' +
-          '创建于 2026-03-26，最近一次推送 2026-04-18。</p>',
-        terms: ['Binder', 'ioctl', '/dev/binder', 'GOT Hook', 'BR_TRANSACTION', 'BC_TRANSACTION',
-          'Parcel', 'Seccomp 用户态通知', 'process_vm_readv', 'IPackageManager', 'FLAG_DEBUGGABLE'],
+          '<p>三组样本（<code>com.vietinbank.ipay</code>、<code>com.vnpay.bidv</code>、<code>com.VCB</code>）产出的 <code>dexfixed_*.dex</code> 经 repair 之后，' +
+          '<b>JADX 都能正常加载</b>。也就是说，「FART 6.0 的引用链在 Android 16 上不成立」这件事被具体定位到了，并且被一条新写法替代掉了。</p>',
+        terms: ['FART', 'R0DUMP', 'ArtMethod', 'copied / obsolete ArtMethod', 'DexFile', 'dexElements', 'getClassNameList', 'dumpMethodCode', 'cookie', 'class descriptor', 'Settings.Global', 'MediaStore', 'DexProtector', 'JADX'],
         limits:
-          '<p>README 里明确写出的约束（<b>照录，不代其下结论</b>）：</p>' +
-          '<p>① <b>仅支持 ARM64 架构</b>——这一点很关键：它是 GOT Hook，依赖目标架构的指令与表结构；<br>' +
-          '② <b>需要 Linux 内核 ≥ 5.10</b>（Seccomp 用户态通知机制的引入版本），依赖项一节里再次强调"Kernel 版本大于 5.10"；' +
-          '构建依赖 NDK r25+ 与 CMake 3.22+；<br>' +
-          '③ <b>许可证是 GPL-2.0</b>——这会影响它的使用与二次分发方式，采用前需要确认与你的项目许可是否兼容；<br>' +
-          '④ <b>README 没有提供"已知问题 / 成功率 / 兼容机型矩阵"这类章节</b>，' +
-          '也没有给出在带反调试、带完整性校验的目标上的实测结论。' +
-          '<span class="hit">这意味着"能不能在你的目标上稳定工作"需要你自己验证——README 给的是能力与依赖，不是实测保证。</span><br>' +
-          '⑤ README 末尾只留了 Issue 与邮箱作为反馈渠道，<b>没有列出测试覆盖范围</b>。</p>',
+          '<p>① <b>最该记的一条是作者自己的约束</b>：<b>「代码里有策略位」不等于「设备上已验证」</b>——' +
+          'oat / vdex、JIT、instrumentation 这几条路径并未全部覆盖。代码里写了分支，不代表真机上那条路径被跑通过。</p>' +
+          '<p>② <b>设备单一</b>：验证只在一加 9（lemonade）+ LineageOS 23.2 上做过，其他机型、其他 ROM、其他内核未测。' +
+          '而本章 26.6 节刚强调过：<b>从 Android 12 起 ART 是 APEX 模块，系统版本不再等同于 ART 版本</b>——' +
+          '换一台设备，ART 模块版本可能就不是同一个了。</p>' +
+          '<p>③ <b>样本单一</b>：三个样本都是 DexProtector，<b>不能外推到 VMP 或其他壳型</b>。本章的结论没变——遇到 VMP，基于 dex 的脱壳路线直接失效。</p>' +
+          '<p>④ <b>同帖姊妹帖正文未抓取，本站不做内容推测</b>：<b>《ART 底层执行链：从 ArtMethod::Invoke 看 FART 在 Android 12–16 为什么失效》</b>' +
+          '（thread-292312，2026-8-5，作者 FinSectech）——抓取时只在列表页看到了它的标题、TID、日期与作者，<b>正文内容未获取</b>。' +
+          '既然没读到，就不替它总结，也不猜它讲的是哪几处失效点。<span class="hit">这条注记本身就是本章要教的纪律：' +
+          '「我看到这个标题」和「我知道它说了什么」是两件事。</span></p>',
         analysis:
-          '<p><b>这个案例是本章 26.10 节的一次完整工程化兑现，而且它每一步都踩在本章讲过的机制上。</b></p>' +
-          '<p><b>① 它验证了"Binder 的落点是 ioctl"这条判断的实际价值。</b>' +
-          '本章说这句话时是从"seccomp 拦不到 Binder"这个现象出发的（第 24 章的案例）。' +
-          '而这个项目把它反过来用：<b>既然 Binder 一定要经过 ioctl，那劫持 ioctl 就能看到全部 Binder 事务。</b>' +
-          '<span class="hit">同一个事实，攻防两侧的用法正好相反——这就是"理解机制"比"记住技巧"值钱的原因。</span></p>' +
-          '<p><b>② 它回答了本章 26.10 节留下的一个悬空问题。</b>' +
-          '那一节说过："客户端侧看到的只是编号 + Parcel，想知道编号对应哪个方法，要靠 AIDL 生成类或服务端 switch。"' +
-          '而这个项目做到了<b>自动提取服务名与方法名</b>——' +
-          '这说明<b>这些信息在 Binder 事务里是可解析的</b>：接口描述符（DESCRIPTOR）是明文，' +
-          '服务名也是明文。<span class="hit">"名字被藏起来了"这句话在 Binder 层并不成立——' +
-          '藏起来的只是业务方法的语义，通道本身的标识是明文的。</span>' +
-          '这与第 20 章"反射藏不住自己"、第 26 章"服务名是稳定字符串"是同一条思路。</p>' +
-          '<p><b>③ 它的示例选得很准：改 <span class="mono">IPackageManager.getApplicationInfo</span> 清掉 ' +
-          '<span class="mono">FLAG_DEBUGGABLE</span>。</b>' +
-          '这一条同时印证了本章的两处内容：<br>' +
-          '· 26.11 节说"<b>风控最爱查 <span class="mono">PackageManager</span></b>"——这个示例正是从"被查"翻转成"改答案"；<br>' +
-          '· 26.10 节第 ④ 步说"<b>调用方的 UID/PID 由内核填入、不可伪造</b>"——' +
-          '但请注意：<b>这个项目改的不是"调用方身份"，而是"服务端返回的内容"</b>。' +
-          '<span class="hit">这是一个很重要的边界：<b>Binder 保证的是"谁在调"不可伪造，' +
-          '但它不保证"返回的数据"没被中间人改过——因为中间人就在你自己的进程里。</b></span></p>' +
-          '<p><b>④ 它用的是 GOT Hook，这一点值得单独指出。</b>' +
-          '第 1 章讲过 inline hook（改函数头）与 PLT/GOT hook（改跳转表项）的区别，' +
-          '而这里选择了后者。<b>原因很实际：</b><span class="mono">ioctl</span> 是一个<b>被导入的函数</b>' +
-          '（来自 libc），所以它在 <span class="mono">libbinder.so</span> 的 GOT 里有表项，改表项比改代码段更干净、' +
-          '也更容易绕开"检测函数头是否被改"这类检测（与第 1、21 章的对抗内容呼应）。</p>' +
-          '<p><b>⑤ 关于它的局限，README 的态度是诚实的：</b>给的是<b>能力清单 + 明确的兼容性边界</b>' +
-          '（ARM64、内核 ≥ 5.10、构建依赖），<b>没有夸大战绩</b>——' +
-          '没有"支持所有 App"、没有成功率数字、没有机型矩阵。' +
-          '<span class="hit">而"内核 ≥ 5.10"这条限制恰恰是本章反复强调的一个主题：' +
-          '<b>底层手段总带版本枷锁</b>——就像第 19 章说"每个安卓版本 ART 都会变"、' +
-          '第 24 章说"每换一个版本沙箱都要重适配"。<b>越靠近内核，枷锁越硬。</b></span></p>',
-        link: 'https://github.com/ggggmllll/AndProxyDemo',
-        linkNote: 'GitHub 公开仓库（GPL-2.0）。本次核实：仓库页与 raw README 均返回 200，README 正文 8464 字节，' +
-                  '作者、创建时间、许可证、语言、star 数取自 GitHub API。该库定位是安全研究/隐私保护/自动化测试用途。'
+          '<p><b>本章 26.6 节给的是一个诊断框架：看到「换版本就失效」，先按形态分类——编译不过 / 读出垃圾 / 脱不出内容 / 部分缺失。' +
+          '这个案例是一次真实兑现，而它的失效形态属于最阴的那一类：不是编译不过，是「脱不出内容」。</b></p>' +
+          '<p><b>① 失效的具体形态。</b>旧代码的隐含假设是「拿到一个 ArtMethod，就能顺着它摸到 DexFile，然后 dump 出方法体」。' +
+          'Android 16 上这个假设不成立了：<b>copied / obsolete 的 ArtMethod 没有有效的 DexFile</b>。' +
+          '注意这意味着什么——<span class="hit">这不是「代码写错了」，而是「你以为稳定的那条引用链，在新版本不再成立」</span>。' +
+          '代码一行没改、逻辑一步没错，但它脚下的地板被换掉了。<b>这正是本章那张版本表的现实含义：表里那些「结构重构」「访问器抽象」的条目，' +
+          '落到工程里就是「某条你以为永远成立的引用链断了」。</b></p>' +
+          '<p><b>② 适配的思路：顺着新版本的接口走，而不是硬扛旧写法。</b>' +
+          '作者没有去重建一个假的 DexFile、也没有想办法从别处硬凑一个旧结构，而是<b>改用带 cookie 的 <code>dumpMethodCode()</code> 重载，' +
+          '并用 cookie / class descriptor 选 fallback DexFile</b>——新版本既然提供了这条路径，就按它的规则把数据要出来。' +
+          '这个动作和第 16 章讲的「知识才是护城河」是同一件事：能这么改，前提是他清楚 cookie 是什么、class descriptor 能反查出什么，' +
+          '也就是他读得懂 ART 源码。<b>收藏工具的人在等新版本的工具，理解原理的人在按新版本重定位脱壳点。</b></p>' +
+          '<p><b>③ 必须区分「能编译」和「已验证」。</b>作者明确写了一句：<b>「代码里有策略位」不等于「设备上已验证」</b>，' +
+          '并列出了 oat / vdex、JIT、instrumentation 三条未全覆盖的路径。' +
+          '这跟本章反复强调的纪律是同一条：<b>dump 出来的 dex 能在 JADX 里打开，只证明它可反编译，不证明它是完整的</b>——' +
+          '工具会在你没覆盖的路径上安静地给出一个不完整的结果。<br>' +
+          '<span class="hit">所以工具的完成度要用覆盖率证明，不能用「我写了这个功能」证明。</span>' +
+          '写了一个分支，和这个分支在设备上被跑通、被观察到预期行为，中间隔着一整个测试的工程量。</p>' +
+          '<p><b>最后一条，关于这份材料的边界。</b>抓取时同帖的姊妹帖（thread-292312）只有标题、TID、日期和作者可见，正文没拿到。' +
+          '<b>正确的处理方式就是不写它</b>——不猜它的技术内容，不替它补结论，只在局限里注明「正文未获取」。' +
+          '这和上面第 ③ 点是同一条纪律的两面：对工具要说「未验证」，对材料要说「未读到」。' +
+          '<b>本课所有案例都按这个标准处理，你读其他资料时也该按这个标准要求作者。</b></p>',
+        link: 'https://bbs.kanxue.com/thread-292107.htm',
+        linkNote: '看雪论坛原创帖（第 16 章 16.5C 已从「脱壳流程」角度引用过同一篇，此处聚焦版本演进）'
+      }
+    },
+
+    /* ================= 26.7 ================= */
+    {
+      h: '26.7',
+      title: '决策演练：接到一个从没见过的加固 App',
+      html: '<p>现在把时间轴和链路合起来用。第一个情境是<b>最真实的那种开局</b>：甲方丢给你一个 APK，一句「客户说这个 App 用了国外的加固，你三天内给我结果」。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境一 · 限时出结果',
+            scenario: '<b>情境：</b>你拿到一个 APK，甲方明确说「用了国外的商业加固，具体是什么不清楚」。你只有 <b>3 天</b>。手上有一台 Android 14 的真机（已刷入适配好的 FART14）和一台 Android 10 的测试机。你甚至不确定它是不是 DexProtector。<br><br><b>你的第一个动作是什么？</b>',
+            choices: [
+              { t: '先花半天做「壳类型判定」：把 APK 丢进反编译器看 dex 是否完整、方法体是否为空、有没有可疑 native 库，再决定路线', next: 'n1' },
+              { t: '不管是什么壳，先把 App 装到 Android 14 真机上跑一遍 FART14，看能不能出产物——反正工具已经现成了', next: 'n2' },
+              { t: '直接上第 20 章的 VMP 分析思路，先把 native 层和关键算法拆开看', next: 'n3' },
+              { t: '先上网搜这个 App 用了什么加固、有没有人写过现成的脱壳脚本，找到再动手', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选A · 先判类型', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先用十分钟的判断，省掉两天的弯路',
+            result: '<b>为什么对：</b>脱壳的路线<b>完全</b>取决于壳的类型，而判类型是有明确观察指标的：<br>' +
+              '① <b>dex 能不能被正常反编译，方法体是否为空</b>——整体加密但内存里完整 = 一代壳；结构完整、方法体空或被 nop = 抽取壳；<br>' +
+              '② <b>APK 里有没有体积异常大的 native 库</b>——是 VMP 的重要嫌疑信号（但要结合其他证据，不能只凭这一点下结论）；<br>' +
+              '③ <b>有没有多出来 dex / assets 里的加密数据</b>。<br>' +
+              '<b>认知根源：</b>新手总觉得「分析」和「动手」是对立的，先动手显得更勤奋。但脱壳这件事上，<b>路线选错的代价是「干了两天，发现方向根本不通」</b>。十分钟的判类型，是整个流程里性价比最高的十分钟。<br>' +
+              '<b>然后怎么做：</b>判定是抽取壳 → 走 FART 主动调用路线；判定是纯一代壳 → 内存 dump 更快；发现 VMP 特征 → 提前和甲方对齐预期，或者直接准备「不脱壳、走黑盒调用/动态 Trace」的备选方案。'
+          },
+          n2: {
+            label: '选B · 直接跑工具', terminal: true, verdict: 'bad',
+            verdictTitle: '不算错得离谱，但你会失去判断力',
+            result: '<b>为什么不好：</b>「工具已经现成了，先跑一遍」听起来很务实，而且<b>它确实常常能用</b>——但这正是危险之处：<b>你跑出了产物，却不知道产物为什么能出来，也不知道它缺了什么。</b><br>' +
+              '具体后果有两条：<br>' +
+              '① <b>没有基线就无法判断「脱干净了没有」</b>。抽取壳的产物经常是「有文件、能打开、方法体残缺」。你手上没有「壳类型」这个参照，就看不出残缺，交付一个半成品。<br>' +
+              '② <b>失败时你无法定位原因</b>。跑不出结果，你分不清是 FART14 没适配好、是壳有反调试拦住了、还是它根本就是 VMP。<br>' +
+              '<b>认知根源：</b>把「工具」当成黑盒，就会把「工具跑通了」当成「任务完成了」。<b>正确姿势不是不跑，而是「先判类型 → 带着预期去跑 → 用预期去核对产物」。</b>一遍跑完，你既拿到了产物，也验证了自己的判断。'
+          },
+          n3: {
+            label: '选C · 直接上 VMP 思路', terminal: true, verdict: 'bad',
+            verdictTitle: '越级操作：在没确认之前就假设了最难的情况',
+            result: '<b>为什么错：</b>VMP 是加固里<b>最重</b>的手段，成本极高，厂商通常只用在少数核心方法上，不会全量使用。一上来就假设「它是 VMP」，等于<b>用最贵的方案去打一个可能根本不需要它的目标</b>。<br>' +
+              '<b>认知根源：</b>这是「技术炫耀型误判」——学了第 20 章的重型武器，就想找地方用它。<b>判断壳类型的第一原则是「从最简单的可能性开始排除」</b>：先看 dex 完整不完整，再看方法体空不空，最后才考虑 VMP。<br>' +
+              '<b>正确顺序：</b>判类型应该在<b>前三十分钟</b>内完成，而不是跳过它直接进重武器。<b>如果判定确实有 VMP</b>，那也要先明确范围：是全部关键算法被虚拟化，还是只有一两个校验函数？范围决定了你是「绕过去」还是「硬啃」。'
+          },
+          n4: {
+            label: '选D · 先搜现成方案', terminal: true, verdict: 'bad',
+            verdictTitle: '信息检索不是错，把它当第一步才是错',
+            result: '<b>为什么不好：</b>搜索本身是必要动作，但<b>把「找到现成脚本」当作前置条件，会让你把三天预算全押在运气上</b>。海外商业加固的针对性脚本，公开资料本来就稀少；而且就算搜到了，它是给哪个加固、哪个安卓版本的，往往不可考。<br>' +
+              '<b>认知根源：</b>这是「工具收藏思维」的直接体现——相信存在一把别人配好的万能钥匙。<b>但加固厂商与脱壳工具的博弈是持续的</b>：今天公开的脚本，明天就被针对性对抗掉了。<br>' +
+              '<b>正确姿势：</b>搜索应该<b>服务于你的判断</b>——先自己判出壳类型和大版本适配情况，再用搜索去验证「这类壳的公开资料怎么说」，两者互相印证。<b>不要用搜索代替观察，更不要用它代替原理。</b>'
+          }
+        }
+      }
+    },
+
+    /* ================= 26.8 ================= */
+    {
+      h: '26.8',
+      title: '决策演练：判定类型之后，路线怎么选',
+      html: '<p>第二个情境接着上一个：<b>你已经判定了类型</b>，现在要在路线之间做取舍。这一节刻意把「反直觉」放在正确选项上——<b>本情境的正确答案是「不脱壳」</b>。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境二 · 反直觉的路线选择',
+            scenario: '<b>情境：</b>你按上一节的流程做完了判类型，得到三条关键信息：<br>' +
+              '① dex 结构完整，但<b>大量方法体是空的</b> → 抽取特征明确；<br>' +
+              '② <b>只有两个核心校验方法</b>反编译出来是一堆看不懂的东西，其余方法体填充后都正常 → 疑似 VMP，但<b>范围极小</b>；<br>' +
+              '③ 甲方的真实需求是：<b>「我要知道这个 App 的签名是怎么算出来的」</b>——他们要做接口对接，不是要一份完整源码。<br><br>' +
+              '<b>你手上的时间是 3 天，今天已经是第 2 天。你选哪条路？</b>',
+            choices: [
+              { t: 'FART14 全量脱壳，把整个 App 的方法体都 dump 出来，然后修复成完整 dex 再慢慢看那两处', next: 'n1' },
+              { t: '不追求完整脱壳：用 FART 的主动调用只针对那两个关键方法，配合动态 Trace 直接抓它的输入输出，反推签名算法', next: 'n2' },
+              { t: '既然有 VMP，就按第 20 章的方法把那两个虚拟化的方法完整还原成等价算法', next: 'n3' },
+              { t: '先把全部 native 库拖出来丢进 IDA，从那两个方法的 native 实现里找算法', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选A · 全量脱壳', terminal: true, verdict: 'bad',
+            verdictTitle: '技术正确，但目标错位：你回答了一个没被问的问题',
+            result: '<b>为什么不好：</b>全量脱壳本身对抽取壳是有效路线，这里错的是<b>优先级</b>。<br>' +
+              '① <b>甲方要的是算法，不是源码</b>。全量 dump 之后，你仍然要面对「那两个方法看不懂」的同一堵墙，只是多花了一天去产出一堆你用不到的东西。<br>' +
+              '② <b>主动调用是慢的且有损耗</b>。遍历几万个方法逐个执行，耗时以小时计，还可能因为调用失败漏方法、因为异常把 App 搞崩——<b>这些代价换来的产物，对当前目标几乎没有边际价值</b>。<br>' +
+              '<b>认知根源：</b>把「脱壳」当成了目的而不是手段。脱壳只是获取信息的一种途径；<b>当目标只需要少量信息时，全量脱壳是昂贵且低效的</b>。<br>' +
+              '<b>什么时候它才对：</b>当需求是「完整还原这个 App 的逻辑」时，全量脱壳就是正确路线。<b>路线没有绝对好坏，只有与目标是否匹配。</b>'
+          },
+          n2: {
+            label: '选B · 定向 + 动态 Trace', terminal: true, verdict: 'good',
+            verdictTitle: '正确（反直觉）：不追求脱壳，直接拿结果',
+            result: '<b>为什么对：</b>这是本章决策框架里最容易被忽略的一条——<b>脱壳不是唯一出路，甚至常常不是最优出路</b>。<br>' +
+              '① <b>目标倒推手段</b>：甲方要「签名怎么算」，那么我需要的是 <b>输入 → 输出</b> 的映射关系，而不是方法体的源码。动态 Trace 直接观测这个映射，成本低得多。<br>' +
+              '② <b>VMP 恰好最不怕这个打法</b>：VMP 保护的是「方法体不被读懂」，但它<b>不改变方法的输入输出契约</b>——App 自己还得正常调用它、拿到正确签名。所以对 VMP，<b>黑盒观测往往比硬还原更现实</b>。<br>' +
+              '③ <b>FART 依然有用，但用法变了</b>：只对目标方法做定向触发 + dump，用来确认「这个方法在哪、参数长什么样」，剩下的交给 Trace。<b>工具是手段的组合，不是单选题。</b><br>' +
+              '<b>认知根源：</b>新手把「脱壳」当成必经关卡，觉得不脱壳就是没本事。<b>成熟的判断是：先问「我要的信息，最短路径是什么」，再问「脱壳能不能提供它」。</b>'
+          },
+          n3: {
+            label: '选C · 硬还原 VMP', terminal: true, verdict: 'bad',
+            verdictTitle: '方向没错，但时间预算错得离谱',
+            result: '<b>为什么不好：</b>还原虚拟化保护是<b>逆向里最耗时的工程之一</b>，通常以周甚至月计。你现在只剩一天多，这条路在时间上直接不成立。<br>' +
+              '<b>认知根源：</b>把「技术上的彻底」误当成「工程上的正确」。<b>实战里最重要的一项能力是估算成本</b>：一条路即使理论可行，如果成本超出预算，它对当前任务就等于不可行。<br>' +
+              '<b>正确做法：</b>先评估 VMP 的<b>范围与强度</b>——只有两个方法，属于极小范围，这种情况下「绕过」的性价比远高于「还原」。<b>如果甲方后来真的要求算法级还原，那是一个新项目、新预算，而不是在三天里顺手做完的事。</b>把预期提前对齐，是专业性的体现，不是能力不足。'
+          },
+          n4: {
+            label: '选D · 先拖 native 库', terminal: true, verdict: 'bad',
+            verdictTitle: '一个看似合理的动作，但顺序反了',
+            result: '<b>为什么不好：</b>「拖 native 库进 IDA」本身是必要的分析动作，问题在于<b>你还没有证据说明这两个方法就在 native 层</b>。<br>' +
+              '① <b>VMP 不等于 native</b>。虚拟化保护可以是纯 Java 层实现的解释器 + 自定义字节码，也可以是 native 实现，<b>两者在没验证前都只是假设</b>。<br>' +
+              '② <b>先拖进去的代价很高</b>。海外加固的 native 库通常带混淆、字符串加密、反调试，进去就是一片沼泽；<b>花半天毫无产出，第三天就没了</b>。<br>' +
+              '<b>认知根源：</b>把「熟悉的手法」当成「通用的第一步」。<b>正确顺序是先用最便宜的观测确认「这个逻辑到底在哪一层」</b>——比如 Trace 一下这个方法的调用，看它是否下探到 native；确认了，再决定要不要进 IDA。<b>先定位，再深挖。</b>'
+          }
+        }
+      }
+    },
+
+    /* ================= 26.9 ================= */
+    {
+      h: '26.9',
+      title: '决策演练：移植卡住时，往哪里查',
+      html: '<p>最后一个情境把镜头拉回本章的主线——<b>移植本身</b>。这是每个做 FART 版本适配的人都会遇到的真实场景：代码编过了，刷进去了，日志却什么都没打。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境三 · 首次移植卡在验证环节',
+            scenario: '<b>情境：</b>你在做 Android 10 的 FART 移植。现在状态是：<br>' +
+              '① 按这一版源码改过的 ART <b>编译通过了</b>；<br>' +
+              '② 产物已经刷入设备，<b>系统正常开机</b>；<br>' +
+              '③ 装了一个普通 App 启动它，<code>adb logcat</code> 过滤后 <b>没有任何输出</b>，<code>/sdcard/fart/</code> 目录压根没生成。<br><br>' +
+              '<b>你的下一步排查动作是什么？</b>',
+            choices: [
+              { t: '回到编译配置与刷入路径，确认设备上真正被加载的 ART 到底是不是我编译的那一份', next: 'n1' },
+              { t: '先改代码加更多日志，把插桩点前后都打上输出，重新编译一遍再看', next: 'n2' },
+              { t: '怀疑是 art 对开机镜像的校验导致改动没生效，去找改机型 / 签名校验绕过的方法', next: 'n3' },
+              { t: '换回上一个已知能跑的 FART 版本，先确认设备和流程本身没问题，再回来对比差异', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选A · 先确认产物真的生效', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先证明「我的代码在跑」，再谈它为什么不输出',
+            result: '<b>为什么对：</b>排查的第一原则是<b>从最靠近根因、成本最低的假设开始</b>，而「我编译的东西真的被加载了吗」是所有假设里<b>最底层的一个</b>。<br>' +
+              '① 如果设备加载的还是系统自带的 ART，那么<b>你后面做的任何代码修改、任何日志埋点，全都不会被观测到</b>——继续改代码就是纯粹的浪费。<br>' +
+              '② 验证方式可以是：在插桩代码里放一个<b>启动时必定被打印的无害标记</b>，或者核对设备上对应库文件的属性/校验值与你的编译产物是否一致。<br>' +
+              '<b>认知根源：</b>「代码编过了 + 系统能开机」会给人强烈的「已经生效」错觉。但<b>编译成功只证明代码语法正确，刷入成功只证明没把系统搞坏</b>，两者都不证明你的那份二进制正在运行。<b>这是移植类问题最容易踩、也最容易漏掉的一环。</b>'
+          },
+          n2: {
+            label: '选B · 加日志重新编译', terminal: true, verdict: 'bad',
+            verdictTitle: '勤奋的弯路：在一堆未知里加更多未知',
+            result: '<b>为什么不好：</b>「没输出就加日志」是本能反应，但它有个前提——<b>你得先确定代码真的在跑</b>。在没确认这一点之前加日志，会出现两种结果：<br>' +
+              '① <b>新日志也一条不打</b>。此时你面对的是两个未知（代码没生效 / 插桩点选错），信息量反而更低；<br>' +
+              '② <b>新日志打了一堆</b>，把你淹没在噪声里，更难定位。<br>' +
+              '而且每次加日志都要<b>重新编译 + 重新刷入</b>，单次循环的成本以小时计——<b>用一个高成本的循环去试一个本该先排除的低层假设，是典型的效率陷阱</b>。<br>' +
+              '<b>认知根源：</b>把「动作多」等同于「进度快」。排查的正确姿势是<b>按假设的底层程度排序，从最底层往上逐个排除</b>，而不是同时打开所有可能性。'
+          },
+          n3: {
+            label: '选C · 怀疑校验导致改动不生效', terminal: true, verdict: 'bad',
+            verdictTitle: '跳到结论：你连「改动是否送达」都还没验证',
+            result: '<b>为什么不好：</b>「系统校验拦住了我的改动」是一个<b>具体的、需要证据的假设</b>，而不是可以默认的前提。在还没确认「产物有没有被加载」的情况下直接跳到「去找绕过校验的方法」，等于<b>为一个未经验证的假设去找解法</b>。<br>' +
+              '后果是双重的：<b>时间花在了可能根本不需要的工作上</b>；同时你依然没有排除「代码加载了但插桩点选错了」这个更常见的可能。<br>' +
+              '<b>认知根源：</b>把「别人的经验帖」当成「我的现场事实」。论坛里确实常见「刷入不生效」的案例，但<b>你的现场是不是同一类问题，必须用自己的观测来判定</b>。<br>' +
+              '<b>正确顺序：</b>先确认产物是否被加载（选 A）→ 若已加载却无输出，再检查插桩点是否被走到 → 若确实被系统拦下，才进入绕过校验的环节。'
+          },
+          n4: {
+            label: '选D · 换回旧版本对照', terminal: true, verdict: 'bad',
+            verdictTitle: '被「对照实验」的外表骗了：这里根本没有可用的对照组',
+            result: '<b>为什么错：</b>「换回已知能跑的版本」听起来像严谨的对照实验，但在本情境里前提就不成立——<b>你想换回的那个旧版本，是为另一个安卓版本做的移植，本来就不能在 Android 10 上跑</b>。<br>' +
+              '「已知能跑」只在你原来的那套系统环境里成立，<b>它不是一个可用的对照组</b>。换回去大概率也是没输出，你会得到「新旧都不行」这种毫无信息量的结论，还多花掉几轮刷机时间。<br>' +
+              '<b>认知根源：</b>把科学方法的名词当成方法本身。<b>对照实验成立的前提是「只变一个变量」</b>；当对照组本身在你当前平台上就无效时，做对照只是浪费预算。<br>' +
+              '<b>正确做法：</b>先确认「当前这份产物有没有被加载」（选 A），把问题域从「整条链路」缩小到一个点上。<b>排除法的价值在于每一步只排除一个未知。</b>'
+          }
+        }
+      }
+    },
+
+    /* ================= 26.10 ================= */
+    {
+      h: '26.10',
+      title: '实战：FART14 秒脱 DexProtector，与「新壳方法论」',
+      html: '<p>回到本章标题里的实战。<b>DexProtector 是国外知名的商业加固方案</b>（由波兰的安全公司开发，被大量海外 App 采用），保护强度高、实现闭源、公开资料有限。所以下面这张表要读得小心：<b>左列写的是「这类商业加固通常具备的能力」，不是「DexProtector 内部一定如何实现」</b>——它的具体机制我们没有可靠依据，不做臆测。<b>这张表的用途是训练你的应对思路，而不是当它的产品说明书。</b></p>' +
+            '<p>读表前先对齐三个词的用法：' + T.term('VMP', '虚拟化保护。把关键方法的原始指令翻译成自定义字节码，由内置解释器执行。此时方法体不再是 dex 指令，基于 dex 的脱壳工具会直接失效——需改用第 20 章的技术，或走动态 Trace 绕过。') + '指「关键方法被翻译成自定义字节码」，它和「方法体被抽走」是两种不同的问题；' + T.term('主动调用', 'FART 的核心机制：遍历所有方法并逐个强制执行，用「必须执行就必须有方法体」这一因果，逼迫 ART / 壳把被抽取的 code item 回填到内存，再趁机 dump。调用是手段，回填才是目的。') + '是 FART 对付抽取壳的手段；' + T.term('秒脱', '面对一个新壳 App 时几分钟内拿到产物。快的来源不是技术简单，而是「适配目标系统版本」这项前期工作已经提前完成。') + '则描述了前期投入兑现之后的状态。</p>' +
+            T.tbl(
+              ['保护能力（商业加固的常见手段）', '它想让你卡在哪', '应对思路（方法论，非具体实现）'],
+              [
+                ['<b>dex 加密 + 运行时解密</b>', '静态打开 APK 时看不到真实 dex', '承认这一点：<b>静态不行就转运行时</b>。在内存里等它解密完成的那一刻做 dump —— 这也是一代壳的经典解法'],
+                ['<b>抽取壳（方法体抽取）</b>', 'dump 出来的 dex 结构完整但方法体为空，让你以为「脱成功了」', '<b>必须主动调用触发回填</b>：这正是 FART 主动调用循环存在的理由。同时在验证阶段坚持「反编译看方法体」，不接受「有文件就算成功」'],
+                ['<b>VMP（关键方法虚拟化）</b>', '核心方法体不再是 dex 指令，基于 dex 的脱壳手段整体失效', '识别出来就别硬扛：<b>要么上第 20 章的技术，要么走「不脱壳、直接黑盒调用/动态 Trace 拿输入输出」</b>。范围评估决定选哪条'],
+                ['<b>反调试 / 反 Frida</b>', '你的注入与 Hook 一挂上去就被发现，App 主动退出或行为异常', '环境对抗是独立课题（见第 15 章）。要点：<b>先确认「是被反调试拦了」还是「我的工具本身有问题」</b>，两者的排查方向完全不同'],
+                ['<b>完整性校验</b>', 'APK 被改过、内存被改过就拒绝运行', '改包常常行不通 → <b>尽量不改原文件，改用运行时观测</b>；或先定位校验点再决定处理方式'],
+                ['<b>字符串 / 常量加密</b>', '反编译出来一堆无意义字符串，看不出逻辑', '运行时 dump 或动态观测；这也是「脱壳」之外的独立战场，工具与思路都不同'],
+                ['<b>针对脱壳工具的对抗</b>', '让你的工具跑不起来 / 产物残缺', '<b>这是持续博弈，不是一次胜负</b>。所以能力必须建立在原理上：工具被封了，你还能回源码重新找脱壳点']
+              ]
+            ) +
+            T.note('key', '🔑 遇到一个新壳时的决策框架（本章最终产出）', '<p>把全章内容压缩成四步，<b>这四步对任何没见过的壳都适用</b>：</p>' +
+              '<p><b>① 判类型</b> —— dex 能否正常 dump 出来（一代壳）？方法体是否为空（抽取壳）？关键方法是否为看不懂的自定义字节码（VMP 嫌疑）？<b>这一步必须在前 30 分钟内完成。</b></p>' +
+              '<p><b>② 选路线</b> —— 一代壳 → 内存 dump；抽取壳 → 必须主动调用触发回填（FART）；有 VMP → 第 20 章技术，或干脆不脱壳、走动态 Trace 绕过。</p>' +
+              '<p><b>③ 没有现成工具时</b> —— 回到 ART 源码，按 26.5 节的六步链路自己找脱壳点。<b>这就是「会读源码」的兑现时刻。</b></p>' +
+              '<p><b>④ 实在脱不掉</b> —— 换思路：不脱壳，直接黑盒调用（见第 21 章 unidbg）或动态 Trace 抓输入输出。<b>目标是拿到结果，不是完成脱壳这个动作。</b></p>' +
+              '<p>这四步的价值在于：<b>它把「我该怎么办」从一个焦虑问题，变成了一个有顺序的判断题。</b></p>') +
+            T.note('ok', '✅ 回到「秒脱」', '<p>为什么课程能演示「用 FART14 快速脱掉 DexProtector」？因为 <b>Android 14 的适配工作在演示之前就已经做完了</b>（26.5 节的六步，一步不少）。演示现场剩下的只是：装 App → 触发它跑起来 → 等主动调用循环走完 → 取产物 → 反编译验证。</p>' +
+              '<p><b>这个顺序请你反过来读一遍：如果那六步没做，现场就是另一幅景象</b>——你会盯着一个没输出的 logcat，在三天里反复重编译。所谓「秒脱」，是前期投入的利息，不是技术难度的证明。</p>',
+              '<p class="small muted">补充说明：本节刻意不描述 DexProtector 的内部实现细节。对这些闭源商业方案，可靠的做法是<b>用自己的观测去判定它这一版用了哪些手段</b>，而不是拿网上的传闻当事实——<b>这一点本身就是本章方法论的一部分</b>。</p>'),
+      quiz: {
+        id: 'q12-1', chapter: 12, answer: 2,
+        stem: '某加固 App 脱壳后，用反编译器打开 dump 出来的 dex：类名、方法名、字段都齐全，但<b>超过一半的方法点进去是空的</b>（没有指令）。最合理的判断与对策是？',
+        options: [
+          { t: 'dump 失败了，dex 没抓完整 —— 应该调整 dump 时机，抓得更早一点', why: '方向反了。如果 dex 没抓完整，缺失的会是整个类甚至整段数据，而不是「结构齐全、唯独方法体为空」这种规整的缺失。' },
+          { t: '这是 CompactDex 格式，需要先做格式转换才能正常反编译', why: 'CompactDex 影响的是指令的编码方式，会出现反编译乱码/报错，而不是「方法体为空」。这是把两种不同症状混为一谈。' },
+          { t: '这是抽取壳：加壳时方法体就被抽走了，没被执行过的方法还没回填 —— 应该用主动调用把方法逐个触发，逼它回填后再 dump', why: '正确。「结构完整但方法体为空」是抽取壳的典型指纹：它保留了 dex 的骨架（类名方法名），抽走的只有 code item。而壳只在方法真正要执行时才填回去，所以被动 dump 拿不到。' },
+          { t: '这是 VMP：方法体被虚拟化了，所以看不到指令 —— 应该按第 20 章的方法还原虚拟化', why: '过度判断。VMP 通常只覆盖少数关键方法，不会出现「一半方法都是空」的分布。而且 VMP 的方法体不是「空」，是自定义字节码。' }
+        ],
+        explain: '<b>「结构完整、方法体为空」是抽取壳的指纹。</b>加固厂商在加壳阶段把方法体（code item）从 dex 里抽走，只留结构；App 运行时，壳在方法真正要执行的前一刻才把方法体解密填回内存。<br><br>' +
+          '这条因果直接决定了脱壳策略：<b>你没法「等」它——因为 App 的启动路径只覆盖一部分方法</b>，剩下的大量方法可能永远不被执行，也就永远不会回填。所以 FART 设计的核心就是<b>主动调用</b>：遍历所有类、所有方法，逐个强制执行，用「要执行就必须有方法体」这个硬约束逼 ART / 壳把 code item 填回来，然后立刻 dump。<br><br>' +
+          '顺带记住两种「看似相似、其实不同」的症状：<b>CompactDex</b> → 反编译乱码或报错（编码问题）；<b>VMP</b> → 少数关键方法是看不懂的自定义字节码（语义问题）。<b>把症状和成因对上，才不会拿着 A 的方案去治 B 的病。</b>'
+      }
+    },
+
+    /* ================= 26.11 ================= */
+    {
+      h: '26.11',
+      title: '自测：版本演进的两道判断题',
+      html: T.note('', '📝 这两题问的是「为什么会这样」，不是「是什么」', '<p>如果你前面只是把时间轴看了一遍，这两题会有点难；如果你真的理解了「脱壳点依附于 ART 内部结构」这条因果，它们应该是直接推出来的。</p>'),
+      quiz: {
+        id: 'q12-2', chapter: 12, answer: 1,
+        stem: '你为 Android 10 移植好的 FART，在 Android 14 设备上刷入后：系统能正常开机、日志里有你加的启动标记、脱壳流程却<b>在遍历到方法那一步就崩了</b>。最合理的解释是？',
+        options: [
+          { t: 'Android 14 的反调试机制发现了 FART，主动把进程杀掉了', why: '与现象不符。反调试通常表现为 App 退出或行为异常，而不是「遍历到方法这一步崩在系统 ART 里」；何况这时崩的往往是系统进程。' },
+          { t: 'FART 的遍历逻辑直接依赖 ArtMethod 的内存布局，而这个结构在 10→14 之间持续演进（例如部分信息被移到辅助访问结构里），旧代码取方法体的方式已经不成立', why: '正确。这正是「为什么必须持续维护」的最直接体现：加载路径、类链接接口还能靠语义重新定位，但取方法体这一步是拿内存布局说话的，布局变了就必须改用新的访问方式。' },
+          { t: 'Android 14 开始禁止第三方代码访问 /sdcard，所以是写文件权限的问题', why: '症状不符。权限问题会在写文件时报错，而不会导致在「遍历方法」这一步崩溃；而且存储权限是应用层问题，与 ART 内部遍历无关。' },
+          { t: 'dex 文件格式在 Android 14 变了，导致解析类定义时崩掉', why: 'dex 格式相对稳定，「遍历到方法这一步才崩」也不符合解析阶段崩溃的特征——崩点已经越过了 dex 解析，进入运行时结构。' }
+        ],
+        explain: '<b>关键在于分清「哪一步依赖什么」。</b>主动调用循环有三层：遍历 DexFile、遍历 ClassDef、遍历方法并取方法体。前两层的接口即使改名重构，你还能<b>按语义</b>在新源码里重新找到（比如「谁负责把 dex 里的类变成可调用的类」）；<b>但第三层是直接读 ArtMethod 的内存布局</b>——这个结构从 Android 10（为 hidden API 策略调整）到 Android 11+（部分信息移到 <code>CodeItemDataAccessor</code> 一类辅助结构，<span class="pill warn">名称待核实</span>）一直在变。<br><br>' +
+          '所以「崩在遍历方法那一步」这个现象本身就是一条强线索：<b>它精确地指出了你这次移植失败的位置——接口层你可能是对的，结构层你没有对齐。</b><br><br>' +
+          '<b>更重要的推论：</b>这不是「你运气不好碰上了 Android 14」，而是<b>必然会发生的事</b>。任何依赖 ART 内存布局的工具，只要系统还在演进，就必须持续维护。这就是本章反复强调「FART 是要维护的项目，不是成品」的原因。'
+      }
+    },
+
+    /* ================= 26.12 ================= */
+    {
+      h: '26.12',
+      title: '自测：动手顺序与「秒脱」的本质',
+      quiz: {
+        id: 'q12-3', chapter: 12, answer: 3,
+        stem: '第一次移植 FART 到 Android 10，下面哪种做法最可能让你在有限时间里定位到问题？',
+        options: [
+          { t: '一次性把三个组件（dex dump / 主动调用 / 修复）全改完，再整体编译刷入一次看结果', why: '看起来高效，实际是最糟的顺序。三个组件同时改动，一旦没结果，你面对的是三个未知叠加，日志里任何一条都可能是假线索。' },
+          { t: '先把修复组件写完善，确保 dump 出来的东西一定能合并成可反编译的 dex', why: '优先级错了。修复组件对应的是「产物处理」，是三个组件里最稳的一块（dex 格式相对稳定），也是唯一在没拿到有效 dump 之前无法验证的一块。' },
+          { t: '先跑通 dex dump，能看到完整 dex 落盘，就说明移植基本成功', why: '把「dex dump 成功」等同于「移植成功」是本章最想破除的错觉。对抽取壳而言，dump 出来的 dex 结构完整、方法体为空，离可用还差最关键的一步。' },
+          { t: '按「编译通过 → 遍历跑通 → 取到方法体」的依赖顺序分阶段验证，每个阶段都有独立的成功标志', why: '正确。这三个阶段恰好对应「接口层 → 逻辑层 → 结构层」三层依赖，逐层推进时每一步只有一个未知，出问题能立刻定位。' }
+        ],
+        explain: '<b>移植要按依赖层次分阶段，而不是按功能模块分。</b>从 26.4 节的循环可以读出清晰的三层：<br><br>' +
+          '<b>第一层·接口层：</b>枚举 DexFile、ClassLinker 接口、各种访问器的签名。这层的成功标志是<b>代码能编过</b>——最便宜、也最该先解决，因为它拦着你验证后面任何东西。<br>' +
+          '<b>第二层·逻辑层：</b>遍历能不能真的走完，能不能看到类和方法的数量符合预期。标志是<b>日志能打印出遍历进度</b>。这一层不涉及内存布局，靠语义重定位就能搞定。<br>' +
+          '<b>第三层·结构层：</b>能不能从方法拿到正确的 code item。标志是<b>dump 出的方法体是真的指令</b>，而不是空数组。<b>这层最难，因为它直接踩在 ArtMethod 的布局上。</b><br><br>' +
+          '<b>反向做法为什么致命：</b>如果你一次改完三个组件再刷机，失败时你这三层全都处于未知状态。而每一次「改代码 → 编译 → 刷入 → 验证」的循环成本是以小时计的——<b>在有限时间里，你的循环次数就是最稀缺的资源，必须让每次循环只排除一个未知。</b>'
+      }
+    },
+
+    /* ================= 26.13 ================= */
+    {
+      h: '26.13',
+      title: '自测：把「秒脱」的账算清楚',
+      quiz: {
+        id: 'q12-4', chapter: 12, answer: 1,
+        stem: '课程演示用 FART14 在几分钟内脱掉了一个 DexProtector 加壳的 App。关于这件事，下面哪个理解是正确的？',
+        options: [
+          { t: '说明 DexProtector 的保护强度不如国产加固，所以能被快速脱掉', why: '把「快」归因于「目标弱」是最省事的解释，但也是错的。这属于臆测对手的实现与强度，而这个结论没有任何观测支持。' },
+          { t: '「几分钟」只覆盖了运行脱壳工具这一段；适配 Android 14（读源码、重定位脱壳点、编译刷入验证）的前期投入是以天/周计的，只是它发生在演示之前', why: '正确。这是本章最有价值的认知：秒脱是前期投入的利息。前期工作（尤其是「在 ART 源码里重新找到脱壳点」）才是真正的技术活。' },
+          { t: '因为 FART 是一次性写好的通用工具，一次适配就能长期使用', why: '与本章主线完全相反。FART 每个安卓大版本都要重新移植，这正是 Android 8 / 9 / 10 / 11+ / 12-14 那条时间轴要说明的事。' },
+          { t: '因为脱壳本质上是自动化流程，理解了原理之后工具会自动适配新版本', why: '归因错误。工具不会自动适配——ART 内部结构一变，插桩点就失效。每次适配都需要有人去读那一个版本的源码重新定位。' }
+        ],
+        explain: '<b>把「秒脱」的账算清楚，是本章的收束。</b><br><br>' +
+          '演示现场你看到的是：装 App → 启动 → 主动调用循环跑完 → 取产物 → 反编译。这部分确实只要几分钟。<br>' +
+          '但你没看到的是之前发生的事：<b>确定目标版本、下载对应 AOSP 源码、读 ART 源码重新定位 dex 加载点与 code item 回填点、把三个组件的插桩挪过去对齐、编译、刷入、反复验证</b>——这就是 26.5 节的六步链路，以天甚至周计。<br><br>' +
+          '<b>所以正确的结论有两层：</b><br>' +
+          '① <b>技术难度没有消失，只是被前置了。</b>「秒脱」不是「简单」，而是「难的部分已经做完了」。<br>' +
+          '② <b>这个前置投入会过期，但能力不会。</b>FART14 只对 Android 14 那一档有效，下一个大版本到来时又要重来一遍；可每一次重来，你依赖的都是同一套能力——<b>读 ART 源码、找到语义事件、重新定位脱壳点</b>。这套能力从 Android 6 用到 14，大概率还能再用十年。<br><br>' +
+          '<b>这就是本章最想留给你的一句话：逆向的护城河在于原理理解，不在于工具收藏。</b>收藏工具的人，每次系统升级都要重新找工具；理解原理的人，每次系统升级只是重新做一遍他早就会做的事。'
       }
     }
   ],
-
   glossary: [
-    { t: '四大组件', d: 'Activity（界面）、Service（无界面后台）、BroadcastReceiver（接收广播）、ContentProvider（跨进程数据共享）。它们必须在 AndroidManifest.xml 中显式声明，系统只认识组件，不认识你的业务逻辑。' },
-    { t: '组件导出（exported）', d: '决定"别的 App 能不能唤起这个组件"。历史规则是"带 intent-filter 就默认导出"，Android 12 起带 intent-filter 的组件必须显式声明该属性。它同时是攻击面与逆向入口。' },
-    { t: 'Activity 生命周期', d: 'onCreate → onStart → onResume → onPause → onStop → onDestroy，从 Stop 回到前台时经过 onRestart。它不是直线而是可被打断的状态机；onDestroy 不保证被调用；配置变化会触发销毁重建。' },
-    { t: 'configChanges 与销毁重建', d: '默认情况下屏幕旋转等配置变化会销毁并重建 Activity，导致 onCreate 被再次调用。声明 android:configChanges 可自行处理。这是"onCreate 跑了两次"最常见的原因。' },
-    { t: 'ContentProvider 的创建时机', d: '它的 onCreate 早于 Application.onCreate——因为系统要先装好"对外提供的能力"，才认为进程准备好了。想抢占最早执行时机（加固、SDK 自动初始化）常用它。' },
-    { t: 'Service 与线程', d: 'Service 解决的是"生命周期长"，不是"跑在哪个线程"。它的生命周期回调默认由主线程 Looper 调度，因此在其回调里做耗时操作同样会 ANR。' },
-    { t: 'startService 与 bindService', d: '前者由 stopService/stopSelf 结束，与调用方死活无关；后者在最后一个客户端解绑时自动销毁。两者混用时必须既 stop 又 unbind 才会销毁——这是"Service 永不退出"的常见原因。' },
-    { t: 'Looper', d: '线程的消息循环，每个线程最多一个，存在 ThreadLocal 中。主线程的在 ActivityThread.main 里由 prepareMainLooper() 创建，随后立即进入 loop() 死循环。' },
-    { t: 'MessageQueue', d: '按 when（绝对时间戳）排序的单链表，不是普通队列。因此"谁先执行"取决于时间戳而非入队顺序；when 相同的按入队先后。' },
-    { t: 'Handler', d: '消息的发送者与处理者，构造时绑定一个 Looper。post(Runnable) 与 sendMessage 走同一条路（前者把 Runnable 放进 Message.callback）。分发优先级：msg.callback → Handler.Callback → handleMessage。' },
-    { t: 'sendMessageAtFrontOfQueue', d: '把消息直接插到队列头部，是消息队列里唯一能"插队"的手段。框架用它保证高优先级事件（如同步屏障后的异步消息）不被饿死，滥用会让正常消息排不上队。' },
-    { t: 'ANR', d: 'Application Not Responding。机制是：主线程在处理某条消息时耗时过久，导致后续消息（尤其是用户输入事件）超过阈值未被处理。根因永远可归结为"某个回调在主线程上执行太久"。' },
-    { t: 'Binder', d: 'Android 的跨进程通信机制。物理落点是对 /dev/binder 做 ioctl；调用方的 UID/PID 由内核填入、不可伪造。它只做一次数据拷贝（通过内存映射）。' },
-    { t: 'BinderProxy / Stub', d: '客户端侧的代理与服务端的实现基类。asInterface(IBinder) 是分叉点：同进程返回本地 Stub（不走 Binder），跨进程返回 Proxy（走 transact）。' },
-    { t: 'transact / onTransact', d: 'Binder 的调用入口与分发入口。前者发送（code + Parcel + flags），后者按 code 分发到具体方法。code 是整数编号，是"编号→方法"映射表的所在。' },
-    { t: 'Parcel', d: 'Binder 的序列化容器。参数按写入顺序读出，有位置指针，读写顺序必须严格一致。Binder 事务有大小上限（约 1MB 量级且进程内共享），超限抛 TransactionTooLargeException。' },
-    { t: 'oneway', d: '不等待回复的 Binder 调用（FLAG_ONEWAY）。没有返回值、跨进程不保证顺序、不保证送达。用于不需要结果的单向通知。' },
-    { t: 'Binder 线程池', d: '服务端处理 Binder 事务的线程来源，不是服务端主线程。这决定了"在服务端下钩子时，代码跑在哪个线程上"。' },
-    { t: 'AIDL', d: '接口定义语言。构建时生成 Stub（服务端）与 Stub.Proxy（客户端），把跨进程调用封装成看起来像普通方法调用的形式。' },
-    { t: '动态加载只认 dex', d: 'Android 类加载器加载的是 dex，不是 JVM 字节码。javac 产出 .class 后必须经 d8（旧版 dx）转成 classes.dex。所谓"能被安卓动态加载的 jar"，实质是一个内含 classes.dex 的 zip。' },
-    { t: 'DexClassLoader', d: '可加载任意路径 dex/jar/apk 的类加载器，是插件化与加固壳的核心手段。参数包括 dex 路径、优化目录（新版本已忽略）、so 搜索路径、父加载器。' },
-    { t: 'InMemoryDexClassLoader', d: '直接从内存中的 ByteBuffer 加载 dex，不落盘。因此"去文件系统找解密后的 dex"这条路对它无效，必须 dump 内存。' },
-    { t: '存储沙箱的三次转折', d: '分区存储之前（可读写整张 sdcard）→ Android 10 引入分区存储（可用 requestLegacyExternalStorage 临时退回）→ Android 11 起强制分区存储（需 MediaStore 或「所有文件访问权限」）。具体分界以官方文档为准。' },
-    { t: 'W^X 与可执行目录限制', d: '较新 Android 版本禁止 App 从可写目录执行本地代码，因此"把 so 放 sdcard 再 dlopen"在新系统上会失败。分析此类方案前必须先确认目标版本是否还允许。' }
+    { t: 'FART', d: '基于 ART 的安卓脱壳工具，核心由三块组成：dex 文件 dump、code item dump（含主动调用）、修复组件。原始实现基于 Android 6.0，后续版本由社区与个人持续移植。' },
+    { t: 'ART 移植', d: '把为某个安卓版本编写的 ART 内部插桩代码，适配到另一个版本上的过程。本质工作是读对应版本 AOSP 源码、重新定位脱壳点、对齐接口与结构、重新编译刷入。' },
+    { t: '脱壳点', d: '插桩代码所依附的 ART 内部位置。不是一个固定函数名，而是一个语义事件——例如「dex 加载完成」「方法体 code item 回填完成」。函数名随版本变，语义事件不变。' },
+    { t: 'CompactDex', d: 'Android 9 引入的 dex 变体，为节省内存而优化，指令操作数被重新编码。若 dump 到的是它，需要额外转换处理，否则产物无法正常反编译。' },
+    { t: 'CodeItemDataAccessor', d: 'Android 11+ 一类用于访问方法体（code item）的辅助结构 <span class="pill warn">名称与职责待核实</span>。它标志着 ART 把内部字段逐步封装、不再允许直读的趋势。' },
+    { t: '主动调用（invoke）', d: 'FART 的核心机制：遍历所有方法并逐个强制执行，用「必须执行就必须有方法体」这一因果，逼迫 ART / 壳把被抽取的 code item 回填到内存，再趁机 dump。' },
+    { t: '抽取壳', d: '加壳时把方法体从 dex 中抽走，只在方法真正执行前由壳解密填回。它的 dex 结构完整（类名、方法名都在），但方法体为空 —— 因此必须先触发回填才能脱。' },
+    { t: 'VMP（虚拟化保护）', d: '把关键方法的原始指令翻译成自定义字节码，由内置解释器执行。此时方法体不再是 dex 指令，基于 dex 的脱壳工具会直接失效，需改用第 20 章的技术或走动态 Trace 绕过。' },
+    { t: 'DexProtector', d: '国外知名商业加固方案，保护手段通常包括 dex 加密、抽取、方法虚拟化、反调试、完整性校验、反 Frida 检测等。实现闭源，公开资料有限，具体内部机制不可臆测。' },
+    { t: '秒脱', d: '指面对一个新壳 App 时几分钟内拿到产物。快的来源不是技术简单，而是「适配目标系统版本」这项前期工作已经提前完成。' },
+    { t: 'init_boot 分区', d: 'Android 12 引入的分区变化，ramdisk 的归属发生调整，导致刷入方式随之改变 —— 属于「只有交付方式变了、插桩逻辑不用动」的那一类版本演进。' },
+    { t: '前期投入 vs 后期效率', d: '本章的核心认知模型：读源码、找脱壳点、适配编译是以天/周计的投入，且会随版本过期；但由此获得的原理理解可以迁移，换来的是面对新壳时的分钟级效率。' }
   ],
-
   teacher: {
-    id: 't26', chapter: 26,
-    name: '教你重新认识安卓的老兵',
-    sub: '你写的每一行代码，都是被系统叫起来才跑的',
-    intro:
-      '<p>很多人做了一两年逆向，对加固、混淆、脱壳如数家珍，<b>但说不清一个 Activity 是怎么被拉起来的。</b></p>' +
-      '<p>这不是知识缺口的问题——<b>这是坐标系的问题。</b>不知道坐标系，你所有的"下钩子"都只能靠试；' +
-      '有了坐标系，你会先问"这段代码是被谁、在什么时候、在哪个线程上调起来的"，然后钩子自己就浮出来了。</p>' +
-      '<p>我要问的就是坐标系。答不上来可以要提示，但提示不算过关。</p>',
+    id: 'ch12', chapter: 12,
+    name: '追问老师 · 第 26 章',
+    sub: '拷问你对「版本演进」与「脱壳点重定位」的理解是否真的成立',
+    intro: '<p style="margin:0">这一章最容易产生一种虚假的掌握感：看完了时间轴、看懂了对照表，就以为「我会移植 FART 了」。下面五个问题会逐步逼你回到原理层——尤其后两题，如果你只会背「Android 10 改了 ArtMethod」，是答不上来的。</p>',
     questions: [
       {
-        id: 'c26q1', depth: 1, threshold: 0.7,
-        q: '用你自己的话说清楚：<b>为什么说"安卓 App 不是从头执行到尾的程序"？</b>' +
-          '这对逆向意味着什么？',
+        id: 'c12q1', depth: 1, threshold: 0.7,
+        q: '为什么一个在 Android 10 上跑得好好的 FART，换到 Android 14 上就不工作了？请从「脱壳点是怎么确定的」这个角度回答。',
         concepts: [
-          { label: 'App 的进程是被 Zygote fork 出来的，不是自己启动的；fork 让它继承了预加载的类库与资源',
-            hint: 'App 的进程是怎么来的？',
-            any: ['fork', 'zygote', '孵化', '继承', '预加载', '不是 exec', '派生', '复制'] },
-          { label: '唯一的 main（ActivityThread.main）跑起来后立刻进入 Looper.loop()，之后处于"等消息"状态',
-            hint: '那个 main 函数做了什么之后就再也不返回了？',
-            any: ['looper', 'loop', '消息循环', '死循环', '等消息', 'activitythread', '消息队列', '事件驱动'] },
-          { label: '业务代码是被回调驱动的：没有系统/事件来调，它一行都不跑',
-            hint: '你的代码什么时候才会执行？',
-            any: ['回调', '被调用', '事件', '驱动', '系统调用', '没人调就不跑', '被动', '被拉起', '按需'] },
-          { label: '逆向意义：每个"唤起点"都是一个稳定的下钩位置，不必在几十万行里盲找',
-            hint: '这个模型对"该 hook 哪里"有什么帮助？',
-            any: ['下钩', 'hook 点', '钩子', '唤起点', '入口', '稳定', '不用盲找', '定位', '观测点'] },
-          { label: '逆向意义：组件的生死由系统决定，所以"运行环境"不是你能假定的',
-            hint: '谁决定这个进程什么时候死？',
-            any: ['系统决定', '随时被杀', '内存压力', '不保证', '生命周期由系统', '低内存', '被回收'] }
+          { label: 'ART 内部结构随版本持续演进', hint: 'ART 本身是活的代码，它每个大版本都在动吗？', any: ['ART 内部结构', '内部结构', '结构变化', '结构变了', '版本差异', '持续演进', '不断变化', '每个版本都在变', '源码变化', '结构演进', 'art 变了', 'art 在变'] },
+          { label: '脱壳点必须重新定位', hint: '插桩的位置是由什么决定的？那个东西变了会怎样？', any: ['脱壳点', '重新定位', '重新找', '插桩点', 'hook 点', 'hook点', '定位脱壳点', '重定位', '找点位', '插桩位置', '重新插', '点位变了'] },
+          { label: 'FART 是插进 ART 内部的探针，依赖运行时结构', hint: 'FART 不是独立进程，它是嵌在哪里的代码？', any: ['插桩', '探针', '依赖 ART', '依赖art', '嵌入', '运行时结构', '插进 ART', '侵入', '改 art', '改源码'] },
+          { label: '所以要读对应版本的 AOSP 源码', hint: '那你怎么知道新版本该插在哪里？', any: ['AOSP', 'aosp', '源码', '读源码', '看源码', 'art 源码', 'source', '对着源码'] }
         ],
         hints: [
-          '先从进程的诞生说起：它是被"新建"的，还是被"复制"出来的？',
-          '再想那个唯一的 main：它执行完之后，程序结束了吗？'
+          '先想清楚：FART 的代码是「跑在 ART 外面」还是「嵌在 ART 里面」？',
+          '插桩的位置不是一个固定地址，它是被什么决定的？那个东西在版本之间稳定吗？'
         ],
         probes: [
-          '追问：既然业务代码都是被回调驱动的，那"App 一启动就执行的代码"到底挂在哪里？你能说出至少三个位置吗？',
-          '再追问：onDestroy 不保证被调用这件事，会怎么影响"退出时清理"这类设计？'
+          '你说要重新定位脱壳点——那具体要找的是什么？是一个函数名，还是别的东西？',
+          '如果原来的函数改了名、甚至搬到了别的文件里，你怎么在新源码里把它认出来？'
         ],
-        model: '<b>一、进程层面的真相：它是被"复制"出来的</b><br><br>' +
-          '安卓 App 的进程<b>不是被 <span class="mono">exec</span> 起来的，而是被 Zygote <span class="mono">fork</span> 出来的</b>。' +
-          'Zygote 在系统启动时就把框架类库、常用资源预加载好了，' +
-          '<b>fork 出来的子进程直接继承这一整套内存</b>。<br><br>' +
-          '这一条同时解释了两件事：<br>' +
-          '· <b>为什么安卓 App 能"秒开"</b>——不需要重新加载一遍系统类；<br>' +
-          '· <b>为什么 Zygote 是所有 App 的共同祖先</b>——所以第 22 章的 LSPosed 只要在 Zygote 里注入，' +
-          '就能对之后启动的每一个 App 生效。<br><br>' +
-          '<b>二、执行层面的真相：main 是一句死循环</b><br><br>' +
-          'App 确实有一个 <span class="mono">main</span>（<span class="mono">ActivityThread.main</span>），' +
-          '但它做的事是：<span class="mono">prepareMainLooper()</span> 建好主线程的消息队列 → ' +
-          '把 <span class="mono">ApplicationThread</span> 注册给 AMS → 然后 <b><span class="mono">Looper.loop()</span> 进入死循环</b>。<br>' +
-          '<span class="hit">从那一刻起，这个进程就在"等消息"，而不是在"执行你的逻辑"。</span><br><br>' +
-          '<b>三、所以你的代码是被"叫"起来跑的</b><br><br>' +
-          '界面上的一次点击、系统的一次广播、另一个进程通过 Binder 的一次调用、' +
-          '一条延迟消息到期……<b>这些才是你代码的执行起点。</b>' +
-          '没有它们，你的代码一行都不会跑。<br><br>' +
-          '<b>四、这对逆向意味着什么（三条）</b><br><br>' +
-          '<b>① "该 hook 哪里"这个问题有了系统性的答案。</b>既然代码是被唤起点调起来的，' +
-          '那么<b>每一个唤起点都是一个稳定的下钩位置</b>：' +
-          '组件入口（<span class="mono">onCreate</span> / <span class="mono">onStartCommand</span> / <span class="mono">onReceive</span> / <span class="mono">query</span>）、' +
-          '消息分发、Binder 调用、生命周期回调。<br>' +
-          '<span class="hit">你不需要在几十万行代码里盲找——先问"这个功能是由什么事件触发的"，钩子自己就浮出来了。</span><br><br>' +
-          '<b>② 运行环境是你不能假定的。</b>组件什么时候被创建、什么时候被销毁，' +
-          '<b>由系统按内存压力和用户行为决定</b>，不由你决定。' +
-          '所以 <span class="mono">onDestroy</span> 可能不来、进程可能被无声杀掉、' +
-          '旋转屏幕可能让 onCreate 再跑一遍。<br>' +
-          '<b>逆向上的后果：</b>不要因为"逻辑上它应该执行过"就断定它执行过——' +
-          '<b>要去看证据。</b><br><br>' +
-          '<b>③ 早期时机比你想的更早。</b>因为进程是 fork 出来的，' +
-          '<span class="mono">ContentProvider.onCreate</span> 早于 <span class="mono">Application.onCreate</span>，' +
-          '而 <span class="mono">attachBaseContext</span> 更早。<br>' +
-          '<span class="hit">这就是加固壳为什么抢那些位置——它们比"业务代码的起点"更靠前。' +
-          '而你的钩子如果装在业务层，就永远慢一步。</span>',
-        after:
-          '<p><b>如果你的追问答案是"三个位置"，这里对一下：</b>' +
-          '① <span class="mono">attachBaseContext</span>（最早，拿到 Context）；' +
-          '② <span class="mono">ContentProvider.onCreate</span>（早于 Application，很多人不知道）；' +
-          '③ <span class="mono">Application.onCreate</span>（常规位置）。' +
-          '<span class="hit">还有第 ④ 个：so 的 ELF 构造函数（<span class="mono">.init_array</span>）——' +
-          '那比上面三个都早，因为它在 dlopen 时就跑了（第 20.1 节）。</span></p>'
+        model: 'FART 不是一个跑在 App 外面的独立工具，它是<b>嵌进 ART 运行时里面的一段插桩代码</b>：在 dex 加载完成的那个点上把完整 dex 落盘，在方法体（code item）回填的那个点上把它 dump 出来。所以「脱壳点插在哪里」这件事，<b>完全由 ART 的内部结构决定</b>——不是由 FART 的作者决定的，也不是由一个可以背下来的地址决定的。<br><br>' +
+          '而 ART 的内部结构，从 Android 5 到 14 就没有停过。可以粗分为几种变化类型：<b>加载路径变了</b>（Android 8 的 DexFile 结构重构、ClassLinker 接口调整；Android 10 出现新的 dex 加载路径）——原来 hook 的那个函数可能改名、换签名、甚至搬家；<b>结构布局变了</b>（Android 10 为支持 hidden API 策略调整 ArtMethod；Android 11+ 把部分信息移到 CodeItemDataAccessor 一类的辅助结构里）——原来直接读字段的写法直接失效；<b>产物格式变了</b>（Android 9 引入 CompactDex，指令操作数被重新编码）——dump 出来的东西不再是标准 dex；<b>只有交付方式变了</b>（Android 12 引入 init_boot 分区）——插桩逻辑不用动，但刷入方式要改。<br><br>' +
+          '所以「FART 10 换到 14 就不工作」不是运气问题，<b>是必然</b>。这也正是移植的本质工作：<b>打开对应版本的 AOSP 源码，找到「dex 什么时候加载完」「方法体什么时候回填」这两个语义事件在这一版代码里的位置，把插桩挪过去。</b>版本会变、名字会变，但这两个问题是永恒的——会问这两个问题的人，永远能在新版本上重建 FART。',
+        after: '<p>如果你只答出「ART 变了所以要改」，那是一句废话；<b>真正要能说出的是「变的是哪一层，所以我要重新找的是什么」</b>。</p>'
       },
       {
-        id: 'c26q2', depth: 1, threshold: 0.7,
-        q: '<b>Service 到底是不是"后台线程"？</b>请说清它的真实性质，以及这个误解会怎么坑到你。',
+        id: 'c12q2', depth: 1, threshold: 0.7,
+        q: 'FART 的核心组件可以拆成三块。请说出这三块分别是什么，并指出<b>哪一块的版本差异最大、为什么</b>。',
         concepts: [
-          { label: 'Service 不是线程，它是组件；它的生命周期回调默认由主线程 Looper 调度',
-            hint: '它的回调跑在哪个线程上？',
-            any: ['不是线程', '组件', '主线程', 'ui线程', 'looper', '主线程调度', '同一个线程'] },
-          { label: 'Service 解决的问题是"生命周期长"，不是"不阻塞主线程"',
-            hint: '它存在的意义是什么？',
-            any: ['生命周期', '长期运行', '常驻', '存活', '长命', '与界面无关', '不是并发', '不是异步'] },
-          { label: '在 Service 里做耗时操作照样会 ANR，和在 Activity 里一样',
-            hint: '那会有什么后果？',
-            any: ['anr', '卡死', '阻塞', '无响应', '一样会', '同样', '超时'] },
-          { label: '要真正在后台干活必须自己开线程 / 线程池 / 用 JobScheduler 一类',
-            hint: '那正确做法是什么？',
-            any: ['开线程', '子线程', 'thread', '线程池', 'executors', 'jobservice', 'jobscheduler', 'workmanager', 'coroutine', '协程', 'intentservice'] },
-          { label: '逆向意义：不能因为"它在 Service 里"就排除"这段代码跑在主线程上"',
-            hint: '这对分析线程有什么影响？',
-            any: ['不能排除', '主线程', '线程判断', '误判', '跑在主线程', '排查', '线程假设'] }
+          { label: 'dex 文件 dump（在加载完成处落盘完整 dex）', hint: '第一块负责把什么完整地拿出来？在什么时机？', any: ['dex 文件 dump', 'dump dex', 'dex dump', 'dex文件', '整体 dump', '导出 dex', '内存 dump', '第一块', '①'] },
+          { label: 'code item dump（含主动调用）', hint: '第二块要拿到的是「方法」的哪一部分？靠什么手段？', any: ['code item', 'codeitem', '方法体', '主动调用', 'invoke', '遍历方法', '方法 dump', '第二块', '②'] },
+          { label: '修复组件（合并回 dex、修正头与 map 段）', hint: 'dump 出来的碎片怎么变成能反编译的成品？', any: ['修复', '修复组件', '合并', '文件头', 'map 段', 'map段', '重建 dex', '修正', '第三块', '③'] },
+          { label: '主动调用那一块版本差异最大，因为它直接依赖 ArtMethod 的内存布局', hint: '哪一块必须「直接读内存里的结构体字段」？', any: ['ArtMethod', 'artmethod', '方法体那块', '最不稳定', '版本差异最大', '内存布局', '主动调用那块', '取方法体'] }
         ],
         hints: [
-          'Service 的 onStartCommand / onBind 是谁调用的？那个调用者的线程是什么？',
-          '如果它真的跑在后台线程上，那"Service 里做耗时操作会 ANR"这件事还成立吗？'
+          '三块分别解决三个不同的问题：整体在哪、方法体在哪、碎片怎么拼回去。',
+          '同样是插桩，有的地方只是调用一个接口，有的地方要直接读结构体字段——哪种更脆弱？'
         ],
         probes: [
-          '追问：既然 Service 在主线程上，那它到底解决了什么问题？为什么还需要它？',
-          '再追问：如果我要在后台做一件真正耗时的活，正确做法是什么？'
+          '你说第二块最难——具体难在「遍历」这一步，还是难在「取方法体」这一步？',
+          '如果只能先让一块跑通，你会先让哪一块跑通？为什么？'
         ],
-        model: '<b>结论先行：Service 是组件，不是线程；它的回调跑在主线程上。</b><br><br>' +
-          '<b>为什么会误解：</b>名字叫 Service、文档说"后台工作"、' +
-          '看上去"没有界面所以应该在后台跑"——这三个印象叠起来，就形成了错误的直觉。<br>' +
-          '<b>但"后台"在这里指的是"没有界面"，而不是"不在主线程"。</b><br><br>' +
-          '<b>机制上的原因：</b>Service 的生命周期回调' +
-          '（<span class="mono">onCreate</span> / <span class="mono">onStartCommand</span> / <span class="mono">onBind</span> / <span class="mono">onDestroy</span>）' +
-          '是<b>系统通过主线程的消息队列投递进来的</b>——和 Activity 的生命周期回调走的是同一个 Looper。<br>' +
-          '所以：<b>在主线程上做耗时操作会 ANR，这件事在 Service 里一模一样。</b><br><br>' +
-          '<b>那 Service 到底解决什么：</b>它解决的是<b>"这段逻辑不属于任何一个界面，而且要比界面活得久"</b>。<br>' +
-          '· Activity 会随用户操作被销毁，Service 不会（除非你或系统结束它）；<br>' +
-          '· 所以"下载""播放""心跳上报"这类需要跨界面持续存在的任务适合放在 Service 里。<br>' +
-          '<b>但它提供的只是"生命周期"，不提供"并发"。</b>这两件事必须分清楚。<br><br>' +
-          '<b>正确做法：</b>耗时逻辑要自己开子线程/线程池；' +
-          '或者用 <span class="mono">IntentService</span>（内部自带工作线程，但已有更新替代方案）、' +
-          '<span class="mono">JobScheduler</span> / <span class="mono">WorkManager</span>（带系统调度与约束条件）、' +
-          '协程等。<b>Service 只负责"活着"，不负责"不占主线程"。</b><br><br>' +
-          '<b>这个误解怎么坑到逆向（两条）：</b><br>' +
-          '① <b>线程判断错，钩子白装。</b>如果你假设"Service 里的代码在子线程"，' +
-          '用了只对子线程生效的 hook 方式，或者反过来<b>排除了"它在主线程上"的可能</b>，' +
-          '你就会在错误的地方找答案。<br>' +
-          '② <b>排查 ANR 时找错方向。</b>看到 ANR 的栈在 Service 回调里，' +
-          '如果你以为"Service 是后台的所以不该卡主线程"，就会怀疑是别的原因（比如系统调度、Binder 阻塞），' +
-          '<span class="hit">而真正的答案就在眼前：<b>那段代码本身就在主线程上，它自己就是元凶。</b></span><br><br>' +
-          '<b>顺带补一条本章讲过的同类误解：</b>Binder 服务端的代码<b>也不在它自己的主线程上</b>——' +
-          '它跑在 Binder 线程池里。<span class="hit">所以"在哪一层"和"在哪个线程"，永远是两个独立的问题。</span>'
+        model: 'FART 的三块组件，对应脱壳要回答的三个问题：<br><br>' +
+          '<b>① dex 文件 dump</b>——回答「整体在哪」。在 DexFile 完成映射/加载的那个点上，把内存里结构完整的 dex 落盘。需要适配的是 DexFile 的构造、Open 系列方法，或者这一版新的加载入口（随版本变化）。<br><br>' +
+          '<b>② code item dump（含主动调用）</b>——回答「方法体在哪、怎么拿到」。遍历所有类与所有方法，逐个触发调用以强制回填，然后 dump 方法体。需要适配三件事：怎么遍历 DexFile 里的 ClassDef、怎么拿到方法的 code_item、以及 <b>ArtMethod 的字段布局</b>。<br><br>' +
+          '<b>③ 修复组件</b>——回答「碎片怎么拼回去」。把 dump 出的方法体合并回 dex，修正文件头与 map 段，产出反编译器能打开的成品。dex 格式本身相对稳定，但 CompactDex 这类变体需要额外处理。<br><br>' +
+          '<b>版本差异最大的是 ②，因为它直接踩在 ArtMethod 的内存布局上。</b>① 依赖的是「加载路径」，路径再改，你要找的语义事件（dex 加载完成）总归只在少数几个地方；③ 依赖的是 dex 格式规范，那是公开且稳定的东西。<b>只有 ② 是拿内存里结构体的字节布局说话的</b>——而 ArtMethod 从 Android 10（为 hidden API 策略调整）到 Android 11+（部分信息移到 CodeItemDataAccessor 一类辅助结构）一直在动。<br><br>' +
+          '<b>实用推论：移植时把大部分时间留给 ②。</b>典型失败场景不是「dump 不出 dex」，而是「dex dump 出来了，方法体全是空的」。'
       },
       {
-        id: 'c26q3', depth: 2, threshold: 0.7,
-        q: '你的 Frida 脚本报告 hook 装上了，但目标方法<b>一次都没被调用</b>。' +
-          '<b>请用本章的知识，给出至少三种与"进程/时机/线程"有关的解释，并说明各自的验证方法。</b>',
+        id: 'c12q3', depth: 2, threshold: 0.75,
+        q: 'FART 为什么要费大力气去「主动调用」每一个方法？为什么不能等壳自己把方法体解密好，然后被动 dump？',
         concepts: [
-          { label: '进程不对：目标逻辑在别的进程（android:process=":remote"），而你的注入只针对一个进程',
-            hint: '一个 App 一定只有一个进程吗？',
-            any: ['多进程', '进程', 'remote', 'android:process', '别的进程', '独立进程', '进程不对', '冒号'] },
-          { label: '时机不对：代码跑在更早的回调里（ContentProvider.onCreate 早于 Application.onCreate，attachBaseContext 更早）',
-            hint: '有没有比 Application.onCreate 更早的回调？',
-            any: ['时机', '更早', 'contentprovider', 'provider', 'attachbasecontext', '早了', '注册晚了', '提前'] },
-          { label: '线程不对：代码在别的线程上（native 自建线程 / Binder 线程池 / 子线程），你的钩子挂在另一条路径上',
-            hint: '线程也会让钩子落空吗？',
-            any: ['线程', '子线程', 'binder线程', 'native线程', '另一个线程', '线程不对', '线程池'] },
-          { label: '代码在别的进程里执行（Binder 的另一侧，如 system_server），本进程只能看到客户端这一侧',
-            hint: 'Binder 调用的另一半在哪？',
-            any: ['binder', 'system_server', '服务端', '另一个进程', '跨进程', '另一半', '客户端侧'] },
-          { label: '验证方法：把钩子提前（spawn / attachBaseContext / hook dlopen），并打印进程与线程 id',
-            hint: '怎么区分这几种原因？',
-            any: ['spawn', '提前', 'attachbasecontext', 'dlopen', '打印进程', '线程id', 'pid', 'tid', '观测', '计数', 'frida-ps'] },
-          { label: '验证方法：用 frida-ps 或 ps 看进程列表，确认有没有带冒号后缀的进程',
-            hint: '怎么确认"是不是多进程"？',
-            any: ['frida-ps', 'ps', '进程列表', '列出进程', '冒号', '有没有另一个进程', '枚举进程'] }
+          { label: '抽取壳只在方法真正执行前才回填方法体', hint: '壳把方法体抽走后，是什么时候、因为什么原因才把它填回去？', any: ['抽取', '抽取壳', '按需', '用到才解密', '执行前', '回填', '懒加载', '延迟解密', '要用才填', '被动'] },
+          { label: '没被执行的方法永远不会回填', hint: 'App 启动路径会覆盖到全部方法吗？', any: ['不执行', '没执行', '未执行', '永远不会', '不会被调用', '启动路径', '覆盖率', '跑不到', '走不到', '用不到'] },
+          { label: '主动调用强制触发回填', hint: '既然等不到，那就只能怎么办？', any: ['主动调用', 'invoke', '强制执行', '遍历调用', '逼它', '触发', '全量调用', '挨个调用'] },
+          { label: '调用是手段，回填才是目的', hint: '你调用这些方法，是为了执行 App 的业务逻辑吗？', any: ['手段', '目的', '副作用', '目的不是执行', '不是为了执行', '只为触发', '不关心结果'] }
         ],
         hints: [
-          '先不要怀疑"我钩子写错了"——"装上了"已经排除了这一点。那还有什么会让代码"不在你的观测范围内"？',
-          '从三个维度各想一个：它在哪个进程、它在什么时刻、它在哪条线程。'
+          '壳不是「一次性把方法体全解密」，它是「什么时候需要，什么时候解密」——那没被需要的方法会怎样？',
+          '你现在被动等它，等价于赌「App 会执行到所有方法」，这个赌注成立吗？'
         ],
         probes: [
-          '追问：如果确认是多进程，你的下一步是什么？把钩子装到另一个进程有什么额外成本？',
-          '再追问：如果代码确实在 system_server 里，你还想观测这次调用，你能做的最近的一件事是什么？'
+          '如果某个方法被调用了但抛了异常，它算不算「已经回填」？这对你的 dump 完整度意味着什么？',
+          '主动调用循环的复杂度是「类数 × 方法数」，这意味着什么代价？这个代价换来了什么？'
         ],
-        model: '<b>前提读对：</b>"hook 装上了"说明地址解析成功、注入成功，<b>不是工具问题</b>；' +
-          '"从未命中"说明<b>这段代码在你观测期间没有执行</b>。<br>' +
-          '把它拆成三个维度：<b>进程 / 时机 / 线程</b>。<br><br>' +
-          '<b>① 进程不对（多进程）</b><br>' +
-          '一个 App 可以有多个进程（<span class="mono">android:process</span>），' +
-          '风控、推送、插件化常用。<b>进程之间不共享内存</b>，所以你的注入只影响你注入的那一个。<br>' +
-          '<b>验证：</b><span class="mono">frida-ps -U | grep 包名</span> 看有没有带冒号后缀的进程；' +
-          '或者进 adb shell 看 <span class="mono">ps -A</span>。<br>' +
-          '<span class="hit">这条的"额外成本"是：你要在每个目标进程里各注入一次，而且进程间通信的观测点要重新布。</span><br><br>' +
-          '<b>② 时机不对（跑得比你早）</b><br>' +
-          '本章的重点之一：<b><span class="mono">attachBaseContext</span> → <span class="mono">ContentProvider.onCreate</span> → ' +
-          '<span class="mono">Application.onCreate</span> → <span class="mono">Activity.onCreate</span></b>。<br>' +
-          '如果你把钩子装在 <span class="mono">Application.onCreate</span>，' +
-          '而目标在 <span class="mono">ContentProvider.onCreate</span> 里——<b>你已经慢了整整一步</b>。<br>' +
-          '再往前还有 <span class="mono">.init_array</span>（so 的 ELF 构造函数，dlopen 时就跑）。<br>' +
-          '<b>验证 / 对策：</b>改用 <span class="mono">spawn</span> 模式（在 App 主线程跑起来之前注入）；' +
-          '或者把钩子提前到 <span class="mono">attachBaseContext</span>；' +
-          '或者 hook <span class="mono">dlopen</span> 在模块加载那一刻就位。<br><br>' +
-          '<b>③ 线程不对</b><br>' +
-          '代码可能跑在：<b>native 自建线程</b>（心跳、上报、检测）；' +
-          '<b>Binder 线程池</b>（服务端事务处理）；普通子线程。<br>' +
-          '如果你的钩子挂在"主线程的某条路径"上，而这些代码走的是另一条线程，就永远等不到。<br>' +
-          '<b>验证：</b>在钩子相关的路径上打印 <span class="mono">Process.getCurrentThreadId()</span>；' +
-          '观察 <span class="mono">AttachCurrentThread</span> 有没有被调用（native 线程要调 Java 必须先附着，' +
-          '这是一个很灵的旁证）。<br><br>' +
-          '<b>④ 补充一条：代码在别的进程里（Binder 的另一侧）</b><br>' +
-          '这一条严格说属于"进程不对"，但机制不同：<b>你想 hook 的那个方法，实现根本不在这个进程里。</b><br>' +
-          '比如你想 hook 某个系统服务的方法——它在 <span class="mono">system_server</span> 里，' +
-          '你通常没有权限注入那个进程。<br>' +
-          '<b>能做的：</b>退回到客户端这一侧——hook <span class="mono">BinderProxy.transact</span> 观察/修改参数，' +
-          '或者 hook <span class="mono">asInterface</span> 看它是本地对象还是远程代理。<br>' +
-          '<span class="hit">本章 26.14 的案例做的就是这件事：既然进不去服务端，<b>就把客户端这一侧的所有 Binder 事务拦下来。</b></span><br><br>' +
-          '<b>统一的方法论：先加观测点，再猜原因。</b><br>' +
-          '把这几件事一起做，成本不到十分钟，却能一次性区分开：<br>' +
-          '· <span class="mono">frida-ps</span> 列进程 → 排除多进程；<br>' +
-          '· 在钩子里打印 pid / tid → 排除线程；<br>' +
-          '· 在 <span class="mono">attachBaseContext</span>、<span class="mono">ContentProvider.onCreate</span>、' +
-          '<span class="mono">dlopen</span> 各下一个"路过就打印"的探针 → 排除时机；<br>' +
-          '· 加一个命中计数器 → 区分"真的没执行"和"执行了但你的日志没打出来"。<br>' +
-          '<span class="hit">"装上了但零命中"根本不是一个谜题，它是一个可以被四个观测点分开的问题。</span>',
-        after:
-          '<p><b>再给一条本章特有的排查顺序建议：</b>先查<b>进程</b>（最便宜，一条命令），' +
-          '再查<b>时机</b>（改一下注入模式），最后查<b>线程</b>（要加打印）。<br>' +
-          '<span class="hit">顺序依据是"验证成本"，不是"发生概率"——因为最便宜的那个往往也是高频原因。</span></p>'
+        model: '<b>因为你要脱的是抽取壳，而抽取壳的解密是「按需」的。</b><br><br>' +
+          '先用一个反例把问题说清楚：如果是<b>一代壳</b>（整体加密、启动时一次性解密到内存），那么内存里那份 dex 结构完整、方法体齐全，你确实可以被动 dump，什么都不用做。但<b>抽取壳</b>不同：加固厂商在加壳阶段就把方法体（code item）从 dex 里抽走了，dex 只剩下骨架——类名、方法名、字段都在，<b>唯独方法体是空的</b>。壳只在某个方法<b>真正要执行的前一刻</b>，才把它的方法体解密填回内存。<br><br>' +
+          '<b>这个机制决定了被动等待必然失败。</b>因为 App 启动时只会执行到一部分方法——那些冷门方法、异常分支、还没被触发到的功能路径，它们的 code item 永远不会回填。你等得再久，dump 出来的也是一份「有文件的空壳」。<br><br>' +
+          '<b>FART 的破法是把因果反过来用：</b>既然「方法要执行，就必须有方法体」，那我就<b>主动把每个方法都调用一遍</b>，用强制执行这个硬约束，逼 ART / 壳不得不把 code item 填回来。注意这里最重要的一点——<b>调用是手段，回填才是目的</b>。你根本不关心方法执行出什么结果，甚至不关心它抛不抛异常，你只要那个副作用：方法体出现在内存里。这也正是主动调用比「先找到壳的解密函数、再想办法调它」更工程化的地方：<b>你不需要理解壳的加密算法，你只需要让它不得不干活。</b><br><br>' +
+          '代价也很明确：三层循环意味着「类数 × 每类方法数」量级的调用次数，一个中等 App 就是几万次，耗时可观，而且调用失败或异常会被漏掉——这也解释了为什么脱完的 dex 里常有几个方法仍然反编译不出来。',
+        after: '<p>反过来记：<b>如果你看到的现象是「dex 完整但方法体大量为空」，那么「主动调用」就是唯一的正解</b>，而不是去调整 dump 时机。</p>'
       },
       {
-        id: 'c26q4', depth: 2, threshold: 0.7,
-        q: '<b>为什么说 Binder 调用"在底层就是一次 ioctl"？</b>' +
-          '这个事实给逆向带来哪两个具体后果？',
+        id: 'c12q4', depth: 2, threshold: 0.75,
+        q: '甲方丢给你一个从没见过的加固 App，只给你三天，要求「搞清签名算法」。请说出你的决策顺序，以及你会先做什么、为什么。',
         concepts: [
-          { label: 'Binder 的物理通道是字符设备 /dev/binder，通信通过对它做 ioctl 完成',
-            hint: 'Binder 通信具体是对哪个东西做什么操作？',
-            any: ['/dev/binder', 'binder设备', '字符设备', 'ioctl', '驱动', 'BINDER_WRITE_READ'] },
-          { label: '后果一：基于文件系统 syscall（open/read/write）的监控看不到 Binder 流量',
-            hint: '如果你只监控文件读写，能看到 Binder 吗？',
-            any: ['seccomp', '文件读写', 'open', 'read', 'write', 'syscall', '监控不到', '看不到', '绕过', '拦不到'] },
-          { label: '后果二：想观测或修改 Binder，就要在 ioctl 这一层（或更上层的 transact）下手',
-            hint: '那想观测 Binder 该在哪里下手？',
-            any: ['hook ioctl', 'libbinder', '拦截', '观测', 'transact', 'hook', 'GOT', '上一层'] },
-          { label: 'Binder 走 ioctl 而非 read/write，是它"高效"与"难被通用监控覆盖"的共同原因',
-            hint: '为什么它不走普通的读写？',
-            any: ['一次拷贝', 'mmap', '高效', '内存映射', '不是读写', '共享内存', '性能'] },
-          { label: '调用方的 UID/PID 由内核填入，不可伪造——这是 Binder 的安全性质',
-            hint: 'Binder 为什么比其它 IPC "安全"？',
-            any: ['uid', 'pid', '内核填入', '不可伪造', '身份', '安全', '内核态', '可信'] }
+          { label: '先判壳的类型（一代壳 / 抽取壳 / 有无 VMP）', hint: '路线完全取决于壳的类型，那第一步该干嘛？', any: ['判类型', '判断类型', '先判断', '壳类型', '分类', '判定', '识别', '是什么壳', '判断壳'] },
+          { label: '判类型的观察指标：dex 能否 dump、方法体是否为空、关键方法是否是自定义字节码', hint: '你靠什么现象来判断它属于哪一类？', any: ['方法体为空', '空的', 'dex 完整性', '能否 dump', '自定义字节码', '虚拟化', 'vmp 特征', '观察', '指标', '现象'] },
+          { label: '按目标倒推路线，不一定非要脱壳', hint: '甲方要的是「算法」还是「一份完整源码」？', any: ['目标', '需求', '倒推', '不一定要脱壳', '不一定脱壳', '黑盒', '拿结果', '输入输出'] },
+          { label: '走不通就换思路：黑盒调用 / 动态 Trace 抓输入输出', hint: 'VMP 让脱壳失效时，还有什么不吃方法体源码的打法？', any: ['unidbg', '黑盒', '动态 trace', 'trace', '不脱壳', '绕过', '输入输出', '抓参数', '观测'] }
         ],
         hints: [
-          'Binder 通信在系统调用层面是什么形式？想一想 /dev/binder 是什么类型的设备。',
-          '如果你写一个 seccomp 规则只拦 open/read/write，Binder 上的数据会被拦到吗？'
+          '三条路线的成本差一个数量级，而选路线的依据只有一个——它是什么壳。',
+          '再想一遍甲方那句话：他们需要的是「方法体源码」还是「一个可以复现的输入输出关系」？'
         ],
         probes: [
-          '追问：既然 ioctl 是一个必经点，为什么"在 ioctl 上做拦截"仍然有局限？',
-          '再追问：Binder 保证了"调用方身份不可伪造"，那它保证"返回的数据没被改过"吗？'
+          '你说先判类型——判类型要花多久？如果半小时内判不出来怎么办？',
+          '如果判定它只有两个关键方法被虚拟化，其余都是普通抽取，你会改路线吗？为什么？'
         ],
-        model: '<b>一、为什么是 ioctl</b><br><br>' +
-          '<b>Binder 的物理通道是一个字符设备 <span class="mono">/dev/binder</span>。</b>' +
-          '用户态与它的全部交互都通过 <span class="mono">ioctl(fd, BINDER_WRITE_READ, &bwr)</span> 完成——' +
-          '<b>不是 read/write，而是 ioctl</b>。<br><br>' +
-          '原因是设计选择：<b>Binder 需要"一次调用里既写又读"</b>（发出事务、取回结果），' +
-          '而且支持同步/异步两种语义。这种复杂的命令-响应结构用 <span class="mono">read</span>/<span class="mono">write</span> 表达不了，' +
-          '用 <span class="mono">ioctl</span> 的命令码机制最自然。<br>' +
-          '另外，<b>它只做一次数据拷贝</b>——驱动把一块内核缓冲区映射到目标进程的用户空间（<span class="mono">binder_mmap</span>），' +
-          '传统 IPC 要拷贝两次。这也是为什么它比 socket/pipe 更适合做高频的进程间调用。<br><br>' +
-          '<b>二、后果一：文件系统监控看不到 Binder</b><br><br>' +
-          '这一点在本项目第 24 章的一个真实案例里出现过：<b>某个安全 SDK 通过 Binder 查询已安装应用，' +
-          '而基于文件 syscall 的 seccomp 过滤拦不到它——因为它走的是 ioctl，' +
-          '压根不经过 open/read/write 这条路径。</b><br>' +
-          '<span class="hit">这条的普遍意义：<b>任何"我只拦文件操作"的监控方案，都天然对 Binder 盲。</b>' +
-          '而现代 App 的大量敏感行为（查包、查权限、查设备信息、调系统服务）恰恰都在 Binder 上。</span><br><br>' +
-          '<b>三、后果二：想观测 Binder，就要在 ioctl 或更上层下手</b><br><br>' +
-          '两个层次可选：<br>' +
-          '· <b>native 层 hook <span class="mono">ioctl</span></b>（通常是 <span class="mono">libbinder.so</span> 里对 libc ' +
-          '<span class="mono">ioctl</span> 的导入调用），<b>覆盖面最全</b>——所有 Binder 事务都从这里过；' +
-          '本章 26.14 的案例正是这么做的（GOT Hook）；<br>' +
-          '· <b>Java 层 hook <span class="mono">BinderProxy.transact</span></b>，更简单，' +
-          '能拿到接口描述符、事务编号与 Parcel，但<b>只覆盖 Java 层的调用</b>（native 直接用的 Binder 看不到）。<br>' +
-          '<span class="hit">选哪个取决于你的目标：要"全"就下沉到 ioctl，要"快"就停在 transact。</span><br><br>' +
-          '<b>四、顺带说清一个容易混淆的点：身份 vs 数据</b><br><br>' +
-          'Binder 有一个很强的安全性质：<b>调用方的 UID/PID 是内核在转发时填入的，调用方自己填不了。</b>' +
-          '所以服务端可以确信"你是谁"。<br>' +
-          '但请注意它<b>不保证</b>什么：<b>它不保证"返回给你的数据没有被改过"。</b><br>' +
-          '<span class="hit">因为中间人就在你自己的进程里——如果你能改自己进程里的 GOT 表，' +
-          '就能改掉服务端返回的内容（26.14 的案例正是这么干的：清掉 <span class="mono">FLAG_DEBUGGABLE</span>）。' +
-          '<b>"身份不可伪造"与"数据不可篡改"是两个独立的安全目标，Binder 只保证了前者。</b></span>',
-        after:
-          '<p><b>关于追问"为什么在 ioctl 上拦截仍有局限"：</b>至少三点——<br>' +
-          '① <b>架构与版本依赖</b>：GOT Hook 依赖具体的动态链接结构与指令集（26.14 的案例就只支持 ARM64）；<br>' +
-          '② <b>可能被更底层的调用绕过</b>：如果目标直接用 syscall 指令进内核（不经过 libc 的 ioctl 包装），' +
-          'GOT Hook 就失效了——这与第 13 章"内联 SVC 绕过 libc hook"是同一类问题；<br>' +
-          '③ <b>自身可能被检测</b>：改 GOT 表会留下痕迹，遍历自己的 GOT 或校验关键表项就能发现。<br>' +
-          '<span class="hit">这三条正好对应全课的主线：<b>越靠近内核越难被绕过，但版本枷锁也越硬。</b></span></p>'
+        model: '<b>决策顺序是四步：判类型 → 选路线 → 没工具就回源码 → 实在不行换思路（不脱壳）。</b><br><br>' +
+          '<b>第一步，判类型（必须在前 30 分钟内完成）。</b>这是全流程性价比最高的半小时，因为三条路线的成本差一个数量级，而选路线的唯一依据就是壳的类型。观察指标很具体：把 APK 丢进反编译器看 dex 是否完整、方法体是否为空（结构完整 + 方法体空 = 抽取壳）；看有没有体积异常大的 native 库、关键方法是不是一堆看不懂的自定义字节码（VMP 的嫌疑信号）；看资源里有没有多出来的加密数据。这一步做错，代价是「干了两天发现方向不通」。<br><br>' +
+          '<b>第二步，按目标倒推路线。</b>这里有个关键点：<b>先把甲方的需求翻译清楚</b>。他要的是「签名怎么算」，那就意味着你需要的是<b>输入到输出的映射关系</b>，而不是方法的源码。这个翻译会彻底改变你的路线——如果只有两个关键方法可疑，FART 对这两个方法做定向触发 + 动态 Trace 抓输入输出，往往比全量脱壳快得多，而且<b>VMP 恰好最不怕这种打法</b>：虚拟化保护的是「方法体不被读懂」，它并不改变方法的输入输出契约，App 自己还得调用它、还得拿到正确的签名。<br><br>' +
+          '<b>第三步，没有现成工具就回源码。</b>如果判出来是常规抽取壳，而你手上没有适配当前系统的 FART，那就按六步链路自己移植：定版本、读 AOSP 源码找脱壳点、插桩、编译、刷入、验证。<b>这就是「会读 ART 源码」这件能力的兑现时刻。</b><br><br>' +
+          '<b>第四步，实在脱不掉就换思路。</b>不脱壳，直接黑盒调用（unidbg）或动态 Trace。<b>记住目标是拿到结果，不是完成「脱壳」这个动作。</b>很多新手把脱壳当成必经关卡，反而把自己困住了。',
+        after: '<p>这道题的高分答案里一定有「不一定非要脱壳」——<b>能主动放弃一条昂贵路线，是成熟度而不是偷懒</b>。</p>'
       },
       {
-        id: 'c26q5', depth: 3, threshold: 0.72,
-        q: '<b>综合题。</b>有人总结说：「安卓里没有"自己开始跑"的代码——' +
-          '每一段代码都是被某个人、通过某个入口、在某个线程上调起来的。」<br>' +
-          '请用本章的知识，<b>把这句话展开成一套可操作的排查方法</b>：' +
-          '当你要找一个功能的实现位置时，你会从哪几个维度去问、每问一次能得到什么信息。',
+        id: 'c12q5', depth: 3, threshold: 0.75,
+        q: '有人说：「课程能几分钟脱掉 DexProtector，说明脱壳这件事不难，工具做好了一次就够用。」请完整反驳这个说法，并说明<b>你认为这个领域真正的护城河是什么</b>。',
         concepts: [
-          { label: '维度一：谁触发的（组件入口）——按钮点击、通知、广播、其他 App 调起、Provider 查询、Service 启动',
-            hint: '这个功能是被什么"事件"触发的？',
-            any: ['组件', '触发', '入口', 'activity', 'service', 'receiver', 'provider', '点击', '广播', '通知', 'intent'] },
-          { label: '维度二：什么时候（生命周期与初始化时机）——attachBaseContext / Provider.onCreate / Application.onCreate / 具体组件回调',
-            hint: '它是在启动的哪个阶段跑的？',
-            any: ['生命周期', '时机', 'oncreate', 'attachbasecontext', 'application', 'provider', '启动阶段', '早晚'] },
-          { label: '维度三：在哪条线程（主线程 Looper / 子线程 / Binder 线程池 / native 自建线程）',
-            hint: '它在哪条线程上执行？',
-            any: ['线程', '主线程', 'looper', '子线程', 'binder线程', 'native线程', '线程池', 'tid'] },
-          { label: '维度四：在哪个进程（是否多进程、是否需要跨进程才能到达）',
-            hint: '它在哪个进程里跑？',
-            any: ['进程', '多进程', 'remote', 'pid', '跨进程', 'binder', '另一个进程'] },
-          { label: '维度五：怎么被通知到的（消息投递 / Binder / 回调注册），这决定了调用链在哪一段是断的',
-            hint: '从触发到执行，中间经过了什么"边界"？',
-            any: ['消息', 'handler', 'post', 'binder', '回调', '投递', '边界', '断链', '调用链'] },
-          { label: '每一问都要能回答"成功时看到什么、失败时排除什么"，否则这个问法就没价值',
-            hint: '怎么判断一个排查动作值不值得做？',
-            any: ['成功看到', '失败排除', '信息量', '值不值得', '成本', '收敛', '排除法'] },
-          { label: '落地手段：用组件清单当地图、用调用栈分段拼接、用 hook 唤起点、用 traces 文件、用行为反推',
-            hint: '具体拿什么工具去问这几个维度？',
-            any: ['清单', 'manifest', '调用栈', 'stack', 'hook', 'traces', 'anr', '行为', '反推', '日志', 'logcat'] }
+          { label: '秒脱是前期投入的结果，不是技术简单', hint: '那几分钟之前，发生过什么？', any: ['前期', '前置', '提前做完', '准备工作', '投入', '已经做完', '不是简单', '利息', '之前做的'] },
+          { label: '适配工作量以天/周计，且随版本必然过期', hint: '读源码、重定位、编译刷入这一套要多久？下一个大版本来了会怎样？', any: ['过期', '失效', '要重做', '时间成本', '会失效', '重新移植', '每个版本', '又得改', '维护成本'] },
+          { label: '护城河是原理理解与读源码的能力', hint: '什么东西从 Android 6 用到 14 都还有效？', any: ['原理', '护城河', '读源码', '理解', '能力', '迁移', '不会过期', '吃透原理', '底层'] },
+          { label: '工具收藏是假安全感；工具被封了还得回源码', hint: '如果别人针对你的工具做了对抗，你还剩什么？', any: ['工具收藏', '收藏', '假安全', '依赖工具', '工具会失效', '工具不是', '现成工具', '搬工具'] }
         ],
         hints: [
-          '把"某个人"和"某个入口"和"某个线程"拆成三个独立的问题——它们各有各的查法。',
-          '再想想：为什么"经过的边界"也值得单独问一次？它决定了什么？'
+          '把「秒脱」拆成时间线：哪一段是几分钟，哪一段是天和周？',
+          '再往前一步：那几天的投入，会不会因为下一个安卓大版本而作废？如果会，那到底什么没有作废？'
         ],
         probes: [
-          '追问：这五个维度里，哪一个最容易让"钩子明明装上了却不命中"？为什么？',
-          '再追问：如果五个维度都问过了还是找不到，说明什么？下一步该往哪一层走？'
+          '你说工具会过期、能力不会——请具体举一个「能力」的例子，说明它在 Android 6 和 14 上都成立。',
+          '如果明天 Android 16 发布，你手上没有任何人做好的移植，你的第一步是什么？要花多久？'
         ],
-        model: '<b>这句话是对的，而且它可以被操作化。五个维度，每个都有明确的问法与产出。</b><br><br>' +
-          '<b>维度一：谁触发的？（组件入口）</b><br>' +
-          '<b>怎么问：</b>这个功能是用户点了某个界面、还是收到通知、还是开机/网络变化、' +
-          '还是被别的 App 调起、还是被 Provider 查询触发的？<br>' +
-          '<b>拿什么问：</b><span class="mono">AndroidManifest.xml</span> 就是地图——' +
-          '看有哪些组件、哪些带 <span class="mono">intent-filter</span>、哪些是导出的。<br>' +
-          '<b>得到什么：</b>一个<b>确定的类名</b>（比如 <span class="mono">LoginActivity</span>）。' +
-          '<span class="hit">这一步的性价比最高——你从"几十万行代码"缩小到了"一个类"。</span><br><br>' +
-          '<b>维度二：什么时候？（生命周期与初始化时机）</b><br>' +
-          '<b>怎么问：</b>它是在应用启动阶段跑的，还是在某个界面显示时跑的？' +
-          '如果是启动阶段，是 <span class="mono">attachBaseContext</span>、' +
-          '<span class="mono">ContentProvider.onCreate</span>、还是 <span class="mono">Application.onCreate</span>？<br>' +
-          '<b>得到什么：</b><b>这个决定你的钩子要装多早。</b>' +
-          '如果目标在 Provider 里，而你把钩子装在 Application —— <span class="hit">那你就慢了一步，表现为"装上了但零命中"。</span><br><br>' +
-          '<b>维度三：在哪条线程？</b><br>' +
-          '<b>怎么问：</b>主线程（Looper 调度）？子线程？Binder 线程池？native 自建线程？<br>' +
-          '<b>得到什么：</b><b>这决定你的钩子在哪条路径上才有机会命中</b>，' +
-          '也决定你能不能从主线程的 hook 看到它。<br>' +
-          '<span class="hit">本章 26.8 节那句话在这里落地：<b>"我的 hook 装上了但没命中"，一半的答案在这几种线程里。</b></span><br><br>' +
-          '<b>维度四：在哪个进程？</b><br>' +
-          '<b>怎么问：</b>一个命令就够——<span class="mono">frida-ps</span> 看有没有带冒号后缀的进程。' +
-          'Binder 调用的"另一半"是不是在 <span class="mono">system_server</span> 里？<br>' +
-          '<b>得到什么：</b>排除掉"进程不对"这个最便宜的怀疑，或者发现"需要在另一个进程里也注入一次"。<br><br>' +
-          '<b>维度五：中间经过了什么边界？</b><br>' +
-          '<b>怎么问：</b>从触发到执行，中间经过了消息投递（<span class="mono">Handler.post</span>）？' +
-          '线程池？Binder？还是直接调用？<br>' +
-          '<b>得到什么：</b><b>这个维度决定了"调用栈在哪一段是断的"。</b><br>' +
-          '<span class="hit">这是本章最容易被忽略、但在实战里最省时间的一问：<b>' +
-          '栈的语义是"当前这一段执行"，经过了投递/跨进程之后，你就看不到发起者了。</b>' +
-          '知道在哪里断，你就知道要在哪里<b>补一个观测点把两段接起来</b>（第 26.9 节的决策演练讲的就是这个）。</span><br><br>' +
-          '<b>附加的一条纪律：每一问都必须能回答"成功看到什么、失败排除什么"。</b><br>' +
-          '比如"hook 一个可能相关的方法"——成功了你能拿到参数，失败了你能排除"它不在这里"。' +
-          '而"再读一遍汇编"——成功了也未必得到结论，失败了什么都排除不了。<br>' +
-          '<span class="hit">凡答不上这两个问题的动作，往后排。</span><br><br>' +
-          '<b>落地手段（与前几章的呼应）：</b><br>' +
-          '· <b>组件清单当地图</b>——维度一；<br>' +
-          '· <b>调用栈分段拼接</b>——维度五，用第 30 章的"七条线索"里的栈分析；<br>' +
-          '· <b>hook 唤起点</b>——维度一/二/三的通用手段；<br>' +
-          '· <b>ANR traces 文件</b>——一份带调用栈的真实运行时快照，<b>能直接看到方法调用链</b>；<br>' +
-          '· <b>从行为反推</b>——不猜调用关系，直接 hook 数据层（网络、加解密、文件），看谁在动数据。<br><br>' +
-          '<b>关于追问"五个都问过还找不到"：</b>' +
-          '那说明<b>你要找的东西不在你观测的这一层</b>。可能的方向：<br>' +
-          '· 它被 <b>Native 化</b>了（第 20.11 节）——Java 层根本没有方法体；<br>' +
-          '· 它被 <b>加固壳</b>藏起来了（第 19 章）——连类都可能不在你看到的 dex 里；<br>' +
-          '· 它在 <b>另一个进程或另一个 App</b> 里（跨进程 / 跨应用）；<br>' +
-          '· 它在 <b>服务端</b>（这时候要验证的是"客户端到底发了什么"，而不是"客户端算了什么"）。<br>' +
-          '<span class="hit">"五个维度都问过"本身就是一条重要信息：<b>它说明问题不在"定位"，而在"层次"</b>——' +
-          '该换一层观测了，而不是继续在同一层里换钩子。</span>'
-      },
-      {
-        id: 'c26q6', depth: 3, threshold: 0.72,
-        q: '<b>综合题（贯通本章）。</b>一个 App 的行为很奇怪：<br>' +
-          '· 它在<b>没有任何界面</b>的情况下也会做网络请求；<br>' +
-          '· 你在主进程里 hook 了它的网络库，<b>抓不到那些请求</b>；<br>' +
-          '· 你用 <span class="mono">ps</span> 看，发现它有两个进程。<br>' +
-          '请结合本章内容，<b>说清这个 App 可能用了哪些机制、你打算怎么一步步把它锁死</b>，' +
-          '并指出<b>每一步依据的是本章的哪条机制</b>。',
-        concepts: [
-          { label: '无界面执行代码：BroadcastReceiver（静默触发点）或 Service / JobScheduler 一类后台机制',
-            hint: '没有界面还能跑代码，靠的是哪类组件？',
-            any: ['broadcastreceiver', 'receiver', '广播', 'service', 'jobservice', 'jobscheduler', 'workmanager', 'alarmmanager', '无界面', '后台'] },
-          { label: '静态注册的 Receiver 能在 App 未启动时被系统唤起（冷启动入口）',
-            hint: '哪种注册方式能让 App 没启动也被叫起来？',
-            any: ['静态注册', '清单', 'manifest', '冷启动', '未启动', '开机', '系统唤起'] },
-          { label: '两个进程意味着要先确认"目标逻辑在哪一个进程里"，抓不到很可能是注入了错误的进程',
-            hint: '两个进程这件事，首先意味着什么？',
-            any: ['进程', '哪个进程', '注入错', '多进程', 'remote', '独立进程', '分别注入'] },
-          { label: '跨进程通信（Binder）意味着调用链在进程边界断开，本进程只能看到自己这一侧',
-            hint: '网络请求可能是由另一个进程发起的，那你怎么才能看到它？',
-            any: ['binder', '跨进程', 'ipc', '另一个进程发起', '边界', '断链', '客户端侧'] },
-          { label: '排查手段：frida-ps / ps 列进程并分别注入；用 spawn 抢时机；hook 组件入口',
-            hint: '具体怎么动手？',
-            any: ['frida-ps', 'ps', '列进程', '分别注入', 'spawn', '抢时机', 'hook 入口', 'onreceive', 'attach'] },
-          { label: '还要考虑：网络可能走 native 直连或自研 SSL（第 23 章），此时 Java 层网络库 hook 不命中',
-            hint: '如果它在正确的进程里但你还是抓不到呢？',
-            any: ['native', '自研', 'ssl', '直连', 'socket', '不是java', 'openssl', 'boringssl', '下沉'] },
-          { label: '收口：把"组件 → 进程 → 线程 → 通信边界 → 实现层"按成本排序逐层排除',
-            hint: '把整个流程收成一句有顺序的方法论。',
-            any: ['顺序', '逐层', '成本', '排除', '组件', '进程', '线程', '边界', '实现层', '排查顺序'] }
-        ],
-        hints: [
-          '先回答"没有界面怎么还能跑代码"——这指向组件而非线程。',
-          '再回答"两个进程意味着什么"——你之前的所有 hook 是在哪个进程里生效的？'
-        ],
-        probes: [
-          '追问：如果确认网络请求是在另一个进程里发起的，你有哪些办法看到它的参数？',
-          '再追问：如果两个进程都注入了、网络库也 hook 了，还是抓不到——你下一步该怀疑什么？'
-        ],
-        model: '<b>先说结论：这三个现象各自对应本章的一条机制，而且它们指向的是同一件事——' +
-          '"我的观测点不在它的执行路径上"。</b><br><br>' +
-          '<b>第一步：无界面执行代码 → 组件（维度一：谁触发的）</b><br>' +
-          '本章 26.6 节讲过：<b>BroadcastReceiver 与 ContentProvider 是"系统/其他 App 视角"的组件，' +
-          '它们的价值就在于能在没有界面的情况下被执行。</b><br>' +
-          '· <b>静态注册的 Receiver 能在 App 未启动时被唤起</b>——这是很典型的"冷启动入口"；<br>' +
-          '· 也可能是 Service（含前台 Service，会带一个常驻通知）或 ' +
-          '<span class="mono">JobScheduler</span> / <span class="mono">WorkManager</span>；' +
-          '<span class="pill warn">具体是哪种，取决于你看到的系统行为与通知——这一层要靠观测确认，不能靠猜</span>。<br>' +
-          '<b>动作：</b>看清单里的 Receiver / Service 声明，特别是带 <span class="mono">intent-filter</span> 的那些。<br>' +
-          '<b>依据：</b>26.3 的"组件即入口"、26.6 的"无界面执行"。<br><br>' +
-          '<b>第二步：两个进程 → 先确认目标逻辑在哪个进程（维度四：在哪个进程）</b><br>' +
-          '这一步是<b>成本最低、也最可能直接解决问题</b>的一步。<br>' +
-          '本章反复强调：<b>进程之间不共享内存</b>，你的注入只影响注入的那一个。' +
-          '你在主进程 hook 网络库抓不到请求，<b>最省事的解释就是：那些请求是在另一个进程里发的。</b><br>' +
-          '<b>动作：</b><span class="mono">frida-ps -U</span> 或 <span class="mono">ps -A</span> 列出全部进程，' +
-          '对每个相关进程分别注入，再观察。<br>' +
-          '<b>依据：</b>26.1 的"进程 ≠ App"、26.13 的"进程不对"这条坑。<br>' +
-          '<span class="hit">这一步之所以要排第二，是因为它"成功时直接给出答案、失败时排除一个维度"，而成本只是一条命令。</span><br><br>' +
-          '<b>第三步：通信边界 → 调用链在哪断的（维度五）</b><br>' +
-          '如果请求确实在另一个进程里发，那"从点击到请求"这条链<b>中间跨了进程</b>——' +
-          'Binder（本章 26.10）或其他 IPC。' +
-          '<b>跨进程之后，栈在另一侧重新开始</b>，你在这个进程里永远看不到完整的链。<br>' +
-          '<b>动作：</b>把观测点移到<b>边界</b>上——' +
-          '在发起侧 hook Binder 调用（<span class="mono">transact</span>）或消息投递（<span class="mono">Handler.post</span>），' +
-          '在接收侧 hook 组件入口（<span class="mono">onStartCommand</span> / <span class="mono">onReceive</span>），' +
-          '<b>两段分别打，再拼起来</b>。<br>' +
-          '<b>依据：</b>26.9 决策演练的结论——<b>栈只能覆盖"当前这一段执行"</b>。<br><br>' +
-          '<b>第四步：如果进程对了、入口也对了，还是抓不到 —— 怀疑实现层（维度三 + 更下层）</b><br>' +
-          '两种可能：<br>' +
-          '· <b>网络不走 Java 层</b>：第 23 章讲过，native 直连、自研 SSL（Flutter/BoringSSL/WebView）都会让' +
-          'Java 层网络库的 hook 失效——<b>这是"钩子装上了但零命中"的经典解释</b>；' +
-          '· <b>线程不对</b>：请求可能在一个 native 自建线程或线程池里发出，' +
-          '而你的钩子挂在主线程的调用路径上。<br>' +
-          '<b>动作：</b>下沉到 <span class="mono">send</span>/<span class="mono">recv</span> / ' +
-          '<span class="mono">SSL_write</span>/<span class="mono">SSL_read</span>（第 23 章），' +
-          '或打印 tid 确认线程。<br>' +
-          '<b>依据：</b>26.8 的"三种线程"、26.13 的"实现层"这一行。<br><br>' +
-          '<b>把整套流程收成一句方法论：</b><br>' +
-          '<span class="hit">按"组件 → 进程 → 通信边界 → 线程 → 实现层"的顺序逐层排除，' +
-          '每一层都问"成功时我看到什么、失败时我排除什么"。</span><br>' +
-          '这个顺序的依据是<b>验证成本</b>（一条 ps 命令 < 一次 spawn 注入 < 一次 ioctl 层 hook），' +
-          '而不是"发生概率"。<br><br>' +
-          '<b>最后，回到本章那句心法：</b>' +
-          '这三个现象看起来像三个谜题，其实<b>是同一个问题的三种表现</b>——' +
-          '"你的观测点不在它的执行路径上"。' +
-          '<span class="hit">而本章教的，就是<b>把"它在哪条执行路径上"这个问题拆成几个可以分别回答的小问题</b>：' +
-          '哪个进程、哪个时刻、哪条线程、经过了什么边界。</span>'
+        model: '<b>这个说法有两处错，而且错在同一个根源上：把「工具跑起来的那一刻」当成了全部工作。</b><br><br>' +
+          '<b>第一处错：把「秒脱」理解成技术简单。</b>演示现场那几分钟，覆盖的是：装 App、启动、等主动调用循环走完、取产物、反编译验证。但在这之前发生的事是——确定目标 Android 版本、下载对应版本的 AOSP 源码、在几十万行 C++ 里找到「dex 加载完成」和「方法体回填」这两个语义事件、把三块组件的插桩挪过去并对齐接口、编译 ART、刷入设备、反复验证直到「反编译能看到真实方法体」。<b>这套工作以天甚至周计。</b>所以正确的表述是：<b>技术难度没有消失，只是被前置了。</b>秒脱是前期投入的利息，不是难度的证明。<br><br>' +
+          '<b>第二处错：以为「一次适配长期有效」。</b>这恰恰是本章那条时间轴要推翻的：Android 8 重构 DexFile、Android 9 引入 CompactDex、Android 10 调整 ArtMethod 以支持 hidden API 策略、Android 11+ 把信息移到 CodeItemDataAccessor 一类辅助结构、Android 12 改分区……<b>FART 不是成品，是一个必须跟着系统版本持续维护的项目。</b>FART14 只对 Android 14 那一档有效。<br><br>' +
+          '<b>那么真正的护城河是什么？是原理理解，是「读 ART 源码、在任意版本里重新定位脱壳点」的能力。</b>工具会随版本失效，二进制的 FART 6.0 用不到 Android 10 上，FART 10 的也用不到 14 上；但「知道 dex 在哪里被解密、方法体什么时候回填、脱壳点该往哪插、遇到 VMP 该换什么思路」这套认知，从 Android 6 一直用到现在。<br><br>' +
+          '<b>所以看到别人秒脱，不要问「他用的是哪个工具」，要问「他为这个工具提前做了什么」。</b>前者是收藏家的问题，后者是工程师的问题。收藏工具的人，每次系统升级都要重新找工具；理解原理的人，每次系统升级只是重新做一遍他早就会做的事。',
+        after: '<p>这道题真正想确认的是：<b>你有没有把「工具」和「能力」分开看</b>。凡是把二者混为一谈的答案，都会在下一个安卓版本发布时失效。</p>'
       }
     ]
   }
 };
-
-/* ==========================================================================
-   本章 Lab 用到的纯函数（带 ch26 前缀，避免与其它章节在同一上下文里重名）
-   ========================================================================== */
-
-function ch26esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>"']/g,
-    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-/* ---- 实验一：存储路径与权限判定（真实分层规则） ---- */
-function ch26StorageData(v) {
-  v = v || {};
-  const raw = String(v.path || '').trim();
-  const api = parseInt(String(v.api || '').replace(/[^0-9]/g, ''), 10) || 0;
-  const pkg = String(v.pkg || 'com.example.app').trim() || 'com.example.app';
-  const perms = String(v.perm || '').split(/[,，\s]+/).map(s => s.trim().toUpperCase()).filter(Boolean);
-  const has = p => perms.some(x => x === p || x.endsWith(p));
-
-  // 路径规范化：真实地解掉 . 与 ..（这正是"路径穿越"的判定依据）
-  let norm = raw.replace(/\\/g, '/');
-  const isAbs = norm.startsWith('/');
-  const segs = norm.split('/');
-  const out = [];
-  for (const s of segs) {
-    if (s === '' || s === '.') continue;
-    if (s === '..') { out.pop(); continue; }
-    out.push(s);
-  }
-  norm = (isAbs ? '/' : '') + out.join('/');
-
-  const escaped = norm !== raw.replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/\.\//g, '/');
-
-  // 分类
-  let cls, clsLabel, note = '';
-  const mInternal = /^\/data\/(data|user\/\d+)\/([^/]+)(\/|$)/.exec(norm);
-  const mExtPkg = /^(\/sdcard|\/storage\/emulated\/\d+|\/storage\/self\/primary)\/Android\/data\/([^/]+)(\/|$)/.exec(norm);
-  const mExtObb = /^(\/sdcard|\/storage\/emulated\/\d+)\/Android\/obb\/([^/]+)(\/|$)/.exec(norm);
-  const mExt = /^(\/sdcard|\/storage\/emulated\/\d+|\/storage\/self\/primary)(\/|$)/.exec(norm);
-
-  if (mInternal) {
-    cls = 'internal'; clsLabel = '内部私有目录';
-    if (mInternal[2] === pkg) note = '这是本 App 自己的内部目录。';
-    else { note = '这是<b>别的 App</b> 的内部目录——非 root 下不可访问。'; cls = 'internalOther'; }
-  } else if (mExtPkg) {
-    if (mExtPkg[2] === pkg) { cls = 'extSelf'; clsLabel = '外部私有目录（本 App）'; note = '这是本 App 自己的外部私有目录。'; }
-    else { cls = 'extOther'; clsLabel = '外部私有目录（别的 App）'; note = '这是<b>别的 App</b> 的外部私有目录。'; }
-  } else if (mExtObb) {
-    cls = (mExtObb[2] === pkg) ? 'obbSelf' : 'obbOther'; clsLabel = 'OBB 目录';
-    note = 'OBB 用于存放 App 的扩展资源包。';
-  } else if (mExt) {
-    cls = 'shared'; clsLabel = '共享外部存储'; note = '这是共享目录（所有 App 都能看到）。';
-  } else if (/^\/data(\/|$)/.test(norm)) {
-    cls = 'systemData'; clsLabel = '系统数据区'; note = '非 App 可达（除 root）。';
-  } else {
-    cls = 'unknown'; clsLabel = '未知 / 其他路径'; note = '不在常见存储分类里。';
-  }
-
-  // 判定
-  const lines = [];
-  let verdict, vcls;
-  const need = [];
-
-  if (cls === 'internal') {
-    verdict = '✅ 可读写（无需任何权限）'; vcls = 'pass';
-  } else if (cls === 'internalOther' || cls === 'systemData') {
-    verdict = '❌ 不可访问（除非 root）'; vcls = 'fail';
-  } else if (cls === 'extSelf') {
-    verdict = '✅ 可读写（API 19 起无需权限）'; vcls = 'pass';
-  } else if (cls === 'obbSelf') {
-    verdict = '✅ 可读写（无需存储权限）'; vcls = 'pass';
-  } else if (cls === 'extOther' || cls === 'obbOther') {
-    if (api >= 30) { verdict = '❌ 不可访问（API 30+ 强制分区存储）'; vcls = 'fail'; need.push('分区存储之后，App 默认看不到别的 App 的私有目录'); }
-    else { verdict = '⚠️ 旧版本上可能可访问（分区存储之前的行为）'; vcls = 'warn'; need.push('API ' + api + ' 处于分区存储之前或过渡期，行为还不严格'); }
-  } else if (cls === 'shared') {
-    if (has('MANAGE_EXTERNAL_STORAGE')) { verdict = '✅ 可读写（已具备「所有文件访问」权限）'; vcls = 'pass'; }
-    else if (api >= 30) {
-      verdict = '❌ 直接按路径访问共享目录不可行'; vcls = 'fail';
-      need.push('API 30+ 要么走 <code>MediaStore</code>，要么申请 <code>MANAGE_EXTERNAL_STORAGE</code>（「所有文件访问」）');
-    } else if (api >= 29) {
-      if (has('WRITE_EXTERNAL_STORAGE') || has('READ_EXTERNAL_STORAGE')) {
-        verdict = '⚠️ 可能可访问，但依赖分区存储的过渡配置';
-        need.push('API 29 是分区存储的引入版本，当年可用 <code>requestLegacyExternalStorage</code> 临时退回旧行为');
-        vcls = 'warn';
-      } else { verdict = '❌ 缺少存储权限'; vcls = 'fail'; need.push('需要 <code>READ/WRITE_EXTERNAL_STORAGE</code>'); }
-    } else {
-      if (has('WRITE_EXTERNAL_STORAGE')) { verdict = '✅ 可读写（分区存储之前的行为）'; vcls = 'pass'; }
-      else if (has('READ_EXTERNAL_STORAGE')) { verdict = '⚠️ 只可能读，写需要 <code>WRITE_EXTERNAL_STORAGE</code>'; vcls = 'warn'; }
-      else { verdict = '❌ 缺少存储权限'; vcls = 'fail'; need.push('需要 <code>WRITE_EXTERNAL_STORAGE</code>（或至少 READ）'); }
-    }
-  } else {
-    verdict = '❓ 无法判定'; vcls = 'warn';
-  }
-
-  return { raw, norm, api, pkg, perms, cls, clsLabel, note, verdict, vcls, need, escaped,
-    summary: '<p>' + verdict + '</p>' + (need.length ? '<ul>' + need.map(n => '<li>' + n + '</li>').join('') + '</ul>' : '') };
-}
-
-function ch26Storage(v) {
-  const d = ch26StorageData(v);
-  let html = '<div class="lab-kv">' +
-    '<span>原路径 <b style="font-size:11px">' + ch26esc(d.raw) + '</b></span>' +
-    '<span>规范化后 <b style="font-size:11px">' + ch26esc(d.norm) + '</b></span>' +
-    '<span>目标 API <b>' + (d.api || '?') + '</b></span></div>';
-
-  html += '<table class="lab-tbl"><tr><th>判定项</th><th>结果</th></tr>' +
-    '<tr><td>路径分类</td><td><code>' + d.cls + '</code> —— ' + d.clsLabel + '</td></tr>' +
-    '<tr><td>说明</td><td>' + d.note + '</td></tr>' +
-    '<tr><td>已具备权限</td><td>' + (d.perms.length ? '<code>' + d.perms.join('</code> <code>') + '</code>' : '<span class="muted">（无）</span>') + '</td></tr>' +
-    '<tr class="' + (d.vcls === 'pass' ? 'same' : 'diff') + '"><td><b>结论</b></td><td><b>' + d.verdict + '</b></td></tr>' +
-    '</table>';
-
-  if (d.escaped) {
-    html += '<div class="lab-msg fail"><b>⚠️ 注意：这个路径里含有 <code>. / ..</code> 这类分量，规范化之后跳到了别处</b>' +
-      '<div class="lab-note">' +
-      '你输入的是 <code>' + ch26esc(d.raw) + '</code>，规范化之后是 <code>' + ch26esc(d.norm) + '</code>。<br>' +
-      '<b>这正是"路径穿越"的机制：</b>如果代码只做字符串拼接、不做规范化，' +
-      '那么 <code>../</code> 就能把"沙箱内某个子目录下的文件"变成"沙箱外的任意文件"。<br>' +
-      '<span class="hit">注意区分两件事：<b>存储权限管的是"能不能进这个目录"，路径规范化管的是"能不能出这个目录"</b>——' +
-      '这是两个独立的问题。很多 ContentProvider 目录遍历漏洞就是"权限没问题、但路径没规范化"。</span>' +
-      '</div></div>';
-  }
-
-  html += '<div class="lab-msg key"><b>🔑 判定的分层依据</b><div class="lab-note">' +
-    '<b>第一层看"属于谁"：</b>内部私有（只有本 App）→ 外部私有（本 App 免权限）→ 共享（需要权限/媒体库）→ 别人的私有目录（新版本禁止）。<br>' +
-    '<b>第二层看"目标 API 落在哪一段"：</b>' +
-    'API &lt; 29（分区存储之前）→ API 29（引入分区存储，有过渡开关）→ API ≥ 30（强制分区存储）。<br>' +
-    '<b>第三层看"权限够不够"：</b>注意 <code>MANAGE_EXTERNAL_STORAGE</code>（所有文件访问）' +
-    '<b>与普通存储权限不是一个层级</b>——它是敏感权限，需要专门授予。<br>' +
-    '<span class="pill warn">各 API 级别的具体分界、过渡开关的生效范围、厂商 ROM 的额外改动，请以官方文档当期说明为准' +
-    '——这是本章最容易过期的内容。</span>' +
-    '</div></div>';
-
-  html += '<div class="lab-msg model"><b>💡 逆向视角：这条判定有什么用</b><div class="lab-note">' +
-    '① <b>避免把"必然失败的做法"当成有效攻击面。</b>' +
-    '你在代码里看到一段从 <code>/sdcard</code> 读文件的逻辑，如果它的目标 API 是 30+ 且没有「所有文件访问」权限，' +
-    '<b>那这段逻辑在你的设备上根本跑不通</b>——不要在上面浪费分析时间。<br>' +
-    '② <b>权限声明本身就是行为特征。</b>看到 App 申请了「所有文件访问」，' +
-    '你就知道它需要看全盘（清理、备份、文件管理、或取证类风控）。这比在代码里瞎找高效得多。<br>' +
-    '③ <b>路径规范化是漏洞判定的关键。</b>做 ContentProvider 审计时，' +
-    '要看的是"它有没有在拼接后做规范化与白名单校验"，而不是"它有没有检查权限"（第 29 章会专门讲）。' +
-    '</div></div>';
-  return html;
-}
-
-/* ---- 实验二：消息队列执行顺序的真实模拟 ---- */
-function ch26SimQueue(text) {
-  const lines = String(text || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-  if (!lines.length) return { err: '没有可解析的输入行' };
-  const ops = [];
-  for (const ln of lines) {
-    // 按位置解析，不要用"关键词黑名单"过滤——那样会把名字就叫 D 的消息误当成 d= 参数
-    const m = /^\s*(postDelayed|post|front|sendMessageAtFrontOfQueue)\s+([A-Za-z_$][\w$]*)(?:\s+t\s*=\s*(-?\d+))?(?:\s+d\s*=\s*(-?\d+))?\s*$/i.exec(ln);
-    if (!m) {
-      return { err: '这一行认不出：「' + ch26esc(ln) + '」——格式应为 <类型> <名字> t=<投递时刻> d=<延迟>，' +
-        '类型可选 post / postDelayed / front' };
-    }
-    ops.push({
-      kind: m[1].toLowerCase(),
-      raw: ln,
-      name: m[2],
-      t: m[3] === undefined ? 0 : Number(m[3]),
-      d: m[4] === undefined ? 0 : Number(m[4])
-    });
-  }
-  // 真实排序：front 插队首；其余按 when = t + d 稳定排序
-  const queue = [];
-  ops.forEach((o, idx) => {
-    o.when = o.kind === 'front' ? -1 : o.t + o.d;
-    o.idx = idx;
-  });
-  const normal = ops.filter(o => o.kind !== 'front')
-    .sort((a, b) => (a.when - b.when) || (a.idx - b.idx));
-  // front 类按投递顺序依次插到最前（后投的插得更前）
-  const fronts = ops.filter(o => o.kind === 'front').sort((a, b) => a.idx - b.idx);
-  const order = fronts.slice().reverse().map(o => o.name).concat(normal.map(o => o.name));
-  // 找 when 相同的一组
-  const byWhen = {};
-  normal.forEach(o => { (byWhen[o.when] = byWhen[o.when] || []).push(o.name); });
-  const sameWhen = Object.keys(byWhen).filter(k => byWhen[k].length > 1)
-    .map(k => 'when=' + k + '：' + byWhen[k].join(' → '));
-  return { ops, order, sameWhen };
-}

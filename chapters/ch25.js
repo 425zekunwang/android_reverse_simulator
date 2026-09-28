@@ -1,2472 +1,1126 @@
-/* 第 25 章 · 白盒密码：白盒 AES 与 DFA 攻击
-   —— 威胁模型 / 白盒实现甄别 / 表格化构造 / 统计特征 / DFA 密钥提取
-   主线：算法一步没改，密钥却不在任何地方——它被焊进了实现的每一张表里。
-   数据文件：只写 window.CHAPTER，禁止 require/import/fetch/async。 */
-
 window.CHAPTER = {
   no: 25,
-  title: '白盒密码：白盒 AES 与 DFA 攻击',
-  lede: '前面 24 章处理的都是「算法还在，只是被改了、被藏了、被混淆了」。这一章处理更极端的一类：<strong>算法一步没改，密钥却不在任何地方</strong>——它被溶进了实现的每一张查找表里。<br>本章教三件事：<strong>怎么认出白盒</strong>（第 8 章那套常量比对会全部零命中）、<strong>它内部长什么样</strong>（把 AES 的每一步表格化之后，密钥被打散到了哪里）、<strong>怎么用 DFA 把密钥挖出来</strong>（差一个字节的故障，怎么在密文里长出一个可预测的形状）。',
+  title: 'eBPF 环境搭建与源码赏析',
+  lede: '前面几章你一直在<strong>用户态</strong>里和对手贴身肉搏：Frida 注入、脱壳、反调试，招招都在对方的视野里。这一章把观测点整体往下压一层——<strong>eBPF</strong> 让一小段受限程序直接跑在 Linux 内核中，用内核的视角去看系统调用、文件访问和函数调用。本章先讲清 eBPF 的安全模型（内核凭什么敢执行你写的代码），再落到 Android 的真实限制（为什么大多数手机根本跑不起来），最后回答一个绕不开的问题：<strong>这对逆向到底有什么用</strong>。',
   meta: [
-    '核心问题：<b>当密钥不存在于任何一段内存里、而是散布在几十张表里时，你还能不能把它还原出来</b>',
-    '关键机制：<b>表格化（把多轮运算合并成查找表）+ 编码（外部/内部）+ 差分故障分析（DFA）</b>',
-    '对手：<b>白盒 AES 实现（查找表 / 插入扰乱项 / 多变量密码三条路线）、外部编码、运行时动态生成的表、完整性校验</b>'
+    '核心问题：<b>一段用户写的代码，凭什么被允许跑在内核里？</b>',
+    '关键工具：<b>clang -target bpf + libbpf / CO-RE / BCC / bpftrace / bpftool</b>',
+    '对手：<b>被观测的 App（看不见你）＋ 厂商裁剪过的内核（它挡得住你）</b>'
   ],
 
   sections: [
-    /* ==================== 25.1 ==================== */
+    /* ================= 25.1 直觉 ================= */
     {
-      h: '25.1', title: '白盒威胁模型：把「密钥保密」这个前提抽掉',
+      h: '25.1',
+      title: '先建立直觉：内核里为什么要装一个虚拟机',
       intuition: {
-        tag: '直觉模型 · 把钥匙焊进锁芯',
-        body: '<p>传统密码学的模型是一扇<b>国标防盗门</b>：门的设计图纸公开（算法公开），但钥匙只在你手里（密钥保密）。攻击者可以随便研究这把锁的工作原理，只要他拿不到钥匙，就打不开。</p>' +
-              '<p>白盒场景把这个模型换掉了。攻击者不是一个在门外撬锁的人，而是<b>一个能把整扇门拆下来、放在工作台上、还能中途伸手把某一颗弹子掰弯的人</b>。他读得到锁芯的每一处细节，甚至能改掉加工过程中的一个参数，然后观察最终的锁还能不能开。</p>' +
-              '<p>于是设计目标被迫改变：<b>不是"让你拿不到钥匙"，而是"就算我把整扇门摊开给你看，你也不该一眼认出钥匙长什么样"。</b>钥匙不再是口袋里的一件东西，而是被熔进了锁芯的金属配比里。</p>'
+        tag: '直觉模型 · 传送带上的安检机器人',
+        body:
+          '<p>你是一家机场的安保负责人。传统做法是：<b>站在出口拦人翻包</b>——这相当于用户态 hook（Frida、PLT hook），你在行李已经离开传送带之后才动手，动作大、容易被看见。</p>' +
+          '<p>eBPF 的做法是：<b>把一台只会执行你写的检查清单的机器人，直接装到传送带内部</b>。这台机器人上岗前要过机场自己的严格审查（<b>验证器</b>），上岗后只能用机场指定的几件工具（<b>helper 函数</b>），只能把结果写进一本共享登记本（<b>BPF Map</b>），而且明令禁止三件事：<b>不许搬走行李、不许改动行李、不许赖着不走（不许死循环、不许睡眠阻塞）</b>。</p>' +
+          '<p>机器人被锁死在传送带里，旅客（App）根本看不见它——这就是 eBPF 对逆向最大的价值，也是它最大的风险来源。</p>'
       },
       html:
-        '<p>先把三种攻击者模型摆在一起。它们不是"难度递增"，而是<b>能力假设完全不同</b>——混在一起想，后面所有判断都会歪。</p>' +
-        T.tbl(['模型', '攻击者手里有什么', '密钥安全依赖什么', '典型手段'], [
-          ['黑盒', '只有输入输出（或一个远程接口）', '算法强度 + 密钥长度', '抓包、喂数据、比对输出'],
-          ['灰盒', '能观测执行过程（时序、功耗、故障），但看不到内部值', '实现层面的抗侧通道能力', '功耗分析、缓存计时、故障注入'],
-          ['白盒', '完整的二进制、可读全部内存、可单步、<b>可改任意中间状态</b>', '<b>不靠「藏」，靠「算不出来」</b>', 'DRM 播放器、移动支付风控 SDK、端上白盒 AES']
+        '<p><b>BPF</b>（Berkeley Packet Filter）不是什么新概念——1992 年就提出了，它是 <code>tcpdump</code> 背后那套' + T.term('包过滤', '在网络栈中按规则筛掉不需要的报文，只把关心的包交给上层，避免无谓的数据拷贝') + '机制的底座，干的事很窄：从网络包里按规则挑出你要的那些。</p>' +
+        '<p>2014 年（Linux 3.18）内核把 BPF 整个重做了一遍，从「包过滤器」升级成了<strong>一个运行在内核中的' + T.term('通用虚拟机', '这里指 eBPF 不再是某个固定用途的过滤器，而是能执行通用字节码、挂到多种事件源上的执行引擎') + '</strong>，这就是 <b>eBPF</b>（extended BPF）。它今天被用来做' + T.term('可观测性', 'Observability：通过系统调用、函数调用、网络等外部信号推断系统内部正在发生什么，而不是靠加日志') + '（性能分析、系统调用追踪）、网络（负载均衡、DDoS 防护）和安全监控（运行时检测、LSM 策略）。</p>' +
+        T.tbl(['阶段', '是什么', '典型使用者'], [
+          ['BPF（1992）', '网络包过滤的字节码，只处理网络包', 'tcpdump、libpcap'],
+          ['eBPF（2014，Linux 3.18）', '内核中的通用虚拟机，可挂到几十种事件源上', '性能分析、网络安全、可观测性']
         ]) +
-        '<p>第三行的最后一格很关键：白盒模型下的攻击者，<b>可以读取进程内存里的任何一个字节，也可以在某一条指令执行前把某个寄存器的值改掉</b>。这不是夸张的假设——一台 root 过的手机、一个带调试器的 PC、一个被脱壳的 so，都已经满足这个条件。</p>' +
-        T.note('key', '🔑 本章主线，一句话', '<p>白盒密码要解决的不是"加密够不够强"，而是 <b>"密钥以什么形式存在"</b>。</p>' +
-          '<p>只要密钥在<b>某一刻、某个地址上、以那 16 个字节的形式</b>出现过，白盒攻击者就一定拿得到它——他可以下一个内存断点，也可以直接读。' +
-          '所以白盒实现的设计目标只有一个：<b>让密钥从不以"完整形态"出现过</b>，而是以系数、表项、编码常量的形式散布在整个实现里。</p>' +
-          '<p>理解这一点，你才能理解本章后面所有的技术动作：<b>我们不是在"解密"，我们是在从一堆已经被打散的碎片里，把密钥重新拼回来。</b></p>') +
-        '<p>关于术语先说清楚。' +
-        T.term('白盒密码学', '研究"在攻击者完全掌握实现细节、可任意读写内存、可单步执行"的前提下，如何仍然保护密钥的一类密码学分支。它不改变算法本身，而是改变算法的实现形态。') +
-        ' 与 ' +
-        T.term('白盒实现', '把某个标准算法（通常是 AES）用查找表 + 编码重新表达出来的一份具体实现。算法语义不变，但中间量全部被编码打乱，原始密钥不以任何可读形式存在。') +
-        ' 是两个概念：前者是研究领域，后者是你要逆向的那块二进制。</p>' +
-        T.note('warn', '⚠️ 一句必须说的边界', '<p>白盒密码学有正式的学术定义与一批公开论文（早期构造通常被归到 Chow 等人的工作，具体年份、作者顺序与论文标题' +
-          T.pill('warn', '待核实') + '）。本章讲的是<b>工程上怎么识别、怎么攻击</b>，不逐条复述论文结论。' +
-          '凡是涉及具体论文的断言，我都会标明来源或标待核实——<b>这个领域里"我听说某某论文证明了 X"是最容易出错的一类话。</b></p>' +
-          '<p>另外，本章所有攻击性内容都限定在<b>合法授权的安全研究、自家产品加固、教学</b>范围内。不提供针对任何具体线上产品的操作步骤。</p>') +
-        '<h4>从「藏」到「溶」：一句话说清白盒和混淆的区别</h4>' +
-        '<p>第 5 章的 OLLVM 是<b>藏</b>：代码还是那段代码，只是把它打散成你看不懂的样子。你把混淆解开，原样就在那里。</p>' +
-        '<p>第 6 章的 VMP 是<b>换</b>：把原始指令翻译成自定义字节码，解释器是新的。<b>算法已经被改写过了。</b></p>' +
-        '<p>白盒是<b>溶</b>：算法没换、指令也正常，但密钥被以数学方式溶进了每一步运算的常量里。你解不出"原来那 16 个字节"——因为它<b>从来就没有以那 16 个字节的形式存在过</b>。</p>' +
-        '<p>这就是为什么本章的主角不是"反编译"而是"数学"。你要做的不是把代码看懂，而是<b>从表里把方程列出来</b>。</p>',
+        T.note('key', '🔑 本章主线', '<p>记住三件事就够了：<b>①</b> eBPF 程序是<b>内核态</b>运行的；<b>②</b> 它能运行的前提是内核的<b>验证器</b>静态证明它安全；<b>③</b> 它和用户态通信用的是 <b>BPF Map</b>。全章的动画、代码和题目都围绕这三点转。</p>') +
+        T.note('warn', '⚠️ 时效性警告（务必先读）',
+          '<p>本章内容以 <b>2023 年前后</b>的 Linux / Android 生态为背景撰写。eBPF 本身和它在 Android 上的支持情况演进非常快——<b>内核版本、厂商配置、SELinux 策略在不同设备上差异极大</b>。</p>' +
+          '<p>所以本章中任何涉及「当前支持情况」「最新内核版本」「某配置项默认是否开启」的表述，<b>都请当成线索而不是结论</b>，一律以你自己设备上的实测结果为准。文中不确定的点会用 ' + T.pill('warn', '待核实') + ' 标出。</p>') +
+        T.note('', '📌 一句话记住 eBPF 和 Frida 的分工',
+          '<p>' + T.term('Frida', '用户态动态插桩框架，需要注入目标进程，改变其内存与指令') + ' 是「<b>进到敌人家里装摄像头</b>」——看得细，但你要先破门而入，家里的人一定知道有人来过。eBPF 是「<b>在小区门口的电线杆上装摄像头</b>」——看不清家里沙发的花纹，但能看清谁几点进出、拎了什么包，而且住户完全不知道摄像头存在。</p>' +
+          '<p>两者的观测粒度和隐蔽性是一组<b>此消彼长</b>的权衡，不是谁替代谁。第 27 章讲的内核态对抗里，eBPF 是标准观测手段。</p>')
+    },
+
+    /* ================= 25.2 生命周期 stage ================= */
+    {
+      h: '25.2',
+      title: '一个 eBPF 程序的完整生命周期（本章最重要的动画）',
+      html:
+        '<p>下面这台动画把 eBPF 从「一段 C 源码」到「用户态看见结果」的全过程拆成 14 步。' +
+        '请特别留意两个地方：<b>第 ④ 步（' + T.term('验证器', '内核在加载 eBPF 程序时做静态分析，证明它不会崩溃内核、不会无限循环、内存访问不越界') + '）为什么能保证安全</b>，以及<b>第 ⑧⑨ 步（数据怎么从内核回到用户态）</b>。' +
+        '把这两处想通，eBPF 的整个设计哲学就通了。</p>',
+      stage: {
+        title: 'eBPF 程序生命周期：从 C 源码到内核机器码，再回到用户态',
+        speed: 2600,
+        render:
+          '<div class="flow-row" style="align-items:flex-start;gap:16px;flex-wrap:wrap">' +
+            '<div class="flow-col" style="flex:1 1 300px">' +
+              '<div class="blk" id="e1">① 写 eBPF 程序（C 的受限子集）</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e2">② clang -target bpf 编译 → eBPF 字节码 .o</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e3">③ 用户态 bpf(BPF_PROG_LOAD) 提交字节码</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e4">④ 内核验证器 verifier 逐项静态检查</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e5">⑤ JIT 编译成本机机器码</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e6">⑥ attach 到钩子点（kprobe / tracepoint…）</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e7">⑦ 事件触发，内核执行你的程序</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e8">⑧ 用 helper 写 BPF Map / ringbuf</div>' +
+              '<div class="arrow">▼</div>' +
+              '<div class="blk" id="e9">⑨ 用户态读 Map，拿到结果</div>' +
+            '</div>' +
+            '<div class="flow-col" style="flex:1 1 340px">' +
+              '<div class="card" style="margin-top:10px"><div class="card-title">事件记录（ringbuf 里的内容）</div>' +
+              '<div class="term-box" id="ebuf" style="min-height:100px">[ 空 ]</div></div>' +
+              '<div class="term-box" id="elog" style="margin-top:10px">$ 等待开始…</div>' +
+              '<div class="card" style="margin-top:10px"><div class="card-title">这一步为什么重要</div>' +
+              '<div id="ewhy"><p class="muted">点「下一步 ▶」或「自动播放」开始。</p></div></div>' +
+            '</div>' +
+          '</div>',
+        reset: () => {
+          for (let i = 1; i <= 9; i++) S('e' + i, '');
+          SET('elog', '$ 等待开始…');
+          SET('ebuf', '[ 空 ]');
+          SET('ewhy', '<p class="muted">点「下一步 ▶」或「自动播放」开始。</p>');
+        },
+        steps: [
+          {
+            run: () => { S('e1', 'active'); SET('elog', '$ vim minimal.bpf.c'); SET('ewhy', '<p><b>① 写程序。</b>eBPF 程序用什么语言写？答案是 <b>C 的一个受限子集</b>（也可以用 Rust，通过 Aya 之类的框架）。</p><p>「受限」体现在：不能调用任意内核函数（只能调内核白名单里的 <b>helper</b>）、不能动态分配内存、不能无限循环、不能睡眠。你写的是一个<b>看见事件就处理、处理完就退出</b>的小函数。</p>'); },
+          },
+          {
+            run: () => { S('e1', 'done'); S('e2', 'active'); SET('elog', '$ clang -O2 -g -target bpf -c minimal.bpf.c -o minimal.bpf.o\\n$ file minimal.bpf.o\\nminimal.bpf.o: ELF 64-bit LSB relocatable, eBPF'); SET('ewhy', '<p><b>② 编译。</b>关键参数是 <code>-target bpf</code>：让 clang 生成的是 <b>eBPF 字节码</b>，而不是你宿主机的 x86/ARM 机器码。</p><p>产物是一个普通的 <b>ELF 文件</b>（<code>.o</code>），里面装着字节码、Map 定义、以及<b>重定位信息</b>。注意：此时它还是「平台无关」的中间产物，没跟任何具体内核绑定。</p>'); },
+          },
+          {
+            run: () => { S('e2', 'done'); S('e3', 'active'); SET('elog', '用户态：bpf(BPF_PROG_LOAD, &attr, sizeof(attr))\\n  prog_type  = BPF_PROG_TYPE_KPROBE\\n  insns      = <字节码数组>\\n  license    = "GPL"\\n→ 返回 fd = 7'); SET('ewhy', '<p><b>③ 提交内核。</b>字节码不会自己跑进内核。必须由用户态程序通过 <code>bpf()</code> 系统调用、以 <code>BPF_PROG_LOAD</code> 命令把字节码连同元信息一起交给内核。</p><p>两个容易被忽略的点：<b>①</b> 加载<b>需要权限</b>（内核里检查 <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code> 一类的能力），普通进程根本没资格；<b>②</b> 要提供 <b>license</b>，声明为 <code>GPL</code> 才允许调用某些 GPL-only 的 helper——许可证不匹配时加载会直接失败。</p>'); },
+          },
+          {
+            run: () => { S('e3', 'done'); S('e4', 'active'); SET('elog', '内核对字节码做静态分析（不是运行它）…\\n  · 控制流可达性\\n  · 循环是否有界\\n  · 每条内存访问的边界\\n  · 寄存器/指针类型\\n  · helper 调用是否合法'); SET('ewhy', '<p><b>④ 验证器（verifier）。这是 eBPF 安全性的基石，没有之一。</b></p><p>内核面对的是一个哲学问题：<b>凭什么允许一段用户写的代码在内核态执行？</b>答案不是「信任作者」，而是「<b>用程序证明程序安全</b>」。验证器会模拟执行字节码的<b>所有可能路径</b>，逐条指令检查——它不是沙箱里跑一遍看会不会崩，而是<b>静态地证明</b>这段代码不可能把内核搞坏。</p><p>接下来的三步是验证器最重要的三项检查。</p>'); },
+          },
+          {
+            run: () => { S('e4', 'hot'); SET('elog', '  [检查 1] 循环\\n   旧内核：完全禁止循环，直接拒绝\\n   新内核：允许，但必须能证明循环「有界」\\n  → 无法证明上界的循环：REJECTED'); SET('ewhy', '<p><b>④a 检查循环。</b>最早的 eBPF <b>完全禁止循环</b>，因为循环意味着「可能永不结束」，而内核态死循环等于<b>整机卡死</b>。</p><p>后来的内核放宽了这一限制：允许循环，但验证器必须能<b>证明它有界</b>（例如循环次数是常量、或由 Map 里的值限定在某个范围内的有界循环）。证明不了的，直接拒收。</p><p>这就是为什么 eBPF 程序里写 <code>while</code> 要格外小心——它可能是你被拒的最常见原因。</p>'); },
+          },
+          {
+            run: () => { S('e4', 'hot'); SET('elog', '  [检查 2] 内存访问\\n   寄存器 R1 = ctx 指针，偏移 0 → 允许\\n   寄存器 R2 = 用户态指针 → 禁止直接解引用\\n  → 必须改用 bpf_probe_read_user*() 一类的 helper'); SET('ewhy', '<p><b>④b 检查内存访问。</b>这是最容易踩坑、也最能体现 eBPF 设计意图的一项。</p><p>内核指针（<code>ctx</code>、Map value、数据包）的每一次读写，偏移量都必须被验证器证明<b>落在合法范围内</b>。越界一次就是内核崩溃或者信息泄露。</p><p>而<b>用户态指针在内核里绝对不能直接解引用</b>——因为用户态可以随时把这块内存 unmap 掉，直接读会触发内核 oops。必须用 <code>bpf_probe_read_user()</code> 这类 helper，由内核替你做「安全拷贝」并在失败时返回错误码。你在写 eBPF 时的别扭感，多半来自这条规则。</p>'); },
+          },
+          {
+            run: () => { S('e4', 'hot'); SET('elog', '  [检查 3] 指针类型\\n   R1 = PTR_TO_CTX    → 不能当 PTR_TO_MAP_VALUE 用\\n   R1 += 100          → 类型退化为标量，需重新验证边界\\n  → 类型不匹配：REJECTED'); SET('ewhy', '<p><b>④c 检查指针类型。</b>验证器内部维护一套<b>寄存器类型系统</b>：这个寄存器是 ctx 指针、这个指向 Map 的 value、那个是数据包指针、那个只是个标量数字。</p><p>类型是一道<b>硬墙</b>：ctx 指针不能当 Map value 用，数据包指针不能当栈指针用。更微妙的是，<b>指针一旦做算术运算（加偏移），类型就会退化</b>，之后想再用它读写，必须重新做边界检查。</p><p>此外验证器还会检查 helper 的<b>调用白名单和参数类型</b>——不是所有 helper 对所有程序类型都开放。</p>'); },
+          },
+          {
+            run: () => { S('e4', 'hot'); SET('elog', '  [补充] 验证通过 → 内核返回 prog fd\\n  [失败]   EACCES / EPERM + verifier log\\n\\n  $ cat /sys/kernel/debug/tracing/... 可查看日志'); SET('ewhy', '<p><b>验证失败是常态，不是异常。</b>真写起来你会发现，第一次加载 eBPF 程序几乎一定会被拒。好消息是验证器会输出一份<b>逐指令的日志</b>（通常通过 <code>libbpf_set_print()</code> 或环境变量打开），告诉你第几条指令、哪个寄存器、哪条规则没过。</p><p><b>排查口诀：先看循环有没有上界，再看有没有直接解引用用户态指针，最后看指针类型有没有用混。</b></p>'); },
+          },
+          {
+            run: () => { S('e4', 'done'); S('e5', 'active'); SET('elog', 'JIT：字节码 → 本机机器码（x86-64 / arm64）\\n  bpf_jit_enable = 1\\n加载后即成为内核里一段真实可执行的函数'); SET('ewhy', '<p><b>⑤ JIT 编译。</b>验证通过后，内核把它<b>即时编译成本机机器码</b>（Just-In-Time）。这一步是性能的关键：eBPF 不是解释执行的，跑起来和手写的内核代码是同一个量级。</p><p>如果设备内核没开 JIT（<code>CONFIG_BPF_JIT</code>），程序只能解释执行，性能差一大截——这也是厂商裁剪内核时的一个常见受害项。</p>'); },
+          },
+          {
+            run: () => { S('e5', 'done'); S('e6', 'active'); SET('elog', 'attach：把程序挂到事件源上\\n  kprobe/do_sys_open      → 内核函数被调用时\\n  tracepoint/syscalls/... → 系统调用进入/退出时\\n  uprobe:/lib/libc.so:fn  → 用户态函数被调用时'); SET('ewhy', '<p><b>⑥ 挂载（attach）。</b>程序本身不知道自己要干什么，必须先<b>绑定到一个钩子点</b>。这是 eBPF 灵活性的来源——同一段逻辑换个 attach 点，就从「追踪文件打开」变成「追踪网络连接」。</p>' + T.tbl(['钩子类型', '挂在哪里', '对逆向的价值'], [
+            ['kprobe / kretprobe', '内核函数入口 / 返回', '看内核替 App 做了什么（文件、网络、权限检查）'],
+            ['uprobe / uretprobe', '用户态函数入口 / 返回', '<b>最高</b>：直接盯 so 里的加密、解密、校验函数'],
+            ['tracepoint', '内核预定义的静态追踪点', '稳定，不依赖内核函数名；<b>推荐优先用</b>'],
+            ['XDP', '网络驱动层最早的处理点', '高性能包处理、DDoS 防护'],
+            ['tc', '流量控制层', '网络过滤、限速'],
+            ['perf_event / socket filter / LSM', '性能事件 / socket / 安全策略', '采样分析、包过滤、安全策略钩子']
+          ]) + '</p>'); },
+          },
+          {
+            run: () => { S('e6', 'done'); S('e7', 'active'); SET('e7', 'hot'); SET('elog', '[事件发生] 某个进程调用 openat()\\n→ 进入内核 do_sys_open\\n→ 内核发现这里挂着 BPF 程序\\n→ 调用 JIT 后的机器码（微秒级）'); SET('ewhy', '<p><b>⑦ 触发执行。</b>现在你的代码是内核执行路径的一部分了：只要有进程碰这个事件，内核就会调用你。</p><p><b>关键点：触发是「被动」的。</b>eBPF 没有轮询、没有定时器，它只在<b>事件发生的那一刻</b>被内核叫起来。程序本身极短——读几个字段、写进 Map、返回。这也是它能做到微秒级开销的原因。</p>'); },
+          },
+          {
+            run: () => { S('e7', 'done'); S('e8', 'active'); SET('ebuf', '{\\n  pid  : 4821,\\n  comm : "browser",\\n  fname: "/proc/self/maps"\\n}'); SET('elog', 'e->pid  = bpf_get_current_pid_tgid() >> 32;\\nbpf_get_current_comm(&e->comm, sizeof(e->comm));\\nbpf_probe_read_user_str(&e->fname, ...);\\nbpf_ringbuf_submit(e, 0);   // → 推给用户态'); SET('ewhy', '<p><b>⑧ 回传结果。</b>程序在内核态，怎么把数据交出来？答案只有一条路：<b>BPF Map</b>——内核态和用户态共享的键值存储，是两者通信的<b>主要</b>通道。</p><p>内核态这边用 helper 操作：<code>bpf_map_lookup_elem()</code>、<code>bpf_map_update_elem()</code>、<code>bpf_map_delete_elem()</code>。</p><p>流式数据（比如源源不断的事件）现在推荐用 <b>ringbuf</b>（<code>BPF_MAP_TYPE_RINGBUF</code>），它取代了老式的 <code>perf_event_array</code>：<b>单生产者单消费者、无锁、高效</b>，也不会像 perf buffer 那样给每个 CPU 开一份缓冲。</p>'); },
+          },
+          {
+            run: () => { S('e8', 'done'); S('e9', 'active'); SET('ebuf', '[ 已被用户态读走，槽位释放 ]'); SET('elog', '$ sudo ./minimal\\npid=4821  comm=browser  file=/data/local/tmp/x.bin\\npid=4821  comm=browser  file=/proc/self/maps'); SET('ewhy', '<p><b>⑨ 用户态收割。</b>用户态通过 <code>bpf()</code> 系统调用（或者直接用 <b>libbpf</b> 封装好的 API）读 Map，拿到内核递出来的结构体，打印、写日志、发给分析平台。</p><p>到这里整个闭环完成：<b>源码 → 字节码 → 验证 → JIT → 挂载 → 触发 → 写 Map → 用户态读取</b>。这九步就是 eBPF 的全部骨架，后面所有复杂项目（Cilium、Falco、各种 tracing 工具）都是它加了不同的钩子和 Map 类型。</p>'); },
+          },
+          {
+            run: () => { S('e9', 'done'); SET('elog', '✓ 闭环完成。\\n整个过程中，目标进程:\\n  · 没有被注入\\n  · 没有新增模块\\n  · 没有新增线程\\n  · 没有新增监听端口'); SET('ewhy', '<p><b>回头看一个关键事实：</b>在这整条链路里，<b>被观测的那个进程从头到尾不知道发生了什么</b>。它的内存没被改、模块列表没变、线程表没变、端口没开。</p><p>这就是下一节要展开的核心价值。但先泼一盆冷水：<b>上面这套流程在 PC 的 Linux 上很顺，在 Android 手机上会撞上四堵墙</b>——25.6 节细说。</p>'); }
+          }
+        ]
+      },
+      after:
+        T.note('ok', '✅ 把九步压成一句话',
+          '<p><b>用 C 写、clang 编译成字节码、bpf() 系统调用送进内核、验证器证明它安全、JIT 编译、挂到钩子上、事件触发时执行、结果写进 Map、用户态读取。</b></p>' +
+          '<p>面试或讨论里，只要你能把这九步顺着说下来，并说清「验证器保证了什么」，就已经超过大多数只会背名词的人。</p>')
+    },
+
+    /* ================= 25.3 BPF Maps 数据流 ================= */
+    {
+      h: '25.3',
+      title: 'BPF Maps：数据怎么从内核态回到用户态',
+      html:
+        '<p>上一节的第 ⑧⑨ 步值得单独拉出来做一台动画。原因很简单：<b>eBPF 程序什么都干不了，它只能把结果塞进 Map</b>。' +
+        '你写 eBPF 时 90% 的挫败感都来自这一层——数据明明采到了，用户态就是读不出来。</p>' +
+        '<p>先记住一个反直觉的事实：<b>Map 不是「内核发给用户态的消息」</b>，它是<b>一块双方都能按 fd 访问的共享存储</b>。' +
+        '内核侧和用户态侧谁也不「发送」什么，只是各自往同一个 fd 上读写而已。理解这一点，后面所有的 API 都顺了。</p>',
+      stage: {
+        title: 'BPF Map 的内核态 ↔ 用户态数据通路',
+        speed: 2000,
+        render:
+          '<div class="flow-row" style="align-items:flex-start;gap:14px;flex-wrap:wrap">' +
+            '<div class="flow-col" style="flex:1 1 280px">' +
+              '<div class="card"><div class="card-title">内核态 Kernel</div>' +
+                '<div class="blk" id="k1">eBPF 程序（kprobe 命中）</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="k2">helper 调用</div>' +
+                '<div class="pill" id="k3">bpf_get_current_pid_tgid()</div><br>' +
+                '<div class="pill" id="k4">bpf_get_current_comm()</div><br>' +
+                '<div class="pill" id="k5">bpf_probe_read_user_str()</div><br>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="k6">bpf_ringbuf_reserve() 取记录槽</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="k7">bpf_ringbuf_submit() 提交</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="flow-col" style="flex:0 0 200px">' +
+              '<div class="blk" id="m1">BPF Map</div>' +
+              '<div class="pill" id="m2">RINGBUF</div>' +
+              '<div class="term-box" id="mbuf" style="min-height:120px">[ 空 ]</div>' +
+            '</div>' +
+            '<div class="flow-col" style="flex:1 1 280px">' +
+              '<div class="card"><div class="card-title">用户态 Userspace</div>' +
+                '<div class="blk" id="u1">libbpf 加载程序</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="u2">bpf_map__fd() 拿到 Map fd</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="u3">ring_buffer__new() 注册回调</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="u4">ring_buffer__poll() 轮询</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="blk" id="u5">回调里拿到 struct event</div>' +
+                '<div class="arrow">▼</div>' +
+                '<div class="pill ok" id="u6">printf 输出</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="term-box" id="mlog" style="margin-top:12px">$ 等待开始…</div>',
+        reset: () => {
+          ['k1','k2','k6','k7','m1','u1','u2','u3','u4','u5'].forEach(i => S(i, ''));
+          ['k3','k4','k5'].forEach(i => CLS(i, 'pill'));
+          CLS('m2', 'pill');
+          CLS('u6', 'pill ok');
+          SET('mbuf', '[ 空 ]');
+          SET('mlog', '$ 等待开始…');
+        },
+        steps: [
+          { run: () => { S('k1', 'active'); SET('mlog', '$ sudo ./trace_open\\n[内核] kprobe/tracepoint 触发 → 进入 eBPF 程序'); }, },
+          { run: () => { S('k1', 'done'); S('k2', 'active'); SET('mlog', 'e->pid = bpf_get_current_pid_tgid() >> 32;'); }, },
+          { run: () => { S('k3', 'cool'); SET('mlog', 'e->pid = bpf_get_current_pid_tgid() >> 32;\\n  → 高 32 位是 PID，低 32 位是 TID（一个 64 位数拆两半）'); }, },
+          { run: () => { S('k4', 'cool'); SET('mlog', 'bpf_get_current_comm(&e->comm, sizeof(e->comm));\\n  → 进程名，最多 16 字节，含结尾的 \\\\0'); }, },
+          { run: () => { S('k5', 'cool'); SET('mlog', 'bpf_probe_read_user_str(&e->fname, sizeof(e->fname), filename);\\n  → 内核里不能直接解引用用户态指针，必须让 helper 代读'); }, },
+          { run: () => { S('k2', 'done'); S('k6', 'active'); SET('mbuf', '[ 已预留一条记录槽 ]'); SET('mlog', 'e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);\\nif (!e) return 0;   // 预留失败直接返回，不能阻塞'); }, },
+          { run: () => { S('k6', 'done'); S('k7', 'active'); SET('m1', 'active'); CLS('m2', 'pill acc'); SET('mbuf', '{\\n  pid : 4821,\\n  comm: "browser",\\n  fname:"/proc/self/maps"\\n}'); SET('mlog', 'bpf_ringbuf_submit(e, 0);\\n  → 记录被推到 ringbuf 消费者侧'); }, },
+          { run: () => { S('k1', 'done'); S('k7', 'done'); S('m1', 'done'); S('u1', 'active'); SET('mlog', '$ sudo ./trace_open\\n[用户态] libbpf 已完成程序加载与 attach'); }, },
+          { run: () => { S('u1', 'done'); S('u2', 'active'); SET('mlog', 'int map_fd = bpf_map__fd(skel->maps.events);\\n  → 这就是那块共享存储的句柄'); }, },
+          { run: () => { S('u2', 'done'); S('u3', 'active'); SET('mlog', 'rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);\\n  → 注册回调：内核每提交一条，就调一次 handle_event()'); }, },
+          { run: () => { S('u3', 'done'); S('u4', 'active'); SET('m1', 'hot'); SET('mlog', 'while (1) ring_buffer__poll(rb, 100 /* ms */);\\n  → 用户态主动轮询（本质是对 Map fd 做 epoll）'); }, },
+          { run: () => { S('u4', 'done'); S('u5', 'active'); SET('mbuf', '[ 已消费，缓冲清空 ]'); SET('mlog', '[回调 handle_event]\\n  ctx->pid = 4821, ctx->comm = "browser"'); }, },
+          { run: () => { S('u5', 'done'); S('u6', 'active'); SET('m1', ''); CLS('m2', 'pill'); SET('mlog', 'printf("pid=%d comm=%s file=%s\\\\n", ...);\\npid=4821 comm=browser file=/proc/self/maps'); }, },
+          { run: () => { S('u6', 'cool'); SET('mlog', '✓ 闭环。\\n注意：全程没有任何数据「被发送」——内核写、用户态读，\\n共享的是同一个 fd。'); }, }
+        ]
+      },
+      after:
+        T.note('key', '🔑 Map 选型速查（记这 5 个就够入门）', '') +
+        T.tbl(['Map 类型', '结构', '什么时候用'], [
+          ['<code>BPF_MAP_TYPE_HASH</code>', '键值对，可增删', '按 pid / 路径 / 五元组聚合统计'],
+          ['<code>BPF_MAP_TYPE_ARRAY</code>', '定长数组，索引即键', '配置下发、固定槽位的计数器'],
+          ['<code>BPF_MAP_TYPE_PERCPU_ARRAY</code>', '每个 CPU 一份副本', '高频计数，避免多核写冲突'],
+          ['<code>BPF_MAP_TYPE_RINGBUF</code>', '单生产者单消费者环形缓冲', '<b>流式事件，现代首选</b>，取代 perf_event_array'],
+          ['<code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code>', '每 CPU 一份 perf 缓冲', '老代码常见，新项目不推荐']
+        ]) +
+        T.note('warn', '⚠️ 三个最容易踩的坑',
+          '<p><b>① 有界与失败处理。</b>在 eBPF 里做 Map 查找，返回值<b>必须判空</b>；写 ringbuf 前 <code>reserve</code> 失败也必须返回。验证器会盯着你——忘记判空，加载就被拒。</p>' +
+          '<p><b>② 值大小限制。</b>往 Map value 里塞东西时，结构体大小、栈上临时变量的尺寸都有上限，超出会直接编译或加载失败。大结构体要拆着写或者改用 ringbuf 直接写。</p>' +
+          '<p><b>③ perf buffer 的串扰。</b>老式 <code>perf_event_array</code> 是每 CPU 一份缓冲，多核下事件顺序会被打乱，且要开一大堆 fd。这就是 ringbuf 被推出来的原因。</p>') +
+        T.note('', '📌 对你的逆向工作意味着什么',
+          '<p>你现在应该能看出：<b>「内核态观测」是一个天然的隐蔽通道</b>。数据从 App 看不见的地方被采集、写进内核里的一块存储、再由一个<b>和 App 毫无关系的进程</b>读走。</p>' +
+          '<p>App 就算把 <code>/proc/self/maps</code> 翻烂，也不会看到任何异常——因为它本来就不在自己的地址空间里。这正是 25.5 节要展开的对比。</p>')
+    },
+
+    /* ================= 25.4 最小程序 stepper ================= */
+    {
+      h: '25.4',
+      title: '解剖一段最小的 eBPF 程序（逐行代码推演）',
+      html:
+        '<p>下面这段代码短到可以背下来，但它包含了 eBPF 程序的<b>全部结构要素</b>：SEC 注解、上下文、helper、Map、有界检查。' +
+        '看懂它，再去看 libbpf-bootstrap 或 BCC 里的现成工具，就只是「多了几个钩子和几个字段」而已。</p>' +
+        '<p>任务设定：<b>追踪进程打开文件的行为，把文件名送进 ringbuf。</b>这是 eBPF 世界里 Hello World 级别的例子（BCC 里对应 <code>opensnoop</code>）。</p>',
+      stepper: {
+        title: 'kprobe 追踪文件打开 → 写 ringbuf → 用户态读取',
+        lines: [
+          {
+            code: '<span class="c">// minimal.bpf.c —— 内核态部分</span>\n<span class="k">#include</span> <span class="s">&lt;linux/bpf.h&gt;</span>\n<span class="k">#include</span> <span class="s">&lt;bpf/bpf_helpers.h&gt;</span>',
+            note: '<b>两个头文件决定了一切。</b><code>linux/bpf.h</code> 提供内核侧的 BPF 类型与 helper 声明；<code>bpf/bpf_helpers.h</code> 来自 libbpf，提供 <code>SEC()</code> 宏和 helper 的友好包装。<br>注意：这是<b>内核态代码</b>，不是普通用户态 C——这里没有 libc、没有 <code>malloc</code>、没有 <code>printf</code>（只有调试用的 <code>bpf_printk</code>）。'
+          },
+          {
+            code: '<span class="k">struct</span> <span class="t">event</span> {\n  <span class="t">__u32</span> pid;\n  <span class="t">char</span>  comm[<span class="n">16</span>];\n  <span class="t">char</span>  fname[<span class="n">256</span>];\n};',
+            note: '<b>这是要送到用户态的结构体</b>，两边必须逐字节一致——所以实践中通常抽到一个共享的头文件里，内核态和用户态各 include 一次。<br>字段尺寸在这里不是随便定的：comm 取 16 字节是因为内核里的进程名（TASK_COMM_LEN）就是 16；fname 给 256 是权衡后的常用值，太大会挤爆栈。'
+          },
+          {
+            code: '<span class="k">struct</span> {\n  <span class="t">__uint</span>(type, BPF_MAP_TYPE_RINGBUF);\n  <span class="t">__uint</span>(max_entries, <span class="n">256</span> * <span class="n">1024</span>);\n} events <span class="t">SEC</span>(<span class="s">".maps"</span>);',
+            note: '<b>用 BTF 风格声明一个 Map。</b><code>SEC(".maps")</code> 告诉 libbpf：这个变量不是数据，是一个 Map 定义，请把它放进 ELF 的 maps 段。<br><code>max_entries</code> 对 ringbuf 来说就是<b>缓冲区总字节数</b>，必须是 2 的幂。这段声明只存在于 <code>.o</code> 文件里，加载时由 libbpf 创建真正的内核对象。'
+          },
+          {
+            code: '<span class="t">SEC</span>(<span class="s">"kprobe/do_sys_open"</span>)\n<span class="k">int</span> <span class="f">handle_open</span>(<span class="k">struct</span> <span class="t">pt_regs</span> *ctx) {',
+            note: '<b>SEC 注解 = attach 点的声明书。</b>libbpf 靠扫描段名来决定把这个程序挂到哪里。<code>kprobe/do_sys_open</code> 的意思是「挂在 <code>do_sys_open</code> 这个内核函数入口」。<br><code>ctx</code> 的类型随程序类型变化：kprobe 给的是 <code>struct pt_regs *</code>（寄存器现场）。<span class="pill warn">不同内核版本里 do_sys_open 的符号与签名有差异，建议用 tracepoint 替代以提升可移植性</span>'
+          },
+          {
+            code: '  <span class="k">struct</span> <span class="t">event</span> *e;\n  e = <span class="f">bpf_ringbuf_reserve</span>(&amp;events, <span class="k">sizeof</span>(*e), <span class="n">0</span>);\n  <span class="k">if</span> (!e) <span class="k">return</span> <span class="n">0</span>;',
+            note: '<b>先在 ringbuf 里「预订」一块空间。</b>这是 ringbuf 和普通 Map 的关键差别：普通 Map 是 <code>update</code> 一次性写入，ringbuf 是<b>先 reserve 拿到可写指针、填完再 submit</b>。<br><b>那句判空绝不能省</b>：缓冲区满时 reserve 会返回 NULL（而且不会阻塞，eBPF 里不允许睡眠等待）。漏掉它，验证器直接拒收。'
+          },
+          {
+            code: '  e-&gt;pid = <span class="f">bpf_get_current_pid_tgid</span>() &gt;&gt; <span class="n">32</span>;\n  <span class="f">bpf_get_current_comm</span>(&amp;e-&gt;comm, <span class="k">sizeof</span>(e-&gt;comm));',
+            note: '<b>两个最常用的 helper。</b><code>bpf_get_current_pid_tgid()</code> 返回一个 64 位数：<b>高 32 位是 PID，低 32 位是 TID</b>——所以要右移 32 位才拿到 PID。<br><code>bpf_get_current_comm()</code> 把当前进程名拷进你给的缓冲。<br>注意这里没有任何函数调用栈、没有 libc——<b>helper 就是 eBPF 世界的系统调用</b>。'
+          },
+          {
+            code: '  <span class="t">const char</span> *filename = <span class="t">BPF_CORE_READ</span>(...);\n  <span class="f">bpf_probe_read_user_str</span>(&amp;e-&gt;fname,\n      <span class="k">sizeof</span>(e-&gt;fname), filename);',
+            note: '<b>最容易翻车的一步。</b>文件名字符串在<b>用户态内存</b>里，内核态指针不能直接解引用它——用户态随时可能把这块内存 unmap 掉，硬读就是内核 oops。<br>必须交给 <code>bpf_probe_read_user_str()</code> 这类 helper 做安全拷贝，失败了它会返回负值（很多例子里干脆不检查，因为读不到就留空，但严谨写法应该检查）。<br><span class="pill warn">从内核结构体里抠出 filename 字段的具体写法随内核版本变化很大，CO-RE 的 BPF_CORE_READ 系列是相对可移植的途径，但字段名仍需按目标内核确认</span>'
+          },
+          {
+            code: '  <span class="f">bpf_ringbuf_submit</span>(e, <span class="n">0</span>);\n  <span class="k">return</span> <span class="n">0</span>;\n}\n<span class="t">char</span> <span class="t">LICENSE</span>[] <span class="t">SEC</span>(<span class="s">"license"</span>) = <span class="s">"GPL"</span>;',
+            note: '<b>提交并声明许可证。</b><code>submit</code> 之后这块记录才真的对用户态可见（若不提交要用 <code>discard</code> 归还，否则算泄漏）。<br><code>LICENSE</code> 不是形式主义：内核会检查它，声明 <code>GPL</code> 才允许调用那些 GPL-only 的 helper；写成别的字符串，某些 helper 会导致加载失败。<br>返回值 <code>0</code> 在 kprobe 上通常表示「不干预，继续执行」——eBPF 观测默认是<b>只读</b>的。'
+          },
+          {
+            code: '<span class="c">// minimal.c —— 用户态部分（节选）</span>\n<span class="t">struct</span> minimal_bpf *skel = <span class="f">minimal_bpf__open_and_load</span>();\n<span class="f">minimal_bpf__attach</span>(skel);',
+            note: '<b>用户态只做三件事：打开、加载、挂载。</b>骨架（skeleton）是 <code>bpftool gen skeleton</code> 从 <code>.o</code> 生成的 C 头文件，它把「读 ELF、建 Map、加载程序、attach」这些琐事全包了。<br>这也是 <b>CO-RE</b> 发挥作用的位置：加载时 libbpf 读目标机器的 BTF 做重定位，所以同一份 <code>.o</code> 能在不同内核版本上跑。'
+          },
+          {
+            code: '<span class="t">struct</span> ring_buffer *rb =\n  <span class="f">ring_buffer__new</span>(<span class="f">bpf_map__fd</span>(skel-&gt;maps.events),\n                     handle_event, <span class="n">NULL</span>, <span class="n">NULL</span>);\n<span class="k">while</span> (!exiting) <span class="f">ring_buffer__poll</span>(rb, <span class="n">100</span>);',
+            note: '<b>用户态开始收割。</b>先为 ringbuf 注册一个回调 <code>handle_event</code>，然后死循环轮询。<code>poll</code> 的第二个参数是超时毫秒数，返回负数表示出错，应当退出循环（示例里为了简化省略了判断）。<br>这里的「轮询」底层是对 Map fd 做 epoll，<b>不占 CPU</b>；有数据才唤醒回调。'
+          },
+          {
+            code: '<span class="k">static int</span> <span class="f">handle_event</span>(<span class="k">void</span> *ctx, <span class="k">void</span> *data, <span class="t">size_t</span> len) {\n  <span class="k">struct</span> <span class="t">event</span> *e = data;\n  <span class="f">printf</span>(<span class="s">"pid=%d comm=%s file=%s\\n"</span>,\n         e-&gt;pid, e-&gt;comm, e-&gt;fname);\n  <span class="k">return</span> <span class="n">0</span>;\n}',
+            note: '<b>回调解包。</b>参数 <code>data</code> 指向的就是内核里那个 <code>struct event</code>——因为两边共用同一个头文件定义，可以直接强转使用（真实项目中要注意 <code>len</code> 校验以防越界读）。<br>返回非 0 会中止轮询，一般返回 0 继续。'
+          },
+          {
+            code: '$ clang -O2 -g -target bpf -c minimal.bpf.c -o minimal.bpf.o\n$ bpftool gen skeleton minimal.bpf.o &gt; minimal.skel.h\n$ clang -O2 -g minimal.c -lbpf -lelf -lz -o minimal\n$ sudo ./minimal\npid=4821 comm=browser file=/proc/self/maps\npid=4821 comm=browser file=/data/local/tmp/payload.bin',
+            note: '<b>完整构建链路四步走。</b>① clang 编成 BPF 目标文件；② bpftool 生成骨架头；③ 编用户态程序并链接 libbpf；④ 以 root 运行。<br>注意这个例子是 <b>PC Linux 上的标准流程</b>——搬到 Android 上，第 ④ 步会撞上四堵墙（见 25.6 节）。'
+          }
+        ]
+      },
+      after:
+        T.note('ok', '✅ 记住这四个结构件，你就能读绝大多数 eBPF 源码',
+          '<p><b>①</b> <code>SEC()</code> 决定<b>挂在哪</b>；<b>②</b> <code>SEC(".maps")</code> 定义<b>数据放哪</b>；<b>③</b> helper 决定<b>能拿到什么、怎么安全地拿</b>；<b>④</b> 用户态骨架负责<b>加载、挂载、读取</b>。</p>' +
+          '<p>BCC 的 Python 脚本、bpftrace 的一行命令、Cilium 的复杂数据面，剥到最里面都是这四件。</p>')
+    },
+
+    /* ================= 25.4L 动手实验 ================= */
+    {
+      h: '25.4L', title: '动手实验：当一回 eBPF 验证器',
+      html:
+        '<p>验证器（verifier）是 eBPF 最核心也最抽象的设计。理解它的最好方式不是读文档，' +
+        '而是<b>自己当一次验证器</b>——判断几段代码能不能通过。</p>',
+      lab: {
+        title: '实验：验证器会放行哪一段代码？',
+        goal: '目标：找出会被拒绝的写法',
+        intro:
+          '<p>下面有五段 eBPF 代码片段。<b>其中三段能通过验证器，两段会被拒绝。</b></p>' +
+          '<p><b>任务：找出被拒绝的那两段，并说明验证器拒绝它们的理由。</b></p>' +
+          '<pre style="margin:10px 0;font-size:12.5px"><code>' +
+          '【A】\n' +
+          '  int idx = ctx-&gt;arg0;\n' +
+          '  if (idx &gt;= 0 &amp;&amp; idx &lt; 16)          // ① 先检查\n' +
+          '      return arr[idx];               // ② 再访问\n\n' +
+          '【B】\n' +
+          '  int idx = ctx-&gt;arg0;\n' +
+          '  return arr[idx];                   // 没有边界检查\n\n' +
+          '【C】\n' +
+          '  while (1) { }                      // 无条件死循环\n\n' +
+          '【D】\n' +
+          '  #pragma clang loop unroll(full)\n' +
+          '  for (int i = 0; i &lt; 8; i++) { ... }  // 循环次数固定且可展开\n\n' +
+          '【E】\n' +
+          '  void *p = bpf_map_lookup_elem(&amp;m, &amp;key);\n' +
+          '  if (!p) return 0;                  // ① 先判空\n' +
+          '  return *(int *)p;                  // ② 再解引用' +
+          '</code></pre>',
+        inputs: [
+          { key: 'reject', label: '① 哪两段会被验证器拒绝？（填字母）',
+            hint: '格式：B、C 或 B C', ph: '例如 B、C' },
+          { key: 'reason', label: '② 验证器拒绝它们的共同理由是什么？',
+            hint: '它不做运行时测试，只在加载时做什么？', ph: '因为……', type: 'textarea', rows: 3 }
+        ],
+        runLabel: '🔍 对照验证器判定',
+        run: (v) => {
+          const items = [
+            { k: 'A', pass: true,  title: '先检查 idx 范围，再访问数组',
+              why: '通过。验证器跟踪 <code>idx</code> 的取值范围：经过 <code>if</code> 之后它确定落在 [0,16)，' +
+                   '而 <code>arr</code> 是已知大小的栈数组 → 访问安全。' +
+                   '<b>这是"每条可能路径上都要安全"的典型写法。</b>' },
+            { k: 'B', pass: false, title: '没有边界检查就索引数组',
+              why: '<b>拒绝。</b>验证器无法证明 <code>idx</code> 在数组范围内 —— 它是从上下文读来的<b>不可信输入</b>。' +
+                   'eBPF 不允许任何"可能越界"的访问。<br>' +
+                   '<b>注意：验证器不会"运行时试试看"</b>，它必须在<b>加载时静态证明</b>所有路径都安全。' },
+            { k: 'C', pass: false, title: '无条件死循环',
+              why: '<b>拒绝。</b>eBPF 程序运行在<b>内核态</b>，而且常常在中断/软中断上下文里执行。' +
+                   '死循环会让整个内核挂住。<br>' +
+                   '<b>所以验证器要求所有循环必须可证明会终止</b>（有界循环）。' +
+                   '注意：较新内核支持有界循环，但必须能被证明有上界。' },
+            { k: 'D', pass: true,  title: '固定次数的展开循环',
+              why: '通过。<code>#pragma clang loop unroll(full)</code> 让编译器在<b>编译期</b>把循环完全展开成 8 段直线代码，' +
+                   '指令流里<b>不再有循环结构</b>，验证器看到的是一串确定的直线代码，自然可证明会终止。<br>' +
+                   '<b>这正是 eBPF 里处理循环的经典手法：能展开就展开。</b>' },
+            { k: 'E', pass: true,  title: '判空后再解引用 Map 指针',
+              why: '通过。<code>bpf_map_lookup_elem</code> 可能返回 NULL（key 不存在），验证器<b>知道这一点</b>。' +
+                   '先 <code>if (!p) return 0;</code> 把 NULL 分支排除掉，剩下的路径上 <code>p</code> 一定非空 → 解引用安全。' }
+          ];
+
+          let html = '<table class="lab-tbl"><tr><th>片段</th><th>验证器判定</th><th>理由</th></tr>';
+          items.forEach(it => {
+            html += '<tr class="' + (it.pass ? 'same' : 'diff') + '">'
+              + '<td><b>' + it.k + '</b><br><span style="font-size:11px;color:var(--fg-3)">' + it.title + '</span></td>'
+              + '<td>' + (it.pass ? '✅ 通过' : '❌ <b>拒绝</b>') + '</td>'
+              + '<td style="font-size:12px">' + it.why + '</td></tr>';
+          });
+          html += '</table>';
+
+          // 校验用户答案
+          const picked = String(v.reject || '').toUpperCase().replace(/[^A-E]/g, '').split('');
+          const uniq = [...new Set(picked)].sort();
+          const correct = ['B', 'C'];
+          const ok = uniq.length === 2 && uniq[0] === 'B' && uniq[1] === 'C';
+          if (picked.length) {
+            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>'
+              + (ok ? '✅ 正确：B 和 C 会被拒绝' : '❌ 答案不对') + '</b>'
+              + '<div class="lab-note">' + (ok
+                  ? 'B 是<b>内存安全</b>问题（可能越界），C 是<b>终止性</b>问题（可能死循环）。'
+                  : '正确答案是 <b>B</b> 和 <b>C</b>。<br>' +
+                    'B —— 没有边界检查的数组访问，验证器无法证明不越界。<br>' +
+                    'C —— 无条件死循环，验证器无法证明会终止。<br>' +
+                    '<b>A / D / E 都能通过</b>，因为它们分别用"范围检查""循环展开""判空"给出了静态可证的保证。')
+              + '</div></div>';
+          }
+
+          const reason = String(v.reason || '').trim();
+          if (reason) {
+            const hitStatic = window.AKKC_hasConcept(reason, ['静态', '加载时', '证明', '可证明', '不运行', '编译时', '事先', '不可判定']);
+            const hitSafe = window.AKKC_hasConcept(reason, ['安全', '越界', '死循环', '终止', '崩溃', '崩溃内核', '内存']);
+            html += '<div class="lab-msg ' + (hitStatic && hitSafe ? 'pass' : 'warn') + '"><b>'
+              + (hitStatic && hitSafe ? '✅ 抓住核心了' : '🟡 还不够到位') + '</b>'
+              + '<div class="lab-note">'
+              + '验证器的核心特征是：<b>它不做运行时测试，而是在加载时静态证明"这段程序在任何输入下都不会出事"。</b><br><br>'
+              + '要证明两件事：<br>'
+              + '<b>① 内存安全</b> —— 任何一次访问都在合法范围内（B 违反）<br>'
+              + '<b>② 一定终止</b> —— 不会无限循环卡住内核（C 违反）<br><br>'
+              + '<b>这就是"凭什么允许用户代码进内核"的答案：</b>' +
+              '不是靠权限限制（那限制不住），而是靠<b>数学证明</b>。'
+              + '</div></div>';
+          }
+          return html;
+        },
+        expected: (v) => {
+          const picked = [...new Set(String(v.reject || '').toUpperCase().replace(/[^A-E]/g, '').split(''))].sort();
+          const ok = picked.length === 2 && picked[0] === 'B' && picked[1] === 'C';
+          return {
+            ok,
+            detail: ok
+              ? '<b>完全正确：B 和 C。</b><br>' +
+                '验证器要静态证明两件事：<b>内存安全</b>（B 违反：可能越界）和<b>一定终止</b>（C 违反：可能死循环）。<br>' +
+                'A / D / E 分别靠"范围检查""循环展开""判空"给出了可证的保证。'
+              : '<b>不是这两个。</b>正确答案是 <b>B</b> 和 <b>C</b>。<br>' +
+                '判断方法：逐段问自己"验证器能不能<b>静态证明</b>它安全？"<br>' +
+                '• A 有范围检查 → 能证明<br>• D 循环被展开成直线代码 → 能证明<br>• E 判空后解引用 → 能证明<br>' +
+                '• <b>B</b> 直接用不可信输入索引 → <b>证明不了</b><br>' +
+                '• <b>C</b> 无条件死循环 → <b>证明不了会终止</b>'
+          };
+        },
+        showAnswer:
+          '【会被拒绝的两段】B 和 C\n\n' +
+          'B —— 内存安全问题\n' +
+          '  代码：int idx = ctx->arg0;  return arr[idx];\n' +
+          '  理由：idx 来自上下文的不可信输入，验证器无法证明它落在 arr 范围内。\n' +
+          '        只要存在一条"可能越界"的路径，就拒绝。\n\n' +
+          'C —— 终止性问题\n' +
+          '  代码：while (1) { }\n' +
+          '  理由：eBPF 跑在内核态，死循环会挂住整个内核。\n' +
+          '        验证器要求所有循环都能被证明有上界。\n\n' +
+          '【能通过的三段及原因】\n' +
+          'A：先做范围检查 if (idx >= 0 && idx < 16)\n' +
+          '   → 验证器跟踪 idx 的取值范围，检查后确定落在 [0,16) 内\n' +
+          'D：#pragma clang loop unroll(full)\n' +
+          '   → 编译期完全展开成 8 段直线代码，指令流里没有循环结构\n' +
+          'E：先判空 if (!p) return 0;\n' +
+          '   → 排除 NULL 分支后，剩余路径上 p 一定非空\n\n' +
+          '【验证器的核心特征】\n' +
+          '  它【不做运行时测试】，而是在【加载时静态证明】：\n' +
+          '    "这段程序在任何输入、任何路径下都不会出事"\n\n' +
+          '  要证明两件事：\n' +
+          '    ① 内存安全 —— 每次访问都在合法范围内\n' +
+          '    ② 一定终止 —— 不会无限循环\n\n' +
+          '  这是"凭什么允许用户代码进内核"的答案：\n' +
+          '    不是靠权限限制，而是靠数学证明。',
+        hint:
+          '不要问"这段代码平时跑得通吗"——验证器<b>不运行代码</b>。<br>' +
+          '要问：<b>「验证器能不能在加载时，静态地证明这段程序永远不会出事？」</b><br><br>' +
+          '它主要证明两件事：<br>' +
+          '① <b>内存安全</b>：每次读写都在合法范围内吗？<br>' +
+          '② <b>一定终止</b>：会不会死循环卡住内核？<br><br>' +
+          '拿这两把尺子去量五个片段，答案就出来了。',
+        after:
+          T.note('key', '🔑 这个实验训练的是"从机制推边界"',
+            '<p style="margin-bottom:0">你现在能解释一个很多人答不上来的问题：' +
+            '<b>"eBPF 凭什么敢让用户写的代码跑在内核里？"</b><br><br>' +
+            '答案是<b>验证器</b>——它用静态分析证明了程序不会危害内核。' +
+            '这也解释了 eBPF 的很多"奇怪限制"：<br>' +
+            '• 为什么不能随心所欲循环？→ 终止性无法证明<br>' +
+            '• 为什么只能用 helper 白名单？→ 白名单函数的行为是已知安全的<br>' +
+            '• 为什么不能动态分配内存？→ 分配器的行为无法静态验证<br>' +
+            '• 为什么有 4096 条指令限制？→ 保证验证能在有限时间内完成<br><br>' +
+            '<span class="hit">这一节是本课程方法论的又一次体现：' +
+            '<b>先问"机制是什么"，限制和用法就能自己推导出来，不用背。</b></span></p>')
+      }
+    },
+
+    /* ================= 25.5C 实战案例 ================= */
+    {
+      h: '25.5C', title: '实战案例：某加固 V3/V4 的 Frida 检测定位',
+      case: {
+        source: 'kanxue',
+        title: '[原创]某加固最新版frida检测绕过-trace一把嗦(续)',
+        date: '2026-7-28',
+        author: '东方玻璃',
+        target: '某加固（壳 so = libDexHelper.so）最新 V3 / V4 版 Frida 检测；V3 样本 com.mobile.zgcbank，V4 样本 com.yitong.zjrc.mfs.android',
+        background:
+          '<p>2026 年的一篇看雪原创帖。目标是某加固<b>最新 V3 / V4 版</b>的 Frida 检测：V3 样本 <code>com.mobile.zgcbank</code>，' +
+          'V4 样本 <code>com.yitong.zjrc.mfs.android</code>，壳 so 都是 <code>libDexHelper.so</code>。作者没有点名厂商。</p>' +
+          '<p>环境：Mac mini M4 / macOS 15.7.7、IDA Pro 9.4、Pixel 6A（Android 14）；' +
+          '工具链是 Codex、Frida 16.2.1、ida-export-cli、<b>glass-stalker-trace</b>、SoFixer、bindiff。</p>' +
+          '<p>这篇帖子的看点在于：<b>检测点藏在匿名内存里的 so 中，静态根本无从下手</b>，' +
+          '作者于是走上了一条“先把它变成可分析对象，再让程序自己走一遍，最后用二分法逼出唯一那个人”的路。' +
+          'V4 还多了一层变化——<b>它不再杀进程，而是故意不解密 DEX 让你自己崩</b>。</p>',
+        points: [
+          '版本谱系：V1 / V2 会解密释放真 so 并替换 <code>soinfo</code>，hook 掉线程检测函数即可；<b>V3 / V4 内置自定义 linker，直接把真 so 加载到匿名内存</b>，磁盘上再也找不到它。',
+          'V3 dump 法：<code>Process.enumerateRanges({protection:\'r-x\',coalesce:true})</code> 扫可执行内存，校验 ELF 魔数 <code>0x7f 45 4c 46</code>，并用 <code>Process.enumerateModules()</code> 做白名单排除。',
+          'fullSize 靠解析 Phdr 算：64 位下 <code>e_phoff@32</code>、<code>e_phnum@56</code>、<code>p_size=56</code>，取所有 PT_LOAD 的 <code>p_vaddr+p_memsz</code> 最大值向上按 4096 对齐；dump 完再用 <b>SoFixer</b> 修复。',
+          'hook <code>clone</code> 定位检测线程：<code>args[3]!=0</code> 时读 <code>args[3].add(96).readPointer()</code>；当 Frida 的 <code>Process.findModuleByAddress</code> 返回 null 时，改按 <code>addr.sub(base)</code> 打印偏移。',
+          '确认某个函数是检测点后，用 <code>Arm64Writer.putRet()</code> 把函数头 patch 成 <code>ret</code>，先粗暴验证再谈精细绕过。',
+          'V3 首批 8 个偏移 <code>0x2cb28</code> / <code>0x43ed8</code> / <code>0x3e018</code> / <code>0x4bd70</code> / <code>0x4c608</code> / <code>0x574d8</code> / <code>0x48088</code> / <code>0x4aed8</code> <b>全部处理完，App 仍然崩</b>——说明真凶不在这一批里。',
+          '<b>glass-stalker-trace</b> 用法：插件放进 IDA 的 <code>plugins</code> 目录，<code>configureTrace({moduleName, root:{name:\'JNI_OnLoad\',offset:0x13A8C}})</code> 设根节点，再 <code>trace_start(base,range)</code> 跑；输出节点形如 <code>[tree] |-- sub_29D78 (0x29d78) [from=0x2832c, bl, depth=2]</code>。',
+          '<b>二分法定位</b>：取 trace 树里居中且唯一路径上的中间节点，在它的 <code>onLeave</code> 里 <code>Thread.sleep(10)</code>（5–10s 合适，太久系统会 kill app）；sleep 没跑完就崩 ⇒ 检测点在前半段，跑完才崩 ⇒ 在后半段。',
+          'V3 真检测点 <b><code>sub_2813C</code></b>：不是 JNI_OnLoad 开头的那次调用，而是<b>第 418 行 <code>if</code> 内 fork 分支里的第 2 次调用</b>；功能是扫 <code>cmdline</code> 判断调试态。',
+          '它的返回值语义是四态：<b>0 = 触发 fork、1 = 崩溃、2 = 可运行、3 = 其他点位的正常值</b> ⇒ 用 <code>retval.replace(3)</code> 绕过，而不是简单置 0。',
+          'V4 的检测摊在 8 个线程函数里：<code>0x302b0</code> / <code>0x348a4</code> / <code>0x5171c</code> / <code>0x4741c</code> / <code>0x5e588</code> / <code>0x60a88</code> / <code>0x61b3c</code> / <code>0x6dc04</code>。',
+          'V4 上 trace 默认 10s 窗口不够，要加 <code>maxDurationMs:30000</code>，并用 <code>hotPathSuppress:{functions:[0x80100,0x7C4F0]}</code> 压掉热点函数，最终锁定真检测函数 <b><code>sub_6A5A8</code></b>。',
+          'V4 的指令级定位用 <code>detailTrace:{enabled:true,startOffset:0x10380,untilProcessExit:true}</code>，log 写在 <code>/data/data/&lt;pkg&gt;/files/</code>；关键位置是最后的 <code>blr x20</code>，调用点 <code>0x10674</code>，符号为 <code>_ZN3art13DexFileLoader10OpenCommonEPKhmS2_mRKNSt3__112basic_string...</code>。',
+          '<b>V4 的关键变化</b>：它不再主动杀进程，而是检测到 Frida 后<b>故意不解密 DEX / 埋坑</b>，等正常业务逻辑去调系统 API 时因缺关键数据触发异常崩溃——把“杀你”伪装成“你自己崩的”。',
+          '<code>sub_6A5A8</code> 返回 0 → 正常解密释放 DEX；返回 1 → DEX 无法释放，最后崩溃 ⇒ 必须把它 hook 成 0，并配合 patch <code>6AB94</code>。'
+        ],
+        method: [
+          '先认清对手升级到了哪一代：V1 / V2 的 soinfo 替换法在 V3 / V4 上完全无效，因为真 so 已经进了匿名内存，磁盘侧无从下手。',
+          '把匿名内存里的 so 变成可分析对象：扫 <code>r-x</code> 段 → 校验 ELF 魔数 → 排除已知模块 → 按 Phdr 算出 fullSize → dump 并用 SoFixer 修复。',
+          '拿到可读 so 之后，hook <code>clone</code> 盯住检测线程的创建，先把可疑线程的调用点按 <code>addr.sub(base)</code> 的相对偏移记录下来。',
+          '对首批 8 个偏移逐个 <code>putRet()</code> 试 patch——<b>全部失败</b>，于是放弃“猜偏移”，转向行为追踪。',
+          '用 glass-stalker-trace 从 <code>JNI_OnLoad+0x13A8C</code> 为根跑出一棵调用树，拿到几千个节点的完整执行路径。',
+          '在树上做二分：挑居中节点塞 <code>Thread.sleep(10)</code>，用“崩不崩”把范围砍一半，反复收敛到唯一的那个函数。',
+          '定位到 <code>sub_2813C</code> 后，先读清它的返回值语义（四态！），再用 <code>retval.replace(3)</code> 而不是置 0 来绕过。',
+          'V4 重复同一套流程：先扩 trace 窗口到 <code>maxDurationMs:30000</code> 并压制热点函数，再从 8 个线程函数收敛到 <code>sub_6A5A8</code>。',
+          'V4 上再下沉一层，用 <code>detailTrace</code> 做指令级 trace，顺着最后的 <code>blr x20</code> 找到 <code>DexFileLoader::OpenCommon</code> 这个调用点，确认“不解密 DEX”这条链。',
+          '收口：V4 把 <code>sub_6A5A8</code> hook 成返回 0（让它老老实实解密释放 DEX），并补掉 <code>6AB94</code>，绕过完成。'
+        ],
+        result:
+          '<p>V3 侧：定位到真检测点 <code>sub_2813C</code>，用 <code>retval.replace(3)</code> 绕过——' +
+          '注意这里的关键是<b>读懂了返回值是四态而不是布尔</b>，简单置 0 反而会踩进 <code>fork</code> 分支。</p>' +
+          '<p>V4 侧：从 8 个线程函数收敛到 <code>sub_6A5A8</code>，把它 hook 成返回 <code>0</code> 并 patch <code>6AB94</code>，' +
+          'App 恢复正常——<b>因为返回 0 才会触发正常的 DEX 解密与释放流程</b>。</p>' +
+          '<p>整条路线上真正的两个突破，一个来自<b>把匿名 so 变成可 dump 的对象</b>，另一个来自<b>用二分法把几千个函数砍成 1 个</b>。' +
+          '静态分析在这两个环节都没能直接给出答案。</p>',
+        terms: ['Frida Stalker', 'glass-stalker-trace', 'SoFixer', 'Process.enumerateRanges', 'Arm64Writer', '匿名内存加载', 'JNI_OnLoad', 'retval.replace', 'detailTrace', 'DexFileLoader'],
+        limits:
+          '<p>这篇帖子的局限作者自己交代得比较清楚，也有几处必须替他标注：</p>' +
+          '<p>① <b>trace 结果因插件版本而异</b>——作者用的是 V1.2，换版本输出可能不同。</p>' +
+          '<p>② V4 定位到 <code>sub_6A5A8</code> <b>“有一些运气成分”</b>：插件 V1.0 会折叠节点，导致当时的判断是误打误撞命中的。</p>' +
+          '<p>③ trace 命中过多热点函数时，会触发 trace 引擎自身的性能限制，需要靠 <code>hotPathSuppress</code> 之类的手段减负。</p>' +
+          '<p>④ <b>二分法的节点选取有讲究</b>：要挑居中、且在树上路径唯一的节点，随便挑一个可能压根没被走到，sleep 就白塞了。</p>' +
+          '<p>⑤ <b>加固厂商未点名</b>，样本无法据此复现验证。</p>' +
+          '<p>⑥ 作者还专门反思了“让 AI 自动调 IDA”的坑：<b>AI 谎报军情，说脚本已经跑通，实际把 APP 卡死了</b>，最后他放弃自动化、回归手工操作。</p>',
+        analysis:
+          '<p><b>虽然本案例用的是 Frida Stalker 而不是 eBPF，但它是第 25 章“内核态 / 低层观测”这条思路的方法论同构。</b>' +
+          '本章的元原则是：<b>观测点决定了你能看见什么</b>——eBPF 的价值不在技术先进，而在“观测发生在目标进程的地址空间之外”。' +
+          '这个案例换了个方向用同一条原则：当静态分析看不见目标时，就<b>把观测这件事本身往下压一层</b>，从“读代码”压到“看它怎么跑”。</p>' +
+          '<p><b>第一层，把“不可能”变成“可枚举”。</b>面对匿名内存里的 so，作者没有硬啃汇编，而是用三个可判定的条件——' +
+          '扫 <code>r-x</code> 段、校验 ELF 魔数 <code>0x7f 45 4c 46</code>、用 <code>Process.enumerateModules()</code> 排除已知模块——' +
+          '把它变成了一个<b>可以被 dump 的普通对象</b>。变成文件之后，IDA 能读、bindiff 能比、SoFixer 能修，' +
+          '<span class="hit">原本无从下手的问题，被翻译成了一套标准流程。这是本章 25.7 探测清单的同一种思维：<b>把“行不行”变成一组可测量的数据。</b></span></p>' +
+          '<p><b>第二层，二分法这种“笨办法”的价值。</b>当检测点藏在几千个函数里，作者的解法是塞一个 <code>Thread.sleep(10)</code>，' +
+          '用“崩不崩”把搜索空间砍一半。<b>它比任何静态分析都快</b>，因为它完全绕过了“读懂逻辑”这件事，只依赖一个前提：程序会自己告诉你答案。' +
+          '这正是本课反复强调的元原则——<b>静观看不懂的，让程序自己走一遍</b>——第 25 章的观测优先思路，正是它在内核层的版本。' +
+          '<span class="hit">先让程序走一遍，再决定要读哪一段代码。</span></p>' +
+          '<p><b>第三层，对 AI 的批判性使用。</b>作者明确记录了“AI 谎报军情说脚本通过、实际卡死 APP”，然后回归手工。' +
+          '这个细节比技术本身更重要：<b>AI 适合做“从汇编到逻辑”的静态还原</b>——那部分它确实能省下大量时间；' +
+          '<b>但它不适合做“脚本到底跑没跑通”的判断</b>，因为那是事实问题，必须自己验证。' +
+          '<span class="hit">把 AI 用在“提出假设”上，把人工留在“验证事实”上——这与本章 25.6 那句“唯一可靠的做法是在你自己的目标设备上实测”是同一条底线。</span></p>',
+        link: 'https://bbs.kanxue.com/thread-292208.htm',
+        linkNote: '看雪论坛原创帖'
+      }
+    },
+
+    /* ================= 25.5 eBPF vs Frida 可见性 ================= */
+    {
+      h: '25.5',
+      title: '核心价值：同一个观测行为，Frida 看得见、eBPF 看不见',
+      html:
+        '<p>前面四节都在讲 eBPF 怎么工作。现在必须回答那个最实际的问题：<b>这跟我做逆向有什么关系？</b></p>' +
+        '<p>假定我们想做同一件事：<b>观测目标 App 的一次函数调用，拿到它的入参。</b>有两条路——' +
+        '<b>A 路</b>用 ' + T.term('Frida', '用户态动态插桩框架：把 agent 注入目标进程，在其地址空间内改写指令或解释执行 JS') + ' 注入，' +
+        '<b>B 路</b>用 ' + T.term('uprobe', '内核提供的用户态函数探针机制，在目标进程的指定函数入口插入断点式回调') + ' 从内核侧挂探针。' +
+        '下面这台动画让两条路同时接受<b>同一套 App 自查</b>，看看各自暴露了什么。</p>',
+      stage: {
+        title: '可见性对照实验：App 的六项自查，谁能躲过',
+        speed: 1900,
+        render:
+          '<div class="flow-row" style="align-items:flex-start;gap:14px;flex-wrap:wrap">' +
+            '<div class="flow-col" style="flex:1 1 320px">' +
+              '<div class="card"><div class="card-title">A 路 · Frida 用户态注入</div>' +
+                '<div class="blk" id="fa">目标进程地址空间内</div>' +
+                '<div class="pill" id="f1">1 扫 /proc/self/maps</div><br>' +
+                '<div class="pill" id="f2">2 查线程名 /proc/self/task/*/comm</div><br>' +
+                '<div class="pill" id="f3">3 扫监听端口（27042 一类）</div><br>' +
+                '<div class="pill" id="f4">4 查 TracerPid / ptrace 痕迹</div><br>' +
+                '<div class="pill" id="f5">5 校验代码段是否被改写</div><br>' +
+                '<div class="pill" id="f6">6 校验函数序言字节</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="flow-col" style="flex:1 1 320px">' +
+              '<div class="card"><div class="card-title">B 路 · eBPF 内核态观测</div>' +
+                '<div class="blk" id="ba">目标进程完全在内核视野之外</div>' +
+                '<div class="pill" id="b1">1 扫 /proc/self/maps</div><br>' +
+                '<div class="pill" id="b2">2 查线程名 /proc/self/task/*/comm</div><br>' +
+                '<div class="pill" id="b3">3 扫监听端口</div><br>' +
+                '<div class="pill" id="b4">4 查 TracerPid / ptrace 痕迹</div><br>' +
+                '<div class="pill" id="b5">5 校验代码段是否被改写</div><br>' +
+                '<div class="pill" id="b6">6 校验函数序言字节</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="term-box" id="vlog" style="margin-top:12px">$ 等待开始…</div>',
+        reset: () => {
+          S('fa', ''); S('ba', '');
+          for (let i = 1; i <= 6; i++) { CLS('f' + i, 'pill'); CLS('b' + i, 'pill'); }
+          SET('vlog', '$ 等待开始…');
+        },
+        steps: [
+          { run: () => { SET('vlog', '实验目标：观测目标 App 调用某加密函数时的入参。\\nApp 自身内置了 6 项运行时自查，每秒执行一次。'); } },
+          { run: () => { S('fa', 'hot'); SET('vlog', '[A 路] frida -U -f com.target.app -l hook.js\\n→ agent 被注入目标进程，地址空间里多了一个 so'); } },
+          { run: () => { CLS('f1', 'pill bad'); SET('vlog', '[A 路 · 自查 1] App 打开 /proc/self/maps 逐行扫描\\n  → 命中：frida-agent-64.so  ← 可疑模块，直接暴露'); } },
+          { run: () => { CLS('f2', 'pill bad'); SET('vlog', '[A 路 · 自查 2] App 遍历 /proc/self/task/*/comm\\n  → 命中：gum-js-loop / gmain 一类的框架线程名'); } },
+          { run: () => { CLS('f3', 'pill bad'); SET('vlog', '[A 路 · 自查 3+4] App 扫本地监听端口，并读 /proc/self/status 的 TracerPid\\n  → 端口命中；TracerPid 也可能非 0（取决于接入方式）'); } },
+          { run: () => { CLS('f5', 'pill bad'); CLS('f6', 'pill bad'); SET('vlog', '[A 路 · 自查 5+6] App 把内存里的代码段和磁盘上的 .so 逐字节比对\\n  → 命中：函数序言被改写成跳转指令（inline hook 特征）\\n→ 结论：A 路被抓住，且证据链完整'); } },
+          { run: () => { S('fa', 'done'); S('ba', 'active'); SET('vlog', '--- 换 B 路：拆掉 Frida，改成在钩子点挂 eBPF 程序 ---\\n# 内核侧挂 uprobe 到目标 so 的加密函数入口\\n# 用户态读 ringbuf 拿入参'); } },
+          { run: () => { CLS('b1', 'pill ok'); SET('vlog', '[B 路 · 自查 1] 扫 /proc/self/maps\\n  → 没有新增模块。App 的地址空间和没被观测时一模一样'); } },
+          { run: () => { CLS('b2', 'pill ok'); SET('vlog', '[B 路 · 自查 2] 遍历线程名\\n  → 目标进程一个线程都没多。观测者根本不在这个进程里'); } },
+          { run: () => { CLS('b3', 'pill ok'); CLS('b4', 'pill ok'); SET('vlog', '[B 路 · 自查 3+4] 扫端口、查 TracerPid\\n  → 无新增端口；没有 ptrace，TracerPid=0。\\n  注意：uprobe 用的是内核断点机制，不是 ptrace 附着'); } },
+          { run: () => { CLS('b5', 'pill ok'); CLS('b6', 'pill ok'); SET('vlog', '[B 路 · 自查 5+6] 比对代码段、校验函数序言\\n  → 内存里没有写入任何东西：eBPF 是<b>只读观测</b>，不修改目标指令\\n→ 结论：B 路六项全绿，App 一无所知'); } },
+          { run: () => { S('ba', 'cool'); SET('vlog', '✓ 同一个观测动作，A 路留下 6 处痕迹，B 路留下 0 处（在 App 的可见范围内）。'); } },
+          { run: () => { S('ba', 'hot'); SET('vlog', '⚠️ 但别把话说满：\\n  · 观测者若在用户态，它自己会留下痕迹（进程、文件、网络）\\n  · root 环境下 App 仍可能用非常规手段检测内核（自身带 root 的场景）\\n  · 对手也可以用 eBPF 反过来监控你 —— 这是双向的'); } }
+        ]
+      },
+      after:
+        T.note('key', '🔑 隐蔽性的真正来源', '<p>不是「eBPF 这个技术很隐蔽」，而是<b>「观测发生在目标进程的地址空间之外」</b>。记住这条原理，你就能自己推导出哪些检测手段有效、哪些天生无效：<b>所有依赖「观测者必须在目标进程内部留下东西」的检测，对内核态观测一律失效</b>。</p>') +
+        T.note('warn', '⚠️ 别神化隐蔽性：三个现实约束',
+          '<p><b>① 观测者本身要在设备上落地。</b>你的 loader 是个跑在手机上的用户态进程，它会被 <code>ps</code> 看见、会在文件系统里留下文件。内核态隐蔽的只是「观测动作」，不是「观测者」。</p>' +
+          '<p><b>② 加载 eBPF 程序需要高权限。</b>没 root 基本免谈（见 25.6）。你为了让观测更隐蔽，反而先要在设备上取得最高权限——这是一个很现实的成本。</p>' +
+          '<p><b>③ 这是一场双向博弈。</b>对手同样可以用 eBPF 监控你的行为，甚至用 <code>LSM</code> 钩子加固自己的检测逻辑。第 27 章讲内核态对抗时会展开这一层。</p>') +
+        T.note('', '📌 放回课程的坐标系里',
+          '<p><b>第 20 章</b>讲 ' + T.term('Hypervisor', '虚拟机监控器，运行在比内核更高的特权级（EL2），可以监控甚至篡改内核行为') + '，那是比内核更低的层；' +
+          '<b>第 25 章（本章）</b>是内核态观测的标准手段；<b>第 27 章</b>讲内核态对抗（SVC 系统调用、硬件断点）。</p>' +
+          '<p>三章连起来是一条清晰的主线：<b>谁控制了更低的层，谁就拥有最终的观测权和控制权</b>。用户态的 Frida 打不过内核，内核打不过 Hypervisor。</p>')
+    },
+
+    /* ================= 25.6 安卓四重限制 ================= */
+    {
+      h: '25.6',
+      title: '安卓上的四重限制：为什么大多数手机跑不起来',
+      html:
+        '<p>上面所有动画都在 PC Linux 的语境下。现在把场景换到手机上——这是本章最有价值、也最容易被网上教程误导的部分。</p>' +
+        '<p><b>先给结论：eBPF 在 Android 上「理论可行，实际高度受限」。</b>Android 基于 Linux 内核，内核本身有 BPF 支持；' +
+        'Android 9（kernel 4.9）起内核配置就打开了一部分 BPF 相关功能，较完整的 eBPF 能力一般需要 <b>kernel 4.14+</b>。' +
+        '但「内核里有」和「你能用」之间隔着四堵墙。</p>' +
+        T.tbl(['限制', '挡住的到底是什么', '能不能绕'], [
+          ['① 内核版本', '老设备内核太旧，很多 eBPF 特性（如 BTF、ringbuf、有界循环支持）压根不存在。内核 4.14 以下基本可以放弃', '绕不过。这是硬件与固件层面的既成事实，只能换设备'],
+          ['② 厂商内核裁剪', '手机厂商为减小体积、缩小攻击面，常把 BPF 相关配置裁掉。关键配置如 <code>CONFIG_BPF_SYSCALL</code>、<code>CONFIG_BPF_JIT</code>、<code>CONFIG_DEBUG_INFO_BTF</code> 可能未开启。<b>没有 <code>CONFIG_BPF_SYSCALL</code>，就完全无法加载 eBPF 程序</b>', '理论上可自编译内核刷入，但需解锁 bootloader、有变砖风险，且多数机型内核源码不完整'],
+          ['③ SELinux 策略', 'Android 的强制访问控制会限制 <code>bpf()</code> 系统调用。普通 App 无权调用——即使内核支持，策略也会把你拦在门外', '需要 root 后调整策略，或使用已获授权的域；这本身就是一道高门槛'],
+          ['④ 需要 root', '上面三条叠加的结果：实际使用通常需要 root 权限或定制 ROM', '没有银弹。这是本章所有手机端实验的前提条件']
+        ]) +
+        T.note('key', '🔑 一个反直觉但重要的事实：Android 自己在用 eBPF',
+          '<p>Android 系统本身就把 eBPF 用于<b>网络统计</b>（例如按 UID 统计流量、<code>trafficController</code> 相关的模块）。' +
+          '这件事有两层含义：<b>①</b> 它证明了在真机上跑 eBPF 是可行的——不是纸上谈兵；<b>②</b> 但这些程序由<b>系统进程</b>在开机时加载，普通 App 既没权限、也看不到它们。</p>' +
+          '<p>所以当你在设备上执行 <code>bpftool prog show</code> 看到一堆已有程序时，不要误以为「这台机器对我开放了」——那大概率是系统自己的。</p>') +
+        T.note('warn', '⚠️ 时效性再强调一次',
+          '<p>「哪些机型支持、哪些配置默认开启」这个问题，<b>每一年、每个厂商、每个机型、每个内核版本的答案都不一样</b>，而且厂商会随系统更新调整策略。' +
+          '本章表格里的判断是<b>2023 年前后的普遍经验</b>，不是对你的设备的结论。' +
+          '唯一可靠的做法是<b>在你自己的目标设备上实测</b>——具体探测命令见 25.7。' + T.pill('warn', '待核实') + '</p>'),
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境一 · 项目启动',
+            scenario: '<b>情境：</b>你接到一个任务——要给公司的 Android 安全测试工具加一套「内核态观测」能力，用来追踪目标 App 的文件访问和加密函数入参。团队里有人看了本章前几节，很兴奋，说 eBPF 隐蔽性最好，建议<b>把它作为所有机型上的统一方案</b>。你是这个项目的技术负责人，第一步怎么做？',
+            choices: [
+              { t: 'A. eBPF 隐蔽性碾压用户态方案，直接按统一架构立项，全线推 eBPF', next: 'n1' },
+              { t: 'B. 先拿 3-5 台真实目标机型做内核能力探测（版本、config、BTF、SELinux、root），按探测结果把 eBPF 定位成「特定机型上的可选增强」，主力仍是用户态方案', next: 'n2' },
+              { t: 'C. 既然手机上限制这么多，本章内容直接跳过，继续用 Frida', next: 'n3' },
+              { t: 'D. 先把目标机型的内核源码拉下来自编译、替换掉原厂内核，再上 eBPF', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：把「理论上更优」当成了「工程上可行」',
+            result: '<b>认知根源：混淆了技术上限和工程可达性。</b>eBPF 的隐蔽性确实是数量级的优势，但这个优势有一个硬前提——<b>程序能被加载进内核</b>。而加载受内核版本、厂商配置、SELinux 策略三重约束，这些约束在真实机型上大量存在。<br><br>按统一架构立项的直接后果是：交付时发现 70% 的目标机型根本加载不了，前面的架构投入全部沉没，还要回头改设计。<br><br><b>正确做法：</b>任何依赖设备底层能力的技术方案，第一步都应该是<b>能力探测</b>——把「能不能用」变成一组可测量的数据，再决定投入。'
+          },
+          n2: {
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先探测，再决定投入比例（哪怕结论是「大部分机型用不了」）',
+            result: '<b>这是本章最想让你接受的一个「反直觉」结论：</b>讲了一整章 eBPF，但正确的工程判断往往是<b>不要梭哈</b>。<br><br>探测要回答五个问题：<b>①</b> 内核版本是多少（4.14 以下基本出局）；<b>②</b> BPF 相关配置开没开（尤其是有没有 <code>CONFIG_BPF_SYSCALL</code>）；<b>③</b> <code>/sys/kernel/btf/vmlinux</code> 在不在（决定 CO-RE 能不能用）；<b>④</b> SELinux 拦不拦 <code>bpf()</code>；<b>⑤</b> 有没有 root。<br><br><b>探测的意义在于把技术选型变成数据驱动的决策</b>：如果探测下来只有少数机型可用，那 eBPF 就是一个「针对高价值目标机的精准工具」，而不是产品基线。这种分层设计在安全工程里是常态。'
+          },
+          n3: {
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '从一个极端跳到另一个极端',
+            result: '<b>认知根源：把「受限」读成了「不可用」。</b>限制多 ≠ 不能用。Android 系统自己在用 eBPF（流量统计就是例子），说明内核路径是通的；在部分机型上、配合 root，eBPF 完全能跑出你在 PC 上见过的效果。<br><br>更关键的是：<b>eBPF 提供的能力是用户态方案给不了的</b>。系统调用级别的全量观测、不进入目标进程地址空间的隐蔽性，这些用 Frida 做不到。因为「不是每台机器都能用」就整个放弃，等于放弃了一个能力维度。<br><br><b>正确的态度：</b>把它当作工具箱里的一件特种工具——不常出场，但出场时不可替代。'
+          },
+          n4: {
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '技术上可行，但在错误的阶段做了最重的事',
+            result: '<b>认知根源：跳过了「值不值得」直接进入「怎么做」。</b>自编译内核刷机在原理上确实能解开配置和策略的限制，但它的代价是：解锁 bootloader（很多机型会清空数据甚至熔断）、内核源码不完整导致编译失败、刷入后变砖风险、每换一个机型就要重来一遍。<br><br>而且这道门槛<b>并不能解决内核版本问题</b>——老设备的内核基线太旧，自编译也拿不到上游的新特性。<br><br><b>什么时候 D 才是对的？</b>当你有一台固定的、长期使用的测试样机，且项目明确需要深度内核观测能力时，为它专门定制内核是合理的投入。但这是「选定样机之后的专项工程」，不是「项目第一步」。'
+          }
+        }
+      }
+    },
+
+    /* ================= 25.7 实测与工具链 ================= */
+    {
+      h: '25.7',
+      title: '动手：一台设备到底支不支持？工具链怎么选',
+      html:
+        '<p>25.6 讲了四堵墙，但「我的这台机器到底行不行」只能靠实测。这一节给一份可执行的探测清单——' +
+        '<b>顺序很重要</b>，因为前面的检查不过，后面的做了也白做。</p>' +
+        '<p>另外要提醒一句：下面所有命令都<b>需要 root</b>（或者有等价权限）。没有 root 的话，第 ⑤ 步就已经是终点了。</p>',
       term: {
-        title: '三种攻击者模型的能力边界（读数时注意每一行的"必须"）',
+        title: 'root shell · 设备 eBPF 能力探测（顺序执行）',
         lines: [
-          { t: 'o', s: '黑盒：能选明文、能看密文。看不到任何中间量。', note: '<b>密钥可以安全地躺在进程内存里</b>——攻击者没有读取手段。这是传统密码学默认的模型。' },
-          { t: 'o', s: '灰盒：能测执行的外部效应（时间、功耗、电磁、故障）。看不到内部值。', note: '<b>密钥仍然不必"溶掉"</b>，但实现必须抵抗侧信道。防护方向是"让执行过程不泄露信息"，不是"让密钥不存在"。' },
-          { t: 'w', s: '白盒：能读全部内存、能单步、能改任意中间状态、能重复任意次。', note: '<b>「密钥以明文形式存在于某一刻」这件事本身就成了漏洞。</b>防护方向被迫变成"让密钥不以完整形态出现"。' },
-          { t: 'd', s: '推论：白盒安全性不是"加密强度"问题，而是"密钥的可表达性"问题。', note: '这句推论是本章所有技术判断的出发点。后面每一次"为什么它能被攻破"，答案都会回到这一行。' }
+          { t: 'p', s: 'adb shell', note: '<b>先连上设备。</b>下面所有命令都在设备的 shell 里执行。注意 <code>adb shell</code> 默认进的是 App 的 shell 域，很多命令会被 SELinux 拒绝——所以要先 <code>su</code>。' },
+          { t: 'p', s: 'su', note: '<b>第 ⑤ 道门槛：root。</b>拿不到 root，后面全部免谈。这是最现实的一条限制，也是为什么本章强调「eBPF 在手机上不是随手就能用」。' },
+          { t: 'o', s: '# id' },
+          { t: 'o', s: 'uid=0(root) gid=0(root) context=u:r:magisk:s0' },
+          { t: 'p', s: 'uname -r', note: '<b>第 ① 步：内核版本。</b>这是最硬的一条。Android 9 对应的 kernel 4.9 起内核就开了一部分 BPF 配置；较完整的 eBPF 能力一般需要 <b>4.14+</b>。看到 4.4 / 3.18 这种，基本可以直接放弃这条路线。' },
+          { t: 'o', s: '4.14.190-g0d3d5a1' },
+          { t: 'd', s: '# 上例是一台 4.14 设备：属于「可以一试」的区间。\n# 4.14 以下：BTF / ringbuf 等新特性大概率缺失。' },
+          { t: 'p', s: 'zcat /proc/config.gz | grep -E \'CONFIG_BPF|CONFIG_DEBUG_INFO_BTF\'', note: '<b>第 ② 步：厂商裁剪（最关键的一步）。</b><code>/proc/config.gz</code> 是内核配置。有些设备上这个文件不存在（说明 <code>CONFIG_IKCONFIG_PROC</code> 没开），那就只能去 <code>/boot</code> 或内核源码里找，或者干脆用第 ③ 步的能力探测法间接判断。' },
+          { t: 'o', s: 'CONFIG_BPF_SYSCALL=y\nCONFIG_BPF_JIT=y\n# CONFIG_DEBUG_INFO_BTF is not set' },
+          { t: 'w', s: '# ⚠️ CONFIG_BPF_SYSCALL 是总闸：没有它 → 完全无法加载 eBPF 程序，后面全部不用看了。\n# ⚠️ 没有 CONFIG_BPF_JIT → 只能解释执行，性能大幅下降。\n# ⚠️ 没有 CONFIG_DEBUG_INFO_BTF → 没有 BTF，CO-RE 用不了，程序必须针对具体内核编译。' },
+          { t: 'p', s: 'ls -l /sys/kernel/btf/vmlinux', note: '<b>第 ③ 步：BTF 在不在。</b>这个文件就是内核导出的 BTF 类型信息，它是 <b>CO-RE</b>（Compile Once – Run Everywhere）的前提。文件不存在 = 你没法用 CO-RE，得回到「针对每台设备的内核单独编译」的老办法。' },
+          { t: 'e', s: 'ls: /sys/kernel/btf/vmlinux: No such file or directory' },
+          { t: 'd', s: '# 本例这台机器没有 BTF：说明 CONFIG_DEBUG_INFO_BTF 未开启。\n# 结论：仍可能加载 eBPF 程序，但 portability 方案要降级。' },
+          { t: 'p', s: 'getenforce', note: '<b>第 ④ 步：SELinux。</b>Android 的强制访问控制会限制 <code>bpf()</code> 系统调用。<code>Enforcing</code> 状态下，即使内核支持，策略也会拦你。' },
+          { t: 'o', s: 'Enforcing' },
+          { t: 'p', s: './bpftool feature probe 2>&1 | head -30', note: '<b>第 ③ 步的另一种做法：直接用 bpftool 探测。</b>静态看配置文件容易漏，<code>bpftool feature probe</code> 会真正去问内核「你支持哪些 helper、哪些 Map 类型、哪些程序类型」。<b>注意</b>：你需要先把 <b>bpftool</b> 交叉编译成 <b>arm64/aarch64</b> 版本再推到设备上；用 PC 上的 x86 版本推过去是跑不起来的。' },
+          { t: 'o', s: 'eBPF kernel: available\n  ... helper / map_type / program_type 支持列表 ...' },
+          { t: 'p', s: './bpftool prog show', note: '<b>顺带看看设备上已经有什么。</b>正如 25.6 提到的，Android 系统自己就加载了一些 eBPF 程序（流量统计等）。看到它们说明内核路径是通的，但也提醒你：这些是系统进程的，不是给你的。' },
+          { t: 'o', s: '12: sched_cls  name trafficController  ...  run_time_ns 0' },
+          { t: 'w', s: '# 注意：看不到任何程序 ≠ 内核不支持；\n#      看得到程序 ≠ 你有权限加载自己的程序。两件事要分开判断。' },
+          { t: 'p', s: 'ls /data/local/tmp/', note: '<b>最后：观测者的落脚点。</b>你的 loader 是个用户态可执行文件，得先在设备上有个位置。这一步也提醒你——<b>内核态观测隐蔽，但观测者本身不隐蔽</b>。<code>/data/local/tmp</code> 是最常用的位置，也正因如此它是各种检测的重点扫描区域。' },
+          { t: 'o', s: 'trace_open\nminimal.bpf.o' }
         ]
       },
-      quiz: {
-        id: 'q25-1', chapter: 25, answer: 2,
-        stem: '一个团队说：「我们的 so 里没有明文密钥，密钥是在初始化时算出来的，算完就 <span class="mono">memset</span> 清零了，所以是白盒级别的保护。」按本章的威胁模型，这句话<b>错在哪</b>？',
-        options: [
-          { t: '没错。密钥被清零了，内存里就找不到，攻击者无从下手', why: '清零只能挡住"事后 dump"，挡不住"清零之前读一次"。白盒攻击者能在任意时刻读内存、下断点、甚至在 memset 前就把内存 dump 走——清零对他是无效防护。' },
-          { t: '错在 memset 不可靠，编译器可能把清零优化掉', why: '这确实是一个真实的坑（优化器可能删掉"死写"），但它是次要问题。即使 memset 一字不漏地执行了，白盒模型下保护依然不成立。' },
-          { t: '错在「算出来」这一步：密钥一旦以完整的 16 字节落在内存里，白盒攻击者就能读到它，无论之后是否清零', why: '正确。白盒模型假设攻击者能读全部内存并可在任意时刻中止执行。密钥只要在某一刻以完整形态存在过，就等于泄露。真正的白盒实现要做到的是「让密钥从不以完整形态出现」，而不是「用完赶紧擦掉」。' },
-          { t: '错在没用白盒算法。换成白盒 AES 就安全了', why: '方向看起来对，但结论错了。白盒实现不是"安全/不安全"的二值开关——它是一个提高成本的手段，而且它保护的目标正是"密钥不以完整形态出现"。换算法解决不了这个例子里描述的思维误区。' }
-        ],
-        explain: '<b>这道题考的是威胁模型，不是技术细节。</b>那一整段话里唯一真正的错误是「算出来」——' +
-          '在传统黑盒模型下，把密钥算出来、用完清零，是<b>教科书级的正确做法</b>（不落盘、不常驻）。但在白盒模型下，<b>"内存里存在过"就等于"被看到了"</b>，因为攻击者的能力清单里明确包含"在任意时刻读取任意内存"。' +
-          '<p>注意另外三个选项为什么是诱饵：A 是把黑盒直觉套到白盒上（最常见的错）；B 抓住了一个真实但次要的工程坑，属于"对得不够彻底"；D 看起来最像正解，因为它提到了白盒算法——' +
-          '但它把"用了白盒"当成了"安全"。<b>白盒密码的定位是提高成本，不是提供保证</b>，本章最后一节会把这句话展开。</p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你应该建立起一个条件反射：<b>看到"密钥藏得很深"，先问"它有没有以完整形态在某一刻出现过"</b>。' +
-        '如果出现过，那就不需要用白盒那一套，普通的动态调试就够了。' +
-        '反过来，如果一个实现里<b>你翻遍了内存也找不到那 16 个字节</b>——那才是本章的主场：它大概率是一个白盒实现。</p>')
-    },
-
-    /* ==================== 25.2 ==================== */
-    {
-      h: '25.2', title: '甄别：当第 8 章的整套手法全部零命中',
-      html:
-        '<p>先把第 8 章的方法原样搬过来用一遍。常量特征比对是还原任何加密实现的<b>永远的第一步</b>：它成本最低，而且常常几分钟就出结论。</p>' +
-        '<p>标准 AES 的指纹非常明确：S 盒头部是 <span class="mono">63 7c 77 7b f2 6b 6f c5</span>，逆 S 盒首字节 <span class="mono">52</span>，轮常量从 <span class="mono">01 02 04 08 10 20 40 80 1b 36</span> 走。' +
-        '你也知道第 9 章那一招：静态搜不到就 attach 上去扫内存，表可能运行时才生成。</p>' +
-        '<p>但在白盒实现上，你会遇到一件第 8、9 章里从没出现过的事：<b>所有这些搜索全部零命中，而且不是"搜不到"，是"根本没有可搜的东西"</b>。</p>' +
-        T.tbl(['你做的动作', '预期结果', '白盒实现上的真实结果'], [
-          ['搜 <span class="mono">63 7C 77 7B</span>（S 盒头 4 字节）', '命中 .rodata 里的一张 256 字节表', '<span class="bad">零命中</span>。S 盒被和密钥复合过了，原样不存在'],
-          ['搜 <span class="mono">52 09 6A D5</span>（逆 S 盒头 4 字节）', '命中逆 S 盒（解密方向会用到）', '<span class="bad">零命中</span>。解密方向同样被复合'],
-          ['搜轮常量 <span class="mono">01 02 04 08</span>', '命中轮常量数组', '<span class="bad">零命中</span>。轮密钥被融进表项，不再有独立的轮常量数组'],
-          ['搜 16 字节密钥常量 / 从 <span class="mono">JNI_OnLoad</span> 往下追密钥来源', '找到密钥或它的来源字节', '<span class="bad">追不到</span>。密钥从来没有以完整形态存在过'],
-          ['attach 后 dump 内存找 256 字节置换表', '找到 Base64 表 / S 盒 / RC4 S 盒', '<span class="hit">能找到表</span>，但表的内容和任何标准表都对不上——<b>这才是突破口</b>'],
-          ['照第 24 章的思路 hook <span class="mono">MessageDigest</span> / <span class="mono">Cipher</span> 自吐输入输出', '拿到算法与密钥', '<span class="miss">拿不到密钥</span>。传统 API 根本没被调用，加密是自己拿表算的']
+      after:
+        T.note('', '📌 探测清单（照着走一遍）',
+          '<p><b>①</b> <code>uname -r</code> → 内核版本，4.14+ 才有戏；<b>②</b> <code>CONFIG_BPF_SYSCALL</code> → 总闸，没有就结束；' +
+          '<b>③</b> <code>/sys/kernel/btf/vmlinux</code> → 决定能不能用 CO-RE；<b>④</b> <code>getenforce</code> → SELinux 会不会拦；' +
+          '<b>⑤</b> root 有没有。五条里任何一条卡住，方案就得降级。</p>') +
+        T.tbl(['工具', '仓库', '定位', '什么时候用它'], [
+          ['<b>BCC</b>', '<code>iovisor/bcc</code>', 'Python 前端 + 内嵌 C。开发快，自带大量现成工具（<code>execsnoop</code>、<code>opensnoop</code>、<code>biolatency</code>）', '快速验证想法、临时排查。缺点：<b>每次运行都要编译 C</b>，目标机要装内核头文件，启动有开销'],
+          ['<b>bpftrace</b>', '<code>bpftrace/bpftrace</code>', '类 awk 的高级脚本语言，一行就能写一个追踪器', '现场快速排查，写脚本成本最低。适合「我就想知道是谁在开这个文件」这种问题'],
+          ['<b>libbpf + CO-RE</b>', '<code>libbpf/libbpf</code>', '<b>CO-RE = Compile Once – Run Everywhere</b>：用 BTF 类型信息让同一份 <code>.o</code> 适配不同内核版本', '<b>现代推荐的工程化方案</b>。交付型项目、需要嵌入到 App 或工具链里的场景'],
+          ['<b>bpftool</b>', '<code>libbpf/libbpf</code> 附带', '内核 BPF 子系统的命令行瑞士军刀：列出程序/Map、生成 skeleton、探测能力', '开发期调试与设备探测（注意要交叉编译到 arm64）']
         ]) +
-        T.note('key', '🔑 零命中本身就是最强的诊断信号', '<p>第 8 章教过你一句话：<b>静态搜不到常量，不能断定算法被改了</b>——它可能只是运行时解密出来的，或者被 OLLVM 拆散了。' +
-          '所以"零命中"在第 8、9 章里是一个<b>需要继续排查的中间状态</b>。</p>' +
-          '<p>白盒场景下这个状态升级了：<b>你把动态手段也用上，把内存翻遍，依然找不到任何标准常量</b>，但同时又看到<b>几十上百 KB 的、明显不是普通数据的大块连续数据，和被密集索引访问的代码</b>。' +
-          '这两件事同时成立，基本可以定性：<b>这不是"藏起来的 AES"，这是"被重新表达过的 AES"。</b></p>') +
-        '<h4>白盒实现的五个观察特征</h4>' +
-        '<p>下面这张表是本章最实用的一张。它的用法不是"凑齐五条才能下结论"，而是<b>每一条都能把你往"白盒"这个假设上推一步</b>。</p>' +
-        T.tbl(['#', '观察到的现象', '为什么白盒实现一定有这个现象', '容易误判成什么'], [
-          ['①', '没有任何加密常量：S 盒、逆 S 盒、轮常量、IV、密钥全搜不到', 'S 盒被和轮密钥复合成了 T 表，原始常量不再存在', '「自研算法」——第 8 章反复警告过的误判'],
-          ['②', '存在巨大的、连续的、看不出结构的表区（几 KB 到几百 KB）', '把多轮运算合并成查表，表的体积就是"被合并的运算量"', '「加密的数据块」「固化的资源文件」'],
-          ['③', '大量「查表 + 异或」紧邻出现：<span class="mono">LDRB/LDR</span> 取值，紧接着 <span class="mono">EOR</span>', '查表实现异或/代替，异或实现线性混合，这是表格化的天然指令形态', '「普通的数据搬运循环」'],
-          ['④', '表的索引值不是输入本身：输入先经过一层变换才被用来查表', '<b>外部编码</b>：输入被编码过，编码把明文的统计特征洗掉了', '「输入格式转换」「字节序处理」'],
-          ['⑤', '线性变换（异或 / 矩阵）与非线性变换（查表）<b>交替出现</b>', '这是白盒构造的基本骨架：每一层非线性都要被线性层"搅开"', '「某种解码/校验流程」']
-        ]) +
-        T.note('warn', '⚠️ 第 ②③ 条要小心：别把大数组都当成表', '<p>App 里本来就有很多大数组（图片、词典、查找用的静态数据）。区别在于<b>访问模式</b>：' +
-          '白盒表的访问是<b>高频率、单字节、以变量为索引</b>的，而普通数据数组要么低频、要么按顺序遍历。' +
-          '所以第 ② 条只用来"缩小战场"，真正下结论要靠 ③④。</p>'),
-      stepper: {
-        title: '五步甄别：从「一片空白」到「这是一个白盒实现」',
-        lines: [
-          {
-            code: '<span class="c">// 第一步：常量比对（第 8 章的老办法，必须先做）</span>\n<span class="c">// 在 so / dex / 内存里搜以下字节序列：</span>\n<span class="c">//   63 7C 77 7B   (AES S 盒头)</span>\n<span class="c">//   52 09 6A D5   (逆 S 盒头)</span>\n<span class="c">//   01 02 04 08   (AES 轮常量)</span>\n<span class="c">//   6A 09 E6 67   (SHA-256 IV，顺手也搜一下)</span>\n<span class="f">scan</span>(so, [<span class="s">\'637c777b\'</span>, <span class="s">\'52096ad5\'</span>, <span class="s">\'01020408\'</span>]);</code>',
-            note: '<b>这一步不能跳，而且必须在动静态两个状态下都做。</b>静态搜文件，动态 attach 后扫可读写内存。' +
-              '如果静态没有、动态有，那只是运行时解密（第 9 章的内容），不是白盒。<b>只有两边都零命中，才继续往下走。</b>',
-            state: { '阶段': '① 常量比对', 'S 盒': '未命中', '逆 S 盒': '未命中', '轮常量': '未命中' }
-          },
-          {
-            code: '<span class="k">const</span> ranges = <span class="t">Process</span>.<span class="f">enumerateRanges</span>(<span class="s">\'rw-\'</span>)\n  .<span class="f">filter</span>(r =&gt; r.size &gt;= <span class="n">4096</span> &amp;&amp; r.size &lt;= <span class="n">1048576</span>);\n<span class="f">console</span>.<span class="f">log</span>(ranges.length, <span class="s">\'个候选数据区\'</span>);',
-            note: '<b>第二步：找"可疑的大块数据"。</b>白盒的表不会再小到 64 或 256 字节——它是一整片区域。' +
-              '经验阈值：<b>4KB 起步</b>（16 张 256 字节的表才 4KB，这只是最小规模），上限放到 1MB。这个区间只用来缩小战场，不是判据。',
-            state: { '阶段': '② 定位数据区', '候选区间': '37 个', '合计': '约 2.4 MB' }
-          },
-          {
-            code: '<span class="c">// 第三步：在候选区里找"256 字节的双射"</span>\n<span class="k">function</span> <span class="f">isPerm</span>(ptr, n) {\n  <span class="k">const</span> seen = <span class="k">new</span> <span class="t">Uint8Array</span>(n);\n  <span class="k">for</span> (<span class="k">let</span> i = <span class="n">0</span>; i &lt; n; i++) {\n    <span class="k">const</span> v = ptr.<span class="f">add</span>(i).<span class="f">readU8</span>();\n    <span class="k">if</span> (v &gt;= n || seen[v]) <span class="k">return</span> <span class="k">false</span>;\n    seen[v] = <span class="n">1</span>;\n  }\n  <span class="k">return</span> <span class="k">true</span>;\n}',
-            note: '<b>第三步是本章甄别里最有信息量的一步。</b>第 9 章的置换特征在这里依然有效、但含义变了：' +
-              '标准 S 盒被复合之后<b>仍然是双射</b>（S 是双射，异或常量也是双射，复合还是双射）。所以你会在这片区域里发现<b>大量 256 字节的置换</b>——' +
-              '而这些置换<b>没有一个等于标准 S 盒</b>。这个组合就是白盒 T 表的签名。',
-            state: { '阶段': '③ 置换扫描', '256 字节置换': '命中 11 张', '等于标准 S 盒': '0 张' }
-          },
-          {
-            code: '<span class="c">// 第四步：看谁在访问它（访问模式比内容更可靠）</span>\n<span class="k">const</span> t = <span class="f">ptr</span>(<span class="s">\'0x7d4a1000\'</span>);\n<span class="t">Memory</span>.<span class="f">accessMonitor</span>(t, <span class="n">65536</span>).<span class="f">on</span>(<span class="s">\'access\'</span>, d =&gt; {\n  <span class="f">console</span>.<span class="f">log</span>(d.operation, d.address, <span class="s">\'from\'</span>, d.from);\n});\n<span class="c">// 预期：刷屏。同一批指令在极短时间内重复读同一片区域</span>',
-            note: '<b>第四步：确认它是"表"而不是"数据"。</b>判据是访问模式中的三个同时成立：<b>① 高频</b>（一次加密就是几百上千次访问）、' +
-              '<b>② 单字节</b>（<span class="mono">readU8</span> 级别）、<b>③ 索引是变量</b>而不是递增指针。' +
-              '（<span class="pill warn">待核实</span>：<span class="mono">Memory.accessMonitor</span> 的可用性随 Frida 版本变化；等效手段是硬件断点或 hook 候选读取函数。）',
-            state: { '阶段': '④ 访问模式', '访问频率': '高（刷屏）', '读取宽度': '1 字节', '索引': '变量' }
-          },
-          {
-            code: '<span class="c">// 第五步：确认表的"用法"——找 EOR 与查表的配对</span>\n<span class="c">// 典型形态（AArch64）：</span>\n<span class="c">//   LDRB  w1, [x0, w2]      ; 用变量索引取表项</span>\n<span class="c">//   EOR   w3, w3, w1        ; 把结果异或进累加值</span>\n<span class="c">//   LDRB  w4, [x5, w3]      ; 立刻用结果去查下一张表</span>',
-            note: '<b>第五步给出定性结论。</b>"查表 → 异或 → 再用结果查表"这个链条，就是表格化白盒实现的心跳。' +
-              '看到它，你就不用再怀疑了：<b>这是一个把 AES 表格化之后的白盒实现</b>。' +
-              '接下来的工作是把这些表<b>按轮次和位置编号</b>——那是 25.4 节"前戏"的内容。',
-            state: { '阶段': '⑤ 定性', '结论': '✅ 白盒实现（查表型）', '下一步': '进入攻击前戏' }
-          }
-        ]
-      },
-      quiz: {
-        id: 'q25-2', chapter: 25, answer: 2,
-        stem: '下面四组观察结果，<b>哪一组最足以把目标定性为白盒实现</b>？',
-        options: [
-          { t: '静态搜不到任何加密常量；attach 之后在内存里扫到了<b>一张标准的 256 字节 S 盒</b>', why: '这是第 9 章的"运行时解密"（动态编码表）场景：常量存在，只是编译期不落盘。它有标准 S 盒，所以不是白盒。结论应该是"表是运行时生成的"，而不是"白盒"。' },
-          { t: '搜不到任何加密常量；关键函数的控制流是 <span class="mono">while(1) switch(state)</span> 结构', why: '这是 OLLVM 的控制流平坦化。它改变的是代码形态，常量只是被拆散进分发器、可能搜不全，但语义没变。解开混淆之后常量会重新现身——所以这是第 5 章的活，不是白盒。' },
-          { t: '动静态都搜不到任何标准常量；内存里有一片 64KB 连续数据，其中 11 张 256 字节的完美置换<b>无一等于标准 S 盒</b>；这些表被高频、单字节、以变量为索引地访问，且查表后紧跟异或', why: '正确。这里有三个只可能同时出现在白盒实现上的事实：① 常量真的不存在（动静态都没有）；② 存在大量"是置换但不是标准 S 盒"的表——这正是"双射被密钥复合过"的签名；③ 访问模式是典型的表格化查表。三条合起来就足以定性。' },
-          { t: '搜不到任何常量；但请求签名是 32 位十六进制、长度为 16 字节', why: '这只说明"签名大概是个 128 位的摘要或分组算法"，是一个关于输入输出长度的推断，和"实现内部长什么样"完全无关。把它当成白盒的证据，等于用输出格式去判断内部结构。' }
-        ],
-        explain: '<b>这道题考的是"证据链"而不是"单个特征"。</b>白盒的定性从来不是靠一条现象，而是靠三条同时成立：' +
-          '<p><b>① 常量真的不存在。</b>注意"动静态都搜不到"和"静态搜不到"是两件不同的事——后者只是运行时解密（选项 A）。' +
-          '这一步排除了"藏起来"的可能，剩下"被用掉了"。</p>' +
-          '<p><b>② 存在大量"是置换但不是标准 S 盒"的 256 字节表。</b>这是本题信息量最大的一条。' +
-          '因为 T 表是三个双射（异或常量 + S 盒 + 异或常量）的复合，<b>必然还是双射</b>；' +
-          '而它又和标准 S 盒不同（被密钥复合过了）。"是置换但不等于 S 盒"这个组合，是白盒 T 表的干净签名。</p>' +
-          '<p><b>③ 访问模式符合表格化查表。</b>高频、单字节、变量索引、查表后紧跟异或——' +
-          '这一条排除"这只是一块普通数据"的可能，把这片内存和"运算"绑定起来。</p>' +
-          '<p>选项 B 是第 5 章的混淆（改形态，不改数据），选项 D 把输出格式当成了内部结构的证据。' +
-          '<b>这两类误判在真实工作里都很常见，而且它们的共同点是：用一条弱证据去支持一个强结论。</b></p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你现在应该有一个清晰的判断链条：<b>常量全零命中 → 有大块可疑数据 → 里面有很多"不等于标准 S 盒"的 256 字节置换 → 被高频单字节索引访问 → 查表与异或配对出现</b>。' +
-        '这条链条的每一步都是可观测的客观事实，不需要任何猜测。<b>这就是"甄别"这个词的准确含义：不是感觉像，而是列出证据。</b></p>')
-    },
-
-    /* ==================== 25.3 ==================== */
-    {
-      h: '25.3', title: '它内部长什么样：表、编码、交替变换',
-      html:
-        '<p>定性成"白盒"之后，你需要一张内部结构图，否则后面的攻击动作是盲目的。好消息是：<b>白盒实现的结构比它看起来简单得多，因为三条路线里只有一条在工程上常见。</b></p>' +
-        T.note('warn', '⚠️ 关于三条路线：以公开资料为准', '<p>公开资料里白盒 AES 的构造通常被归为三条路线：<b>查找表（把运算拆成查表 + 编码）</b>、' +
-          '<b>插入扰乱项（在结构里混进额外的方程与线性编码）</b>、<b>多变量密码（用多变量多项式/扩展 S 盒构造，如 ASASA 结构）</b>。' +
-          '这三条路线各自的代表性论文、作者与发表年份' + T.pill('warn', '待核实') + '——我不在这里复述，因为记错作者和年份是这个领域最常见的错误来源。</p>' +
-          '<p><b>但工程现实很清楚：你在 Android App 里遇到的，绝大多数是第一条（查找表型）。</b>另外两条要么性能代价高，要么实现复杂，实际产品里少见。' +
-          '所以本章的攻击方法<b>只针对查找表型白盒</b>，这一点必须说在前面。</p>') +
-        '<p>查找表型白盒的结构可以拆成三层，每一层都有一个明确的目的：</p>' +
-        T.grid(3, [
-          '<div class="card"><div class="card-title">第一层：表（把运算变成查表）</div>' +
-            '<p><b>目的：让密钥与 S 盒不再以独立常量出现。</b></p>' +
-            '<p>把「SubBytes + AddRoundKey」合并成一张 T 表：<span class="mono">T[x] = S[x ^ k] ^ k\'</span>。' +
-            '密钥 <span class="mono">k</span> 和 <span class="mono">k\'</span> 成了表的<b>生成参数</b>，而不是表里的某个字节。</p>' +
-            '<p>类似地，MixColumns 被拆成"一字节进、四字节出"的 Tyi 表。</p></div>',
-          '<div class="card"><div class="card-title">第二层：编码（把表的输入输出洗白）</div>' +
-            '<p><b>目的：让表与表之间对不上，堵死"把两张表拼起来消掉密钥"这条路。</b></p>' +
-            '<p><b>内部编码</b>嵌在相邻两张表之间：上一张表的输出被一个双射变换过，下一张表按编码后的值索引。' +
-            '只有编码匹配的表才能拼在一起。</p>' +
-            '<p><b>外部编码</b>在整条链路的两端：输入先被编码，最终输出再被解码。</p></div>',
-          '<div class="card"><div class="card-title">第三层：线性与非线性交替</div>' +
-            '<p><b>目的：防止编码被线性代数整体消掉。</b></p>' +
-            '<p>如果整条链路只有线性变换和查表，攻击者可以把所有编码合起来当一个未知线性映射解掉。' +
-            '所以构造上必须让<b>线性层（异或/矩阵）</b>与<b>非线性层（表）</b>交替出现。</p>' +
-            '<p>这也是为什么你不能"从第一张表推到第最后一张表"——每一层都在中间插了一个非线性的坎。</p></div>'
-        ]) +
-        T.note('key', '🔑 记住这个结构，后面所有的攻击都挂在它上面', '<p>把上面三层压缩成一句话：<b>白盒实现 = 一串被编码隔开的查找表，线性层负责扩散，非线性层负责打乱。</b></p>' +
-          '<p>于是攻击的入口也被确定下来了：<b>你不可能从表里直接读出密钥（第一层防住了），也不可能靠拼表消掉编码（第二层防住了），' +
-          '但你可以从第三层下手——</b>线性层与非线性层的交替意味着<b>扩散结构还在</b>：' +
-          '改一个表项（等价于改一个中间状态字节），它的影响会按照 MixColumns 的规律扩散出去。' +
-          '<b>这就是 DFA 能在白盒上成立的全部理由。</b></p>'),
-      stage: {
-        title: '外部编码是怎么把一张表「洗白」的',
-        speed: 1400,
-        render: (function () {
-          var r = '<div class="regs" style="margin-bottom:10px">' +
-            '<span class="reg" id="wb_s1"><b>表</b>=标准 S 盒（可直接识别）</span>' +
-            '<span class="reg" id="wb_s2"><b>编码</b>=无</span></div>';
-          r += '<div class="memgrid">';
-          r += '<div class="memrow" style="grid-template-columns:96px repeat(8,1fr)">' +
-            '<span class="addr">索引 0..7</span>';
-          for (var i = 0; i < 8; i++) r += '<span class="cell" id="wb_i' + i + '">' + i + '</span>';
-          r += '</div>';
-          r += '<div class="memrow" style="grid-template-columns:96px repeat(8,1fr)">' +
-            '<span class="addr">表项输出</span>';
-          for (var j = 0; j < 8; j++) r += '<span class="cell" id="wb_o' + j + '">--</span>';
-          r += '</div></div>';
-          return r;
-        })(),
-        reset: function () {
-          for (var i = 0; i < 8; i++) { SET('wb_i' + i, String(i)); CLS('wb_i' + i, 'cell'); }
-          for (var j = 0; j < 8; j++) { SET('wb_o' + j, '--'); CLS('wb_o' + j, 'cell'); }
-          SET('wb_s1', '<b>表</b>=标准 S 盒（可直接识别）');
-          SET('wb_s2', '<b>编码</b>=无');
-        },
-        steps: [
-          {
-            run: function () {
-              var S8 = [0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5];
-              for (var i = 0; i < 8; i++) { SET('wb_o' + i, S8[i].toString(16).padStart(2, '0')); CLS('wb_o' + i, 'cell hi'); }
-            },
-            note: '<b>起点：一张标准的 S 盒。</b>索引就是输入字节，表项就是输出。此刻这张表<b>人眼可识别</b>——开头 <span class="mono">63 7c 77 7b</span> 一眼就认得。' +
-              '任何自动化工具都能靠这四个字节把它揪出来。这就是白盒实现要消灭的特征。'
-          },
-          {
-            run: function () {
-              var E = [0x1f, 0xb7, 0x4a, 0x9c, 0x2d, 0xe1, 0x70, 0x03];
-              for (var i = 0; i < 8; i++) { SET('wb_i' + i, E[i].toString(16).padStart(2, '0')); CLS('wb_i' + i, 'cell rd'); }
-              SET('wb_s2', '<b>编码</b>=输入先过一个双射 E');
-            },
-            note: '<b>第一步改编码：输入先过一个双射 E 再去查表。</b>注意这里的顺序——现在"索引 0"这一格<b>不再对应输入 0</b>，它对应的是"编码后等于 <span class="mono">1f</span> 的那个输入"。' +
-              '<b>表的行顺序被彻底打乱了。</b>你在内存里看到的仍然是一张 256 字节的表，但它和标准 S 盒的逐字节对应关系已经断了。'
-          },
-          {
-            run: function () {
-              var S8 = [0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5];
-              var F = function (v) { return ((v << 3) | (v >>> 5)) & 0xff ^ 0x5a; };
-              for (var i = 0; i < 8; i++) { SET('wb_o' + i, F(S8[i]).toString(16).padStart(2, '0')); CLS('wb_o' + i, 'cell rd'); }
-            },
-            note: '<b>第二步改编码：输出再过一个双射 F。</b>现在这张表从外面看，<b>索引是乱的、值也是乱的</b>。' +
-              '它看起来和一张随机生成的 256 字节表没有任何区别——你没法靠"值长什么样"认出它。'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 8; i++) CLS('wb_o' + i, 'cell wr');
-              SET('wb_s1', '<b>表</b>=「编码后的 S 盒」（人眼不可识别）');
-            },
-            note: '<b>但有一个性质改不掉：它仍然是双射。</b>绿色格子的值是 8 个互不相同、且恰好覆盖某个值域的字节——' +
-              '因为 <b>双射 ∘ 双射 ∘ 双射 = 双射</b>。这一条在 25.2 节的置换扫描里救了你：' +
-              '你正是靠"256 字节的完美置换"在几 MB 内存里把它找出来的。<b>编码能改内容，改不了"它是一个置换"这个结构事实。</b>'
-          },
-          {
-            run: function () {
-              SET('wb_s1', '<b>表</b>=仍是相变的产物：结构与代数特征被继承');
-              CLS('wb_o0', 'cell hi'); CLS('wb_o3', 'cell hi');
-            },
-            note: '<b>更关键的是下面这件反直觉的事：编码洗掉了内容，却没有洗掉代数结构。</b>' +
-              '25.7 节的实验会让你亲手验证：这张表的<b>差分分布</b>和原版 S 盒是同一个谱——' +
-              '<b>仿射编码只是把差分谱重新标号，最大值一格没变。</b>' +
-              '（本演示用的是"移位 + 异或"这类仿射变换；换成任意非线性双射，这个性质就不成立了——这一点很重要，25.7 节会展开。）'
-          },
-          {
-            run: function () {
-              SET('wb_s2', '<b>结论</b>=编码提高门槛，但不消灭代数痕迹');
-              CLS('wb_o1', 'cell wr'); CLS('wb_o5', 'cell wr');
-            },
-            note: '<b>本节结论：编码让"人眼识别"和"常量比对"彻底失效，但没有让这张表变成随机表。</b>' +
-              '它依然带着 AES 的代数指纹（置换性、差分谱、代数次数）。' +
-              '<b>这两件事的分离，正是白盒密码"能被攻破"的根源</b>——防守方要藏的是内容，可攻击方利用的是结构。'
-          }
-        ]
-      },
+        T.note('key', '🔑 三者的关系（面试常问）',
+          '<p><b>BCC 和 bpftrace 内部都基于 libbpf</b>。可以把它们理解成同一套底座上的三种使用姿势：' +
+          'BCC 是「Python 包 C」，bpftrace 是「DSL 脚本」，libbpf 是「直接用 C 写工程」。</p>' +
+          '<p>新项目推荐 <b>libbpf + CO-RE</b>——它避开了 BCC 的两个老问题：<b>目标机需要装内核头文件</b>、<b>每次运行都要现场编译</b>。' +
+          '这两个问题在 PC 上只是慢一点，在手机上往往是「直接跑不起来」。</p>'),
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境一',
-            scenario: '<b>情境：</b>你接到一个风控 SDK 的 so。常量搜索全零命中；attach 之后在可读写内存里扫到一片 96KB 的连续数据，里面至少有几十张 256 字节的完美置换表；用 <span class="mono">LDRB</span> 下断点，看到「查表 → <span class="mono">EOR</span> → 再查表」的密集循环。项目负责人说：「客户催得紧，你先给我把密钥搞出来。」<b>你现在的第一个动作是什么？</b>',
+            label: '情境二 · 实测结果很差',
+            scenario: '<b>情境：</b>你按 25.7 的清单在自己手上的测试机上跑了一遍，结果是：<code>uname -r</code> 显示 <b>4.9</b>；<code>CONFIG_BPF_SYSCALL=y</code> 但 <code>CONFIG_DEBUG_INFO_BTF</code> 没开（<code>/sys/kernel/btf/vmlinux</code> 不存在）；有 root。' +
+              '你原本写好的基于 libbpf + CO-RE 的追踪工具（用 uprobe 盯加密函数）拿过去直接跑不起来。下一步怎么办？',
             choices: [
-              { t: '直接上手 DFA：在表访问点上注入故障，收集正确/错误密文对，开始解方程', next: 'n1' },
-              { t: '先做一轮结构测绘：给表编号、量尺寸、判断有没有外部编码、确认输入输出接口，再决定打哪张表', next: 'n2' },
-              { t: '先从 <span class="mono">JNI_OnLoad</span> 开始逐行反编译整块初始化代码，把表的生成过程看懂再说', next: 'n3' },
-              { t: '既然是白盒，说明静态无解，直接走第 24 章的沙箱路线：插桩 <span class="mono">Cipher</span> / <span class="mono">MessageDigest</span> 自吐', next: 'n4' }
+              { t: 'A. 加大投入，把这台机器的内核源码拉下来，把 CONFIG_DEBUG_INFO_BTF 打开重新编译内核刷进去', next: 'n1' },
+              { t: 'B. 放弃 CO-RE，改成为这台设备的内核单独编译一份 eBPF 目标文件（依赖具体内核的 BTF/头文件），保留 CO-RE 版本给新机型；同时评估用户态方案作为兜底', next: 'n2' },
+              { t: 'C. 既然 CO-RE 用不了，说明 eBPF 这条路在这台机器上彻底走不通，直接放弃', next: 'n3' },
+              { t: 'D. 把 PC 上用得好好的那份 CO-RE 目标文件直接拷到设备上再试一次，说不定能跑', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '顺序错了：你还不知道要打哪张表',
-            result: '<b>认知根源：把"我知道该用什么技术"当成了"我现在就能用这个技术"。</b>DFA 的整个推导建立在两个前提上：' +
-              '① 你知道故障注入在<b>哪个中间状态</b>（是哪一轮、哪一列的哪一个字节）；② 你能把密文的差分<b>正确地对应到方程里</b>。' +
-              '现在你连这几十张表哪张属于第几轮都不知道，更不知道有没有外部编码——<b>注入进去的故障，你根本解释不了它的扩散形状。</b>' +
-              '结果会是：故障确实注进去了，密文也变了，但你对着变化列不出方程。这时候你会以为是"故障注入方式不对"，然后开始在错误的方向上疯狂试错。'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '代价与收益严重不成比例',
+            result: '<b>认知根源：把「技术上能做到」等同于「现在就该做」。</b>自编译内核确实能打开 <code>CONFIG_DEBUG_INFO_BTF</code>，但那意味着：解锁 bootloader、找到（可能并不完整的）厂商内核源码、配置正确的交叉编译工具链、刷机、承担变砖风险，而且<b>每换一台设备就要重来一遍</b>。<br><br>更关键的是，<b>你未必需要 BTF</b>。BTF 是 CO-RE 的前提，不是 eBPF 的前提。没有 BTF，你只是失去了「一份目标文件跑遍所有内核」的能力，还可以回到「针对具体内核编译」的老路。<br><br>先问自己：<b>这台设备是要长期使用的固定样机吗？</b>如果不是，为它定制内核的投入几乎必然打水漂。'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '对：先测绘，再攻击',
-            result: '<b>这是唯一能省时间的路径。</b>结构测绘（也就是 25.4 节的"前戏"）要回答四个问题：' +
-              '<b>① 表在哪、有几张、各多大</b>（用"256 字节置换"这个结构特征去扫，比看内容可靠）；' +
-              '<b>② 表的组织方式</b>（是按 <span class="mono">[轮][位置][256]</span> 排的大数组，还是一堆散落的指针？这决定了你能不能按索引直接算地址）；' +
-              '<b>③ 有没有外部编码</b>（喂一个已知明文，看第一次表访问的索引是不是它——不是的话就有输入编码）；' +
-              '<b>④ 输入输出接口在哪</b>（从哪个函数进、密文从哪个缓冲区出，这决定了你能不能自动化地收集成千上万个密文对）。' +
-              '<p>这四个问题每一个都只需要几分钟到几十分钟，而它们决定了后面几小时的工作能不能成立。<b>还原工作的成本分布从来不是"平均用力"，而是前面 10% 的决定后面 90% 的效率。</b></p>'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：把「缺失的能力」降级处理，而不是全盘放弃',
+            result: '<b>这是本章第二个反直觉结论：没有 BTF / CO-RE，不等于没有 eBPF。</b><br><br>CO-RE 解决的是<b>可移植性</b>问题——让同一份编译产物适配不同内核。没有它，你退回到传统做法：<b>针对目标设备的内核版本，单独编译一份 eBPF 目标文件</b>（需要该内核的头文件/类型信息，字段偏移在编译期就固定下来）。这条路更麻烦、更难维护，但在这个内核（4.9，<code>CONFIG_BPF_SYSCALL=y</code>、有 root）上，它<b>大概率是能跑通的</b>。<br><br>工程上的正确姿势是<b>分层</b>：新机型走 CO-RE 的通用路径，老机型走「一机一编」的特化路径，再老的（内核 &lt; 4.14 或没有 <code>CONFIG_BPF_SYSCALL</code>）走用户态方案兜底。<b>明确每一层的适用边界，比追求一套方案通吃要可靠得多。</b>'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '方向不对：把"看懂生成过程"当成了必要前提',
-            result: '<b>认知根源：高估了"读懂"的价值，低估了"测量"的价值。</b>表的生成函数可能有好几百行，还可能被混淆过。' +
-              '而且<b>你并不需要知道密钥是怎么被放进表里的</b>——你只需要知道<b>故障从哪进、结果从哪出</b>。' +
-              '这是一个典型的"可以绕过而非必须攻克"的环节：白盒的密钥提取攻击（DFA 也好、代数攻击也好）本质上都是<b>把白盒当成一个黑盒加一个可控故障口</b>，从输入输出关系里解出密钥。' +
-              '花两天读懂生成函数，得到的结论是"密钥 k 被异或进了 T 表"——<b>这句话你从结构上五分钟就能推出来，而对提取密钥没有额外帮助。</b>'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '把一个子能力的缺失，误判为整条路线不通',
+            result: '<b>认知根源：把 CO-RE 和 eBPF 划了等号。</b>CO-RE 只是 eBPF 工程化的一种方式（而且是较新的一种），它依赖 BTF。BTF 缺失只说明「你不能用最省事的那种方式」，不代表内核不支持 eBPF。<br><br>回到探测结果本身：<code>CONFIG_BPF_SYSCALL=y</code> —— 说明<b>加载 eBPF 程序的总闸是开的</b>；有 root —— 说明权限这关也过了。这两条已经跨过了最难的两堵墙（25.6 的第 ② 和第 ④ 条）。<br><br><b>读探测结果要分清「缺什么」和「缺的那个是不是必需的」。</b>BTF 是「好用的加速器」，<code>CONFIG_BPF_SYSCALL</code> 才是「生死线」。'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '工具选错了：白盒不走标准 API',
-            result: '<b>认知陷阱：把"沙箱插桩"当成了万能锤。</b>第 24 章的沙箱之所以有效，是因为目标用了标准密码学 API（<span class="mono">MessageDigest</span> / <span class="mono">Cipher</span> / <span class="mono">Mac</span>）。' +
-              '白盒实现的存在意义，恰恰就是<b>不使用这些 API</b>——它自己拿表算。' +
-              '你插桩之后会发现这些函数根本没被调用，日志是空的。<b>这不代表"没有加密"，而是代表"加密不走那条路"。</b>' +
-              '当然，沙箱路线不是完全没用：它可以作为兜底（如果哪天发现目标在别的路径上确实调了标准 API），但它不是这里的第一步。'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '误判了 CO-RE 到底在哪一步生效',
+            result: '<b>认知根源：以为 CO-RE 是「编译时烧进目标文件里的自适配魔法」。</b>事实正相反——CO-RE 的重定位发生在<b>加载时</b>：libbpf 读取<b>目标机器</b>的 <code>/sys/kernel/btf/vmlinux</code>，据此把 <code>.o</code> 里记录的字段偏移改成这台机器的真实偏移。<br><br>所以当目标机器上根本没有 <code>/sys/kernel/btf/vmlinux</code> 时，重定位这一步<b>没有输入</b>，加载必然失败——再拷一百次也一样。这不是运气问题，是机制问题。<br><br><b>排查口诀：CO-RE 加载失败，先确认目标机的 <code>/sys/kernel/btf/vmlinux</code> 存在且可读。</b>把「机制问题」误当成「玄学问题」，是浪费时间的经典方式。'
           }
         }
       },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你应该记住这个结构：<b>表 + 编码 + 线性/非线性交替</b>。' +
-        '以及从这个结构直接推出的攻击入口：<b>编码洗得掉内容，洗不掉扩散结构。</b>' +
-        '下一节讲"前戏"——在动手注入故障之前，必须先完成的四项测绘工作。</p>')
-    },
-    /* ==================== 25.4 ==================== */
-    {
-      h: '25.4', title: '攻击前戏：定位表、数表、认编码、定接口',
-      html:
-        '<p>这一节的名字叫"前戏"，不是修辞。它是本章<b>最容易被跳过、也最容易导致全盘失败</b>的一步。</p>' +
-        '<p>先把因果关系说清楚：DFA 的攻击逻辑是<b>"我改了一个已知的中间状态字节，观察到密文按可预测的方式变化，于是可以列方程"</b>。' +
-        '这要求你在动手之前就回答四个问题——否则你拿到的那些"正确/错误密文对"根本进不了方程。</p>' +
-        T.tbl(['要回答的问题', '为什么答错就全盘皆输', '怎么测'], [
-          ['① 表在哪、有几张、每张多大？',
-           '不知道表的组织方式，你就无法把"第 9 轮第 3 个字节"映射到一个具体的内存地址，也就无法定点注入故障',
-           '扫 256 字节的完美置换；统计表区的偏移分布，看是不是 <span class="mono">[轮][位置][256]</span> 这样的固定步长'],
-          ['② 表属于哪一轮、哪个位置？',
-           'DFA 的方程是"轮次 + 字节位置"的函数。位置认错，方程整组作废，而且不会报错——你只会得到一堆解不出来的候选',
-           '找表的初始化顺序（大多数实现在初始化时按轮次顺序填表）；或者对比不同输入下表被访问的先后次序'],
-          ['③ 有没有外部编码？',
-           '<b>这是最致命的一条。</b>有输入编码时，你喂进去的明文不是被查表的那个值；有输出编码时，你看到的密文差分不是方程里的那个差分',
-           '喂一个已知明文，在第一次表访问处打印索引：等于明文就是没编码，不等于就是有编码'],
-          ['④ 输入输出接口在哪？',
-           'DFA 需要几十到几百组密文对。手工点一次算一组是不可能的，必须能脚本化调用',
-           '找导出的 JNI 函数或内部函数，确认入参缓冲区与出参缓冲区，用 Frida 直接调用（第 21 章的 RPC 手法）']
-        ]) +
-        T.note('key', '🔑 为什么第 ③ 条最致命', '<p>前面三条错了，你通常是"解不出来"；<b>第 ③ 条错了，你通常会"解出一组看起来对的错误答案"</b>。</p>' +
-          '<p>原因是 DFA 的方程本身是<b>关于差分</b>的：<span class="mono">D = S(Y) ^ S(Y ^ mZ)</span>。' +
-          '如果输出侧有一个仿射编码 <span class="mono">L</span>，你观测到的差分是 <span class="mono">L(D)</span> 而不是 <span class="mono">D</span>。' +
-          '仿射变换<b>保持差分谱</b>（25.7 节会验证），所以你的枚举<b>照样能跑出候选</b>，只是候选是"在编码域里正确"的那一组——' +
-          '你会得到 4 个字节的候选集合，取交集后收敛到唯一值，然后兴高采烈地拿去当密钥，<b>发现解出来的是错的</b>。</p>' +
-          '<p>这就是为什么"认编码"必须排在"注入故障"之前。<b>先证明你观测到的量就是方程里的量，再开始列方程。</b></p>') +
-        '<h4>表尺寸的读数：一张表能装下多少东西</h4>' +
-        '<p>表的大小不是随意的，它由"输入几位、输出几位"决定。把下面这张对照表记住，你在内存里看到一块未知数据时就能立刻猜出它是干什么的：</p>' +
-        T.tbl(['尺寸', '形状', '通常是什么', '备注'], [
-          ['256 字节', '8 → 8 位', 'T 表（SubBytes 与轮密钥的复合）、编码表、内部编码用的随机双射', '一定是双射，这让你可以纯靠结构扫出来'],
-          ['1 KB', '4 × 256 字节', '一列 4 张 8→8 表拼在一起，或一张 8→32 位表的低字节部分', '要看清是"4 张表挨着"还是"一张表分 4 段"'],
-          ['4 KB', '4 × 256 × 4 字节', 'Tyi 表：MixColumns 的一列，输入 1 字节、输出 4 字节（32 位）', '一格 4 字节，不是双射——<b>置换扫描在这里失效</b>'],
-          ['16 KB', '16 × 256 × 4 字节', '一整轮的 Tyi 表（16 个位置各一张）', '典型查找表型白盒的"一轮"体量'],
-          ['百 KB 级', '多轮 × 多表', '完整的轮函数表集合，或加了冗余/校验之后的实现', '大小随构造与轮数变化' + T.pill('warn', '待核实')]
-        ]) +
-        T.note('warn', '⚠️ 上面这张表是"典型值"，不是定理', '<p>表尺寸由构造者的设计决定：AES-128 与 AES-256 的轮数不同（10 轮 vs 14 轮），' +
-          '有没有把多轮进一步合并、有没有加完整性校验、有没有把表拆小，都会让尺寸变化。' +
-          '<b>把它当"经验区间"用，不要当"判据"用。</b>真正的判据永远是"这块内存被谁、以什么模式访问"。</p>' +
-          '<p>另外，如果你发现表的尺寸是"非标准"的（比如 512 字节、3 KB），不要急着否定白盒——那可能意味着实现者用了 4 位表、' +
-          '或者把编码单独存了一张表。<b>先量清楚，再下结论。</b></p>'),
-      stepper: {
-        title: '前戏四步：把"一片陌生的表区"变成"一张可攻击的地图"',
-        lines: [
-          {
-            code: '<span class="c">// 第 1 步：喂一个"指纹明文"，看第一次表访问的索引</span>\n<span class="c">// 明文全 0 最方便：任何编码后仍能被认出来</span>\n<span class="k">const</span> out = <span class="f">callEncrypt</span>(<span class="s">\'00000000000000000000000000000000\'</span>);\n<span class="c">// 在第一次 LDRB [base, idx] 处打印 idx</span>\n<span class="f">console</span>.<span class="f">log</span>(<span class="s">\'第一次查表索引 = \'</span>, idx);',
-            note: '<b>这一步直接回答"有没有输入编码"。</b>喂全 0 明文，如果第一次查表的索引是 <span class="mono">0x00</span>，说明<b>输入侧没有编码</b>（或者编码把 0 映射到了 0）。' +
-              '如果索引是别的值，那这个值就是编码后 0 的像——<b>你还可以顺手多喂几个明文，把编码表本身测出来</b>（因为编码是双射，' +
-              '喂 256 个不同的首字节就能采样出整张编码表）。',
-            state: { '阶段': '① 认编码', '输入编码': '待测', '输出编码': '待测' }
-          },
-          {
-            code: '<span class="c">// 第 2 步：把表编号——按地址顺序给每张 256 字节表打上标</span>\n<span class="k">const</span> tables = [];\n<span class="k">for</span> (<span class="k">let</span> off = <span class="n">0</span>; off + <span class="n">256</span> &lt;= size; off += <span class="n">256</span>) {\n  <span class="k">if</span> (<span class="f">isPerm</span>(base.<span class="f">add</span>(off), <span class="n">256</span>)) tables.<span class="f">push</span>(off);\n}\n<span class="f">console</span>.<span class="f">log</span>(tables.length, <span class="s">\'张 256 字节置换表\'</span>);',
-            note: '<b>第 2 步产出的是"表的编号"。</b>注意：只能靠<b>结构</b>（是不是 256 字节置换）来认，不能靠内容——内容已经被编码洗过了。' +
-              '如果一张都扫不到，说明表不是按 256 字节对齐排列的，或者构造用了非 8→8 的表（比如 4 位表、或者带 4 字节表项），' +
-              '这时候要换成"按访问地址聚类"的办法重新测绘。',
-            state: { '阶段': '② 表的编号', '扫到': '11 张', '对齐步长': '256 字节' }
-          },
-          {
-            code: '<span class="c">// 第 3 步：确认表的"轮次归属"——看初始化顺序</span>\n<span class="c">// 在初始化函数里下断点，记录每次写入表的地址</span>\n<span class="c">// 大多数实现按 [轮][位置] 的顺序填表</span>\n<span class="c">// 写入地址 -> 线性映射到 (round, pos)</span>\n<span class="k">const</span> round = <span class="t">Math</span>.<span class="f">floor</span>(<span class="f">firstWriteOffset</span> / <span class="n">4096</span>);',
-            note: '<b>第 3 步是把"表编号"变成"轮次 + 位置"。</b>这一步没有普适公式，靠观察：' +
-              '如果表区是 <span class="mono">96KB</span> 且存在明显的分段结构，先量出段的步长（4096？16384？），再用初始化写入的先后顺序对齐。' +
-              '<b>这一步值得花时间</b>：只有轮次与位置确定了，你后面注入的故障才是"可解释的"。',
-            state: { '阶段': '③ 轮次归属', '段步长': '4 KB', '推断': '第 1..10 轮，每轮 16 个位置' }
-          },
-          {
-            code: '<span class="c">// 第 4 步：建立"自动化取密文"的通道（第 21 章 RPC 手法）</span>\n<span class="k">rpc</span>.<span class="f">exports</span> = {\n  <span class="f">enc</span>: <span class="k">function</span> (hex) {\n    <span class="k">const</span> out = <span class="f">callNativeEncrypt</span>(hex);\n    <span class="k">return</span> out;   <span class="c">// 返回 32 位十六进制密文</span>\n  }\n};',
-            note: '<b>第 4 步常常被忽略，但它决定了你的攻击能不能收敛。</b>一次 DFA 需要几十到几百组密文对；' +
-              '你要能<b>程序化地、可重复地</b>喂明文、取密文，而且结果要稳定（同一个输入两次得到同一个输出）。' +
-              '如果目标有随机化（每次生成不同的表），这一步还会暴露它——你会发现两次调用同一明文的密文不一样，' +
-              '那就必须先解决随机化问题（见 25.13 节）。',
-            state: { '阶段': '④ 接口', '通道': '✅ RPC 已通', '可重复性': '待验证（连喂两次同一明文）' }
-          },
-          {
-            code: '<span class="c">// 收尾自检：四项都确认了，才允许开始注入故障</span>\n<span class="c">//   [ ] 输入侧有无编码（喂全 0 试索引）</span>\n<span class="c">//   [ ] 输出侧有无编码（对比已知实现的密文）</span>\n<span class="c">//   [ ] 表到 (轮, 位置) 的映射已确定</span>\n<span class="c">//   [ ] 密文可以脚本化批量获取，且结果稳定</span>',
-            note: '<b>把这四项写成清单，每项都打勾之后才动手。</b>这不是形式主义：' +
-              'DFA 的失败模式几乎都是"方程里有未知的编码"或"位置对不上"，而这两种失败<b>都不会报错</b>，只会给你一个错误但自洽的结果。' +
-              '<b>前戏做扎实，是为了让后面的失败"可诊断"。</b>',
-            state: { '阶段': '⑤ 自检', '结论': '✅ 可以进入 DFA' }
-          }
-        ]
-      },
       quiz: {
-        id: 'q25-3', chapter: 25, answer: 1,
-        stem: '你喂全 0 明文，在第一次表访问处看到的索引是 <span class="mono">0x6B</span> 而不是 <span class="mono">0x00</span>。<b>最合理的解释与下一步动作是？</b>',
+        id: 'q11-1', chapter: 11,
+        answer: 1,
+        stem: '你在设备上执行 <code>ls /sys/kernel/btf/vmlinux</code>，返回 <code>No such file or directory</code>。基于本章内容，<b>最准确</b>的结论是什么？',
         options: [
-          { t: '说明表被魔改了，索引被加了一个偏移量，减去 0x6B 即可', why: '把"编码"当成了"固定偏移"。编码是一个双射，通常不是"统一加常数"那么简单（非线性双射完全可能）。而且即使真是偏移，你也没有证据——喂一个明文只能得到一个点。' },
-          { t: '说明输入侧存在外部编码：0 被映射成了 <span class="mono">0x6B</span>。下一步多喂几个明文，把整张编码表采样出来', why: '正确。既然编码是一个双射（否则解密不成立），喂 256 个首字节各不相同的明文，就能把"明文字节 → 查表索引"这张映射表逐点采样出来。拿到编码表之后，你既可以把方程建立在编码域上，也可以先把它逆掉恢复到明文域。' },
-          { t: '说明明文缓冲区被填充/对齐处理过，先看内存布局再说', why: '这是一个真实存在的可能性，但它的优先级低于"外部编码"——判断方法很简单：换几个不同的明文再喂一次，如果索引随明文规律变化（且是一个双射），就是编码；如果是固定偏移（比如永远差 16 字节），那才是缓冲区布局问题。' },
-          { t: '不重要，DFA 只关心密文差分，输入被怎么编码不影响', why: '这是本章最危险的一个误解。输入编码会影响"你注入故障时到底改了哪个中间量"——故障位置和差分值都是相对编码域定义的。忽略编码，你会得到自洽但错误的答案。' }
+          { t: '这台设备不支持 eBPF，应该直接放弃', why: '过度推断。BTF 和 eBPF 是两个层次的东西：BTF 是类型信息来源，eBPF 是内核的虚拟机子系统。没有 BTF，内核照样可能支持加载和运行 eBPF 程序。' },
+          { t: '内核很可能没有开启 <code>CONFIG_DEBUG_INFO_BTF</code>，因此 <b>CO-RE 无法使用</b>；但 eBPF 本身是否可用，还要看 <code>CONFIG_BPF_SYSCALL</code> 等配置和实际加载测试', why: '正确。BTF 缺失直接影响的是 CO-RE 的重定位能力（加载时 libbpf 需要读目标机的 BTF），而不是 eBPF 加载能力本身。判断后者要看 BPF 相关的配置与实测。' },
+          { t: '说明 SELinux 正在拦截 <code>bpf()</code> 系统调用', why: '混淆了不同的限制维度。SELinux 拦截会表现为权限类错误（EACCES/EPERM），而不是文件不存在；BTF 文件不存在是配置层面的问题。' },
+          { t: '只要 root 权限足够，就能自动生成这个文件', why: '错误。BTF 是内核在编译期通过配置项生成的调试信息，不是运行时可以凭空创建的文件；有 root 也不能无中生有。' }
         ],
-        explain: '<b>这道题在考"前戏第 ③ 条"的执行力。</b>关键推理是两步：' +
-          '<p>第一，<b>输入侧编码的存在性可以直接用"喂已知明文、看索引"这一步测出来</b>，成本极低。全 0 明文是最方便的选择，因为任何"看起来像编码"的运行结果都会立刻显现。</p>' +
-          '<p>第二，<b>更要紧的是：编码必须是一个双射，这是它的结构性弱点。</b>因为整条链路必须是可逆的（要能正确解密），任何一层编码都必须一一对应。' +
-          '所以它<b>可以</b>被打乱内容，但<b>不能</b>被打乱"每个输入恰好对应一个输出"这个性质。' +
-          '于是"逐点采样 256 次"就能把整张编码表拿到手——<b>这就是防御者留下的一条必然的缝</b>。</p>' +
-          '<p>选项 D 要特别警惕。很多人学到 DFA 之后会形成一个直觉："反正我只比较密文差分"。可 DFA 的方程里，' +
-          '差分 <span class="mono">Z</span> 是<b>故障注入点那个中间量的差分</b>，而它和你"在表面上改了多少"之间的关系，正是被输入编码决定的。' +
-          '<b>把编码忽略掉，方程就不再描述你实际做的操作了。</b></p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">前戏四步的产出物是<b>一张地图</b>：<b>表 → (轮次, 位置)</b> 的映射，加上"输入/输出是否有编码"的结论，加上一条可批量取密文的通道。' +
-        '有了这张地图，DFA 才从"一门技术"变成"一次可重复的计算"。</p>')
+        explain: '<b>这道题考的是一条纪律：把「现象」翻译成「机制」，再翻译成「结论」，不要一步跳到底。</b><br><br>现象：<code>/sys/kernel/btf/vmlinux</code> 不存在。<br>机制：这个文件是内核 BTF（BPF Type Format，内核的调试类型信息）的导出点，由 <code>CONFIG_DEBUG_INFO_BTF</code> 决定是否生成。<br>直接结论：<b>CO-RE 用不了</b>——因为 CO-RE 的重定位在加载时依赖目标机的 BTF。<br>不能推出的结论：<b>eBPF 不能用</b>——那取决于 <code>CONFIG_BPF_SYSCALL</code>（总闸）、<code>CONFIG_BPF_JIT</code>（性能）、SELinux 策略和权限。<br><br>在实际排查里，把「缺 BTF」误当成「不能用 eBPF」，会让你白白放弃一个本来可行的方案；反过来把「有 BTF」当成「一定能跑」，也会让你在加载失败时找不到原因。'
+      }
     },
 
-    /* ==================== 25.5 ==================== */
+    /* ================= 25.8 源码赏析与工程决策 ================= */
     {
-      h: '25.5', title: '从源码角度：把 AES 的每一步表格化',
-      intuition: {
-        tag: '直觉模型 · 把一台机器改造成一本查号台',
-        body: '<p>标准 AES 像一台<b>由四个工位组成的流水线</b>：每个工位做一件明确的事，工件（状态矩阵）依次经过它们。你能看到工位、能看到工件、能看到每道工序的规则。</p>' +
-              '<p>表格化的做法是：<b>把几个工位整体拆掉，换成一本厚厚的查号台</b>。你告诉查号台"输入是 X"，它直接给你"经过这三个工位之后的结果"。' +
-              '原本发生在工位之间的中间值——<b>包括密钥参与异或的那一刻</b>——全部消失在这本书里。</p>' +
-              '<p>这就是为什么在白盒实现里你找不到密钥：<b>密钥从来没有"存在"过，它只是这本书排版时候的一个参数。</b>' +
-              '但注意——书里的每一条目都是"某个输入对应的输出"，而书的<b>整体形状</b>依然被原始工序决定。攻击者读不懂书的内容，但可以从书的形状把它反推出来。</p>'
-      },
+      h: '25.8',
+      title: '源码赏析：三类实用项目的技术原理',
       html:
-        '<p>标准 AES-128 的一轮由四步组成：SubBytes（字节代替）、ShiftRows（行移位）、MixColumns（列混合）、AddRoundKey（轮密钥加）。' +
-        '表格化的目标就是<b>把这四步合并成尽可能少的查表操作</b>，同时保证密钥不被单独读出来。</p>' +
-        '<h4>合并一：SubBytes + AddRoundKey → T 表</h4>' +
-        '<p>这两步都是逐字节的：SubBytes 是 <span class="mono">x → S[x]</span>，AddRoundKey 是 <span class="mono">x → x ^ k</span>。两个逐字节操作的复合仍然是逐字节操作，' +
-        '所以它可以表示成一张 256 字节的表：</p>' +
-        T.code('// 示意代码：说明 T 表是怎么算出来的，不是可编译的完整实现\n' +
-          'for (i = 0; i < 256; i++) {\n' +
-          '    T[i] = S[i ^ k_in] ^ k_out;      // 一个 8->8 的表\n' +
-          '}\n' +
-          '// k_in  : 本轮 AddRoundKey 的密钥字节（被吸收进表里）\n' +
-          '// k_out : 下一轮 AddRoundKey 的密钥字节（提前混进来，减少一次独立操作）') +
-        '<p>这一步做完，<b>密钥 <span class="mono">k_in</span> 与 <span class="mono">k_out</span> 就只以"表的生成参数"的形式存在了</b>。' +
-        '直接读表读不出密钥——因为对任意一个表项 <span class="mono">T[i]</span> 的值，都有 256 种 <span class="mono">(k_in, k_out)</span> 组合能解释它。</p>' +
-        T.note('key', '🔑 但注意：T 表仍然是双射', '<p>因为 <span class="mono">x → x ^ k</span> 是双射、<span class="mono">S</span> 是双射、<span class="mono">y → y ^ k\'</span> 也是双射，' +
-          '<b>三个双射的复合还是双射</b>。所以无论密钥是什么，<b>每一张 T 表都恰好是一个 256 字节的完美置换</b>。</p>' +
-          '<p>这个性质有两面：对防守方，它让 T 表和随机表看起来一样（好事）；对攻击方，它让 T 表可以被"扫"出来（坏事）。' +
-          '而且更微妙的是——<b>双射这个性质本身就把密钥的存在性"钉"住了</b>：如果 T 表不是双射，说明构造出错了。' +
-          '换句话说，<b>密钥被藏进了表里，但表的双射性又保证了它必然可以被某种方式还原出来</b>。</p>') +
-        '<h4>合并二：MixColumns + ShiftRows → Tyi 表</h4>' +
-        '<p>MixColumns 是唯一跨字节的步骤：一列的 4 个字节按矩阵乘出一个新的 4 字节列。' +
-        '把它做成表，输入是 1 个字节，输出是 4 个字节（32 位）——<b>一格 4 字节，所以这种表不是置换，第 9 章那个"置换扫描"在这里失效。</b></p>' +
-        T.code('// 示意代码：MixColumns 的"查表化"，按输出列拆成 4 张表\n' +
-          'for (x = 0; x < 256; x++) {\n' +
-          '    Tyi[0][x] = ( mul(2,x) << 24 ) | ( x << 16 ) | ( x << 8 ) | mul(3,x);\n' +
-          '    Tyi[1][x] = ( mul(3,x) << 24 ) | ( mul(2,x) << 16 ) | ( x << 8 ) | x;\n' +
-          '    Tyi[2][x] = ( x << 24 ) | ( mul(3,x) << 16 ) | ( mul(2,x) << 8 ) | x;\n' +
-          '    Tyi[3][x] = ( x << 24 ) | ( x << 16 ) | ( mul(3,x) << 8 ) | mul(2,x);\n' +
-          '}\n' +
-          '// mul(a,b) 是 GF(2^8) 上的乘法；系数 2 与 3 来自 MixColumns 矩阵') +
-        '<p>这里有一个必须点出来的细节：<b>输出 4 个字节中，只有 1 个字节是"经过非线性"的（就是那个 <span class="mono">mul(2,x)</span> 或 <span class="mono">mul(3,x)</span> 的位置），' +
-        '另外 3 个字节是 <span class="mono">x</span> 或其简单组合。</b>这就是为什么 Tyi 表看起来"有规律"——它是<b>线性</b>步骤的产物，不是非线性步骤的产物。' +
-        '而 DFA 攻击打的就是这一步的扩散结构。</p>' +
-        T.note('warn', '⚠️ 真实实现会更绕，但骨架就是这样', '<p>实际的白盒实现通常还会做三件本章没展开的事：' +
-          '① 把 <span class="mono">mul(2,x)</span> 与 <span class="mono">mul(3,x)</span> 的结果编码后混进别的表；' +
-          '② 给 4 个输出字节各自套一层内部编码（这样下一张表才能按编码后的值索引）；' +
-          '③ 加入额外的"扰乱项"让表不再是单纯的一维函数。' +
-          '这些都会让表看起来更乱，但<b>不会改变"一字节进、四字节出"和"线性扩散"这两个事实</b>——' +
-          '而这两个事实，正是 DFA 的全部依赖。' +
-          '（具体实现细节随构造与实现者变化，<span class="pill warn">待核实</span>：不同白盒方案的编码层次与表结构并不统一。）</p>'),
-      stage: {
-        title: '把一轮 AES 折叠成两张表：T 表与 Tyi 表',
-        speed: 1500,
-        render: (function () {
-          var h = '<div style="margin-bottom:6px" class="small muted">标准一轮 AES（4 个工位）</div>';
-          h += '<div class="flow-row">' +
-            '<span class="blk" id="wb5_a">SubBytes</span>' +
-            '<span class="blk" id="wb5_b">ShiftRows</span>' +
-            '<span class="blk" id="wb5_c">MixColumns</span>' +
-            '<span class="blk" id="wb5_d">AddRoundKey</span>' +
-            '<span class="blk" id="wb5_e" style="opacity:.35">→ 下一轮</span>' +
-            '</div>';
-          h += '<div style="margin:14px 0 6px" class="small muted">表格化之后（2 类查表）</div>';
-          h += '<div class="flow-row">' +
-            '<span class="blk" id="wb5_t">T 表 × 16</span>' +
-            '<span class="blk" id="wb5_y">Tyi 表 × 16</span>' +
-            '<span class="blk" id="wb5_z" style="opacity:.35">→ 下一轮</span>' +
-            '</div>';
-          h += '<div class="memgrid" style="margin-top:14px">' +
-            '<div class="memrow" style="grid-template-columns:110px repeat(4,1fr)">' +
-            '<span class="addr">T 表一格</span>' +
-            '<span class="cell" id="wb5_p0">8 位进</span><span class="cell" id="wb5_p1">8 位出</span>' +
-            '<span class="cell" id="wb5_p2">含密钥</span><span class="cell" id="wb5_p3">双射</span></div>' +
-            '<div class="memrow" style="grid-template-columns:110px repeat(4,1fr)">' +
-            '<span class="addr">Tyi 一格</span>' +
-            '<span class="cell" id="wb5_q0">8 位进</span><span class="cell" id="wb5_q1">32 位出</span>' +
-            '<span class="cell" id="wb5_q2">不含密钥</span><span class="cell" id="wb5_q3">非双射</span></div>' +
-            '</div>';
-          return h;
-        })(),
-        reset: function () {
-          ['a', 'b', 'c', 'd'].forEach(function (k) { S('wb5_' + k, ''); });
-          S('wb5_t', ''); S('wb5_y', ''); S('wb5_z', '');
-          ['wb5_t', 'wb5_y', 'wb5_z'].forEach(function (id) { var e = document.getElementById(id); if (e) e.style.opacity = '.35'; });
-          ['wb5_p0', 'wb5_p1', 'wb5_p2', 'wb5_p3', 'wb5_q0', 'wb5_q1', 'wb5_q2', 'wb5_q3'].forEach(function (id) { CLS(id, 'cell'); });
-        },
-        steps: [
-          {
-            run: function () {
-              S('wb5_a', 'active'); S('wb5_b', 'active'); S('wb5_c', 'active'); S('wb5_d', 'active');
-            },
-            note: '<b>起点：四个工位，工件依次通过。</b>注意其中两个工位是<b>逐字节</b>的（SubBytes、AddRoundKey），另外两个是<b>跨字节</b>的（ShiftRows 是字节换位，MixColumns 是列内混合）。' +
-              '这个"逐字节 vs 跨字节"的区分决定了谁能被合并成表：<b>逐字节操作可以任意复合，跨字节操作只能按列做成表。</b>'
-          },
-          {
-            run: function () {
-              S('wb5_a', 'cool'); S('wb5_d', 'cool'); S('wb5_b', 'done'); S('wb5_c', 'done');
-              S('wb5_t', 'active');
-              var e = document.getElementById('wb5_t'); if (e) e.style.opacity = '1';
-            },
-            note: '<b>合并一：SubBytes + AddRoundKey → T 表。</b>两个逐字节操作复合，仍然是逐字节操作，于是压成一张 256 字节的表。' +
-              '<b>密钥在这一步被"吃掉"了：</b>它从"一个要参与异或的常量"变成了"表的生成参数"。' +
-              'ShiftRows 和 MixColumns 暂时放在一边（它们是跨字节的，不能和逐字节操作直接合）。'
-          },
-          {
-            run: function () {
-              S('wb5_b', 'cool'); S('wb5_c', 'cool');
-              S('wb5_y', 'active');
-              var e = document.getElementById('wb5_y'); if (e) e.style.opacity = '1';
-            },
-            note: '<b>合并二：ShiftRows + MixColumns → Tyi 表。</b>ShiftRows 本质是"哪个字节去哪一列"的索引重排，' +
-              '它可以和 MixColumns 一起写成"1 字节进、4 字节出"的表——<b>但只能按列拆</b>，因为 MixColumns 只在一列内混合。' +
-              '所以一个位置需要 4 张表（对应输出 4 个字节），一共 16 张。'
-          },
-          {
-            run: function () {
-              CLS('wb5_p0', 'cell hi'); CLS('wb5_p1', 'cell hi'); CLS('wb5_p2', 'cell wr'); CLS('wb5_p3', 'cell wr');
-            },
-            note: '<b>T 表的两个关键性质：含密钥、且是双射。</b>"含密钥"是它存在的理由；"双射"是它没法完全隐藏自己的原因（25.2 节的置换扫描正是靠这一条）。'
-          },
-          {
-            run: function () {
-              CLS('wb5_q0', 'cell hi'); CLS('wb5_q1', 'cell rd'); CLS('wb5_q2', 'cell wr'); CLS('wb5_q3', 'cell rd');
-            },
-            note: '<b>Tyi 表的关键性质：不含密钥、但负责扩散，而且不是双射。</b>' +
-              '<b>DFA 打的就是这张表。</b>原因很直接：故障注入在 T 表上时，影响的是"一个字节的值"；' +
-              '而它必须穿过 Tyi 表的列混合，才会在密文里变成一个<b>可预测的 4 字节形状</b>。' +
-              '<b>如果没有 Tyi 这一层扩散，单字节故障永远只会影响单字节密文，DFA 就无从下手。</b>'
-          },
-          {
-            run: function () {
-              S('wb5_z', 'active');
-              var e = document.getElementById('wb5_z'); if (e) e.style.opacity = '1';
-            },
-            note: '<b>一轮的完整表格化形态：16 次 T 查表 + 16 次 Tyi 查表（外加线性层的异或）。</b>' +
-              '把它重复 10 轮，就是一个白盒 AES-128。' +
-              '<b>注意：整个实现里没有一个地方存着"密钥"。</b>但下一节会说明，密钥并没有消失——它只是被分散存储了，而分散的方式留下了可被攻击的结构。'
-          }
-        ]
-      },
-      quiz: {
-        id: 'q25-4', chapter: 25, answer: 0,
-        stem: '为什么一张 T 表（<span class="mono">T[x] = S[x ^ k] ^ k\'</span>）<b>无论密钥是什么，都必然是 256 字节的完美置换</b>？',
-        options: [
-          { t: '因为它是三个双射的复合：异或常量、S 盒代替、再异或常量——双射复合仍是双射', why: '正确。x→x^k 是双射，S 是双射，y→y^k\' 也是双射，三者复合仍是双射。这条性质是可验证的，而且它是白盒实现无法回避的结构性痕迹。' },
-          { t: '因为 S 盒本身是置换，而异或操作不改变值的集合，所以表一定是置换', why: '结论对，但理由是错的。"异或操作不改变值的集合"说的是值域，而不是"一一对应"——一个非双射的函数也可以有满的值域（比如 x→x^2 在 8 位域上）。真正的原因是三条都是双射且复合保持双射性。' },
-          { t: '只有密钥满足特定条件时才是置换，密钥不好时会出现重复值', why: '这与事实相反。密钥取任何值，T 表都是完美置换——这正是它可以被"结构扫描"发现的原因。如果密钥会影响双射性，那这个构造本身就是错的。' },
-          { t: '因为 256 个表项、每个表项 1 字节，恰好能装下一整个置换', why: '把"容量"当成了"必然性"。256 个 1 字节表项只是"有可能"构成置换；随机填充 256 个字节恰好构成置换的概率极低（第 9 章算过是 10 的负一百多次方量级）。T 表必然是置换，是代数结构决定的，不是尺寸决定的。' }
-        ],
-        explain: '<b>这道题的价值在于：它把一个"看着像废话"的事实，变成了后面所有攻击的基础。</b>' +
-          '<p>三条都是双射：<span class="mono">x → x ^ k</span>（异或是自身的逆）、<span class="mono">S</span>（AES 规范里 S 盒就是置换）、<span class="mono">y → y ^ k\'</span>。' +
-          '而双射的复合仍然是双射，这是一个不需要任何额外条件的代数事实。</p>' +
-          '<p>于是在白盒实现里出现了一个奇妙的局面：<b>防守方越是努力地把密钥"溶"进表里，就越是保证了表的双射性——而双射性恰好是攻击方用来在几 MB 内存里定位这些表的最强特征。</b>' +
-          '25.2 节的"置换扫描"能命中 11 张表，靠的就是这一条。</p>' +
-          '<p>更要紧的是第二层含义：<b>双射性意味着"密钥被完全确定了"</b>。一个 8→8 的双射表有多少种可能？<span class="mono">256!</span> 种。' +
-          '但要生成它，只需要 2 个字节的密钥。这个巨大的"表示冗余"就是攻击空间——攻击方不需要枚举 256! 种表，' +
-          '只需要找到那两个字节。<b>DFA 干的正是这件事：绕过表面上的巨大可能性，直接求解背后的 2 个字节。</b></p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你应该能自己画出一轮白盒 AES 的结构：<b>T 表（含密钥、双射）→ Tyi 表（扩散、非双射）</b>，以及这个结构中两个关键的不变量：' +
-        '<b>T 表的双射性</b>（用来定位）和 <b>Tyi 表的列扩散</b>（用来攻击）。</p>')
-    },
-
-    /* ==================== 25.6 ==================== */
-    {
-      h: '25.6', title: '密钥被打散到哪去了：为什么"分散"反而留下痕迹',
-      html:
-        '<p>到这里你可能会有一个疑问：既然密钥被分散到了几十张表里，那<b>从数学上它到底还在不在？</b>在的话，为什么读不出来？不在的话，为什么又能被还原？</p>' +
-        '<p>答案可以用一句话概括，这句话也是本章最重要的一句判断：' +
-        '<b>密钥没有被销毁，它只是被"重新编码"了一次——从"一个 16 字节的量"变成了"一组生成表的参数"。</b>' +
-        '这个重新编码是<b>信息守恒</b>的：只要表还在、只要解密还能正确工作，密钥的全部信息就必然还在表里。</p>' +
-        T.note('key', '🔑 信息守恒：白盒密码的第一性原理', '<p>看一个极端的例子：假如把 AES-128 做成"一张包含全部 <span class="mono">2^128</span> 种明文到密文映射的超级表"（固定密钥），' +
-          '那这张表就<b>完全确定</b>了密钥。表的大小是天文数字，但它包含的信息量是<b>完整</b>的——你完全可以（理论上）从这张表里把密钥算出来。' +
-          '（这个"任何有限函数都可以做成表"的观察，公开资料里常被用来说明白盒的好处与代价。）</p>' +
-          '<p>反过来，<b>如果密钥的信息不在表里，那这张表就不可能正确地加密</b>。所以：<b>密钥信息必然存在，问题只是"以什么形式存在、以及能不能被有效提取"。</b>' +
-          '白盒密码的全部努力，都是在提高"提取"的代价——<b>不是让提取变成不可能。</b></p>') +
-        '<h4>那为什么不能被"直接"提取出来？</h4>' +
-        '<p>因为分散之后，每个局部都丢失了全局信息。举一个具体的数：一张 T 表 <span class="mono">T[x] = S[x ^ k_in] ^ k_out</span> 有 256 个表项，' +
-        '而它只由 2 个字节（16 位）的密钥材料决定。<b>平均每个表项泄露 16/256 = 0.0625 位</b>——你盯着一个表项看，什么也看不出来。</p>' +
-        '<p>更麻烦的是内部编码：相邻两张表之间插了一层双射，所以 <b>你不能把相邻两张表"对接"起来消掉中间量</b>，' +
-        '因为上一张表的输出值域和下一张表的索引值域之间差了一个未知的双射。这是白盒设计里最关键的一招——' +
-        '它把"局部提取"这条路堵死了。<b>没有了内部编码，整个白盒构造会在几分钟内被解掉。</b></p>' +
-        T.note('warn', '⚠️ 那么"分散"为什么还是留下了痕迹', '<p>因为<b>分散是一个被迫的工程妥协</b>。</p>' +
-          '<p>理论上的白盒可以是一张巨大的表（信息完整、无结构、无法攻击），但它的体积是 <span class="mono">2^128</span> 量级，根本存不下。' +
-          '所以真实实现<b>必须把表切小</b>——切成几十张 256 字节或 4 KB 的表。而<b>每一次切分，都必须"顺着 AES 的结构去切"</b>：' +
-          'SubBytes 是逐字节的，所以按字节切；MixColumns 是列内的，所以按列切；ShiftRows 是行置换，所以变成索引重排。</p>' +
-          '<p><b>切分的边界暴露了算法的结构。</b>攻击方拿不到"密钥",但拿得到"这个实现是由标准的逐字节代替 + 列混合 + 行置换组成的"这个事实。' +
-          '有了这个事实，DFA 就有了立足点：<b>我知道扩散是怎么发生的，所以我能在合适的位置注入故障，并预判它的扩散形状。</b></p>' +
-          '<p>这就是本章反复出现的那个对立：<b>防守方要藏"内容"，攻击方利用"结构"。内容可以被编码洗掉，结构一旦被洗掉算法就不工作了。</b></p>') +
-        '<h4>把这条推理落到具体的构造上</h4>' +
-        '<p>下面这个案例把查找表型白盒的构造过程完整地摊开了——它正好可以用来验证上面这一段推理。</p>',
-      case: {
-        source: 'kanxue',
-        title: '[原创]白盒AES算法详解(三)',
-        date: '2024-12-30',
-        author: 'ElainaDaemon',
-        target: '查找表型白盒 AES 的教学实现（作者自实现的完整流程，非特定 App）',
-        background:
-          '<p>这是看雪社区「白盒AES算法详解」系列三篇中的第三篇，作者 <b>ElainaDaemon</b>，发在密码应用版块，' +
-          '标题带 <b>[原创]</b> 标记（同系列第二篇标注为转帖）。第一篇讲标准 AES 与故障对密文的影响，第三篇讲<b>白盒 AES 到底怎么实现</b>。</p>' +
-          '<p>这篇帖子的价值在于：它没有停在"白盒用查表实现"这句结论上，而是把 <code>TBoxes</code> / <code>TyiTableBoxes</code> / ' +
-          '<code>shiftTab</code> / <code>ioInvTable</code> 这几个部件逐个写出来，并给出生成代码。' +
-          '<b>本课 25.5 节讲的"T 表 / Tyi 表 / 索引重排"三件套，在这篇帖子里有对应的具体实现。</b></p>',
-        points: [
-          '帖中把白盒 AES 的实现路线归纳为三条：<b>查找表技术</b>（把模块的输入输出全部做成表 + 混淆置乱编码）、' +
-            '<b>插入扰乱项</b>（增加额外扰乱方程与线性编码，扰乱原始代数结构）、<b>多变量密码</b>（如 ASASA 结构：Affine → S-box → Affine → S-box → Affine）。' +
-            '<span class="pill warn">待核实</span>：各条路线对应的论文作者、标题与年份，本课不复述，以原帖与原始论文为准。',
-          '帖子引用了一个极端的说明：如果把 AES-128 整体做成一张表，需要 <code>2^128 × 128</code> 比特的空间 —— 也就是说"任何有限函数都能做成表"，' +
-            '但代价是不可接受的体积。<b>这正是"必须切小表"的动机。</b>',
-          '<b>TBoxes 同时实现 SubBytes 与 AddRoundKey</b>：<code>TBoxes[i][j][x] = sBox[x ^ expandedKey[16*i + j]] ^ expandedKey[16*(i+1) + j]</code>。' +
-            '一个字节进、一个字节出，<b>轮密钥被吸收进表的生成式</b>。',
-          '<b>TyiTables 实现 MixColumns</b>：帖中给出 4 张表的生成式，每个表项是 <b>32 位</b>，用 <code>gMul(2,x)</code> / <code>gMul(3,x)</code> 计算 GF(2⁸) 乘法，' +
-            '并分别放在 32 位量的不同字节位置上 —— 与本课 25.5 节讲的"1 字节进、4 字节出"完全对应。',
-          '<b>ShiftRows 用 <code>shiftTab</code> 数组实现</b>：帖中给出的映射是 <code>{0,5,10,15, 4,9,14,3, 8,13,2,7, 12,1,6,11}</code>，' +
-            '作为"取哪一列的哪一个字节"的索引表，被折叠进表的生成循环里。',
-          '<b>输入混淆用 <code>ioInvTable</code>（16 字节随机数）</b>：帖中在生成表时用 <code>srand(time(nullptr))</code> + <code>rand()%256</code> 生成，' +
-            '并在查表前与输入异或（<code>tmp = x ^ ioInv</code>）。<b>注意这是"每次运行都不一样"的随机化——这一点对攻击方影响重大。</b>',
-          '<b>对 TyiTableBoxes 再加一层异或混淆</b>：帖中给出用 <code>MixTable[x % 16]</code> 对每个表项异或的代码，作者明确说这是"增加攻击者逆向工程的难度"。',
-          '<b>最后一轮的差别被专门处理</b>：帖中 <code>if (i == 9)</code> 分支把最后一轮直接与<br/>' +
-            '<code>expandedKey[160 + j]</code> 异或，而不走 MixColumns —— 这与标准 AES 第 10 轮没有 MixColumns 一致，' +
-            '<b>也正好是本课 25.9 节讨论的"故障注入点在哪里"的那一轮。</b>'
-        ],
-        method: [
-          '先讲清楚密钥扩展：把 16 字节主密钥扩展成 <b>176 字节 / 11 组</b>轮密钥（<code>expandKey</code>），轮常数 <code>rCon</code> 参与每 4 轮的 g 函数。',
-          '把一轮拆成三类部件：<b>SubBytes + AddRoundKey 合成 TBoxes</b>；<b>MixColumns 拆成按列的 TyiTables（32 位表项）</b>；<b>ShiftRows 变成 shiftTab 索引表</b>。',
-          '用 <code>ioInvTable</code> 的随机字节对输入做异或混淆，让同一个明文在不同运行中走向不同的表项。',
-          '生成 <code>TBoxes</code> 与 <code>TyiTableBoxes</code>（帖中 <code>TyiTableBoxes</code> 的规模是 <code>[9][16][256]</code>）；' +
-            '最后一轮不做 MixColumns，直接异或末轮密钥。',
-          '在 TyiTableBoxes 上再叠一层 <code>MixTable</code> 异或混淆，抬高静态分析成本。',
-          '给出完整的 <code>AesBoxEncrypt()</code> 主流程，把随机化、表生成、加密三步串成一个可运行的整体。'
-        ],
-        result:
-          '<p>帖子给出的是一份<b>完整可跟随的查找表型白盒 AES-128 构造</b>：密钥扩展 → T 表（代替 + 轮密钥）→ Tyi 表（列混合，32 位表项）→ ' +
-          'shiftTab 行移位 → ioInvTable 输入混淆 → 末轮特殊处理，最后串成加密主流程。</p>' +
-          '<p>对本课最有价值的一点是：<b>它把"密钥去哪了"这个问题回答得很具体</b>。' +
-          '密钥既不在某个全局数组里，也不在某一处内存中，而是<b>同时出现在 TBoxes 的生成式里和末轮的异或里</b>，' +
-          '并且被 ioInvTable 的随机混淆进一步打散 —— 单看任何一张表都读不出它。</p>',
-        terms: ['白盒AES', 'TBoxes', 'TyiTableBoxes', 'shiftTab', 'ioInvTable', '查找表技术', 'ASASA 结构', 'GF(2⁸) 乘法', 'gMul', '轮密钥扩展', 'rCon', '混淆置乱编码'],
-        limits:
-          '<p>按本课纪律，把这篇帖子的局限如实标出：</p>' +
-          '<p>① 作者在文末明确写道自己「<b>也在学习探索中</b>」，并请读者对「错误或表述不当的地方」斧正 —— ' +
-          '也就是说这是一份<b>教学性质的实现</b>，不是某个产品级的加固方案，其安全性不能等同于商业白盒实现。</p>' +
-          '<p>② 帖中引述的三条实现路线及其背后的论文（查找表 / 插入扰乱项 / 多变量密码）<span class="pill warn">待核实</span>：' +
-          '本课不复述具体作者、标题与年份，因为这类信息必须以原始论文为准，转述极易出错。</p>' +
-          '<p>③ 帖中的 <code>ioInvTable</code> 用 <code>srand(time(nullptr))</code> 生成，这意味着<b>不同次运行的混淆表不同</b>。' +
-          '作者没有讨论这种随机化对各类攻击的实际影响，本课在 25.13 节把它作为一个独立的工程问题来讨论。</p>' +
-          '<p>④ 帖子主要讲"怎么把 AES 白盒化"，<b>没有展开具体的密钥提取攻击</b>——攻击部分是系列后续的内容，本课在 25.8 节之后自行展开。</p>',
-        analysis:
-          '<p><b>用本课方法论拆解：这篇帖子正好印证了本章的两条核心判断。</b></p>' +
-          '<p><b>第一，印证了"密钥信息必然守恒，但被重新编码了"。</b>' +
-          '帖子里的 <code>TBoxes[i][j][x] = sBox[x ^ expandedKey[...]] ^ expandedKey[...]</code> 这一行就是全部答案：' +
-          '密钥从"一个要参与运算的常量"变成了"生成 256 个表项的参数"。<b>密钥没有被消灭，它被"编译"进了表里。</b>' +
-          '这也解释了为什么本课在 25.2 节说"零命中本身就是最强的诊断信号"——标准常量之所以搜不到，' +
-          '是因为它们全部被复合进了 T 表，而不是被加密或压缩了。</p>' +
-          '<p><b>第二，印证了"切分的边界暴露了算法结构"。</b>' +
-          '帖子里的三个部件（TBoxes / TyiTables / shiftTab）恰好对应 AES 的三个结构特征：逐字节代替、列内混合、行置换。' +
-          '作者<b>必须</b>这样切，否则算法就不成立。于是尽管密钥被彻底打散，<b>"这是一轮标准 AES"这个事实反而更清楚了</b>——' +
-          '本课 25.8 节的 DFA 之所以能成立，前提正是这个事实。</p>' +
-          '<p><b>第三，这一节也暴露了防守方的真实处境。</b>' +
-          '帖子里所有的加固手段（ioInvTable 随机化、MixTable 异或）都是在<b>提高单张表的"可读性门槛"</b>，' +
-          '但没有任何一条改变了"一字节进、四字节出、按列混合"的骨架。' +
-          '这就是本课在 25.3 节说的那句话的具体版本：<b>编码洗得掉内容，洗不掉结构。</b>' +
-          '读这篇帖子时，建议你带着这个视角再看一遍：<b>哪几行是在"藏内容"，哪几行在无意中"暴露结构"。</b></p>',
-        link: 'https://bbs.kanxue.com/thread-285052-1.htm',
-        linkNote: '该帖需要登录才可查看完整内容（未登录访问会先经过一次安全验证），但帖子主体内容可正常获取。'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你应该能回答这个看似矛盾的问题了：' +
-        '<b>密钥被彻底打散了（所以读不出来），但密钥的信息完整地留在实现里（所以能被算出来）；而打散所依赖的"切分"，反过来暴露了 AES 的结构（所以攻击有立足点）。</b></p>')
-    },
-
-    /* ==================== 25.7 ==================== */
-    {
-      h: '25.7', title: '统计学视角：白盒表"看起来随机"，但不是均匀随机',
-      html:
-        '<p>这一节要回答一个很实际的问题：<b>你手上有一块 96KB 的数据，你怎么知道它是白盒表，而不是一段加密后的资源、一张图片、或者随机噪声？</b></p>' +
-        '<p>直觉答案是"看值分布均不均匀"。<b>这个直觉是错的，而且错得很典型。</b>下面把可观测量摊开，你会发现有些指标完全没有区分力，有些指标一击致命。</p>' +
-        T.tbl(['可观测量', '怎么算', '白盒表的表现', '有区分力吗'], [
-          ['值的分布熵', '统计 256 个值各自出现多少次，算香农熵',
-           '<b>恒等于 8.0 比特</b>——因为表是双射，每个值恰好出现一次',
-           '<span class="bad">❌ 零区分力</span>。一张随机置换的熵也是 8.0，两者一模一样'],
-          ['是否双射（置换）', '看 256 个表项是否互不重复',
-           '<b>一定是</b>（T 表是三个双射的复合）',
-           '<span class="miss">⚠️ 只能用来找表，不能用来区分"白盒表 vs 随机表"</span>'],
-          ['<b>差分谱（最大差分计数）</b>', '对每个非零输入差分 a，统计输出差分 b 的出现次数，取全局最大值',
-           '<b>AES 系表是 4</b>；随机置换是 <b>10~14</b> 之间',
-           '<span class="hit">✅ 一击致命</span>。这是本节的主角'],
-          ['不动点数量', '统计 <span class="mono">T[x] == x</span> 的个数',
-           'AES S 盒有固定值（可数）；仿射编码会改变它',
-           '<span class="miss">⚠️ 弱</span>。编码一换就变了，不稳定'],
-          ['行与行之间的差分', '把表按 16×16 排列，比较相邻行的异或模式',
-           '继承了 GF(2⁸) 乘法的规律性',
-           '<span class="miss">⚠️ 中</span>。需要先知道表是怎么排的'],
-          ['表被访问的地址分布', '在运行时统计每个 256 字节块的访问频次',
-           '高度不均匀：热表被反复击中，冷表几乎不碰',
-           '<span class="hit">✅ 强</span>。但它定位的是"代码路径"，不是"表结构"']
+        '<p>最后一节把「热门 eBPF 项目」按用途分成三类，说清它们各自用了什么钩子、解决什么问题。你会发现：<b>看懂了 25.2 的九步和 25.4 的四个结构件，这些项目就没有神秘感了</b>。</p>' +
+        T.tbl(['类别', '核心钩子', '技术原理', '对逆向的用处'], [
+          ['<b>系统调用追踪</b><br><span class="small">如 BCC 的 execsnoop / opensnoop</span>',
+           '<code>tracepoint</code>（如 <code>sys_enter</code>/<code>sys_exit</code>）、<code>kprobe</code>',
+           '在每个系统调用的入口/出口挂程序，从上下文里取出参数（路径、flags、fd）和返回值，写进 Map 或 ringbuf，用户态聚合成「谁在什么时候做了什么」',
+           '<b>极高</b>。App 的任何文件访问、网络连接、进程创建最终都要走系统调用，这里能看到<b>完整且不可绕过</b>的行为序列'],
+          ['<b>网络过滤</b><br><span class="small">如 Cilium、XDP 程序、tc 分类器</span>',
+           '<code>XDP</code>（驱动层最早处理点）、<code>tc</code>（流量控制层）、<code>socket filter</code>',
+           '在网络包进入协议栈前后直接读取/修改/丢弃。XDP 在驱动收包后最先执行，性能极高，常用于 DDoS 防护和负载均衡；tc 层能做更复杂的流分类',
+           '<b>中高</b>。可观测目标的全部网络流量（域名、IP、载荷元数据），且<code>XDP</code> 层可以做到丢包级干预'],
+          ['<b>性能分析</b><br><span class="small">如 BCC 的 biolatency、火焰图工具</span>',
+           '<code>perf_event</code>、<code>kprobe</code>、<code>tracepoint</code>',
+           '用采样或埋点记录延迟、调用次数、栈回溯，聚合到 PERCPU_ARRAY 之类的 Map 里再导出。关键是<b>开销极低</b>，可以长时间挂在生产环境',
+           '<b>中</b>。定位目标 App 的性能瓶颈和热点函数，间接推断其内部结构']
         ]) +
-        T.note('key', '🔑 为什么"熵"没有区分力，而"差分谱"有', '<p>因为熵只关心<b>值的边缘分布</b>。一个置换把 256 个值各用一次，' +
-          '所以无论这张表是标准 S 盒、是被密钥复合过的 T 表、还是纯粹的随机置换，<b>边缘分布都完全一样，熵都是 8.0</b>。</p>' +
-          '<p>差分谱关心的是<b>条件分布</b>：<span class="mono">输入差 a 时，输出差的分布长什么样</span>。' +
-          '这是在问一个关于"表内部的结构关系"的问题，而不是"表里有哪些值"的问题。</p>' +
-          '<p>而 AES 的 S 盒是被<b>刻意设计</b>成差分均匀的：对任何非零输入差分，任何输出差分最多出现 <b>4 次</b>。' +
-          '随机置换没有这个性质——它在某对差分上会"撞车"到 10 次以上。' +
-          '<b>这就是"白盒表继承了 AES 代数结构"这句抽象话的具体含义。</b></p>') +
-        T.note('warn', '⚠️ 从这里可以直接看出防守方的必答题', '<p>接着上面的推理往下走一步：<b>如果差分谱能区分白盒表和随机表，那防守方是不是只要把差分谱"洗掉"就行了？</b>答案是——可以，但代价很大，而且洗不干净。</p>' +
-          '<p>实验会告诉你：<b>仿射（线性）编码根本洗不掉差分谱的上界</b>，因为线性映射作用在差分上只是"换个标号"，最大计数一格不变。' +
-          '想真的把差分谱拉回随机水平，必须用<b>非线性编码</b>——而一旦在每一层之间都插入随机双射，表的体积、初始化时间、运行性能都会明显上升。' +
-          '<b>这就是白盒密码里"安全"与"性能"的第一场拉锯战。</b>下面这个实验让你亲手把这条界线量出来。</p>'),
-      lab: {
-        title: '实验：白盒表的统计指纹——熵骗了你，差分谱没有',
-        goal: '目标：用真实统计量区分白盒表与随机表',
-        intro:
-          '<p>下面这个实验全部用<b>真实计算</b>：标准 S 盒直接取自 <span class="mono">window.CRYPTO.AES.sbox</span>（由本站在浏览器里现算出来，不是硬编码的），' +
-          '白盒 T 表按 <span class="mono">T[x] = S[x ^ k0] ^ k1</span> 用你给的密钥算出来，仿射编码用 GF(2⁸) 乘法实现，随机置换用固定种子的伪随机序列生成。</p>' +
-          '<p><b>要做的事：</b>① 点运行，看五张表的四个统计量；② <b>找出哪个统计量能区分"白盒表"和"随机表"</b>；' +
-          '③ 在结论框里写清楚：<b>为什么熵区分不出来，而差分谱可以</b>，以及<b>仿射编码对差分谱做了什么</b>。</p>',
-        inputs: [
-          { key: 'key', label: 'AES-128 密钥（十六进制，决定 T 表内容）', hint: '32 个十六进制字符',
-            value: '2b7e151628aed2a6abf7158809cf4f3c' },
-          { key: 'verdict', label: '你的结论：哪个统计量有区分力？为什么？仿射编码改变了什么？',
-            hint: '至少说到两点：① 差分谱/最大差分计数 ② 仿射编码与"不变/保持"的关系',
-            type: 'textarea', rows: 4, ph: '例如：熵都是 8.0 所以区分不出来；能区分的是……' }
-        ],
-        runLabel: '🔍 测量五张表',
-        autorun: true,
-        run: function (v) {
-          var C = window.CRYPTO;
-          var S = C.AES.sbox;
-          var hx = C.normHex(v.key || '');
-          if (hx.length !== 32) {
-            return '<div class="lab-msg warn"><b>密钥长度不对</b><div class="lab-note">AES-128 需要 32 个十六进制字符（16 字节），当前 ' + hx.length + ' 位。</div></div>';
-          }
-          var key = [];
-          for (var i = 0; i < 16; i++) key.push(parseInt(hx.substr(i * 2, 2), 16));
-          var xt = function (a) { return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff; };
-          var mul = function (a, b) { var r = 0; while (b) { if (b & 1) r ^= a; a = xt(a); b >>= 1; } return r & 0xff; };
-
-          /* 固定种子的确定性伪随机置换：保证同一个读者每次看到同一张"随机表" */
-          var lcg = function (seed) {
-            var x = seed >>> 0;
-            return function () { x = (Math.imul(x, 1664525) + 1013904223) >>> 0; return x; };
-          };
-          var randPerm = function (seed) {
-            var a = [], rnd = lcg(seed), i, j, t;
-            for (i = 0; i < 256; i++) a.push(i);
-            for (i = 255; i > 0; i--) { j = rnd() % (i + 1); t = a[i]; a[i] = a[j]; a[j] = t; }
-            return a;
-          };
-          var sArr = []; for (var q = 0; q < 256; q++) sArr.push(S[q]);
-
-          var k0 = key[0], k1 = key[1];
-          var tbox = []; for (var t2 = 0; t2 < 256; t2++) tbox.push(S[t2 ^ k0] ^ k1);
-          var tAff = []; for (var t3 = 0; t3 < 256; t3++) tAff.push(mul(tbox[t3], 0x1f) ^ 0xb7);
-          var P = randPerm(99);
-          var tNon = []; for (var t4 = 0; t4 < 256; t4++) tNon.push(P[tbox[t4]]);
-          var rndTbl = randPerm(12345);
-
-          var entropy = function (tb) {
-            var f = new Array(256).fill(0), i, h = 0;
-            for (i = 0; i < tb.length; i++) f[tb[i]]++;
-            for (i = 0; i < 256; i++) if (f[i]) { var p = f[i] / tb.length; h -= p * Math.log(p) / Math.LN2; }
-            return h;
-          };
-          var ddtMax = function (tb) {
-            var best = 0, argA = 0, argB = 0, a, x, b;
-            for (a = 1; a < 256; a++) {
-              var cnt = new Int32Array(256);
-              for (x = 0; x < 256; x++) cnt[tb[x] ^ tb[x ^ a]]++;
-              for (b = 0; b < 256; b++) if (cnt[b] > best) { best = cnt[b]; argA = a; argB = b; }
-            }
-            return { best: best, a: argA, b: argB };
-          };
-          var fixedPoints = function (tb) { var n = 0; for (var i2 = 0; i2 < 256; i2++) if (tb[i2] === i2) n++; return n; };
-          var isPerm = function (tb) { return new Set(tb).size === tb.length; };
-
-          var rows = [
-            { name: 'A. 标准 AES S 盒', tb: sArr, note: '由 CRYPTO 现算' },
-            { name: 'B. 白盒 T 表 S[x^' + k0.toString(16).padStart(2, '0') + ']^' + k1.toString(16).padStart(2, '0') + '', tb: tbox, note: '密钥被复合进表' },
-            { name: 'C. T 表 + 仿射外部编码', tb: tAff, note: 'mul(x,0x1f)^0xb7（线性）' },
-            { name: 'D. T 表 + 非线性输出编码', tb: tNon, note: 'T 表外面套一层随机双射' },
-            { name: 'E. 纯随机置换', tb: rndTbl, note: '固定种子生成' }
-          ];
-
-          var html = '<table class="lab-tbl"><tr><th>表</th><th>双射</th><th>熵(bit)</th><th>最大差分计数</th><th>不动点</th></tr>';
-          var ddtList = [];
-          rows.forEach(function (r) {
-            var d = ddtMax(r.tb);
-            ddtList.push(d.best);
-            html += '<tr><td>' + r.name + '<br><span class="small muted">' + r.note + '</span></td>' +
-              '<td>' + (isPerm(r.tb) ? '✅ 是' : '❌ 否') + '</td>' +
-              '<td>' + entropy(r.tb).toFixed(4) + '</td>' +
-              '<td><b>' + d.best + '</b><br><span class="small muted">a=0x' + d.a.toString(16) + ' b=0x' + d.b.toString(16) + '</span></td>' +
-              '<td>' + fixedPoints(r.tb) + '</td></tr>';
-          });
-          html += '</table>';
-
-          var sBoxDdt = ddtList[0], tboxDdt = ddtList[1], affDdt = ddtList[2], nonDdt = ddtList[3], rndDdt = ddtList[4];
-          html += '<div class="lab-msg ' + (tboxDdt === sBoxDdt ? 'pass' : 'warn') + '"><b>读数一：熵是废的</b>' +
-            '<div class="lab-note">五张表的熵全部是 <b>8.0000</b>。原因：它们都是 256 字节的双射，每个值恰好出现一次，' +
-            '边缘分布完全一样。<b>熵只能告诉你"这是一个置换"，不能告诉你"这是谁做的"。</b></div></div>';
-
-          html += '<div class="lab-msg pass"><b>读数二：最大差分计数才是那条分界线</b>' +
-            '<div class="lab-note">A（标准 S 盒）= <b>' + sBoxDdt + '</b>，B（白盒 T 表）= <b>' + tboxDdt + '</b>，' +
-            'E（随机置换）= <b>' + rndDdt + '</b>。<br>' +
-            '<b>AES 系表的差分谱上界被钉在 ' + sBoxDdt + '，随机置换在 10~14 之间。</b>' +
-            '换句话说：<b>密钥复合、编码扰动都没有改变这个上界</b>，而"是不是 AES 造的"一眼可辨。' +
-            '这就是"白盒表看起来随机，但不是均匀随机"的量化版本。</div></div>';
-
-          html += '<div class="lab-msg key"><b>读数三：仿射编码洗不掉它，非线性编码才能</b>' +
-            '<div class="lab-note">C（T 表 + 仿射外部编码）= <b>' + affDdt + '</b>，与 B 完全相同。<br>' +
-            '<b>D（T 表 + 非线性输出编码）= <b>' + nonDdt + '</b>，已经被拉到随机水平（跟 E 的 ' + rndDdt + ' 同级）。</b><br>' +
-            '原因：仿射映射作用在<b>差分</b>上只是"换个标号"——<span class="mono">L(u) ^ L(v) = L(u ^ v)</span>，' +
-            '所以对每个输入差 a，输出差的计数分布被整体重排，<b>最大值不变</b>。' +
-            '非线性双射没有这个性质（<span class="mono">P(u) ^ P(v)</span> 与 <span class="mono">u ^ v</span> 无关），所以差分谱被打散。<br>' +
-            '<b>结论：想藏住 AES 的代数指纹，必须付"非线性编码"的代价——这是白盒密码里最实在的一道成本线。</b></div></div>';
-
-          html += '<div class="lab-msg warn"><b>现在轮到你下结论</b>' +
-            '<div class="lab-note">在下面的结论框里写清楚三件事：<br>' +
-            '① 为什么<b>熵</b>和<b>双射性</b>区分不出白盒表与随机表？<br>' +
-            '② 哪个统计量能区分？它衡量的是什么样的结构？<br>' +
-            '③ 仿射编码对这个统计量做了什么？非线性编码呢？<br>' +
-            '写完之后点「✓ 检查我的答案」。</div></div>';
-          return html;
-        },
-        expected: function (v) {
-          var H = window.AKKC_hasConcept;
-          var txt = v.verdict || '';
-          if (!txt.trim()) {
-            return { ok: false, detail: '结论框是空的。<b>看懂不等于会写</b>——至少说清"哪个统计量有区分力"和"仿射编码做了什么"。' };
-          }
-          var g1 = H(txt, ['差分', '差分谱', '差分分布', '差分均匀', 'ddt', 'differential', '最大差分']);
-          var g2 = H(txt, ['熵', 'entropy', '都相同', '都一样', '区分不出', '无法区分', '一样', '均匀', '边缘分布', '都是 8']);
-          var g3 = H(txt, ['仿射', '线性', 'affine', '不变', '保持', '非线性', '编码']);
-          var hits = (g1 ? 1 : 0) + (g2 ? 1 : 0) + (g3 ? 1 : 0);
-          var ok = hits >= 2;
-          return {
-            ok: ok,
-            detail: (ok ? '✅ 命中了 <b>' + hits + '/3</b> 个要点。' : '❌ 只命中 <b>' + hits + '/3</b> 个要点。') +
-              '<br><b>命中情况：</b>差分谱 <b>' + (g1 ? '✔' : '✘') + '</b>　' +
-              '熵/边缘分布区分不出 <b>' + (g2 ? '✔' : '✘') + '</b>　' +
-              '仿射编码与不变性 <b>' + (g3 ? '✔' : '✘') + '</b>' +
-              (ok ? '<br>你已经抓住了本节的核心：<b>区分白盒表的不是"值的分布"，而是"差分的分布"。</b>'
-                  : '<br>提示：想想五张表里<b>哪一个数字</b>在 A/B/C 三行完全一样、而 E 行明显不同。再想想那个数字衡量的是"表里有哪些值"还是"表内部的关系"。')
-          };
-        },
-        showAnswer:
-          '① 熵和双射性为什么区分不出来：\n' +
-          '   表是 256 字节的双射 → 每个值恰好出现一次 → 边缘分布完全确定 → 熵恒为 8.0 比特。\n' +
-          '   密钥复合、仿射编码、随机置换，全都不改变这一点。所以这两个指标只能"找到表"，不能"认出表"。\n\n' +
-          '② 有区分力的是最大差分计数（差分谱上界）：\n' +
-          '   对每个非零输入差分 a，统计所有输出差分的出现次数，取全局最大值。\n' +
-          '   AES 系表 = 4（S 盒被设计成 4-差分均匀，T 表是它与异或常量的复合，谱不变）\n' +
-          '   随机置换 = 10~14（取决于具体置换）\n' +
-          '   它衡量的是"表内部的输入-输出关系结构"，而不是"表里有哪些值"。\n\n' +
-          '③ 仿射编码做了什么：什么都没改变。\n' +
-          '   仿射映射作用在差分上是线性的：L(u) ^ L(v) = L(u ^ v)。\n' +
-          '   所以对固定的输入差分 a，输出差分的计数分布只是被"重新标号"，最大值一格不变。\n' +
-          '   非线性双射没有这个性质，差分谱会被打散到随机水平。\n\n' +
-          '④ 工程含义：想藏住 AES 的代数指纹，必须用非线性编码 —— 代价是表的体积、\n' +
-          '   初始化时间和性能。这是白盒密码里安全与性能的第一场拉锯。',
-        hint:
-          '别盯着"表里有哪些值"看，盯着"表内部的关系"看。<br>' +
-          '第一步：比较五张表的<b>熵</b>——它们一样吗？为什么会一样？（提示：它们都是双射）<br>' +
-          '第二步：比较五张表的<b>最大差分计数</b>——哪几行一样、哪一行明显不同？<br>' +
-          '第三步：C 行比 B 多套了一层仿射编码，它的最大差分计数变了吗？为什么？<br>' +
-          '（差分的关键性质：<span class="mono">L(u) ^ L(v) = L(u ^ v)</span> 对线性 L 成立。）',
-        after:
-          T.note('ok', '✅ 实验的收获', '<p style="margin-bottom:0">你刚刚亲手验证了本章最关键的一条工程判断：' +
-            '<b>白盒实现藏得住"内容"，藏不住"结构"。</b><br>' +
-            '更具体地说：<b>值的分布（熵）不是结构，差分的分布（差分谱）才是。</b>' +
-            '这条判断可以直接迁移到别的地方：判断一段代码是不是 OLLVM 混淆的，看的不是"代码里有哪些指令"，而是"控制流的转移关系"；' +
-            '判断一个序列是不是随机的，看的不是"数字范围"，而是"它有没有被人为构造出来的规律"。</p>')
-      },
-      quiz: {
-        id: 'q25-5', chapter: 25, answer: 2,
-        stem: '你从内存里 dump 出一张 256 字节的表，发现它<b>既是完美置换、熵又是 8.0 比特</b>。同伴说：「熵这么高、又是双射，肯定是随机生成的一张表，别浪费时间了。」你该怎么反驳？',
-        options: [
-          { t: '没法反驳——熵 8.0 且是双射，确实只能是随机表', why: '把两个"必然成立"的性质当成了"随机"的证据。任何 256 字节的双射都有熵 8.0，包括标准 AES S 盒本身。这两个指标对"是不是白盒表"零信息量。' },
-          { t: '反驳不了，但可以再算一次看看运气', why: '这不是技术判断，是碰运气。而且"再算一次"不会给出新信息——同一个熵值算一百次还是 8.0。' },
-          { t: '追问：这张表的<b>差分谱上界</b>是多少？如果是 4 左右，它就是 AES 系构造；如果是 10 以上，才可能是随机的', why: '正确。熵与双射性只能说明"这是一个置换"，而差分谱上界才能区分"AES 造的表"和"随机表"。AES 系表的差分均匀性上界是 4，随机置换在 10~14 之间。' },
-          { t: '追问：这张表在文件里还是在堆上？在堆上就是运行时生成的，与白盒无关', why: '位置信息确实有用（判断是静态常量还是运行时生成），但它回答的是另一个问题。即使表在堆上，它也可能是白盒表——很多白盒实现在初始化时才填表。' }
-        ],
-        explain: '<b>这道题考的是"哪个统计量有区分力"这个判断本身。</b>' +
-          '<p>先把两个陷阱点破：<b>熵 8.0</b> 是"256 字节双射"的必然结果，不是"随机"的证据——标准 S 盒、被密钥复合的 T 表、随机置换，三者的熵全都是 8.0。' +
-          '<b>双射性</b>同理，它是 T 表构造的代数必然（第 25.5 节的 quiz 刚验证过）。所以这两个指标合起来，能告诉你的只有一句话：<b>"这是一张表。"</b></p>' +
-          '<p>真正有区分力的是<b>差分谱上界</b>。它的物理含义是"这张表的输入输出关系有多均匀"：' +
-          'AES 的 S 盒被设计成 4-差分均匀（对任何非零输入差分，任何输出差分最多出现 4 次），而这个性质<b>在密钥复合与仿射编码下都不变</b>；' +
-          '随机置换没有这个约束，会撞到 10 次以上。</p>' +
-          '<p>这道题还有一个隐藏的收获：<b>同伴的那句话之所以听起来有道理，是因为它用了两个"看起来很专业"的指标。</b>' +
-          '逆向工作里最常见的一类错误不是"什么都不算"，而是"算了一堆看起来很硬的指标，却没有一个是针对当前问题的"。' +
-          '<b>先问"我这个指标能区分哪两种假设"，再决定要不要算它。</b></p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">你要带走的是一个"指标清单 + 每个指标的区分力"：' +
-        '<b>熵和双射性 → 用来找表（零区分力）；差分谱上界 → 用来认表（一击致命）；访问地址分布 → 用来定位代码（强）</b>。' +
-        '更重要的是那个反问句式：<b>「这个指标能区分哪两种假设？」</b>——它能帮你省掉大量无效计算。</p>')
-    },
-    /* ==================== 25.8 ==================== */
-    {
-      h: '25.8', title: 'DFA 的通用原理：故障在密文里扩散出一个"形状"',
-      intuition: {
-        tag: '直觉模型 · 敲一下水管，听回声判断哪一段堵了',
-        body: '<p>一根埋在地下的水管，你看不到内部。但你在某一端<b>敲一下</b>，另一端的出水会抖一下——抖动的<b>时间、幅度、形态</b>和"你在哪里敲、管子怎么走"有关。' +
-              '敲的位置不同，回声的样子就不同。</p>' +
-              '<p>DFA 就是这套逻辑。你不知道密钥（看不到管子内部），但你能在中间状态的某个位置<b>精确地改一个字节</b>（敲一下），' +
-              '然后观察密文的变化（听回声）。<b>因为扩散结构是已知的，回声的形状是可预测的</b>——而"可预测"就意味着"可以列方程求解"。</p>' +
-              '<p>关键差别在于：这里敲的位置和方式你都<b>完全控制</b>，不像侧信道那样只能被动听。这就是为什么白盒场景下的 DFA 比灰盒场景更有力。</p>'
-      },
-      html:
-        '<p>把 DFA 拆成三个可分别验证的事实。这三条都不依赖任何具体实现，只依赖 AES 的结构。</p>' +
-        '<h4>事实一：扩散只由两步决定</h4>' +
-        '<p>AES 的状态是一个 4×4 的字节矩阵。一轮里有两步会造成<b>跨字节影响</b>：</p>' +
-        T.tbl(['步骤', '做什么', '对"差异"的影响'], [
-          ['AddRoundKey', '逐字节异或轮密钥', '<b>不扩散</b>。异或是线性的：<span class="mono">(a^k) ^ (b^k) = a ^ b</span>，差异原样保留，与密钥无关'],
-          ['SubBytes', '逐字节查 S 盒', '<b>不扩散</b>。逐字节操作，一个字节的差异还是一个字节的差异（但值会变）'],
-          ['ShiftRows', '每行循环左移 0/1/2/3 个字节', '<b>换位扩散</b>。差异的<b>个数不变</b>，但位置被搬到不同的列'],
-          ['MixColumns', '每列 4 字节做矩阵乘法', '<b>数量扩散</b>。1 个字节的差异 → 该列 <b>4 个字节</b>全部不同。这是唯一的数量放大器']
-        ]) +
-        T.note('key', '🔑 记住这一行，DFA 就懂了一半', '<p><b>只有 MixColumns 会让差异"变多"，只有 ShiftRows 会让差异"挪窝"，其他两步对差异的形状毫无影响。</b></p>' +
-          '<p>所以"故障在密文里长什么样"，完全由<b>故障位置后面还剩几次 MixColumns、几次 ShiftRows</b>决定。' +
-          '不用看密钥、不用看具体实现——数次数就够了。</p>') +
-        '<h4>事实二：数一数剩下的 MixColumns，就知道形状</h4>' +
-        '<p>AES-128 一共 10 轮，<b>最后一轮没有 MixColumns</b>。所以从"注入点"往后数，MixColumns 的剩余次数只有三种可能：</p>' +
-        T.tbl(['注入时机', '剩余 MixColumns 次数', '密文差异字节数', '能不能用来做 DFA'], [
-          ['第 10 轮内部（最后一个 MixColumns 之后的任何位置）', '0', '<b>1 个字节</b>', '<span class="bad">❌ 不行</span>：1 个方程里有 2 个未知量（状态值和差分值），每个密钥候选都能找到解释'],
-          ['倒数第二个 MixColumns <b>之前</b>（即第 9 轮）', '1', '<b>4 个字节</b>', '<span class="hit">✅ 正好</span>：4 个方程共用一个未知差分，取交集就能把候选压下去'],
-          ['比第 9 轮更早（第 8 轮及以前）', '2 或更多', '<b>16 个字节</b>', '<span class="miss">⚠️ 溢出</span>：扩散过头，方程里耦合的未知量变多，要额外的工作量才能用'],
-          ['本来就在最后一轮之外（比如改输出缓冲区）', '0', '1 个字节', '<span class="bad">❌ 不行</span>：这已经不是"注入故障"，而是"改结果"']
-        ]) +
-        '<p>上表的"4 个字节"还带着一个更强的信息：<b>这 4 个字节的位置也是固定可预测的</b>。' +
-        '假设故障注在倒数第二个 MixColumns 输入的第 <span class="mono">c</span> 列，那么经过 MixColumns（整列 4 字节都变）、SubBytes（不变形）、ShiftRows（行置换）之后，' +
-        '最终密文里发生变化的是这 4 个下标：</p>' +
-        T.code('// 状态按列优先编号：state[c*4 + r]，c 是列（0..3），r 是行（0..3）\n' +
-          '// 故障注入在第 9 轮 MixColumns 的输入、第 c 列\n' +
-          '// 受影响的状态下标（输入侧，即第 9 轮 MixColumns 的输出）：\n' +
-          '//    4c, 4c+1, 4c+2, 4c+3        （整列）\n' +
-          '// 末轮 ShiftRows 之后，它们被搬到：\n' +
-          '//    idx(r) = 4 * ((c - r + 4) % 4) + r     对 r = 0..3\n' +
-          '//\n' +
-          '// c = 0  ->  0, 13, 10, 7      （排序后 0, 7, 10, 13）\n' +
-          '// c = 1  ->  4,  1, 14, 11     （排序后 1, 4, 11, 14）\n' +
-          '// c = 2  ->  8,  5,  2, 15     （排序后 2, 5,  8, 15）\n' +
-          '// c = 3  -> 12,  9,  6,  3     （排序后 3, 6,  9, 12）\n' +
-          '// 注意这四个下标正好构成一条"斜线"——因为 ShiftRows 的第 r 行左移 r 位') +
-        T.note('ok', '✅ 这个"斜线形状"是本实验的第一道自检', '<p>当你在真实的白盒实现上注入故障后，<b>第一件事不是去解方程，而是检查密文差异是不是恰好 4 个字节、且落在某一条斜线上</b>。</p>' +
-          '<ul><li>是 4 个字节、落在斜线上 → 注入位置正确，可以开始列方程；</li>' +
-          '<li>是 1 个字节 → 注入点在最后一个 MixColumns 之后，位置太靠后；</li>' +
-          '<li>是 16 个字节 → 注入点太靠前；</li>' +
-          '<li>是 4 个字节但<b>不在斜线上</b> → 说明有外部编码或额外的线性变换参与，密文差分被"扭"过了（25.12 节展开）。</li></ul>') +
-        '<h4>事实三：四个方程共用一个未知差分</h4>' +
-        '<p>这是 DFA 的数学核心，也是它比"暴力枚举密钥"强的地方。把末轮写出来：</p>' +
-        T.code('// 设第 9 轮 MixColumns 输入为 A（正确）与 X（故障），输入差分 Z = A ^ X\n' +
-          '// 第 9 轮 MixColumns 输出的第 r 个字节 = sum_j M[r][j] * a_j\n' +
-          '// 因为只有第 r_fault 个字节被改过，所以只有一个系数起作用：\n' +
-          '//    o_r(X) = o_r(A) ^ M[r][r_fault] * Z\n' +
-          '//\n' +
-          '// 再经过 AddRoundKey(K9) -> SubBytes -> ShiftRows -> AddRoundKey(K10)：\n' +
-          '//    C[i_r]      = S( o_r(A) ^ K9[...] ) ^ K10[i_r]\n' +
-          '//    C\'[i_r]     = S( o_r(A) ^ M[r][r_fault]*Z ^ K9[...] ) ^ K10[i_r]\n' +
-          '//\n' +
-          '// 两边异或，K10 被消掉：\n' +
-          '//    C[i_r] ^ C\'[i_r]  =  S(Y_r)  ^  S( Y_r ^ M[r][r_fault]*Z )\n' +
-          '//    其中 Y_r = o_r(A) ^ K9[...] 是未知的中间值，但四个 r 共用同一个 Z') +
-        '<p>关键就在最后一句：<b>四个方程里的 <span class="mono">Z</span> 是同一个未知量。</b>' +
-          '单独看任何一个方程，它有两个未知数（<span class="mono">Y_r</span> 和 <span class="mono">Z</span>），' +
-          '共有 <span class="mono">256 × 255</span> 种可能——信息量太少。' +
-          '但四个方程联立之后，<b>能被同一个 Z 同时解释的那些 Y 才是候选</b>，可能性瞬间收缩。</p>' +
-        '<p>25.10 节的实验会把这个收缩过程一步步算给你看：<b>单个方程允许 127 个 Z；四个方程取交集掉到十几到三十几个；' +
-          '再往下推出该位置对应的末轮密钥字节，候选从 256 掉到几十个（实测区间 30~64，随密钥、位置与差分变化）；' +
-          '换几个不同差分的故障再取交集，就收敛到 1 个。</b>这就是 DFA 的全过程。（这一串数字不是估算——全部由实验现场算出。）</p>',
-      stage: {
-        title: '故障在 AES 里扩散出的"斜线形状"（真实轮函数推演）',
-        speed: 1500,
-        render: (function () {
-          var h = '<div class="regs" style="margin-bottom:10px">' +
-            '<span class="reg" id="wb8_a"><b>阶段</b>=初始状态</span>' +
-            '<span class="reg" id="wb8_b"><b>差异字节</b>=1</span></div>';
-          h += '<div style="margin:4px 0 6px" class="small muted">状态矩阵（列优先：左起第 1 列 = 下标 0..3）</div>';
-          h += '<div class="memgrid">';
-          for (var r = 0; r < 4; r++) {
-            h += '<div class="memrow" style="grid-template-columns:54px repeat(4,1fr)">';
-            h += '<span class="addr">行 ' + r + '</span>';
-            for (var c = 0; c < 4; c++) h += '<span class="cell" id="wb8_' + (c * 4 + r) + '">--</span>';
-            h += '</div>';
-          }
-          h += '</div>';
-          h += '<div class="small muted" style="margin-top:8px">格子里的数字 = 该字节在"正确 / 故障"两种情况下的值是否相同（0 = 相同，X = 不同）</div>';
-          return h;
-        })(),
-        reset: function () {
-          for (var i = 0; i < 16; i++) { SET('wb8_' + i, '0'); CLS('wb8_' + i, 'cell'); }
-          SET('wb8_a', '<b>阶段</b>=初始状态');
-          SET('wb8_b', '<b>差异字节</b>=1');
-        },
-        steps: [
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) { SET('wb8_' + i, '0'); CLS('wb8_' + i, 'cell'); }
-              SET('wb8_0', 'X'); CLS('wb8_0', 'cell hi');
-              SET('wb8_b', '<b>差异字节</b>=1');
-              SET('wb8_a', '<b>阶段</b>=注入点：第 9 轮 MixColumns 输入，下标 0');
-            },
-            note: '<b>起点：在第 9 轮 MixColumns 的输入处，把下标 0 这个字节改掉。</b>此刻只有 1 个字节不同。' +
-              '注意这个位置在白盒实现里的对应物：<b>它不是"某个变量"，而是某张 T 表的某一行表项</b>——改一个表项，等价于对所有落在这个表项上的输入做了一次异或。'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) CLS('wb8_' + i, 'cell');
-              var col = [0, 1, 2, 3];
-              for (var k = 0; k < 4; k++) { SET('wb8_' + col[k], 'X'); CLS('wb8_' + col[k], 'cell rd'); }
-              SET('wb8_b', '<b>差异字节</b>=4');
-              SET('wb8_a', '<b>阶段</b>=第 9 轮 MixColumns 之后（整列被扩散）');
-            },
-            note: '<b>第一次放大：MixColumns 把 1 个差异变成了整列 4 个差异。</b>原因是列混合是"列内"的线性组合，' +
-              '一列里任何一个字节变了，这一列的 4 个输出字节全都会变（只要对应的矩阵系数非零——AES 的 MixColumns 矩阵恰好每一格都非零）。' +
-              '<b>这就是"4 个字节"的来源。</b>'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) CLS('wb8_' + i, 'cell');
-              var idx = [0, 13, 10, 7];
-              for (var k = 0; k < 4; k++) { SET('wb8_' + idx[k], 'X'); CLS('wb8_' + idx[k], 'cell wr'); }
-              SET('wb8_b', '<b>差异字节</b>=4（位置已搬移）');
-              SET('wb8_a', '<b>阶段</b>=末轮 ShiftRows 之后');
-            },
-            note: '<b>第二次变形：ShiftRows 把这一列"斜着搬走"。</b>第 r 行的字节向左移 r 位，于是原本挤在同一列的 4 个差异，' +
-              '被搬到了 4 个不同的列里——形成一条<b>斜线</b>。差异的<b>数量没变</b>（还是 4 个），但位置变了。' +
-              '<b>要被攻击方记住的关键：所谓"形状"，说的就是这个斜线的具体位置。</b>'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) CLS('wb8_' + i, 'cell');
-              var idx = [0, 13, 10, 7];
-              for (var k = 0; k < 4; k++) { CLS('wb8_' + idx[k], 'cell wr'); }
-            },
-            note: '<b>最后两步不改形状。</b>末轮的 SubBytes 是逐字节的（4 个差异还是 4 个差异），' +
-              'AddRoundKey 是异或（差异与密钥无关，因为两边异或同一个密钥会被消掉）。' +
-              '<b>所以你在密文里看到的 4 字节斜线形状，就是 MixColumns + ShiftRows 的"指纹"。</b>'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) CLS('wb8_' + i, 'cell');
-              var idx = [4, 1, 14, 11];
-              for (var k = 0; k < 4; k++) { SET('wb8_' + idx[k], 'X'); CLS('wb8_' + idx[k], 'cell rd'); }
-              SET('wb8_a', '<b>阶段</b>=换成第 1 列注入（c=1）');
-            },
-            note: '<b>换一列注入，形状平移。</b>第 1 列注入时，密文差异落在下标 <span class="mono">1, 4, 11, 14</span>。' +
-              '<b>四个注入列对应四条不同的斜线，合起来正好覆盖全部 16 个密文字节</b>——' +
-              '这就是"攻击 4 个列位就能拿到完整末轮密钥"的原因（25.10 节实验会给出这条结论的计算验证）。'
-          },
-          {
-            run: function () {
-              for (var i = 0; i < 16; i++) { SET('wb8_' + i, 'X'); CLS('wb8_' + i, 'cell hot'); }
-              SET('wb8_b', '<b>差异字节</b>=16（溢出）');
-              SET('wb8_a', '<b>阶段</b>=如果在第 8 轮或更早注入');
-            },
-            note: '<b>反例：注得太早会发生什么。</b>如果在第 8 轮注入，差异会先扩散成一整列，再被 ShiftRows 拆到 4 个不同的列，' +
-              '然后第 9 轮的 MixColumns 再把每一列各自放大一次——<b>最终 16 个字节全部不同</b>。' +
-              '这样的样本<b>不是不能用</b>，但方程里同时耦合了更多未知量，需要额外的工作量。' +
-              '<b>所以"注在哪一轮"不是随便选的：它决定了你后面方程的规模。</b>'
-          }
-        ]
-      },
-      quiz: {
-        id: 'q25-6', chapter: 25, answer: 1,
-        stem: '你在一个白盒实现的第 9 轮注入单字节故障，收集到一组密文对。观察密文差异，发现<b>恰好 4 个字节不同</b>，但它们的下标是 <span class="mono">0, 5, 10, 15</span>——<b>不是</b>任何一条斜线（斜线应为 0/7/10/13、1/4/11/14、2/5/8/15、3/6/9/12 之一）。<b>最合理的判断是？</b>',
-        options: [
-          { t: '正常，四种斜线的规律是我记错了，继续解方程', why: '规律没有记错：0/5/10/15 是"整行"形状（步长为 5），斜线形状的特征是每行下标模 4 各不相同。忽略这个异常继续解方程，会得到自洽但错误的结果。' },
-          { t: '异常。0/5/10/15 是 4×4 矩阵的"对角线"，说明差异没有经过 ShiftRows 的搬移——极可能输出侧还有一层线性/仿射变换（外部编码）把差分"扭"过了', why: '正确。斜线形状来自 ShiftRows 的行移位；如果差异保持在"对角线"上，说明差分在输出前被另一层线性映射作用过。这正是外部编码存在的典型征兆，必须先把它测出来再列方程。' },
-          { t: '说明故障注入失败，需要换一个位置重新注入', why: '注入是成功的——密文确实变了，而且只变了 4 个字节，说明扩散次数恰好是 1 次 MixColumns。位置也没错（错的话字节数不会是 4）。真正的问题在"输出侧"，不在"注入侧"。' },
-          { t: '说明目标用的不是标准 AES，MixColumns 矩阵被魔改过', why: '这是一个可能的替代解释，但它排在"外部编码"之后。判断方法很简单：如果是 MixColumns 被魔改，那么其他列注入时也会出现"整齐但不合规"的形状；如果是外部编码，形状的异常会表现为一个统一的线性变换。先做一步验证，不要直接跳到"魔改"。' }
-        ],
-        explain: '<b>这道题考的是"形状是自检工具"这个意识。</b>很多人把 DFA 理解成"注入故障 → 跑枚举 → 拿密钥"，' +
-          '跳过了中间最重要的一步：<b>先验证你观测到的东西符合理论预期。</b></p>' +
-          '<p>为什么斜线是"理论预期"？因为它是<b>纯结构推论</b>：MixColumns 把差异限制在一列内（4 个字节），' +
-          'ShiftRows 把第 r 行的字节左移 r 位，于是这 4 个字节各自落在不同的列上，形成"每行下标模 4 互不相同"的形状。' +
-          '这个推论不依赖密钥、不依赖实现细节——<b>只要目标用的是标准 AES 的 ShiftRows 与 MixColumns，形状就必须是这样。</b></p>' +
-          '<p>所以形状不对时，可能的解释按优先级排：① <b>输出侧有线性/仿射编码</b>（最常见，编码把差分整体做了一次线性变换）；' +
-          '② 注入点不在理论位置上（但那样字节数通常也不对）；③ 目标的 ShiftRows/MixColumns 被改过（最不可能，因为改动会破坏算法正确性）。' +
-          '<b>先按①去验证，成本最低。</b></p>' +
-          '<p>顺带记住这个形状的另一半用途：<b>它能告诉你故障注在哪一列。</b>看到差异落在 <span class="mono">2, 5, 8, 15</span>，你立刻知道故障在第 2 列——' +
-          '这在"你不知道表的编号"的时候，是免费的定位信息。</p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">三条事实：<b>① 只有 MixColumns 放大差异、只有 ShiftRows 搬移差异；' +
-        '② 数剩余 MixColumns 的次数就知道密文里有几个字节不同（1 / 4 / 16）；③ 四个方程共用一个未知差分 Z，联立才能收缩候选。</b></p>' +
-        '<p>下一节专门回答那个被反复问到的问题：<b>为什么非得是"倒数第二轮"？</b></p>')
-    },
-
-    /* ==================== 25.9 ==================== */
-    {
-      h: '25.9', title: '为什么必须注在倒数第二个 MixColumns 之前',
-      html:
-        '<p>这一节只回答一个问题，但它是 DFA 里最容易被"背下来而不是想通"的一点。如果你只是记住了"要注在倒数第二轮"，' +
-        '那么在遇到变体（轮数不同、注在别的轮、有外部编码）时你会完全无从判断。</p>' +
-        '<p>先给结论，再算给你看：<b>因为只有这个位置能同时满足"方程数量足够"和"未知量数量可控"。</b>三个候选位置逐一验算：</p>' +
-        T.grid(3, [
-          '<div class="card"><div class="card-title">注在最后一轮：1 个方程，2 个未知量</div>' +
-          '<p>密文只差 1 个字节，得到 1 个方程：<span class="mono">D = S(Y) ^ S(Y ^ Z)</span>。</p>' +
-          '<p>对<b>每一个</b>密钥候选 <span class="mono">k</span>，都有 <span class="mono">Y = S⁻¹(C ^ k)</span>；' +
-          '而对任意一个 Y，只要 Z 在 1..255 里跑，<span class="mono">S(Y) ^ S(Y ^ Z)</span> 几乎能取到全部 255 个非零值。</p>' +
-          '<p><b>结论：任何 k 都能被某个 Z 解释 → 零信息量。</b>（25.10 节的实验会把这句话算成数字。）</p></div>',
-          '<div class="card"><div class="card-title">注在倒数第二个 MixColumns 之前：4 个方程，5 个未知量</div>' +
-          '<p>密文差 4 个字节，得到 4 个方程：<span class="mono">D_r = S(Y_r) ^ S(Y_r ^ m_r·Z)</span>，' +
-          '<span class="mono">r = 0..3</span>。</p>' +
-          '<p>未知量是 <span class="mono">Y_0..Y_3</span> 和 <span class="mono">Z</span>，看起来是 5 个未知数只有 4 个方程——' +
-          '<b>但四个方程共用同一个 Z，这就是可解的关键：它可以被"消去"。</b></p>' +
-          '<p>先对每个方程求出「哪些 Z 能解释它」，再取交集——Z 的候选从 127 掉到十几到三十几个；<b>Z 定下来之后，每个 Y_r 的候选只剩几十个</b>，' +
-          '对应的末轮密钥字节也就只剩几十个候选（实测 30~64）。</p></div>',
-          '<div class="card"><div class="card-title">注在第 8 轮及更早：16 个方程，但未知量爆炸</div>' +
-          '<p>密文 16 个字节全变。方程变多了，但<b>它们之间的关系也变复杂了</b>：差异经过两次 MixColumns，' +
-          '方程里会引入更多中间未知量之间的耦合。</p>' +
-          '<p>这条路<b>并非走不通</b>——公开文献里的 DFA 有各种注入点的变体。<span class="pill warn">待核实</span>：' +
-          '不同文献对"第几轮"的编号约定与注入点位置并不统一，本课不复述具体结论。</p>' +
-          '<p>但工程上它显著更贵：需要更多的样本、更复杂的方程整理。所以<b>首选永远是倒数第二个 MixColumns 之前</b>。</p></div>'
-        ]) +
-        T.note('key', '🔑 一句话总结"为什么是倒数第二轮"', '<p><b>因为它是唯一一个"扩散恰好发生一次"的位置。</b></p>' +
-          '<p>在这个位置注入，扩散次数刚好为 1：<b>MixColumns 把 1 个未知的差分放大成 4 个可观测的方程，' +
-          '而这 4 个方程共用同一个未知差分 Z，于是可以取交集把它消掉。</b></p>' +
-          '<p>再往后（最后一轮）：<b>0 次扩散，方程数不足以约束未知量</b>；再往前（第 8 轮及以前）：<b>扩散不止一次，未知量之间开始互相耦合</b>。' +
-          '所以这个位置是"信息量刚好"的那个点——数学上的甜点区。</p>') +
-        T.note('warn', '⚠️ 「倒数第二轮」在不同轮数下是不同的轮号', '<p>别把"第 9 轮"当成一条铁律。AES-128 是 10 轮，所以倒数第二个 MixColumns 在第 9 轮；' +
-          '<b>AES-192 是 12 轮，AES-256 是 14 轮，对应的轮号会往后移。</b>' +
-          '更稳妥的记忆方式是记<b>相对位置</b>：<b>"最后一个 MixColumns 之前的那个 MixColumns"，也就是"倒数第二个 MixColumns 的输入"。</b></p>' +
-          '<p>还有一个容易踩的坑：白盒实现里"轮"的编号可能和教科书不一致（有的实现把初始 AddRoundKey 算作第 0 轮，' +
-          '有的把最后一轮单独处理）。<b>所以判断注入位置时，不要数轮号，要数"这个位置往后还有几次 MixColumns"。</b></p>'),
-      stepper: {
-        title: '三个注入位置的方程数对照（把"为什么是倒数第二轮"算清楚）',
-        lines: [
-          {
-            code: '<span class="c">// 位置甲：最后一个 MixColumns 之后（末轮内部）</span>\n<span class="c">// 密文差异字节数：</span>\n<span class="n">1</span>\n<span class="c">// 方程：D = S(Y) ^ S(Y ^ Z)</span>\n<span class="c">// 未知：Y（0..255）、Z（1..255）</span>',
-            note: '<b>位置甲：只差 1 个字节。</b>方程数 1，未知量 2。看上去"两个未知数一个方程"应该还有 256 个解——' +
-              '但真正的问题是：<b>对每一个 Y，都能找到至少一个 Z 让等式成立</b>。' +
-              '所以从"Y 的候选"这个角度看，<b>256 个 Y 全部通过</b>。' +
-              '<b>零信息量。</b>',
-            state: { '密文差异': '1 字节', '方程数': '1', '未知量': 'Y, Z', '能定出密钥字节吗': '❌ 不能' }
-          },
-          {
-            code: '<span class="c">// 位置乙：倒数第二个 MixColumns 之前</span>\n<span class="c">// 密文差异字节数：</span>\n<span class="n">4</span>\n<span class="c">// 方程：D_r = S(Y_r) ^ S(Y_r ^ m_r * Z)   r = 0..3</span>\n<span class="c">// 未知：Y_0..Y_3、Z，但 Z 是<b>共用</b>的</span>',
-            note: '<b>位置乙：差 4 个字节，4 个方程，共用一个 Z。</b>这是唯一"刚刚好"的位置。</p>' +
-              '<p>处理顺序很关键：<b>先解 Z（用四个方程的交集），再解 Y_r（在 Z 已知的前提下）</b>。' +
-              '如果反过来先猜 Y_r，每个方程都会给出巨大候选集，永远收敛不了。' +
-              '<b>"先消掉共用未知量，再解各自的未知量"——这个顺序是 DFA 全部技巧的浓缩。</b>',
-            state: { '密文差异': '4 字节', '方程数': '4', '未知量': 'Y_r × 4 + Z', '能定出密钥字节吗': '✅ 能，但需多个样本取交集' }
-          },
-          {
-            code: '<span class="c">// 位置丙：第 8 轮及更早</span>\n<span class="c">// 密文差异字节数：</span>\n<span class="n">16</span>\n<span class="c">// 方程变多，但中间未知量也变多</span>\n<span class="c">// 每个混淆层都会引入新的未知量耦合</span>',
-            note: '<b>位置丙：16 个字节全变。</b>方程数量确实涨到 16 个，但<b>未知量涨得更快</b>：' +
-              '差异要穿过两次 MixColumns，方程里出现多组互相关联的中间值。' +
-              '工程上这意味着"要写更多的代码、收更多的样本、解更难的方程"。<b>不是不能做，是不划算。</b>',
-            state: { '密文差异': '16 字节', '方程数': '16', '未知量': '显著增多（多层耦合）', '能定出密钥字节吗': '⚠️ 能但代价高' }
-          },
-          {
-            code: '<span class="c">// 结论：位置乙 = 倒数第二个 MixColumns 之前</span>\n<span class="c">// 判据不是"第几轮"，而是：</span>\n<span class="c">//   这个位置往后，恰好还有 1 次 MixColumns</span>\n<span class="c">// AES-128：10 轮 -> 第 9 轮</span>\n<span class="c">// AES-192：12 轮 -> 第 11 轮</span>\n<span class="c">// AES-256：14 轮 -> 第 13 轮</span>',
-            note: '<b>把判据从"轮号"改成"剩余 MixColumns 次数"。</b>这是本节最实用的一条：' +
-              '面对任何轮数的 AES、任何编号方式的白盒实现，你只需要问一句"<b>从我要注入的地方往后数，还有几次 MixColumns？</b>"。' +
-              '答案是 1，就对了。',
-            state: { '判据': '剩余 MixColumns 次数 = 1', '结论': '✅ 可以开始攻击' }
-          }
-        ]
-      },
+        T.note('key', '🔑 从源码里最该学的三个模式',
+          '<p><b>① SEC 段名就是配置。</b>读一个 eBPF 项目，先从 <code>SEC("...")</code> 看它挂了哪些钩子——钩子决定了它能看见什么，这比读逻辑更快。</p>' +
+          '<p><b>② 数据结构的定义就是信息边界。</b>内核态和用户态共享的那个 <code>struct event</code>，列出了这个工具能给你的<b>全部</b>信息。看它，就知道这个工具能不能解决你的问题。</p>' +
+          '<p><b>③ helper 的用法暴露了它的能力上限。</b>用了 <code>bpf_probe_read_user_str()</code> 说明它在读用户态字符串（uprobe 类）；用了 <code>bpf_skb_*</code> 系列说明它在处理网络包；只用 <code>bpf_get_current_pid_tgid()</code> 和 Map，那多半是个统计类工具。</p>') +
+        T.note('', '📌 对逆向实战的具体用法（把本章落到地上）',
+          '<p>假设你要分析一个 App 的加密协议，但在用户态怎么 hook 都被反调试挡住。用 eBPF 的思路是：</p>' +
+          '<p><b>①</b> 先按 25.7 探测目标设备是否具备条件；<b>②</b> 确认加密函数所在的 so，用 <code>uprobe</code> 挂到函数入口和返回；' +
+          '<b>③</b> 入口处用 helper 读参数（<code>bpf_probe_read_user</code> 系列），返回处读返回值或输出缓冲；<b>④</b> 写进 ringbuf，用户态进程收集。</p>' +
+          '<p>整个过程中，目标 App <b>没有新增模块、没有新增线程、代码段没有被改写</b>——它的常规反调试检测全部落空。这就是本章开头说的「在电线杆上装摄像头」。</p>'),
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境二',
-            scenario: '<b>情境：</b>你已经能在目标白盒实现上稳定注入故障了。正确密文 <span class="mono">8d f4 e9 aa … d6 4b</span>，注入后的密文也变了，但<b>变化看起来毫无规律</b>：' +
-              '有时变 1 个字节，有时变 4 个，有时变 16 个；即使同为 4 个，位置也不固定。你打算怎么办？',
+            label: '情境三 · 老板要「反 eBPF 检测」',
+            scenario: '<b>情境：</b>你在甲方做 App 加固。防护团队开会时，安全负责人说：「既然 eBPF 能在内核态偷偷看我们，那你们加固组想办法<b>检测出设备上有没有人在用 eBPF 监控我们</b>，加进我们的反调试体系。」' +
+              '你清楚前面几节讲的原理。<b>你会怎么回应这个需求？</b>',
             choices: [
-              { t: '既然样本不稳定，就多收集一些，用统计的方法投票选出最常见的那个形状', next: 'n1' },
-              { t: '先停下来做归因：分别确认"注入点在哪一次 MixColumns 前后"和"输出侧有没有线性编码"，把形状的成因解释清楚再继续', next: 'n2' },
-              { t: '怀疑白盒实现有反调试/随机化，先去检查有没有完整性校验在干扰', next: 'n3' },
-              { t: '把 DFA 换成代数攻击（BGE 类思路），绕开故障注入这个不稳定的环节', next: 'n4' }
+              { t: 'A. 直接答应，回去就写代码遍历内核里的 BPF 程序列表，发现有挂在目标进程上的就报警', next: 'n1' },
+              { t: 'B. 先说明能力边界：不越权的情况下 App 根本拿不到内核态信息，这条路走不通；但有<b>真正可行</b>的替代方向——检测「观测者」在用户态留下的痕迹（高权限环境、异常进程与文件、设备的 root/解锁状态），并指出这是双向博弈', next: 'n2' },
+              { t: 'C. 告诉负责人 eBPF 是内核态技术，我们做不了任何事，这个需求没法接', next: 'n3' },
+              { t: 'D. 建议在 App 里直接读取 /proc/kallsyms 和内核内存，扫描 BPF 相关数据结构', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '把"归因失败"当成了"样本噪声"',
-            result: '<b>认知根源：用统计掩盖了对因果的无知。</b>密文差异的形状是<b>确定性</b>的——它由"注入点往后还有几次 MixColumns"唯一决定。' +
-              '形状不稳定只有三种可能：<b>① 你的注入点每次都不同</b>（比如在表区里随机挑了一个表项改，而这个表项被多条路径共用）；' +
-              '<b>② 你的注入位置在"轮次"上不稳定</b>（比如 hook 的点在循环里，每次命中的迭代不同）；' +
-              '<b>③ 输出侧有编码，而且编码与输入相关</b>（这会让差分不再是输入的确定函数）。' +
-              '<p>这三种都是<b>可诊断的具体故障</b>，多收样本只会让你拿到一堆混合了三种成因的数据，<b>永远也投不出正确答案</b>。' +
-              '更糟的是：投票选出的"最常见形状"很可能是某个巧合，会让你在错误的方向上走得很远。</p>'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '承诺了一个在权限模型下做不到的事',
+            result: '<b>认知根源：把「内核里有这个能力」当成了「App 有这个权限」。</b>遍历内核里的 BPF 程序，需要通过 <code>bpf()</code> 系统调用做 <code>BPF_PROG_GET_NEXT_ID</code> 一类的枚举操作，或者读内核内存。这需要 <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code> 级别的高权限——<b>普通 App 根本没有</b>，而且这正是 25.6 第 ③ 条讲的 SELinux 限制所针对的行为。<br><br>答应了做不到的事，比一开始就说清楚代价大得多。安全工程里，<b>先说边界，再谈方案</b>是基本职业素养。'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '对：先归因，再解方程',
-            result: '<b>这是唯一能收敛的做法。</b>具体分两问：</p>' +
-              '<p><b>问一：注入点到底在哪一次 MixColumns 的前后？</b>' +
-              '用 25.9 节的判据——<b>数密文差异字节数</b>：1 个字节说明注在最后一个 MixColumns 之后；4 个说明注在倒数第二个之前；16 个说明注得更早。' +
-              '如果同一份代码上这三种都出现，说明<b>你的注入动作没有落在同一个位置</b>，先把这个定住（最常见的原因是 hook 点选在了表区之外的共享代码上）。</p>' +
-              '<p><b>问二：输出侧有没有线性/仿射编码？</b>' +
-              '判据是<b>形状是否落在斜线上</b>（0/7/10/13 等四条斜线之一）。' +
-              '如果字节数对、但位置不对，就是编码在起作用——这需要把方程改到编码域里解，或者先反向测出编码（25.4 节的采样法）。</p>' +
-              '<p><b>两问都有确定答案之后，形状就变成可预测的了</b>，方程也就能列出来。这一步花的几十分钟，会省掉后面几天的试错。</p>'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：厘清边界，把不可行的需求转成可行的需求',
+            result: '<b>这是本章最重要的一次认知迁移。</b>答案的关键不是「能不能检测 eBPF」（在 App 权限下不能），而是<b>「把你的威胁模型从内核态挪回用户态」</b>。<br><br>要加载 eBPF 程序，观测者必须：<b>①</b> 取得 root 或等价高权限——那么设备的 root 状态本身就是最强的信号；<b>②</b> 在设备上放一个用户态 loader——它会出现在进程列表和文件系统里；<b>③</b> 很可能解锁了 bootloader、刷了非官方镜像。<br><br>这些<b>全部是可以从 App 侧合理检测的</b>（当然也要受 SELinux 和 Android 版本的限制，需要实测确认哪些 API 可用）。<br><br>同时要明确告诉负责人：<b>这是双向博弈，不存在一劳永逸。</b>你的检测手段会被绕过，对方也会升级；加固的价值在于抬高成本，不是造一道绝对防线。'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '过早跳到"对抗"层面',
-            result: '<b>认知根源：把一个可解释的现象，归因给了外部敌人。</b>反调试和完整性校验确实存在于某些加固方案里，但它们的行为特征<b>不是"形状不稳定"</b>：' +
-              '完整性校验通常表现为"程序崩溃/结果错误/被退出"，而不是"故障扩散形状随机"。' +
-              '<p>更要紧的是这个思维习惯的代价：一旦把失败归因给"对手的防护"，你就停止了对自身实验的检查。' +
-              '而白盒攻击里 90% 的失败原因都在自己这一侧——<b>注入点选错、轮次对不上、有编码没测出来</b>。' +
-              '<b>先把可控变量排查干净，再考虑对抗。</b></p>'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '把「不能直接做」答成了「什么都做不了」',
+            result: '<b>认知根源：只回答了字面问题，没有回到需求背后的真实目标。</b>负责人真正想要的是「降低被内核态观测的风险」，而「检测 eBPF」只是他想到的一种实现方式。<br><br>App 侧确实拿不到内核态信息，但风险降低路径依然存在：提高观测者的门槛（root 检测、完整性校验、设备可信状态评估）、增加观测者的成本、把敏感逻辑下沉到更难被静态定位的位置。<br><br><b>面对一个技术上不可实现的需求，优秀的回应是「重新定义问题」，而不是「拒绝问题」。</b>前者是工程师，后者只是执行者。'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '换赛道不解决归因问题',
-            result: '<b>认知根源：把"这条路遇到困难"直接等价于"这条路走不通"。</b>代数攻击（利用表与表之间的编码关系做消元）是另一条真实存在的攻击路线，' +
-              '但它<b>依赖不同的前提</b>：需要能确认表与表之间的编码结构、需要能拿到足够多的输入输出对。' +
-              '在你连"注入点在哪"都说不清楚的情况下，你对这个实现的结构了解程度还不足以支撑代数攻击。</p>' +
-              '<p>更实际的问题是：<b>换赛道会让你失去刚刚积累的所有观测数据</b>，而 DFA 的问题其实是一个几十分钟就能定位的小故障。' +
-              '<b>技术路线的切换应该是"评估后的决定"，不是"受挫后的逃跑"。</b></p>'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '技术上正是那道权限墙拦住的路径',
+            result: '<b>认知根源：以为「读文件」比「调系统调用」更容易。</b>在 Android 上，<code>/proc/kallsyms</code> 和内核内存恰恰是限制最严的东西：<code>kptr_restrict</code> 一类内核参数会让符号地址对非特权进程隐藏；<code>/dev/kmem</code> 在现代内核上基本不存在；SELinux 也会拦住这类访问。<br><br>更根本的是：<b>App 的进程运行在 EL0，内核数据在 EL1</b>。从用户态「扫描内核内存」本身就是个伪命题——你没有那个视角，除非先拿到内核读写能力，而那就等于已经 root 了。<br><br>这条选项的诱惑在于它听起来很「底层、很硬核」，但方向错了，越硬核越浪费时间。'
           }
         }
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">把"为什么是倒数第二轮"记成一句可复用的判据：' +
-        '<b>从注入点往后数，还有几次 MixColumns？答案是 1 就对了。</b>' +
-        '以及记住 DFA 的求解顺序：<b>先用四个方程的交集消掉共用的差分 Z，再解各个位置自己的未知量。</b></p>')
+      }
     },
-
-    /* ==================== 25.10 ==================== */
+    /* 三个自测题各占一个 section —— 同一 section 里放多个 quiz 键会被 JS 静默覆盖 */
     {
-      h: '25.10', title: '动手实验：DFA 故障扩散推演器',
-      html:
-        '<p>这一节的实验是本章的核心。它用<b>站内真实的 AES 实现</b>（<span class="mono">window.CRYPTO.aesKeyExpansion</span> / ' +
-        '<span class="mono">window.CRYPTO.aesEncryptBlock</span> / <span class="mono">window.CRYPTO.AES.sbox</span>）' +
-        '真实地加密两次——一次正常、一次带故障——然后把 25.8 / 25.9 节的推理一步步算成数字。</p>' +
-        '<p><b>没有任何一个数字是写死的</b>：你换一个密钥、换一个故障位置、换一个差分值，所有候选集合都会重新计算。' +
-        '这正是它作为"推演器"而不是"演示动画"的意义。</p>' +
-        T.note('warn', '⚠️ 实验的模型说明（先说清楚，免得误会）', '<p>本实验模拟的是<b>"攻击者能精确改写倒数第二个 MixColumns 输入处的一个中间状态字节"</b>这个能力。' +
-          '在真实的白盒实现里，这个动作的实现方式是<b>改写某张 T 表的某一行表项</b>——改表项等价于对该表项对应的输入值做一次异或，' +
-          '所以在攻击模型上和"改写中间状态字节"是同一件事。</p>' +
-          '<p>实验<b>不能</b>做到的事：它不会真的去改你的手机、也不会真的遍历内存。它是把 DFA 的<b>数学部分</b>完整跑一遍。' +
-          '这部分恰好是白盒 DFA 里最难、也最容易出错的部分（候选集的交集与收缩），所以值得单独练。</p>' +
-          '<p>另外要注意：本实验的目标是<b>标准 AES</b>，不是带外部编码的白盒实现。带外部编码的情况（密文差分被线性变换扭过）' +
-          '需要在方程里多处理一层，本课在 25.12 节说明原理，但不展开完整的攻击实现。</p>'),
-      lab: {
-        title: '实验：DFA 故障扩散推演器（真加密两次 + 真实候选收缩）',
-        goal: '目标：看候选集从 256 → 30 → 1 的真实收缩',
-        intro:
-          '<p>下面会让你指定四个东西：密钥、明文、故障位置、注入的差分值。系统会：</p>' +
-          '<p>① 用真实 AES <b>加密两次</b>（正确密文 / 故障密文），算出密文差分的<b>形状</b>；' +
-          '② 只用这一对密文（<b>不使用真实差分值</b>，就像真实攻击者那样）反推出该位置的末轮密钥字节候选；' +
-          '③ 自动再造 4 个不同差分值的故障样本，<b>对候选集取交集</b>，展示收缩过程；' +
-          '④ 把结果和真实的 <span class="mono">K10</span>（由 <span class="mono">aesKeyExpansion</span> 算出）对照，验证攻击是否命中。</p>' +
-          '<p><b>状态编号约定：</b>状态矩阵按<b>列优先</b>编号，下标 <span class="mono">i = c*4 + r</span>（c 是列 0..3，r 是行 0..3）。' +
-          '所以 <span class="mono">0,1,2,3</span> 是第 0 列，<span class="mono">4..7</span> 是第 1 列，以此类推。' +
-          '故障注入点在<b>第 9 轮 MixColumns 的输入</b>——也就是倒数第二个 MixColumns 之前。</p>',
-        inputs: [
-          { key: 'key', label: 'AES-128 密钥（十六进制）', hint: '32 个十六进制字符', value: '2b7e151628aed2a6abf7158809cf4f3c' },
-          { key: 'plain', label: '明文（十六进制）', hint: '32 个十六进制字符', value: '00112233445566778899aabbccddeeff' },
-          { key: 'pos', label: '故障位置（状态下标 0..15，列优先）', hint: '0..3 是第 0 列；建议先试 0', value: '0' },
-          { key: 'delta', label: '注入的差分值（十六进制 01..ff）', hint: '对中间状态做异或，例如 2a', value: '2a' },
-          { key: 'verdict', label: '你的结论：① 为什么必须注在倒数第二个 MixColumns 之前？② 单次故障最多能确定几个密钥字节？为什么还需要多次？',
-            hint: '写全三点：位置（倒数第二个列混淆之前 / 剩余 1 次 MixColumns）、单次影响 4 个字节、多次取交集才唯一',
-            type: 'textarea', rows: 4, ph: '例如：这个位置往后恰好只剩一次列混合，所以……' }
+      h: '25.9', title: '自测（一）：BTF 缺失意味着什么',
+      quiz: {
+        id: 'q11-2', chapter: 11,
+        answer: 2,
+        stem: '一位同事说：「eBPF 就是把 Frida 那套 hook 搬到内核里跑，原理一样，只是位置不同。」这个说法<b>最主要的错误</b>在哪里？',
+        options: [
+          { t: '没有错误，本质就是这样', why: '这个说法抹掉了 eBPF 最核心的设计——验证器，也抹掉了两者在能力边界上的巨大差异。' },
+          { t: 'eBPF 不能 hook 用户态函数，所以和 Frida 没有可比性', why: '不准确。uprobe/uretprobe 正是挂到用户态函数入口/返回的钩子，eBPF 完全可以观测用户态函数——只是方式与 Frida 的指令改写完全不同。' },
+          { t: 'Frida 是改写目标进程的指令/内存来拦截执行，而 eBPF 程序是<b>独立运行在内核里的程序</b>，靠内核提供的钩子点被动触发；而且它必须先通过<b>验证器</b>的静态安全证明才能加载，能力被 helper 白名单严格限制', why: '正确。差别不是「换个位置执行同样的逻辑」，而是两套完全不同的执行与安全模型。' },
+          { t: 'eBPF 只能用在 Linux 服务器上，手机上根本不存在这种东西', why: '错误。Android 基于 Linux 内核，系统自身就在用 eBPF（例如网络统计）。限制在于厂商配置、内核版本和 SELinux，而不是「不存在」。' }
         ],
-        runLabel: '⚡ 真实加密两次并解方程',
-        autorun: true,
-        run: function (v) {
-          var C = window.CRYPTO;
-          var hx = C.normHex(v.key || ''), hp = C.normHex(v.plain || '');
-          var pos = parseInt(String(v.pos || '0').replace(/[^0-9]/g, ''), 10);
-          var dhex = C.normHex(v.delta || '');
-          if (hx.length !== 32) return '<div class="lab-msg warn"><b>密钥长度不对</b><div class="lab-note">AES-128 需要 32 个十六进制字符，当前 ' + hx.length + ' 位。</div></div>';
-          if (hp.length !== 32) return '<div class="lab-msg warn"><b>明文长度不对</b><div class="lab-note">AES 分组是 16 字节（32 个十六进制字符），当前 ' + hp.length + ' 位。</div></div>';
-          if (!(pos >= 0 && pos <= 15)) return '<div class="lab-msg warn"><b>故障位置超范围</b><div class="lab-note">状态下标必须在 0..15 之间。</div></div>';
-          if (dhex.length !== 2) return '<div class="lab-msg warn"><b>差分值不对</b><div class="lab-note">请输入 1 个字节的十六进制（如 2a）。</div></div>';
-          var delta = parseInt(dhex, 16);
-          if (delta === 0) return '<div class="lab-msg warn"><b>差分值为 0 等于没注入</b><div class="lab-note">异或 0 不改变任何值，密文不会变化，也就没有样本可用。请换一个非零值。</div></div>';
-
-          var key = [], plain = [], i, j;
-          for (i = 0; i < 16; i++) key.push(parseInt(hx.substr(i * 2, 2), 16));
-          for (i = 0; i < 16; i++) plain.push(parseInt(hp.substr(i * 2, 2), 16));
-          var rk = C.aesKeyExpansion(key);
-          var S = C.AES.sbox, INV = C.AES.inv;
-          var xt = function (a) { return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff; };
-          var mul = function (a, b) { var r = 0; while (b) { if (b & 1) r ^= a; a = xt(a); b >>= 1; } return r & 0xff; };
-
-          /* 真实 AES 轮函数 + 在第 9 轮 MixColumns 输入处注入故障 */
-          var encFault = function (pt, rkObj, fpos, fval) {
-            var w = rkObj.w, Nr = rkObj.Nr;
-            var s = Uint8Array.from(pt);
-            var addRK = function (r) { for (var q = 0; q < 16; q++) s[q] ^= w[r * 16 + q]; };
-            addRK(0);
-            for (var round = 1; round <= Nr; round++) {
-              for (var b = 0; b < 16; b++) s[b] = S[s[b]];
-              var t = Uint8Array.from(s);
-              for (var c2 = 0; c2 < 4; c2++) for (var r2 = 0; r2 < 4; r2++) s[c2 * 4 + r2] = t[((c2 + r2) % 4) * 4 + r2];
-              if (round === Nr - 1) s[fpos] ^= fval;   /* 倒数第二个 MixColumns 的输入 */
-              if (round !== Nr) {
-                for (var c3 = 0; c3 < 4; c3++) {
-                  var a = [s[c3 * 4], s[c3 * 4 + 1], s[c3 * 4 + 2], s[c3 * 4 + 3]];
-                  s[c3 * 4] = mul(a[0], 2) ^ mul(a[1], 3) ^ a[2] ^ a[3];
-                  s[c3 * 4 + 1] = a[0] ^ mul(a[1], 2) ^ mul(a[2], 3) ^ a[3];
-                  s[c3 * 4 + 2] = a[0] ^ a[1] ^ mul(a[2], 2) ^ mul(a[3], 3);
-                  s[c3 * 4 + 3] = mul(a[0], 3) ^ a[1] ^ a[2] ^ mul(a[3], 2);
-                }
-              }
-              addRK(round);
-            }
-            return s;
-          };
-
-          var Cc = Array.from(C.aesEncryptBlock(plain, rk));
-          var Cf = Array.from(encFault(plain, rk, pos, delta));
-          var K10 = Array.from(rk.w.slice(16 * rk.Nr, 16 * rk.Nr + 16));
-
-          var diffIdx = [];
-          for (i = 0; i < 16; i++) if (Cc[i] !== Cf[i]) diffIdx.push(i);
-
-          var html = '';
-          html += '<div class="lab-kv"><span>轮数 Nr = <b>' + rk.Nr + '</b></span>' +
-            '<span>注入点 = <b>第 ' + (rk.Nr - 1) + ' 轮 MixColumns 输入</b></span>' +
-            '<span>注入下标 = <b>' + pos + '</b>（第 ' + Math.floor(pos / 4) + ' 列，第 ' + (pos % 4) + ' 行）</span>' +
-            '<span>差分 = <b>' + delta.toString(16).padStart(2, '0') + '</b></span></div>';
-
-          /* 密文与差分可视化 */
-          var gridRow = function (idp, arr, ref, cls) {
-            var s = '';
-            for (var k = 0; k < 16; k++) {
-              var mark = (ref && arr[k] !== ref[k]) ? cls : '';
-              s += '<span class="cell ' + mark + '">' + arr[k].toString(16).padStart(2, '0') + '</span>';
-            }
-            return s;
-          };
-          var wrap = function (label, inner) {
-            return '<div class="memrow" style="grid-template-columns:104px repeat(16,1fr);margin-bottom:3px">' +
-              '<span class="addr">' + label + '</span>' + inner + '</div>';
-          };
-          html += '<div class="memgrid" style="margin:12px 0">' +
-            wrap('正确密文 C', gridRow('c', Cc, null, '')) +
-            wrap('故障密文 C\'', gridRow('f', Cf, Cc, 'rd')) +
-            wrap('差分 C^C\'', gridRow('d', Cc.map(function (x, k2) { return x ^ Cf[k2]; }), Cc.map(function () { return 0; }), 'wr')) +
-            '</div>';
-
-          if (diffIdx.length !== 4) {
-            html += '<div class="lab-msg fail"><b>样本不可用</b><div class="lab-note">' +
-              '密文差异是 <b>' + diffIdx.length + '</b> 个字节，不是 4 个。按 25.8 节的判据，这意味着注入位置不在"倒数第二个 MixColumns 之前"。' +
-              '本实验固定注入在第 ' + (rk.Nr - 1) + ' 轮，正常情况一定是 4 个字节；出现别的数目说明参数被改动了，请重置后重试。</div></div>';
-            return html;
-          }
-
-          var col = Math.floor(pos / 4), rfault = pos % 4;
-          var idxOf = function (r) { return 4 * ((col - r + 400) % 4) + r; };
-          var M = [[2, 3, 1, 1], [1, 2, 3, 1], [1, 1, 2, 3], [3, 1, 1, 2]];
-
-          /* 核心：只用一对密文，反推 Z 的候选集合与末轮密钥字节候选 */
-          var solvePair = function (A, B) {
-            var zsets = [], r;
-            for (r = 0; r < 4; r++) {
-              var idx = idxOf(r), m = M[r][rfault], D = A[idx] ^ B[idx];
-              var zs = {};
-              for (var z = 1; z < 256; z++) {
-                var mz = mul(m, z);
-                for (var y = 0; y < 256; y++) if ((S[y] ^ S[y ^ mz]) === D) { zs[z] = 1; break; }
-              }
-              zsets.push(zs);
-            }
-            var zed = {};
-            for (var zz in zsets[0]) {
-              var okAll = true;
-              for (r = 1; r < 4; r++) if (!zsets[r][zz]) { okAll = false; break; }
-              if (okAll) zed[zz] = 1;
-            }
-            var ksets = [];
-            for (r = 0; r < 4; r++) {
-              var idx2 = idxOf(r), m2 = M[r][rfault], D2 = A[idx2] ^ B[idx2];
-              var ks = {};
-              for (var zk in zed) {
-                var mz2 = mul(m2, parseInt(zk, 10));
-                for (var y2 = 0; y2 < 256; y2++) if ((S[y2] ^ S[y2 ^ mz2]) === D2) ks[S[y2] ^ A[idx2]] = 1;
-              }
-              ksets.push(ks);
-            }
-            var zsizes = zsets.map(function (o) { return Object.keys(o).length; });
-            return { zsizes: zsizes, zedSize: Object.keys(zed).length, zed: Object.keys(zed).map(Number).sort(function (a, b) { return a - b; }), ksets: ksets };
-          };
-
-          var res = solvePair(Cc, Cf);
-          html += '<div class="lab-msg key"><b>第一步：Z 的候选是怎么被四个方程一起压下来的</b><div class="lab-note">' +
-            '四个方程各自允许的 Z 个数：<b>' + res.zsizes.join(' / ') + '</b>（对应密文下标 ' +
-            idxOf(0) + ' / ' + idxOf(1) + ' / ' + idxOf(2) + ' / ' + idxOf(3) + '）。<br>' +
-            '<b>四者取交集后只剩 ' + res.zedSize + ' 个 Z：</b><span class="mono">' +
-            res.zed.map(function (z) { return z.toString(16).padStart(2, '0'); }).join(' ') + '</span><br>' +
-            '<b>注意：整个计算过程只用到了两串密文，没有用到你输入的真实差分值 ' + delta.toString(16).padStart(2, '0') + '。</b>' +
-            '攻击者本来就不可能知道它——这正是 DFA 的巧妙之处。</div></div>';
-
-          /* 多故障取交集 */
-          var extra = [0x11, 0x33, 0x55, 0x77];
-          var acc = res.ksets.map(function (o) { return Object.keys(o).map(Number); });
-          var trace = [];
-          trace.push({ label: '样本 1（差分 ' + delta.toString(16).padStart(2, '0') + '）', sizes: acc.map(function (a) { return a.length; }) });
-          extra.forEach(function (dx, n) {
-            var cf2 = Array.from(encFault(plain, rk, pos, dx));
-            var r2 = solvePair(Cc, cf2);
-            for (var q = 0; q < 4; q++) {
-              var set2 = {};
-              r2.ksets[q] && Object.keys(r2.ksets[q]).forEach(function (kk) { set2[kk] = 1; });
-              acc[q] = acc[q].filter(function (kk) { return set2[kk]; });
-            }
-            trace.push({ label: '样本 ' + (n + 2) + '（差分 ' + dx.toString(16).padStart(2, '0') + '）', sizes: acc.map(function (a) { return a.length; }) });
-          });
-
-          html += '<div class="lab-msg pass"><b>第二步：候选集在多个样本下逐次收缩</b><div class="lab-note">' +
-            '<table class="lab-tbl"><tr><th>样本</th><th>下标 ' + idxOf(0) + ' 的候选数</th><th>下标 ' + idxOf(1) + '</th><th>下标 ' + idxOf(2) + '</th><th>下标 ' + idxOf(3) + '</th></tr>';
-          trace.forEach(function (t) {
-            html += '<tr><td>' + t.label + '</td>' + t.sizes.map(function (s) { return '<td>' + s + '</td>'; }).join('') + '</tr>';
-          });
-          html += '</table>' +
-            '<b>单次故障给每个位置留下几十个候选（本例第一个样本的数值见上表）；每多注入一个不同差分的故障，候选就被交掉一大半。</b>' +
-            '这就是"为什么要多次注入"的量化答案。</div></div>';
-
-          /* 与真实 K10 对照 */
-          var rowsK = '', allHit = true, uniqCount = 0;
-          for (var rr = 0; rr < 4; rr++) {
-            var ix = idxOf(rr), cands = acc[rr].slice().sort(function (a, b) { return a - b; });
-            var hit = cands.indexOf(K10[ix]) >= 0;
-            if (!hit) allHit = false;
-            if (cands.length === 1) uniqCount++;
-            rowsK += '<tr class="' + (hit ? 'same' : 'diff') + '"><td>K10[' + ix + ']</td>' +
-              '<td>' + cands.length + ' 个候选</td>' +
-              '<td>' + (cands.length <= 12 ? cands.map(function (c4) { return c4.toString(16).padStart(2, '0'); }).join(' ') : '（太多，略）') + '</td>' +
-              '<td>真值 ' + K10[ix].toString(16).padStart(2, '0') + ' ' + (hit ? '✅ 在候选集中' : '❌ 不在！') + '</td></tr>';
-          }
-          html += '<div class="lab-msg ' + (allHit ? 'pass' : 'fail') + '"><b>第三步：和真实末轮密钥对照</b><div class="lab-note">' +
-            '<table class="lab-tbl"><tr><th>末轮密钥字节</th><th>5 个样本取交集后</th><th>候选（≤12 个时列出）</th><th>验证</th></tr>' + rowsK + '</table>' +
-            (allHit ? '<b>全部命中。</b>攻击者不知道密钥，却把真值锁在了候选集里——这一点必须亲手验证一次，因为它是判断"你的方程写对了没有"的唯一标准。'
-                    : '<b>有位置没命中，说明这段代码或你的参数有问题。</b>正常情况下真值必然在候选集里（否则方程推导有误）。') +
-            '<br>本次已经有 <b>' + uniqCount + '/4</b> 个位置收敛到唯一值。</div></div>';
-
-          /* 完整 K10 需要覆盖四个列位 */
-          var cover = {};
-          for (var c5 = 0; c5 < 4; c5++) for (var r5 = 0; r5 < 4; r5++) cover[4 * ((c5 - r5 + 400) % 4) + r5] = 1;
-          var allIdx = Object.keys(cover).map(Number).sort(function (a, b) { return a - b; });
-          html += '<div class="lab-msg warn"><b>第四步：把整把末轮密钥凑齐要多少工作</b><div class="lab-note">' +
-            '本次注入在第 <b>' + col + '</b> 列，只能约束末轮密钥的这 4 个字节：<span class="mono">' + [0, 1, 2, 3].map(function (r6) { return idxOf(r6); }).join(', ') + '</span>。<br>' +
-            '四个列位合起来覆盖的密文下标是：<span class="mono">' + allIdx.join(', ') + '</span> —— <b>共 ' + allIdx.length + ' 个，正好是全部 16 个字节</b>。<br>' +
-            '所以：<b>4 个列位 × 每个列位若干个不同差分的故障 ≈ 十几次注入，就能拿到完整的末轮密钥 K10</b>；' +
-            '再用密钥扩展的逆过程（AES-128 可以由一轮轮密钥反推主密钥，25.11 节的案例会给出一条完整的手算链）就能还原主密钥。<br>' +
-            '（"最少需要几次注入"在不同资料里有不同说法 <span class="pill warn">待核实</span>；本实验只演示"每个列位一次故障 → 几十个候选，多次取交集 → 唯一"这条确定的路径。）</div></div>';
-
-          html += '<div class="lab-msg key"><b>现在轮到你下结论</b><div class="lab-note">' +
-            '在结论框里写清三点：<br>' +
-            '① <b>为什么必须注在倒数第二个 MixColumns 之前</b>（提示：从注入点往后数，还剩几次 MixColumns？这个数字决定了什么？）<br>' +
-            '② <b>单次故障最多能确定几个密钥字节</b>？为什么一次不够？<br>' +
-            '③ 单次故障之后每个位置的候选大约有多少个？靠什么把它们收敛到唯一？<br>' +
-            '写完点「✓ 检查我的答案」。</div></div>';
-
-          return html;
-        },
-        expected: function (v) {
-          var H = window.AKKC_hasConcept;
-          var t = v.verdict || '';
-          if (!t.trim()) return { ok: false, detail: '结论框是空的。至少回答"为什么是倒数第二个 MixColumns 之前"这一问——它是本节的核心。' };
-          var g1 = H(t, ['倒数第二个', '倒数第二', '倒数两个', '第 9 轮', '第九轮', 'round 9', '最后一个列混淆之前', '剩余 1 次', '还剩一次', '一次列混合', '一次 mixcolumns', '倒数第二轮']);
-          var g2 = H(t, ['4 个字节', '4个字节', '四个字节', '4 个密钥字节', '4个密钥字节', '四个密钥', '4 字节', '四个位置', '4 个位置']);
-          var g3 = H(t, ['交集', '取交', '多个故障', '多次注入', '多次', '多组', '两组', '三次', '收敛', '多个样本', '不同差分']);
-          var g4 = H(t, ['扩散', '列混合', '列混淆', 'mixcolumns', '共用一个差分', '同一个差分', '同一个 z', '共用', '一列']);
-          var hits = (g1 ? 1 : 0) + (g2 ? 1 : 0) + (g3 ? 1 : 0) + (g4 ? 1 : 0);
-          var ok = hits >= 3;
-          return {
-            ok: ok,
-            detail: (ok ? '✅ 命中了 <b>' + hits + '/4</b> 个要点。' : '❌ 只命中 <b>' + hits + '/4</b> 个要点，再补一补。') +
-              '<br><b>① 倒数第二个 MixColumns 之前的位置</b>：' + (g1 ? '✔' : '✘') +
-              '　<b>② 单次影响 4 个密钥字节</b>：' + (g2 ? '✔' : '✘') +
-              '　<b>③ 多次取交集才能唯一</b>：' + (g3 ? '✔' : '✘') +
-              '　<b>④ 列扩散 / 共用差分 Z</b>：' + (g4 ? '✔' : '✘') +
-              (ok ? '<br>你已经能把 DFA 的推理链讲完整了。'
-                  : '<br>提示：回到实验输出里那三块——"Z 的四个候选数取交集"、"候选集逐次收缩的表格"、"与真实 K10 的对照"，每一块对应一个要点。')
-          };
-        },
-        showAnswer:
-          '① 为什么必须注在倒数第二个 MixColumns 之前：\n' +
-          '   判据不是轮号，而是"从注入点往后还有几次 MixColumns"。\n' +
-          '   0 次（末轮内部）：密文只差 1 字节 -> 1 个方程 2 个未知量 -> 每个密钥候选都能被某个 Z 解释 -> 零信息。\n' +
-          '   1 次（倒数第二个之前）：密文差 4 字节 -> 4 个方程共用一个未知差分 Z -> 取交集可以把 Z 压到 15 个左右 -> 可解。\n' +
-          '   2 次以上（更早）：密文差 16 字节 -> 方程数变多但未知量耦合更多 -> 代价高。\n' +
-          '   所以"倒数第二个 MixColumns 之前"是信息量刚好够的那个位置。\n\n' +
-          '② 单次故障最多确定 4 个密钥字节：\n' +
-          '   一次单字节故障 -> MixColumns 把差异放大成整列 4 个字节 -> 末轮的 ShiftRows 把它们搬到 4 个不同的列 ->\n' +
-          '   最终约束的是末轮密钥在 4 个特定下标上的字节（本次实验里就是 idx 0/13/10/7）。\n' +
-          '   但单次故障只给每个位置留下几十个候选，不能唯一定出任何一个字节。\n\n' +
-          '③ 靠什么收敛到唯一：\n' +
-          '   密钥是固定的，Z 是每次不同的。所以换一个不同的差分值再注入一次，会得到一个不同的候选集，\n' +
-          '   而真值必然同时在两个集合里 -> 取交集。本实验用 5 个样本：几十 -> 几 -> 1（具体数字随参数变化）。\n\n' +
-          '④ 完整末轮密钥：\n' +
-          '   单次故障只覆盖 4 个密钥字节（一条斜线）；四个列位合起来覆盖全部 16 个密文下标。\n' +
-          '   所以 4 个列位 × 每列位若干个故障，就能拿到完整 K10；再由 K10 逆推主密钥。',
-        hint:
-          '这个实验有三个必看的输出块，一个一个看：<br>' +
-          '① <b>"Z 的候选是怎么被四个方程一起压下来的"</b>——四个数（比如 127/127/127/127）取交集后变成多少？' +
-          '为什么单看一个方程不行？<br>' +
-          '② <b>"候选集在多个样本下逐次收缩"</b>那张表——第一行有多少候选？最后一行呢？中间发生了什么？<br>' +
-          '③ <b>"和真实末轮密钥对照"</b>——真值有没有落在候选集里？这件事为什么必须验证？<br>' +
-          '然后想一个问题：为什么密文差异是 4 个字节、而不是 1 个或 16 个？把"剩余 MixColumns 次数"这件事串起来。',
-        after:
-          T.note('ok', '✅ 实验的收获', '<p style="margin-bottom:0">你刚刚亲手完成了一次 DFA 的核心计算，而且验证了两件很硬的事：' +
-            '<b>① 攻击者不需要知道故障的差分值 Z——它可以从四个方程的交集里被反推出来；' +
-            '② 候选集真的会随样本增加而收缩，并且真值始终被锁在候选集里。</b></p>' +
-            '<p>这两条如果只是"读过"，你在真实目标上一定会怀疑自己的实现；<b>亲手算过一遍，你才知道什么样的输出是"正常"、什么样是"方程写错了"。</b></p>')
-      },
-      after: T.note('key', '🔑 从实验到真实目标的距离', '<p style="margin-bottom:0">这个实验用的是标准 AES。换成真实的白盒实现，你需要额外做的只有三件事：' +
-        '<b>① 把"改写中间状态字节"换成"改写某张表的表项"</b>（数学上等价）；' +
-        '<b>② 确认注入点对应的是第几轮</b>（靠 25.4 节的前戏：表编号 → 轮次映射）；' +
-        '<b>③ 如果有外部编码，把方程搬到编码域</b>（25.12 节）。' +
-        '核心的数学——Z 的交集与候选收缩——<b>和这个实验一模一样</b>。</p>')
+        explain: '<b>「搬到内核里跑」这五个字丢掉了三件最关键的事。</b><br><br><b>① 执行模型不同。</b>Frida 的 Stalker/Interceptor 是<b>改写目标进程</b>——把跳转指令写进函数序言，或接管执行流。eBPF 是<b>一段独立存在于内核中的程序</b>，由内核在事件发生时调用；它不修改目标进程的任何字节。这也是 25.5 里「校验函数序言」那项自查对 eBPF 无效的原因。<br><br><b>② 安全模型不同。</b>Frida 注入的 JS 拥有目标进程的全部权限——它想崩就能崩。eBPF 必须过<b>验证器</b>：静态证明无越界、无死循环、指针类型正确，才能被加载。这是「凭什么允许用户代码进内核」这个问题的答案。<br><br><b>③ 能力边界不同。</b>Frida 能调用目标进程里的任意函数、读写任意内存。eBPF 只能用<b>helper 白名单</b>里的函数，不能动态分配内存、不能阻塞。它的能力是<b>被刻意收窄</b>的。<br><br>所以正确的表述是：<b>两者解决的是「观测/干预」这个大问题下的不同子问题，而不是同一个方案的两种部署位置。</b>'
+      }
     },
-
-    /* ==================== 25.11 ==================== */
     {
-      h: '25.11', title: 'DFA 第一次实战：从一个字节到一个密钥',
-      html:
-        '<p>现在把整条流程串起来。真实的攻击现场是这样的：</p>' +
-        T.grid(3, [
-          '<div class="card"><div class="card-title">① 找注入点</div>' +
-            '<p>在白盒实现里，"注入故障"= <b>改写一张表的某个表项</b>。</p>' +
-            '<p>因为表就是中间状态：<span class="mono">T[x]</span> 的值被改了 <span class="mono">d</span>，' +
-            '等价于对所有落到这个表项上的输入，其输出被异或了 <span class="mono">d</span>。</p>' +
-            '<p><b>选表项的标准：它得在倒数第二个 MixColumns 之前那张 T 表上。</b></p></div>',
-          '<div class="card"><div class="card-title">② 收样本</div>' +
-            '<p>固定明文，正常加密一次得到 <span class="mono">C</span>；改写表项后再加密一次得到 <span class="mono">C\'</span>。</p>' +
-            '<p>然后<b>恢复表项</b>，换一个字差分再改一次，得到第二对。重复若干次。</p>' +
-            '<p>要保证"同一个明文、同一个表项、不同的差分值"——这样 <span class="mono">Z</span> 变了而密钥没变。</p></div>',
-          '<div class="card"><div class="card-title">③ 筛样本 + 解方程</div>' +
-            '<p>先按<b>形状</b>筛：只留 <span class="mono">C ^ C\'</span> 恰好是 4 个字节、且落在斜线上的样本。</p>' +
-            '<p>对每个位置枚举 256 个候选，用 <span class="mono">S</span> / <span class="mono">S⁻¹</span> 验证，' +
-            '再对多个样本的候选集<b>取交集</b>。</p></div>'
-        ]) +
-        '<p>其中"筛样本"这一步是很多人忽略的关键动作。你收集到的样本里一定混着不可用的：' +
-        '有的差异是 1 个字节（注入点太靠后），有的是 16 个字节（太靠前），有的是 4 个字节但不在斜线上（有编码）。' +
-        '<b>如果把这些样本混在一起解方程，候选集永远收敛不了，而你还会以为是方程写错了。</b>下面这个实验专门练这一步。</p>',
-      lab: {
-        title: '实验：故障样本筛选器——哪些样本能用，哪些必须丢掉',
-        goal: '目标：按形状筛样本',
-        intro:
-          '<p>下面有 7 组样本（正确密文 + 故障密文），它们由<b>真实 AES 计算</b>得出，但注入位置不同：' +
-          '有的注在倒数第二个 MixColumns 之前（可用），有的注在最后一个 MixColumns 之后（差异只有 1 个字节），' +
-          '有的注得太早（差异 16 个字节）。</p>' +
-          '<p><b>要做的事：</b>看每组样本的"差异字节数"和"差异位置"，把<b>可用于本课 DFA 的样本编号</b>填进去（用逗号分隔，例如 <span class="mono">1,3,5</span>）。</p>',
-        inputs: [
-          { key: 'key', label: 'AES-128 密钥（十六进制）', hint: '决定所有样本的内容', value: '2b7e151628aed2a6abf7158809cf4f3c' },
-          { key: 'use', label: '哪些样本可用？（填编号，逗号分隔）', hint: '判据：差异恰好 4 个字节（且落在一条斜线上）', ph: '例如 1,3,5' }
+      h: '25.10', title: '自测（二）：把可用性拆成四个维度',
+      quiz: {
+        id: 'q11-3', chapter: 11,
+        answer: [0, 2, 3],
+        stem: '<b>多选。</b>以下关于 eBPF 在 Android 上可用性的判断，哪些是<b>正确</b>的？',
+        options: [
+          { t: '厂商常在定制内核时裁掉 BPF 相关配置，若 <code>CONFIG_BPF_SYSCALL</code> 未开启，则完全无法加载 eBPF 程序', why: '正确。这是 25.6 第 ② 条的核心：BPF 系统调用是总闸，没有它一切免谈。' },
+          { t: '只要设备的 Android 版本足够新，就一定能加载自定义 eBPF 程序', why: '错误。Android 版本只是间接线索，真正的决定因素是内核版本、内核配置、SELinux 策略和权限。系统版本新但内核被裁剪的设备完全可能存在。' },
+          { t: 'Android 系统自身使用 eBPF（例如按 UID 的网络流量统计），这说明内核路径是通的，但这些程序由系统进程加载，普通 App 无权', why: '正确。这既是可行性的证据，也划清了权限边界——「系统能用」不等于「你能用」。' },
+          { t: '即使内核支持，Android 的 SELinux 强制访问控制仍可能限制 <code>bpf()</code> 系统调用，通常需要 root 才能绕过', why: '正确。这是 25.6 第 ③④ 条的叠加效果。' }
         ],
-        runLabel: '📋 生成并检查样本',
-        autorun: true,
-        run: function (v) {
-          var C = window.CRYPTO;
-          var hx = C.normHex(v.key || '');
-          if (hx.length !== 32) return '<div class="lab-msg warn"><b>密钥长度不对</b><div class="lab-note">需要 32 个十六进制字符。</div></div>';
-          var key = [], i;
-          for (i = 0; i < 16; i++) key.push(parseInt(hx.substr(i * 2, 2), 16));
-          var rk = C.aesKeyExpansion(key);
-          var S = C.AES.sbox;
-          var xt = function (a) { return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff; };
-          var mul = function (a, b) { var r = 0; while (b) { if (b & 1) r ^= a; a = xt(a); b >>= 1; } return r & 0xff; };
-          var plain = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
-
-          var encAt = function (pt, rnd, fpos, fval, absolute) {
-            var w = rk.w, Nr = rk.Nr, s = Uint8Array.from(pt);
-            var addRK = function (r) { for (var q = 0; q < 16; q++) s[q] ^= w[r * 16 + q]; };
-            addRK(0);
-            for (var round = 1; round <= Nr; round++) {
-              for (var b = 0; b < 16; b++) s[b] = S[s[b]];
-              var t = Uint8Array.from(s);
-              for (var c2 = 0; c2 < 4; c2++) for (var r2 = 0; r2 < 4; r2++) s[c2 * 4 + r2] = t[((c2 + r2) % 4) * 4 + r2];
-              if (round === rnd) { if (absolute) s[fpos] = fval; else s[fpos] ^= fval; }
-              if (round !== Nr) {
-                for (var c3 = 0; c3 < 4; c3++) {
-                  var a = [s[c3 * 4], s[c3 * 4 + 1], s[c3 * 4 + 2], s[c3 * 4 + 3]];
-                  s[c3 * 4] = mul(a[0], 2) ^ mul(a[1], 3) ^ a[2] ^ a[3];
-                  s[c3 * 4 + 1] = a[0] ^ mul(a[1], 2) ^ mul(a[2], 3) ^ a[3];
-                  s[c3 * 4 + 2] = a[0] ^ a[1] ^ mul(a[2], 2) ^ mul(a[3], 3);
-                  s[c3 * 4 + 3] = mul(a[0], 3) ^ a[1] ^ a[2] ^ mul(a[3], 2);
-                }
-              }
-              addRK(round);
-            }
-            return s;
-          };
-
-          var Cc = Array.from(C.aesEncryptBlock(plain, rk));
-          /* 7 组样本：轮次 / 位置 / 差分（固定的确定性配方） */
-          var recipe = [
-            { rnd: 9, pos: 0, d: 0x11, abs: false },
-            { rnd: 10, pos: 3, d: 0x22, abs: false },
-            { rnd: 9, pos: 5, d: 0x33, abs: false },
-            { rnd: 6, pos: 8, d: 0x44, abs: false },
-            { rnd: 9, pos: 10, d: 0x55, abs: false },
-            { rnd: 9, pos: 15, d: 0x66, abs: false },
-            { rnd: 9, pos: 7, d: 0x77, abs: false }
-          ];
-
-          var hexOf = function (arr) { return arr.map(function (x) { return x.toString(16).padStart(2, '0'); }).join(''); };
-          var html = '<div class="lab-kv"><span>正确密文 C = <b class="mono">' + hexOf(Cc) + '</b></span>' +
-            '<span>明文固定 = <b class="mono">' + hexOf(plain) + '</b></span></div>';
-          html += '<table class="lab-tbl"><tr><th>#</th><th>故障密文 C\'</th><th>差异字节数</th><th>差异位置</th><th>是不是一条斜线</th></tr>';
-
-          var shapes = [[0, 7, 10, 13], [1, 4, 11, 14], [2, 5, 8, 15], [3, 6, 9, 12]];
-          var usable = [];
-          recipe.forEach(function (rc, n) {
-            var cf = Array.from(encAt(plain, rc.rnd, rc.pos, rc.d, rc.abs));
-            var dIdx = [];
-            for (var k = 0; k < 16; k++) if (Cc[k] !== cf[k]) dIdx.push(k);
-            var isSlash = false;
-            shapes.forEach(function (sh) {
-              if (sh.length === dIdx.length && sh.every(function (x) { return dIdx.indexOf(x) >= 0; })) isSlash = true;
-            });
-            if (dIdx.length === 4 && isSlash) usable.push(n + 1);
-            html += '<tr><td><b>' + (n + 1) + '</b></td><td class="mono">' + hexOf(cf) + '</td>' +
-              '<td><b>' + dIdx.length + '</b></td><td class="mono">' + dIdx.join(',') + '</td>' +
-              '<td>' + (isSlash ? '✅ 是' : (dIdx.length === 4 ? '❌ 4 字节但不成斜线' : '—')) + '</td></tr>';
-          });
-          html += '</table>';
-          html += '<div class="lab-msg key"><b>怎么读这张表</b><div class="lab-note">' +
-            '<b>差异字节数是可以直接观测的</b>——你不需要知道注入点在哪一轮，只要看密文差了几个字节，就能反推"注入点往后还剩几次 MixColumns"：<br>' +
-            '<b>1 个字节</b> → 还剩 0 次 → 注在了最后一个 MixColumns 之后 → <b>不可用</b>（1 个方程 2 个未知量）<br>' +
-            '<b>4 个字节</b> → 还剩 1 次 → 正好是我们需要的位置 → <b>可用</b>（4 个方程共用一个 Z）<br>' +
-            '<b>16 个字节</b> → 还剩 2 次以上 → 注得太早 → <b>本课的方法不可用</b>（代价过高）</div></div>';
-          html += '<div class="lab-msg warn"><b>现在轮到你筛</b><div class="lab-note">' +
-            '把可用的样本编号填到上面的输入框里（用逗号分隔）。填完点「✓ 检查我的答案」。</div></div>';
-          return html;
-        },
-        expected: function (v) {
-          var want = [1, 3, 5, 6, 7];
-          var raw = String(v.use || '').match(/[0-9]+/g) || [];
-          var got = [];
-          raw.forEach(function (x) { var n = parseInt(x, 10); if (n >= 1 && n <= 7 && got.indexOf(n) < 0) got.push(n); });
-          got.sort(function (a, b) { return a - b; });
-          var ok = got.length === want.length && want.every(function (x) { return got.indexOf(x) >= 0; });
-          var missing = want.filter(function (x) { return got.indexOf(x) < 0; });
-          var extra = got.filter(function (x) { return want.indexOf(x) < 0; });
-          return {
-            ok: ok,
-            detail: (ok ? '✅ 筛对了。' : '❌ 还不对。') +
-              '<br>你填的是：<b>' + (got.length ? got.join(', ') : '（空）') + '</b>　正确答案是：<b>' + want.join(', ') + '</b>' +
-              (missing.length ? '<br><b>漏掉的：</b>' + missing.join(', ') + '（它们的差异恰好 4 个字节且落在一条斜线上）' : '') +
-              (extra.length ? '<br><b>多选的：</b>' + extra.join(', ') + '（差异不是 4 个字节，或者 4 个字节但不成斜线——后者意味着有编码参与）' : '') +
-              (ok ? '<br>记住这个判据：<b>差异字节数 = 注入点往后剩余的 MixColumns 次数所决定的形状</b>。样本筛选不是可选的整理工作，它是方程能不能解出来的前提。'
-                  : '')
-          };
-        },
-        showAnswer:
-          '可用样本：1, 3, 5, 6, 7\n\n' +
-          '判据（两条同时满足）：\n' +
-          '  ① 差异恰好 4 个字节  ->  注入点往后还剩 1 次 MixColumns\n' +
-          '  ② 这 4 个下标恰好是某一条斜线（0/7/10/13、1/4/11/14、2/5/8/15、3/6/9/12）\n\n' +
-          '不可用的样本及原因：\n' +
-          '  #2  差异 1 个字节   -> 注在最后一个 MixColumns 之后，1 个方程 2 个未知量，零信息\n' +
-          '  #4  差异 16 个字节  -> 注得太早（第 6 轮），扩散过头，方程耦合过多未知量\n\n' +
-          '为什么必须筛：把不同形状的样本混在一起解方程，候选集的交集永远收敛不了，\n' +
-          '而且不会报错 —— 你只会得到一组看似合理却错误的候选。',
-        hint:
-          '只看两列：<b>差异字节数</b>和<b>差异位置</b>。<br>' +
-          '差异字节数告诉你"注入点往后还有几次 MixColumns"：1 个字节 = 0 次，4 个 = 1 次，16 个 = 2 次以上。<br>' +
-          '我们要的是"恰好 1 次"——因为那才是 4 个方程共用一个未知差分的位置。<br>' +
-          '另外别忘了检查形状：4 个字节如果落在 <span class="mono">0,5,10,15</span> 这种"整行"位置上，说明还有别的线性变换参与。',
-        after:
-          T.note('ok', '✅ 实验的收获', '<p style="margin-bottom:0">样本筛选的本质是<b>用形状反推注入位置</b>。' +
-            '这条思路很通用：<b>当你对"自己到底改了什么"没有把握时，去看输出的形状——形状是位置的函数。</b></p>')
-      },
-      case: {
-        source: 'kanxue',
-        title: '白盒AES算法详解(一)',
-        date: '2024-1-25',
-        author: 'ElainaDaemon',
-        target: '标准 AES-128 的 DFA 手工推演（教学实例，非特定 App）',
-        background:
-          '<p>这是看雪社区「白盒AES算法详解」系列的第一篇，作者 <b>ElainaDaemon</b>，2024 年 1 月发布在密码应用版块。' +
-          '第一篇讲标准 AES 与<b>故障对密文的影响</b>，第二篇是转帖，第三篇讲白盒实现（本课 25.6 节收录）。</p>' +
-          '<p>这篇帖子对本课的价值极高，因为它做的事情<b>和本课 25.10 节的实验完全一样</b>：' +
-          '选一把具体的密钥、一个具体的明文，在倒数第二个 MixColumns 之前注入一字节故障，' +
-          '然后把"密文差分 → 方程 → 候选集收缩 → 唯一确定一个末轮密钥字节"整条链条<b>手算了一遍</b>。' +
-          '<b>本课用站内的真实 AES 实现复算了帖子里的全部关键数据，结果逐项一致</b>（见下面的分析）。</p>',
-        points: [
-          '帖子用的具体参数：主密钥 <code>2b7e151628aed2a6abf7158809cf4f3c</code>，明文 <code>00112233445566778899aabbccddeeff</code>；' +
-            '轮密钥 <code>K0..K10</code> 全部列出，其中 <code>K10 = d014f9a8c9ee2589e13f0cc8b6630ca6</code>。',
-          '<b>故障对密文的影响规律</b>（帖子用图示逐一推演）：在初始轮密钥加处注入 → 1 字节；经过一次 MixColumns → 一整列 4 字节；' +
-            '到第二轮 MixColumns 之后 → <b>16 个字节全部不同</b>。并明确点出：<b>只有 MixColumns 会扩散、ShiftRows 只会搬移、AddRoundKey 不会扩散</b>。',
-          '<b>倒数两个 MixColumns 之间注入</b>的结果被明确列出：故障字节在第 1 列 → 密文第 <b>1、8、11、14</b> 字节变化（1 起数）；' +
-            '第 2 列 → 2、5、12、15；第 3 列 → 3、6、9、16；第 4 列 → 4、7、10、13。<b>四种"变法"，正好是本课说的四条斜线。</b>',
-          '<b>把差分形式化</b>：令 <code>Y0 = 2A+3B+C+D+K9,0</code>、输入差分 <code>Z = A ^ X</code>，得到 <code>C0 ^ C0\' = S(Y0) ^ S(Y0 ^ 2Z)</code>；' +
-            '另三个受影响字节分别对应系数 <b>3Z、Z、Z</b>。帖子强调四个式子里的 Z 是<b>同一个</b>。',
-          '<b>候选收缩的完整数字</b>：帖子实测，输出差分约束下每个式子允许 <b>127</b> 个 Z；四式取交集只剩 <b>15</b> 个 Z；' +
-            '在这个约束下 <code>Y0</code> 被限制到 <b>30</b> 个，对应的 <code>K10[0]</code> 候选也是 <b>30</b> 个。' +
-            '（这是<b>那一次具体故障</b>的数值。本课 25.10 节的实验里换密钥、换位置、换差分，会得到 15~31 与 30~64 的不同取值——' +
-            '候选数的具体大小随参数变化，但"取交集收缩"这个机制不变。）',
-          '<b>多故障取交集</b>：帖子分别以"把 state 第 1 字节改成 0 / 改成 1 / 改成 3"注入三次，' +
-            '得到三组候选，前两次交集是 <code>{19, 45, 208}</code>，第三次交集塌缩为 <code>{208}</code>，即 <code>0xd0</code> —— ' +
-            '而这正是帖子自己列出的 <code>K10</code> 的第一个字节。',
-          '<b>从末轮密钥回到主密钥</b>：帖子另外用一整节证明"AES-128 可以由一轮轮密钥反推出主密钥"，并给出 <code>K10 → K9 → … → K0</code> 的手算过程' +
-            '（含 g 函数、S 盒替换与 rCon 的使用）。作者同时给出 AES-192 / AES-256 的对应结论：<b>192 需要一轮半、256 需要两轮轮密钥</b>。'
+        explain: '<b>这道题的关键在于：把「支持」拆成四个独立的维度来判断。</b><br><br><b>① 内核版本</b>——决定有没有这个特性（较完整能力一般需 4.14+，Android 9 / kernel 4.9 起开启部分 BPF 功能）。<br>' +
+          '<b>② 内核配置</b>——决定这个特性<b>在你这台机器上</b>有没有被编译进来，典型开关是 <code>CONFIG_BPF_SYSCALL</code>、<code>CONFIG_BPF_JIT</code>、<code>CONFIG_DEBUG_INFO_BTF</code>。<br>' +
+          '<b>③ SELinux 策略</b>——决定你有没有权限去调用它。<br>' +
+          '<b>④ 运行身份</b>——root 与否，往往决定前三条能不能落地。<br><br>' +
+          '选项 B 的错误是典型的<b>「用代理指标替代真实指标」</b>：Android 版本和内核版本、内核配置之间没有强绑定，厂商可以在很新的系统上裁剪内核，也可以在老系统上开启部分功能。做这类判断，永远要落到<b>实测</b>。<br><br>' +
+          '<span class="pill warn">再次提醒时效性</span>：上述经验以 2023 年前后的生态为背景，不同厂商、机型、内核版本差异极大，请以你自己的目标设备实测结果为准。'
+      }
+    },
+    {
+      h: '25.11', title: '自测（三）：按数据通路排查',
+      quiz: {
+        id: 'q11-4', chapter: 11,
+        answer: 3,
+        stem: '你的 eBPF 程序在内核里采集到了数据，但用户态程序一直读不到任何内容。回看 25.2 的九步流程，<b>最应该优先排查</b>的是哪一环？',
+        options: [
+          { t: '第一步「写程序」——重新检查 C 代码的逻辑是否正确', why: '逻辑错误确实可能导致没有数据，但「内核侧毫无输出」这种症状更典型地指向数据通路而非业务逻辑。而且如果程序有逻辑问题，往往加载阶段就会因为验证器检查失败而暴露。' },
+          { t: '第六步「attach」——确认程序是否挂到了正确的钩子上，以及事件有没有真的发生', why: '这是第二顺位，值得排查（挂错钩子确实会一条数据都没有）。但如果 attach 完全失败，libbpf 通常会在加载或挂载时直接报错，而不是静默无输出。' },
+          { t: '第五步「JIT 编译」——怀疑内核没有开启 JIT，导致程序没有真正执行', why: '方向错误。JIT 只影响<b>性能</b>；没有 JIT 时程序会解释执行，依然会产出数据，只是更慢。这不会造成「完全没有输出」。' },
+          { t: '第八步「写 Map」——检查内核侧是否真的提交了数据：Map 定义、reserve/submit 是否配对、以及漏掉了失败分支的判空', why: '正确。这是最高频的原因，且症状完全吻合：程序在跑、事件在发生，但数据没有进入共享存储。' }
         ],
-        method: [
-          '先讲清 AES 的密钥编排（44 个字的生成规则）与状态矩阵的排列方式，为后面"哪个字节影响哪个字节"打基础。',
-          '证明"轮密钥可以反推主密钥"：以 K10 为例，逐步反推出 K9，再往上推到 K0 —— 说明"拿到任意一轮轮密钥就等于拿到主密钥"。',
-          '用图示推演故障的扩散：从初始轮密钥加开始，逐轮追踪"正常 / 故障"两条执行流的差异格子。',
-          '得出三种形态：早于倒数第二个 MixColumns → 16 字节；倒数两个 MixColumns 之间 → 4 字节（且只有四种"变法"）；晚于最后一个 MixColumns → 1 字节。',
-          '把四字节形态写成方程：MixColumns 的系数决定每个受影响字节的表达式，消掉共同项后得到 <code>S(Y) ^ S(Y ^ mZ)</code> 形式。',
-          '用"遍历 Z 与 Y，看哪些组合能产生观测到的输出差分"的方式<b>枚举</b>，先得每个式子的 127 个 Z，再四式取交集得到 15 个 Z。',
-          '在 Z 被约束的前提下反推 Y 的候选（30 个），再换算成末轮密钥字节的候选（30 个）。',
-          '更换故障值（0 → 1 → 3）重复上述过程，把三次的候选集取交集，唯一确定 <code>K10[0]</code>。',
-          '给出推广：对其它列位做同样的事就能拿到完整的 K10，再由 K10 反推主密钥。'
-        ],
-        result:
-          '<p>帖子完整推演了"一次单字节故障如何约束末轮密钥字节"的全过程，并在具体实例上把候选集从 <b>256 → 30 → 3 → 1</b> 收缩到唯一值 ' +
-          '<code>0xd0</code>，与帖中列出的 <code>K10</code> 首字节完全一致。同时证明了 <b>AES-128 可由一轮轮密钥反推主密钥</b>。</p>' +
-          '<p>帖子最后给出一个成本估计：<b>在最好的情况下，只需要八次故障注入，就可以还原出完整的 K10</b>；' +
-          '不那么完美的情况下，数十次乃至成百上千次也是可接受的（作者认为成本并不高）。' +
-          '<span class="pill warn">待核实</span>：这个"八次"的具体推导帖子没有展开，本课无法复算，故按原帖口径引用而不作为结论。</p>' +
-          '<p>作者在文末对 DFA 的定位说得很清楚：<b>差分故障攻击本来是灰盒攻击中的技术，在白盒加密中我们可以用它来剥离密钥。</b>' +
-          '这句话准确地点出了本章的技术谱系——白盒 DFA 借用的是一套更早就存在的攻击手法。</p>',
-        terms: ['DFA', '差分故障分析', '输入差分 Z', '输出差分', 'MixColumns 扩散', 'ShiftRows 搬移', '轮密钥反推主密钥', 'g 函数', 'rCon', 'S 盒替换', '候选集取交集', '灰盒攻击'],
-        limits:
-          '<p>按本课纪律，把这篇帖子的局限如实标出：</p>' +
-          '<p>① <b>帖子演示的是标准 AES，不是带外部编码的白盒实现。</b>作者自己在总结里说明，这一篇是为后续文章"做铺垫"，' +
-          '白盒实现的分析与针对白盒的攻击在后续篇章。所以<b>不能把这篇的结论直接套到有外部编码的商业白盒实现上</b>——' +
-          '输出侧一旦有仿射编码，观测到的密文差分就不再等于方程的左边（本课 25.12 节）。</p>' +
-          '<p>② <b>故障注入模型是"把中间状态改写成已知常量"</b>（帖中直接把 <code>state[0][0]</code> 赋成 0 / 1 / 3）。' +
-          '在白盒实现里更自然的注入方式是<b>改写表项</b>（等价于异或一个差分），两者在数学上都能产生可用的样本，' +
-          '但"改写成常量"要求攻击者掌握该中间量的完整表示——这一点帖子没有讨论。</p>' +
-          '<p>③ <b>"八次注入还原完整 K10"这个成本估计，帖子未给出推导过程</b><span class="pill warn">待核实</span>。' +
-          '本课在 25.10 节的实验里给出的是一条<b>可复算的路径</b>：每个列位的一次故障留下约 30 个候选，多次取交集收敛；' +
-          '四个列位合起来覆盖全部 16 个末轮密钥字节。</p>' +
-          '<p>④ 帖子是<b>教学性质的推演</b>，目标是自己写的 Python 实现，不是某个真实产品的加固方案。' +
-          '真实目标的表结构、编码层次、随机化手段都会更复杂。</p>',
-        analysis:
-          '<p><b>用本课方法论拆解：这篇帖子可以逐项对上本课 25.8–25.10 节的每一条判断，而且本课用站内真实 AES 复算过。</b></p>' +
-          '<p><b>第一，扩散规律完全吻合。</b>本课在 25.8 节列出的"剩余 MixColumns 次数 → 密文差异字节数（1 / 4 / 16）"，' +
-          '帖子用自己的图示推演得到了同样的结论；四条斜线（帖子写成"四种变法"：1/8/11/14、2/5/12/15、3/6/9/16、4/7/10/13，1 起数）' +
-          '与本课给出的下标集合（0/7/10/13、1/4/11/14、2/5/8/15、3/6/9/12，0 起数）<b>逐个对应</b>。</p>' +
-          '<p><b>第二，候选收缩的数字逐项一致。</b>本课用 <span class="mono">window.CRYPTO</span> 的真实实现复算了帖子里的实例：' +
-          'K10 = <span class="mono">d014f9a8c9ee2589e13f0cc8b6630ca6</span>；正确密文 = <span class="mono">8df4e9aac5c7573a27d8d055d6e4d64b</span>；' +
-          '把 <code>state[0]</code> 置 0 后 = <span class="mono">3cf4e9aac5c757a527d82e55d636d64b</span>；置 1 后 = <span class="mono">dcf4e9aac5c7570a27d82655d6add64b</span>。' +
-          '差异位置 <b>0、7、10、13</b>；四个方程各自的 Z 候选数 <b>127/127/127/127</b>，取交集后 <b>15</b> 个，' +
-          '且这 15 个值与帖中列出的完全一致；该位置末轮密钥字节的候选数 <b>30</b>；两次故障取交集 <b>{19, 45, 208}</b>，三次取交集 <b>{208}</b>。' +
-          '<b>也就是说：这篇帖子的每一个关键数字，都可以用本课实验独立复现。</b></p>' +
-          '<p><b>第三，它正好印证了本课"先消掉共用未知量"的求解顺序。</b>' +
-          '帖子没有先去猜密钥，而是<b>先求 Z 的候选集合</b>（四式取交集），再在 Z 已知的前提下求 Y 和密钥字节。' +
-          '这个顺序是本课 25.9 节反复强调的——<b>如果反过来先枚举密钥，每个方程都会给出巨大的候选集，永远收敛不了。</b></p>' +
-          '<p><b>第四，也是最重要的一点：这篇帖子把本课的核心论点演了一遍。</b>' +
-          '本课在 25.3 / 25.6 节说的"编码洗得掉内容、洗不掉结构"，在这个案例里的具体形态是：' +
-          '<b>帖子里根本没有出现任何"表"</b>——它直接在标准 AES 的状态矩阵上做故障注入。' +
-          '而白盒实现里，"状态矩阵"被换成了"表"，改动中间状态被换成了"改表项"。' +
-          '<b>但只要扩散结构还在（MixColumns 仍然是列内混合、ShiftRows 仍然按行搬移），上面这一整套方程推导就一个字都不用改。</b>' +
-          '这就是为什么白盒 AES 的密钥提取最终仍然落回 AES 本身的结构上。</p>' +
-          '<p><b>建议的读法：</b>先做 25.10 节的实验，拿到自己算出来的候选收缩数据，再回头读这篇帖子。' +
-          '你会发现它的每一步你都已经亲手做过一遍——<b>这时读帖子的价值就不再是"学一个新方法"，而是"对照一份完整的、有人手算过的算例来校验自己的理解"。</b></p>',
-        link: 'https://bbs.kanxue.com/thread-280335.htm',
-        linkNote: '看雪社区帖，未登录访问显示部分内容需登录后可查看完整内容；帖子主体与全部关键数据可正常获取。'
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">完整的 DFA 流程是：<b>找注入点（表项）→ 注入 → 收样本 → 按形状筛样本 → 枚举 + 逆运算验证 → 多样本取交集 → 得末轮密钥 → 反推主密钥</b>。' +
-        '其中"筛样本"和"取交集"是两个最容易做错、也最不该省的环节。</p>')
-    },
-    /* ==================== 25.12 ==================== */
-    {
-      h: '25.12', title: '白盒为什么能被攻破：DFA 依赖的三个前提',
-      html:
-        '<p>先给一个不客气的结论：<b>白盒密码之所以能被攻破，不是因为它的数学不够深，而是因为它必须在"可发布的性能"里做到"抵抗一个拥有全部权限的攻击者"。</b>' +
-        '这两件事之间有根本矛盾。理解这个矛盾，比背下几种攻击方法重要得多。</p>' +
-        '<p>DFA 之所以能打白盒，是因为它依赖三个前提，而<b>前两个在白盒模型下几乎总是成立</b>：</p>' +
-        T.tbl(['前提', '为什么白盒场景下容易成立', '防守方能做什么'], [
-          ['① 能注入<b>可控的</b>故障（知道改了什么、改了多大）',
-           '白盒攻击者能写内存。而在查找表型实现里，"故障"就是<b>改一个表项</b>——改哪个表项、差分多大，完全可控',
-           '完整性校验（改表就崩）。<b>这是唯一真正有效的反制</b>，但它的代价见 25.13 节'],
-          ['② 知道故障发生在<b>哪一轮、哪个位置</b>',
-           '表是按轮次与位置组织并初始化的，测绘一次就能建立"表 → (轮, 位置)"的映射（25.4 节）',
-           '把表打乱摆放、运行时再计算偏移。<b>只提高工作量，不改变可测绘性</b>'],
-          ['③ 扩散结构<b>没有被额外的层打乱</b>',
-           '这一条是防守方真正能反制的地方：<b>外部编码</b>会把观测到的密文差分从 <span class="mono">D</span> 变成 <span class="mono">L(D)</span>',
-           '加仿射/非线性外部编码。代价是性能与体积，而且<b>只能让攻击变贵，不能让攻击消失</b>']
-        ]) +
-        T.note('key', '🔑 外部编码是怎么"打乱方程"的', '<p>回忆 25.8 节的方程左边：<span class="mono">C[i] ^ C\'[i] = S(Y) ^ S(Y ^ mZ)</span>。</p>' +
-          '<p>这个等式的成立依赖一件事：<b>你观测到的密文差分就是进入末轮的那个差分</b>。' +
-          '但如果输出侧有一层编码 <span class="mono">L</span>（<span class="mono">C = L(真实状态)</span>），你观测到的是：</p>' +
-          '<p style="text-align:center" class="mono">C ^ C\' = L(u) ^ L(v)</p>' +
-          '<p>只有当 <span class="mono">L</span> 是<b>仿射（线性）</b>映射时，它才等于 <span class="mono">L(u ^ v)</span>——' +
-          '也就是说，差分被"整体做了一次线性变换"，<b>方程还是成立的，只是未知量多了一层线性映射</b>。' +
-          '这种情形下攻击依然可行，但要先把这个线性映射解出来（需要额外的样本与线性代数），或者把整个方程搬到编码域里解。</p>' +
-          '<p>如果 <span class="mono">L</span> 是<b>非线性</b>双射，那么 <span class="mono">L(u) ^ L(v)</span> 与 <span class="mono">u ^ v</span> 之间没有简单关系，' +
-          '标准 DFA 的方程直接失效。这是白盒防 DFA 的最强手段——<b>但它的代价是：输出侧一旦非线性的编码，编码本身也必须被保护，否则攻击者可以逐点采样把它测出来（25.4 节）。</b></p>') +
-        '<h4>带外部编码的白盒：一个真实的工具参考</h4>' +
-        '<p>针对"白盒实现 + 外部编码"的 DFA 是一个被专门研究过的问题，而且有开源的工程实现可以参考。' +
-        '这里把它作为延伸阅读列出来——它正好说明了本节的判断：<b>外部编码把攻击变复杂了，但没有让它消失。</b></p>' +
-        T.note('ok', '📎 延伸阅读：DarkPhoenix（Quarkslab / SideChannelMarvels）', '<p>' +
-          '<b>项目：</b>DarkPhoenix —— <i>Tool to perform differential fault analysis attack (DFA) on whiteboxes with external encodings</i>。<br>' +
-          '<b>仓库：</b><a href="https://github.com/SideChannelMarvels/DarkPhoenix" target="_blank" rel="noopener">github.com/SideChannelMarvels/DarkPhoenix</a>' +
-          '（本课已访问验证，HTTP 200）<br>' +
-          '<b>依据的论文：</b>Amadori A., Michiels W., Roelse P., <i>A DFA Attack on White-Box Implementations of AES with External Encodings</i>, SAC 2019（README 中引用）。' +
-          '<br><b>初始作者：</b>Nicolas Surbayrole、Philippe Teuwen；版权 Quarkslab；Apache 2.0 许可。</p>' +
-          '<p><b>它的用法恰好印证了本章的方法论：</b>README 要求使用者实现一个继承自 <span class="mono">WhiteBoxedAES</span> 的类，' +
-          '提供 <span class="mono">apply(data)</span>（正常加密）与 <span class="mono">applyFault(data, faults)</span>（带故障加密），' +
-          '其中故障用 <span class="mono">(fround, fbytes, fxorval)</span> 三元组描述——<b>轮次、字节位置、异或差分</b>。' +
-          '这三样正是本课 25.4 节"前戏"要回答的东西：<b>你要先知道哪一轮、哪个位置、能注入多大的差分，攻击脚本才能工作。</b></p>' +
-          '<p>README 里还有一句很值得注意：攻击"必须先注入一次 MixColumn 之前的故障，然后两次、三次往前推"（<i>the fault must first be injected one MixColumn before the output, then two MixColumn before, etc.</i>），' +
-          '并且提供 <span class="mono">reverseRoundMethod</span> / <span class="mono">reverseRoundMethod2</span> 两个方法，' +
-          '用来<b>验证"这个故障位置是否真的对应目标轮次"</b>（判据：把结果逆推回去，看是不是恰好 4 个字节 / 全部字节受影响）。' +
-          '<b>这就是本课 25.9 节"用形状反推注入位置"的工程化形态。</b></p>' +
-          '<p>另外它明确要求：注入故障时<b>必须保证同一输入同一故障得到同一结果</b>，否则就不能用多进程加速——' +
-          '这条约束与本课 25.13 节要讲的"运行时随机化"直接相关。</p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境三',
-            scenario: '<b>情境：</b>你在目标白盒实现上做标准 DFA，流程完全按本课走：注入点确认、形状是 4 字节、候选集从 30 收敛到 1。' +
-              '你拿到了 4 个末轮密钥字节，反推出主密钥，然后用它去解密 App 的其他数据——<b>结果数据乱码。</b>' +
-              '你回头检查，4 个字节的候选收缩过程完全自洽，真值也确实在候选集里（你用另一条已知路径验证过）。<b>问题出在哪？</b>',
-            choices: [
-              { t: '候选集自洽就说明密钥是对的，乱码一定是别的原因（比如数据格式），先去查别的模块', next: 'n1' },
-              { t: '重点怀疑输出侧有外部编码：你解出来的那 4 个字节是"编码域里的末轮密钥"，它和真实末轮密钥之间差一层线性/仿射变换', next: 'n2' },
-              { t: '怀疑候选集交集取错了，重新做更多样本，把候选收到绝对唯一', next: 'n3' },
-              { t: '怀疑末轮密钥不能反推主密钥（AES 的密钥编排可能被改过）', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '忽略了"自洽 ≠ 正确"',
-            result: '<b>认知根源：把"数学过程没有报错"当成了"结论正确"。</b>DFA 的方程是在<b>某个域</b>里成立的。' +
-              '如果输出侧有仿射编码，你观测到的差分是 <span class="mono">L(D)</span> 而不是 <span class="mono">D</span>，' +
-              '而你解出来的"密钥字节"实际上是 <b>经过编码变换之后的值</b>——它在那个域里是自洽的、唯一确定的，' +
-              '但把它当成真实密钥拿去用，自然解不出正确的数据。</p>' +
-              '<p>这是白盒攻击里最隐蔽的一类失败：<b>过程全对、结果自洽、答案错的。</b>它的特征是"数学上无懈可击，工程上不可用"。' +
-              '遇到这种症状，第一个要怀疑的就是"编码域"与"真实域"的差异。</p>'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '对：先确认你解出来的是不是"编码域里的量"',
-            result: '<b>这正是外部编码的典型症状。</b>具体怎么验证：</p>' +
-              '<p><b>第一步，测输出编码。</b>找一个<b>已知答案</b>的输入输出对——比如你有另一条路径能算出某个明文的正确密文（或者目标有解密接口），' +
-              '把"真实密文"与"白盒输出"逐字节对照。如果输出侧的编码是仿射的，两者之间会呈现明显的线性关系（<span class="mono">y = L(x) ^ b</span>）；' +
-              '用 16 组样本就能把 <span class="mono">L</span> 拟合出来（每个输出字节只依赖对应位置的输入字节时，是 8 位域上的线性映射，' +
-              '256 个点足以完全确定它）。</p>' +
-              '<p><b>第二步，把方程搬到正确的域里。</b>拿到 <span class="mono">L</span> 之后有两条路：' +
-              '① 先把观测到的密文差分<b>逆变换</b>回真实域（如果 <span class="mono">L</span> 可逆），再套标准 DFA；' +
-              '② 或者把 <span class="mono">L</span> 合并进方程，在编码域里直接解出真实密钥（多一层线性代数）。' +
-              '工程上更常用的是第一条，因为它能直接复用现成的攻击脚本。</p>' +
-              '<p><b>第三步，回到 25.4 节反思。</b>这一步本来就应该在"前戏"阶段完成——<b>认编码排在注入故障之前</b>。' +
-              '这次的返工，正是跳过前戏的代价。</p>'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '方向错了：问题不在候选数量',
-            result: '<b>认知根源：用一个"更深"的动作去掩盖一个"更早"的错误。</b>候选集已经唯一了，再收样本也不会改变结果——' +
-              '因为<b>你解出的那个值是编码域里唯一正确的值</b>，它本来就是唯一的，不是"收敛得不够"。</p>' +
-              '<p>这是很常见的一种误判：把"答案不对"归因为"精度不够"，于是投入更多算力、更多样本，' +
-              '而真实原因是<b>问题的坐标系选错了</b>。<b>在错误的坐标系里提高精度，只会更精确地得到错误答案。</b></p>'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '概率最低的假设，被排在了第一位',
-            result: '<b>认知根源：先怀疑"最不寻常"的东西，而不是"最常见"的东西。</b>' +
-              'AES 的密钥编排是公开且固定的；改动它需要实现者重写整个密钥扩展，而且会让实现无法与任何标准实现互操作。' +
-              '白盒实现的意义在于"保护标准算法"，而不是"发明新算法"——<b>它几乎不会去改密钥编排。</b></p>' +
-              '<p>与之相对，"加了外部编码"是白盒实现的<b>标准动作</b>——外部编码本来就是白盒构造的组成部分（25.3 节的第一层）。' +
-              '<b>在"最平常的解释"与"最离奇的解释"之间，先验证最平常的那个。</b></p>'
-          }
-        }
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">记住 DFA 的三个前提，以及防守方唯一真正有效的反制点：' +
-        '<b>① 可控故障（白盒里总能做到）② 位置已知（测绘总能做到）③ 扩散结构未被额外层打乱（外部编码就是打这一条）。</b></p>' +
-        '<p>以及那个最隐蔽的失败模式：<b>在编码域里解出了自洽但错误的答案。</b>它的解药是 25.4 节的"前戏"——<b>先证明你观测到的量就是方程里的量。</b></p>')
-    },
-
-    /* ==================== 25.13 ==================== */
-    {
-      h: '25.13', title: '防守方的加强手段：它们各自挡住什么，代价是什么',
-      html:
-        '<p>这一节换个视角：<b>如果你是防守方，你会怎么加固？</b>把手段和代价摊开来看，你会更容易理解"白盒不是绝对安全，而是提高成本"这句话的准确含义。</p>' +
-        T.tbl(['加固手段', '挡住什么', '挡不住什么', '主要代价'], [
-          ['<b>外部编码</b>（输入/输出各套一层双射）',
-           '观测到的密文差分不再是方程里的差分 → 标准 DFA 脚本直接失效',
-           '仿射编码只是"换个标号"，差分谱不变、线性关系可被拟合；非线性编码更有效但更难维护',
-           '实现变复杂；编码表本身要保护；必须保证编解码两端一致'],
-          ['<b>内部编码</b>（相邻表之间插随机双射）',
-           '堵死"把两张表对接起来消掉中间量"这条捷径——这是最关键的一招',
-           '表仍然是双射（可被结构扫描定位）；扩散结构没变（DFA 的前提③仍在）',
-           '表的数量与体积上升；初始化时间变长'],
-          ['<b>运行时随机化</b>（每次运行生成不同的表 / 不同的输入混淆）',
-           '一次 dump 出来的表在另一次运行里不通用；静态分析拿到的表是"过期"的',
-           '攻击者可以在<b>单次运行内</b>完成全部攻击（表在这一次运行里是固定的）；黑盒调用照样可用',
-           '每次启动都要重新生成表，冷启动变慢；随机数质量影响安全性'],
-          ['<b>完整性校验</b>（校验表的校验和）',
-           '<b>直接掐死"改表项来注入故障"这条路</b>——改一个字节就崩',
-           '校验和本身也要被计算，它可以被定位、绕过或伪造；如果校验时机晚于攻击者的采样窗口，攻击仍可完成',
-           '运行时的额外开销；校验逻辑暴露新的攻击面'],
-          ['<b>反调试 / 反注入</b>',
-           '提高"跑起来并观察"的门槛，逼攻击者先花时间绕过检测',
-           '不改变密码学层面的任何东西。<b>它只是把攻击的时间成本往后推</b>',
-           '兼容性风险（误杀正常环境）；需要持续维护对抗'],
-          ['<b>把表拆得更小 / 运行时动态生成表</b>',
-           '静态分析几乎失效（文件里根本没有表）；手工测绘的成本大幅上升',
-           '表终究要在运行时变成内存里的数据，仍然可以被 dump 与访问分析',
-           '体积与启动时间；代码复杂度显著上升'],
-          ['<b>加冗余 / 白盒多样性</b>（不同版本用不同表）',
-           '一份分析成果不能复用到下一个版本',
-           '只需要重新测绘与重跑攻击流程，攻击方法本身不变',
-           '每版本都要重新生成与测试；构建流水线变复杂']
-        ]) +
-        T.note('key', '🔑 一句话看穿所有加固手段', '<p>把这些手段按"它打的是 DFA 三个前提里的哪一个"重新分类，你会发现一个清晰的结构：</p>' +
-          '<ul><li><b>打前提①的（可控故障）</b>：完整性校验。<b>唯一真正有效的一类</b>——因为它直接让"注入故障"这个动作失败。</li>' +
-          '<li><b>打前提②的（位置已知）</b>：动态生成表、表布局随机化、反调试。它们让测绘变贵，但不改变可行性。</li>' +
-          '<li><b>打前提③的（扩散结构）</b>：外部编码。它让方程失效，但代价最大（性能和实现复杂度），而且仿射版本可以被绕过。</li></ul>' +
-          '<p><b>没有任何一条能同时打掉三个前提。</b>这就是"白盒是提高成本"的技术含义：' +
-          '每一条加固都在某个维度上把攻击者的时间成本往后推，但没有任何一条改变了"攻击在信息论上是可能的"这个事实。</p>' +
-          '<p>而从工程角度看，防守方还要额外承担一件事：<b>所有这些加固都必须在不显著影响主流程性能的前提下完成。</b>' +
-          '一个白盒 AES 的吞吐量如果只有标准 AES 的十分之一，很多业务场景就直接不考虑它了。' +
-          '<b>安全与性能的这条线，才是白盒密码真正的战场。</b></p>') +
-        T.note('warn', '⚠️ 一个必须澄清的误解', '<p>经常有人说"白盒被攻破了，所以白盒没用"。这句话两头都不准确。</p>' +
-          '<p>准确的说法是：<b>公开的、标准化的白盒构造，大多已经被公开的攻击方法打了折扣；但"打了折扣"和"完全没有防护价值"是两件事。</b>' +
-          '一个需要两周、需要 root 设备、需要专门的密码学知识才能攻破的实现，和"内存里明文躺着 16 个字节的密钥"，' +
-          '对付的<b>是截然不同的对手</b>。风控 SDK 面对的绝大多数威胁是脚本小子和批量工具，不是密码学研究者。</p>' +
-          '<p>关于"哪些具体构造被哪些具体方法攻破"、以及各类攻击的复杂度数字' + T.pill('warn', '待核实') + '：' +
-          '这类结论必须以原始论文为准。本课不引用任何未经核实的具体数值或作者年份，只讲可验证的机制。</p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境四',
-            scenario: '<b>情境：</b>你按 25.4 节做测绘，结果是这样的：<span class="mono">.rodata</span> 里<b>一张表都没有</b>；' +
-              'attach 上去之后内存里确实出现了表，但<b>每次重新启动 App，同一张表的内容都不一样</b>（你已经验证过两次启动的 dump 不同）。' +
-              '你的静态分析、你的表编号、你之前算好的偏移——全部作废。<b>接下来怎么办？</b>',
-            choices: [
-              { t: '既然每次都不一样，说明无法攻击，直接放弃并向上汇报"目标采用了动态白盒，不可攻破"', next: 'n1' },
-              { t: '把攻击全部搬到单次运行内：attach 一次，在这一次运行的进程里完成测绘 + 注入 + 采样 + 解方程，不依赖任何跨运行的静态数据', next: 'n2' },
-              { t: '去逆向表的生成算法，把生成种子提取出来，然后用种子离线重建那张表', next: 'n3' },
-              { t: '尝试在启动之后、表生成完成的那一刻把整个表区 dump 下来，然后用这份 dump 慢慢做静态分析', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '把"我的方法失效了"当成了"目标不可攻破"',
-            result: '<b>认知根源：混淆了"静态分析失效"和"攻击失效"。</b>运行时随机化打的是 <b>DFA 前提②（位置已知）</b>，' +
-              '它的效果是"让跨运行的知识作废"，<b>不是"让运行时的信息消失"</b>。</p>' +
-              '<p>关键在于：<b>在一次运行之内，表是固定的。</b>攻击者要注入故障、要收样本、要解方程，' +
-              '这些动作完全可以在同一个进程里连续完成——<b>他根本不需要跨运行的一致性。</b></p>' +
-              '<p>这类误判的代价很高：它会让你在一个"其实可以攻"的目标面前直接放弃，而放弃的理由听起来还很专业（"动态白盒"）。' +
-              '<b>判断"能不能攻"要看攻击需要的信息在哪，而不是看你的旧工具还能不能用。</b></p>'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '对：把攻击的"生命周期"缩到一次运行内',
-            result: '<b>这是对付运行时随机化的标准答案。</b>具体要做四件事：</p>' +
-              '<p><b>① 测绘和攻击在同一次 attach 里完成。</b>不要"先 dump 下来慢慢分析"——dump 出来的地址和内容在下一次运行就失效了。' +
-              '所有分析脚本都要能在运行时自己找到表（用 25.2 节的置换扫描，几秒钟就能扫完几 MB）。</p>' +
-              '<p><b>② 表的定位必须靠结构而不是靠偏移。</b>偏移会变，但"256 字节双射""被密集索引访问""查表后接异或"这些结构特征不会变。' +
-              '<b>这正是本课把"结构特征"和"内容特征"分开讲的原因。</b></p>' +
-              '<p><b>③ 故障注入与采样要在同一次运行内闭环。</b>改写表项 → 取密文 → 恢复表项 → 换差分再改，全部由脚本自动完成（第 21 章的 RPC 手法）。</p>' +
-              '<p><b>④ 注意校验窗口。</b>如果实现有完整性校验，你的表项改写必须在"校验之后、使用之前"生效，或者在采样完成后立刻恢复——' +
-              '这往往需要先定位校验的时机。</p>'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '把"可绕过的问题"当成了"必须攻克的问题"',
-            result: '<b>认知根源：高估了"理解生成算法"的必要性。</b>去逆向表的生成算法、提取种子，听起来很彻底，但它有两个问题：</p>' +
-              '<p>① <b>种子可能不在本地。</b>如果种子来自服务端下发、或来自设备的可信执行环境，你根本拿不到。' +
-              '这时候这条路是死的，而"单次运行内攻击"这条路仍然活着。</p>' +
-              '<p>② <b>即使拿到了种子，你仍然要走一遍攻击流程。</b>重建出来的表只是让你"有了表"，' +
-              '而 DFA 需要的"注入故障 + 取样本 + 解方程"一步都不会少。</p>' +
-              '<p>更根本的是工程判断：<b>哪条路的产出更早、更稳？</b>单次运行内攻击只需要一个脚本；逆向生成算法可能要几天，还可能一无所获。' +
-              '<b>先做能闭环的那条路，把"读懂生成算法"留作有余力时的加分项。</b></p>'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '方向对了一半，但关键约束没抓住',
-            result: '<b>认知根源：以为"把数据拿到手"就等于"问题解决了"。</b>dump 下整片表区确实是必要动作，' +
-              '但"用这份 dump 慢慢做静态分析"这句里有致命的假设：<b>你假设 dump 出来的地址在后续实验中仍然有效。</b></p>' +
-              '<p>在运行时随机化的实现里，表的<b>地址</b>和<b>内容</b>都可能变。所以 dump 出来的东西只能用于"理解结构"，' +
-              '不能用于"定点注入"。真正要注入故障时，你必须在<b>当前这次运行</b>里重新定位那张表。</p>' +
-              '<p>正确的组合是：<b>运行时定位（用结构特征）+ 运行时注入 + 运行时采样 + 运行时解方程</b>，四件事在同一个进程里串成一条流水线。' +
-              'dump 只是这条流水线上的一个调试手段，不是分析的前提。</p>'
-          }
-        }
-      },
-      after: T.note('ok', '✅ 这一节的收获', '<p style="margin-bottom:0">这张"手段 / 挡住什么 / 代价"的表，可以当成你评估任何加固方案时的检查清单。' +
-        '判断一句口诀：<b>任何加固都在打 DFA 三个前提中的一个——完整性校验打"可控故障"，随机化与反调试打"位置已知"，外部编码打"扩散结构"。' +
-        '没有哪个能一次打掉三个。</b></p>')
-    },
-
-    /* ==================== 25.14 ==================== */
-    {
-      h: '25.14', title: '工程判断：遇到白盒，先问"值不值得攻"',
-      html:
-        '<p>本章最后一节不讲技术，讲判断。因为在你真正遇到白盒实现的那一刻，<b>最贵的不是攻击技术，而是选错了目标</b>。</p>' +
-        '<p>先给一个残酷但真实的事实：<b>绝大多数"我需要搞定这个白盒加密"的需求，其实并不需要密钥。</b>' +
-        '需求通常是"我要能构造出合法请求"，而这件事<b>黑盒调用就能做到</b>——把目标当成一个函数，输入明文、拿回密文。</p>' +
-        T.note('key', '🔑 三个问题，按顺序问', '<p><b>问题一：我需要的是"密钥"，还是"能算出正确密文"？</b></p>' +
-          '<p>如果只是后者——<b>停在这里，不要往下走了。</b>用第 21 章的 RPC 把加密函数封装成服务，' +
-          '一次 attach、常驻进程、批量调用，当天就能出活。这一条能省掉 80% 的白盒分析工作。</p>' +
-          '<p><b>问题二：黑盒调用真的不够吗？</b></p>' +
-          '<p>只有在下面这些情形下，黑盒调用才不够：需要<b>离线</b>算（不能依赖目标设备在跑）、需要<b>极高吞吐</b>' +
-          '（RPC 的开销不可接受）、需要理解算法以<b>构造特殊输入</b>（比如构造碰撞、构造边界用例）、' +
-          '或者密钥本身就是目标（安全评估、漏洞披露、密钥泄露取证）。</p>' +
-          '<p><b>问题三：攻击成本与收益对得上吗？</b></p>' +
-          '<p>白盒 DFA 的完整流程需要：能 root/调试的设备、能脚本化控制目标、能多次重启与采样、' +
-          '还要处理可能的完整性校验与外部编码。<b>这是一项需要按天计的工作，不是按小时。</b>' +
-          '如果收益只是"少跑一个 RPC 服务"，那这笔账怎么算都是亏的。</p>') +
-        T.tbl(['你的真实目标', '推荐路线', '为什么'], [
-          ['只要能批量算出签名/密文', '<b>黑盒调用（RPC 服务化）</b>', '不需要理解算法，当天可用，随目标版本更新只需重新 attach'],
-          ['需要离线复现整条链路', '先黑盒兜底 → 再考虑白盒分析', '黑盒能立刻产出，白盒分析作为长期投入并行推进'],
-          ['需要理解算法（构造特殊输入/安全评估）', '结构测绘 → 统计识别 → 尝试 DFA 或代数攻击', '此时"理解结构"本身就是产出，即使密钥没拿到也有价值'],
-          ['安全评估 / 加固自家产品', '<b>先画威胁模型，再决定要不要上白盒</b>', '见下面的判断：白盒不是默认选项'],
-          ['密钥是唯一目标（取证/披露）', '完整 DFA 流程 + 工程化采样', '这是本章技术的正面用法，但要有"数天到数周"的预期']
-        ]) +
-        T.note('warn', '⛔ 三种典型的"算错账"', '<p><b>① 用白盒分析去解决一个黑盒调用就能解决的问题。</b>' +
-          '投入两周做 DFA，结果发现"其实我只是想让爬虫能发请求"。这是最常见的浪费。</p>' +
-          '<p><b>② 反过来，把黑盒调用当成了终极方案。</b>' +
-          '黑盒方案依赖"目标设备在跑"，一旦对方换了算法、加了设备绑定、或者你需要在离线环境批量生产，黑盒方案立刻失效——' +
-          '而这时你手上没有任何结构性的理解。<b>所以黑盒是兜底，不是终点。</b></p>' +
-          '<p><b>③ 把"攻破白盒"当成了一次性的成就，而不是一条流水线。</b>' +
-          '白盒实现通常是<b>版本化的</b>：加个随机化、换一批表、加一层编码，你上个月的分析成果就作废了。' +
-          '真正有价值的产出是<b>可复用的工具链</b>（自动测绘 + 自动注入 + 自动解方程），而不是"这一次的密钥"。</p>') +
-        T.note('', '🧭 本章的最终判断', '<p>白盒密码不是"绝对安全"，也绝不是"形同虚设"。</p>' +
-          '<p>它做的事情是：<b>把"读内存就能拿到的密钥"变成"需要专门的密码学攻击才能拿到的密钥"。</b>' +
-          '对绝大多数攻击者来说，这个门槛的抬升是决定性的；对少数有能力的对手来说，它只是把成本从几分钟抬到了几周。</p>' +
-          '<p>所以：<b>作为防守方，白盒值得用，但要清楚它买到的是"时间"而不是"保证"；' +
-          '作为攻击方，白盒值得攻，但要先算清楚这笔账——你要的到底是密钥，还是能算出正确结果的工具。</b></p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境五',
-            scenario: '<b>情境：</b>需求方的原话是：「这个 App 的请求签名我们要能自己算，做爬虫用。签名的加密函数在一个 so 里，' +
-              '我们查过了，没有明文密钥，用的应该是白盒 AES。」项目排期给了你 <b>三天</b>。<b>你怎么安排这三天？</b>',
-            choices: [
-              { t: '三天全部投入到白盒 DFA：测绘、注入、解方程，目标是拿到主密钥，然后自己写一份纯 Python 实现', next: 'n1' },
-              { t: '第一天用 RPC 把签名函数封装成服务，先把业务跑通；剩下的时间用来做结构测绘与统计识别，评估 DFA 的可行性', next: 'n2' },
-              { t: '先花两天逆向 so 里的白盒表生成算法，把生成过程完全搞懂，再决定怎么攻', next: 'n3' },
-              { t: '直接告诉需求方"白盒加密攻不了"，让他们改需求或者找别的方式绕过', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '把"技术上的正确路线"当成了"项目上的正确安排"',
-            result: '<b>认知根源：用技术的难度排序替代了需求的优先级排序。</b>' +
-              '白盒 DFA 确实是本章讲的正路，但需求方要的是"<b>能自己算签名</b>"，不是"<b>拿到主密钥</b>"。' +
-              '这两件事在黑盒调用面前是同一个结果，成本却差了十几倍。</p>' +
-              '<p>更现实的问题是排期：白盒 DFA 的三天预算里，前戏（测绘 + 认编码）就可能吃掉一天半，' +
-              '注入与采样又是一天，一旦遇到完整性校验或外部编码，三天根本收不了口。' +
-              '<b>而你交不出东西的那三天，业务是停着的。</b></p>' +
-              '<p>正确的做法不是放弃 DFA，而是<b>先交一个能用的东西，再去做那个更彻底的东西</b>——' +
-              '黑盒服务和白盒分析并不冲突，前者是后者的保底。</p>'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '对：先保底，再攻坚',
-            result: '<b>这是三天预算下唯一合理的安排。</b></p>' +
-              '<p><b>第一天做黑盒服务：</b>attach 一次、把签名函数用 RPC 暴露出来、Python 端包一个接口，' +
-              '当天业务就能跑。这一天的投入几乎不会浪费——即使后面白盒分析成功，这份服务仍然是回归测试的对照组（<b>用它来验证你还原的实现是不是算得一样</b>）。</p>' +
-              '<p><b>剩下的时间做可行性评估：</b>结构测绘（表在哪、几张、多大）、统计识别（是不是 AES 系构造）、' +
-              '有没有外部编码、有没有完整性校验。**这一轮的目的不是拿到密钥，而是回答"DFA 在这个目标上要花几天"**。</p>' +
-              '<p>评估完你才有资格做决策：如果目标干净、没有校验、没有外部编码，DFA 值得继续；' +
-              '如果有三重防护，那就老老实实把黑盒服务产品化（加超时、重试、连接池、监控），而不是硬啃。</p>' +
-              '<p><b>这个安排的核心是：把"确定能交付的东西"排在前面，把"可能做不完的东西"排在后面，并且给后者留一个明确的止损点。</b></p>'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '又是"必须读懂"的情节',
-            result: '<b>认知根源：把"完全理解"当成了行动的前提。</b>逆向表的生成算法、把生成过程搞懂，' +
-              '这件事的产出是"你知道了密钥怎么被放进表里"——<b>而这个知识对你的两个目标（算签名、拿密钥）都不是必需的。</b></p>' +
-              '<p>算签名：黑盒调用就够了，不需要理解生成算法。</p>' +
-              '<p>拿密钥：DFA 需要的是"注入点 + 样本 + 方程"，也不需要理解生成算法（本课 25.3 节的决策演练里已经辨析过这一点）。</p>' +
-              '<p>两天花在这上面，等于把整个排期押在了一个"技术上很爽但工程上可有可无"的环节上。' +
-              '<b>在有限预算的项目里，"够用即可"是一种能力，不是妥协。</b></p>'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '结论下得太早，而且下错了方向',
-            result: '<b>认知根源：把"难"直接翻译成了"不可能"。</b>白盒加密当然不是攻不了——' +
-              '本章给出的流程（测绘 → 识别 → 前戏 → 注入 → 解方程）是一条完整的、可执行的路。' +
-              '说"攻不了"，等于把本课前面十三节全部否定了。</p>' +
-              '<p>而且你给出的替代方案是"改需求或绕过"，这是在<b>没有做任何可行性评估</b>的前提下给出的结论。' +
-              '它可能碰巧是对的（如果目标真的有三重防护），但它是<b>猜对的</b>，不是<b>判断出来的</b>。</p>' +
-              '<p>工程上最忌讳的就是这种"用结论代替调查"：<b>你既没有给业务一个可用的兜底，也没有给技术一个明确的评估，' +
-              '只是把一个可解的问题标记成了不可解。</b></p>'
-          }
-        }
-      },
-      after: T.note('ok', '✅ 本章的收获', '<p style="margin-bottom:0">三件事：<b>① 认出白盒</b>（常量全零命中 + 大块表 + 高频单字节查表 + 查表与异或配对）；' +
-        '<b>② 看懂它的结构</b>（T 表含密钥且是双射，Tyi 表负责扩散、不是双射，编码洗内容不洗结构）；' +
-        '<b>③ 用 DFA 把密钥挖出来</b>（在倒数第二个 MixColumns 之前注入，用四个方程的交集消掉共用的差分，多样本取交集收敛）。</p>' +
-        '<p>最后加一条判断：<b>遇到白盒，先问"值不值得攻"，再问"怎么攻"。</b></p>')
-    },
+        explain: '<b>这道题训练的是「按数据通路排查」而不是「凭感觉猜」。</b><br><br>把 25.2 的九步按数据流切成三段：<b>入口段</b>（①②③④⑤⑥⑦：写、编、加载、验证、JIT、挂载、触发）、<b>存储段</b>（⑧：写 Map）、<b>出口段</b>（⑨：用户态读）。<br><br>「内核侧采集到了但用户态读不到」这个症状，指向的是<b>存储段和出口段</b>。而出口段相对好验证——先确认 Map fd 拿到了、注册回调成功、<code>poll</code> 返回值不是负数。如果出口段没问题，那问题几乎必然在第八步。<br><br>第八步最常见的三个坑：<b>①</b> Map 定义写错（类型、大小、<code>max_entries</code> 不合法——比如 ringbuf 要求 2 的幂）；<b>②</b> <code>reserve</code> 之后忘了 <code>submit</code>（或该 <code>discard</code> 时没归还），记录永远不出现在消费侧；<b>③</b> 没有处理 <code>reserve</code> 返回 NULL 的情况——缓冲满时静默丢数据，看起来就像「什么都没发生」。<br><br><b>排查口诀：先分入口/存储/出口三段定位，再在段内按可能性排序。</b>比逐个环节乱试快得多。'
+      }
+    }
   ],
 
   glossary: [
-    { t: '白盒密码学', d: '研究"在攻击者完全掌握实现、可读全部内存、可单步执行、可改任意中间状态"的前提下如何仍然保护密钥的一类密码学分支。<b>它不改变算法，只改变算法的实现形态。</b>与传统密码学的核心差别在威胁模型，而不在算法强度。' },
-    { t: '白盒实现', d: '把某个标准算法（通常是 AES）用<b>查找表 + 编码</b>重新表达出来的一份具体实现。算法语义不变，但密钥不再以任何可读形式存在——它被复合进了表的生成参数里。' },
-    { t: 'T 表（查找表）', d: '把 AES 的 SubBytes 与 AddRoundKey 合并而成的 256 字节表：<span class="mono">T[x] = S[x ^ k_in] ^ k_out</span>。它<b>含密钥</b>，并且因为"双射复合双射仍是双射"，<b>无论密钥是什么都必然是完美置换</b>——这条性质既是它可以被定位的原因，也是它藏不干净的原因。' },
-    { t: 'Tyi 表（列混合表）', d: '把 MixColumns（以及 ShiftRows 的索引重排）做成"1 字节进、4 字节出"的表，<b>一格 4 字节</b>。它不含密钥，但负责<b>扩散</b>，而且不是双射。<b>DFA 攻击的立足点就在这张表上。</b>' },
-    { t: '外部编码', d: '套在整条链路两端的双射变换：输入先被编码才进入查表，最终输出再被解码。<b>它让攻击者观测到的密文差分不再是方程里的差分</b>（仿射编码时差一个线性映射，非线性编码时关系更复杂）。这是防守方对抗 DFA 的主要手段。' },
-    { t: '内部编码', d: '嵌在相邻两张表之间的双射。作用是堵死"把两张表对接起来消掉中间量"这条捷径——上一张表的输出值域与下一张表的索引值域之间差了一个未知双射。<b>没有内部编码的白盒构造会在极短时间内被解掉。</b>' },
-    { t: 'DFA（差分故障分析）', d: '在分组密码的中间状态注入一个<b>可控的小故障</b>，比较正确与故障输出的差异，利用扩散结构反推轮密钥的一类攻击。<b>原本是灰盒攻击技术</b>（针对硬件故障注入），在白盒场景下因为"改内存/改表项"完全可控而变得更有力。' },
-    { t: '输入差分 Z / 输出差分', d: '注入点处正确值与故障值的异或结果叫<b>输入差分</b>（记作 Z）；正确密文与故障密文的异或结果叫<b>输出差分</b>。DFA 的关键是：Z 未知但<b>四个方程共用同一个 Z</b>，于是可以用"交集"的方式把它消掉。' },
-    { t: '差分谱 / 最大差分计数', d: '对每个非零输入差分 a，统计所有输出差分的出现次数，取全局最大值。<b>AES 系表是 4</b>（S 盒被设计成 4-差分均匀），<b>随机置换在 10~14 之间</b>。<b>仿射编码保持这个上界不变，只有非线性编码才能把它拉回随机水平。</b>这是区分"白盒表"与"随机表"的唯一硬指标——熵做不到这件事。' },
-    { t: '双射 / 置换', d: '一一对应的映射：n 个位置放 n 个互不重复的值。T 表一定是双射（三个双射的复合）；编码也一定是双射（否则解密不成立）。<b>这个"必然性"是攻击方的礼物</b>：靠它可以在几 MB 内存里把表扫出来，逐点采样就能把编码表测出来。' },
-    { t: '攻击前戏（结构测绘）', d: '动手注入故障之前必须完成的四项工作：<b>① 定位表并编号；② 建立"表 → (轮, 位置)"映射；③ 判断有没有输入/输出编码；④ 建立可批量取密文的通道。</b>这一步做错，后面解出的方程一定失败（而且往往不报错）。' },
-    { t: '末轮密钥 K10', d: 'AES-128 最后一轮的轮密钥。<b>DFA 能直接约束的是它</b>：一次单字节故障约束其中 4 个字节（每个约 30 个候选）。拿到一整轮轮密钥之后，可以用密钥扩展的逆过程反推出主密钥（AES-128 由一轮即可，192/256 分别需要更多）。' },
-    { t: '仿射编码', d: '形如 <span class="mono">x → L(x) ^ b</span> 的编码（L 是 GF(2) 上的线性映射）。它的关键性质是<b>保差分</b>：<span class="mono">L(u) ^ L(v) = L(u ^ v)</span>。<b>所以它打乱内容、但不改变差分谱的上界</b>——这解释了为什么纯仿射的外部编码挡不住白盒表的结构识别。' },
-    { t: '运行时随机化', d: '每次启动都重新生成表（或重新生成输入混淆表）的做法。它让"跨运行的静态分析成果"作废，但<b>不能阻止攻击者在单次运行内完成测绘、注入、采样与解方程</b>——所以对付它的办法是把整条攻击流水线缩到一次 attach 之内。' }
+    { t: 'BPF', d: 'Berkeley Packet Filter，1992 年提出的网络包过滤机制，是 tcpdump 背后的底层技术。它只处理网络包，用途很窄。' },
+    { t: 'eBPF', d: 'extended BPF，2014 年（Linux 3.18）引入。把 BPF 从「包过滤器」扩展成<b>一个运行在内核中的通用虚拟机</b>，可挂到几十种事件源上，用于可观测性、网络和安全监控。' },
+    { t: '验证器 Verifier', d: '内核在加载 eBPF 程序时的静态分析器。它<b>不运行</b>程序，而是模拟所有可能的执行路径，证明代码不会崩溃内核、循环有界、内存访问不越界、指针类型正确。<b>它是 eBPF 安全性的基石</b>。' },
+    { t: 'BPF Map', d: '内核态 eBPF 程序与用户态程序共享的键值存储，是两者通信的<b>主要</b>通道。常见类型有 HASH、ARRAY、PERCPU_ARRAY、RINGBUF、PERF_EVENT_ARRAY。' },
+    { t: 'ringbuf', d: '<code>BPF_MAP_TYPE_RINGBUF</code>，现代推荐的流式数据传输方式。单生产者单消费者、无锁、高效，用来取代老式的 perf_event_array（后者是每 CPU 一份缓冲，会打乱事件顺序且 fd 开销大）。' },
+    { t: 'Helper 函数', d: '内核提供给 eBPF 程序调用的受控函数白名单。eBPF 程序<b>不能</b>直接调用任意内核函数，只能通过这些 helper（如 bpf_probe_read_user、bpf_get_current_pid_tgid）。这是安全边界的一部分。' },
+    { t: 'kprobe / kretprobe', d: '内核函数入口 / 返回处的动态探针，用于追踪内核函数调用。属于较底层的手段，依赖具体的内核函数名与签名。' },
+    { t: 'uprobe / uretprobe', d: '用户态函数入口 / 返回处的探针。对逆向最有用——可以直接盯住某个 so 里的加解密、校验函数，且不需要修改目标进程的任何指令。' },
+    { t: 'tracepoint', d: '内核预先定义的静态追踪点（如系统调用的 sys_enter/sys_exit）。相比 kprobe 更稳定，不依赖内核内部函数名，是<b>推荐优先使用</b>的钩子类型。' },
+    { t: 'BTF', d: 'BPF Type Format，内核的调试类型信息，暴露在 <code>/sys/kernel/btf/vmlinux</code>。它是 CO-RE 的基础——没有它，libbpf 无法在加载时做类型重定位。' },
+    { t: 'CO-RE', d: 'Compile Once – Run Everywhere。借助 BTF 类型信息，让同一份 eBPF 目标文件适配不同内核版本。重定位发生在<b>加载时</b>（libbpf 读目标机的 BTF），因此目标机没有 BTF 时无法使用。' },
+    { t: 'XDP', d: 'eXpress Data Path，网络驱动层最早的数据包处理点。在协议栈之前执行，性能极高，常用于高性能包处理、负载均衡和 DDoS 防护。' }
   ],
 
   teacher: {
-    id: 't25', chapter: 25,
-    name: '白盒老张',
-    sub: '别人看见"没有密钥"就走了，你要是也走，说明这一章你白读了',
-    intro: '<p style="margin:0">这一章我要逼你分清楚三件事：<b>威胁模型</b>（白盒到底假设了什么）、<b>结构</b>（表和编码是怎么搭起来的）、<b>攻击的边界</b>（DFA 靠什么成立、什么时候不成立）。' +
-      '很多人读完能说出"白盒就是把密钥藏进表里"，但一问他"为什么表必然能被区分出来""为什么故障必须注在倒数第二轮"，就答不上来了。</p>' +
-      '<p>六道题，最后三道是综合题。<b>答不出综合题，说明你只是读过这一章。</b></p>',
+    id: 'ch11', chapter: 11,
+    name: '追问老师 · 第 25 章',
+    sub: 'eBPF 的安全模型、它和 Frida 的关系、以及它在 Android 上到底能不能用。',
+    intro: '<p style="margin:0">这一章名词多、门槛高，所以我会问得比前几章更狠。<b>我不接受「eBPF 很强大所以要用它」这种回答</b>——我要听的是：内核凭什么信任它、数据怎么回来、以及在你的目标设备上它究竟跑不跑得起来。答不上来我会一层层追问，直到你自己把逻辑补完整。</p>',
     questions: [
       {
-        id: 'c25q1', depth: 1, threshold: 0.7,
-        q: '传统密码学的假设是"算法公开、密钥保密"。白盒场景把这个假设换成了什么？<b>换掉之后，为什么"把密钥算出来、用完清零"这种写法就不再安全了？</b>',
+        id: 'c11q1', depth: 1, threshold: 0.7,
+        q: '<b>BPF</b> 和 <b>eBPF</b> 是什么关系？请说清 BPF 最初是干什么的、eBPF 在什么时候把它变成了什么。',
         concepts: [
-          { label: '白盒假设攻击者拥有实现的一切：可读全部内存、可单步、可改任意中间状态',
-            hint: '白盒攻击者的能力清单里，比"能读内存"还多了什么？',
-            any: ['读内存', '读全部内存', '全部内存', '任意内存', '单步', '调试', '可改', '修改中间', '任意时刻', '完全掌握', '拥有实现', '拿到实现', '实现的一切', '运行内存', 'dumped', 'dump'] },
-          { label: '密钥只要在某一刻以完整形态出现过，就等于泄露（清零只能挡住"事后 dump"）',
-            hint: '内存断点是什么时候生效的？清零点执行之前，密钥在不在？',
-            any: ['某一刻', '存在过', '出现过', '某一瞬间', '清零前', '清零之前', '完整形态', '明文形式', '瞬时', '短暂的', '断点', '时刻'] },
-          { label: '设计目标变成：让密钥不以完整形态存在（溶进运算、复合进表、被打散）',
-            hint: '既然不能"藏起来"，那就只能怎么办？',
-            any: ['不以完整', '不存在完整', '溶进', '融入', '复合', '打散', '分散', '藏进表', '嵌入', '散布', '混进', '重新编码'] },
-          { label: '白盒的定位是"提高成本"，不是提供绝对保证',
-            hint: '白盒能让攻击变成不可能吗？还是只是变贵？',
-            any: ['提高成本', '成本', '代价', '变贵', '时间成本', '不是绝对', '不能保证', '不是不可能', '提高门槛', '门槛'] }
+          { label: 'BPF 是 1992 年提出的网络包过滤机制，是 tcpdump 的底层',
+            hint: '先想 tcpdump 抓包的时候，那些过滤表达式最终是谁在执行？',
+            any: ['1992', '包过滤', '抓包', 'tcpdump', 'libpcap', 'packet filter', 'berkeley packet filter', '网络包', '报文过滤', '过滤网络包'] },
+          { label: 'eBPF 是 extended BPF，2014 年随 Linux 3.18 引入',
+            hint: '它是在哪个内核版本进入主线的？',
+            any: ['2014', '17.18', 'extended bpf', 'linux 3.18', '扩展 bpf', '扩展版 bpf'] },
+          { label: 'eBPF 把它从专用过滤器升级成运行在内核中的通用虚拟机',
+            hint: '升级之后，它还能不能只处理网络包？',
+            any: ['通用虚拟机', '虚拟机', 'vm', 'virtual machine', '通用', '不再局限于网络', '不只是网络', '内核中运行', '内核态运行', '可编程', '通用执行引擎', '跑在内核里'] }
         ],
         hints: [
-          '先把攻击者的能力列全：不只是"能读"，还包括"能在任意时刻读"和"能改"。',
-          'memset 清零是一个动作，它发生在某个时间点。在这个时间点<b>之前</b>，那 16 个字节在不在内存里？攻击者能不能在那里下断点？'
+          '回忆一下：tcpdump 写 `tcp port 80` 这种过滤条件时，真正的过滤动作发生在用户态还是内核态？',
+          '版本号是个硬知识：BPF 的年代，和 eBPF 进入 Linux 主线内核的版本。'
         ],
         probes: [
-          '追问：如果这个实现把密钥算出来之后立刻用掉、从不写回内存（全部在寄存器里流转），你的结论会变吗？为什么？',
-          '追问：那白盒实现凭什么认为"密钥被复合进表里"就比"密钥在内存里"更安全？它赌的是什么？'
+          '你说 eBPF 是「通用虚拟机」——那它「通用」体现在哪里？和原来只处理网络包相比，多了什么能力？',
+          '为什么这个改动值得单独立一个名字？直接叫 BPF 2.0 不行吗？'
         ],
-        model: '传统模型是"算法公开、密钥保密"——攻击者可以研究一切，就是拿不到密钥。白盒把这个假设整个抽掉了：' +
-          '<b>攻击者手里有完整的实现、能读全部内存、能单步执行、还能在任意指令前把寄存器的值改掉。</b>' +
-          '注意最后两项——它们把问题从"你能不能拿到"变成了"你能不能拦住他拿"，而后者在没有硬件保护的前提下是无解的。</p>' +
-          '<p>所以"算出来、用完 memset 清零"这种写法在大方向上是对的（不落盘、不常驻，这是黑盒模型下的教科书做法），' +
-          '但它对白盒攻击者无效：<b>清零是一个时间点上的动作，而攻击者能在清零之前的任意时刻读内存、下内存断点。</b>' +
-          '那句"密钥存在过"就等于"密钥被看到了"，是这一问的核心。</p>' +
-          '<p>于是设计目标被迫改变：<b>不是"让你拿不到钥匙"，而是"让钥匙不以钥匙的形态存在"。</b>' +
-          '白盒实现的做法是把密钥<b>复合进表的生成参数</b>——密钥不再是内存里的 16 个字节，而是决定了 256 个表项取值的那组系数。' +
-          '单看任何一个表项，都有 256 种密钥组合能解释它。</p>' +
-          '<p>最后必须补一句判断：<b>白盒买到的是"时间"，不是"保证"。</b>' +
-          '本章后面会证明，这些表在统计上仍然可以被识别、在数学上仍然可以被攻击。' +
-          '所以正确的说法是"它把攻击成本从几分钟抬到了几周"，而不是"它让攻击变得不可能"。' +
-          '<b>把这个定位说清楚，你在工程上才不会做错误的取舍。</b>',
-        after: '<p>如果你答出了"清零挡不住任意时刻读取"但没答出"白盒只是提高成本"，说明你的威胁模型清楚了，但工程判断还没建立。<b>这两件事在实战里同样重要。</b></p>'
+        model: '<b>BPF（Berkeley Packet Filter）诞生于 1992 年</b>，解决的问题非常具体：网络抓包时，如果每个包都要先拷到用户态再判断「要不要」，开销太大。BPF 的思路是把过滤规则编译成一小段字节码，<b>在内核里先筛一遍</b>，只把命中的包交给用户态。它是 <code>tcpdump</code> 背后的底层机制（经由 libpcap），几十年里一直很稳定，但用途也一直很窄——只处理网络包。' +
+          '<br><br><b>eBPF（extended BPF）在 2014 年随 Linux 3.18 进入主线内核</b>，做的是把 BPF 从「一个专用过滤器」彻底重做成「<b>一个运行在内核中的通用虚拟机</b>」。这个「通用」体现在三处：<b>①</b> 输入不再限于网络包——内核提供了几十种<b>钩子点</b>（kprobe、tracepoint、uprobe、XDP、LSM……），挂在哪里决定它看见什么；<b>②</b> 指令集扩充为 64 位、寄存器从 2 个扩到 10 个以上（具体数量不必死记），能表达更复杂的逻辑；<b>③</b> 有了 <b>BPF Map</b> 这个内核态与用户态共享的存储，程序可以把状态留下来、把结果交出去。' +
+          '<br><br>于是今天它被用在可观测性（性能分析、系统调用追踪）、网络（负载均衡、DDoS 防护）和安全监控上。<b>对逆向工程师来说，最重要的那句总结是：eBPF 让我们第一次有了一个「写起来像普通程序、跑起来在内核态、还不改目标进程一个字节」的观测手段。</b>',
+        after: '<p>这道题是地基。如果 BPF/eBPF 的关系说不清，后面验证器、Map、Android 限制全都挂不上。</p>'
       },
-
       {
-        id: 'c25q2', depth: 2, threshold: 0.7,
-        q: '第 8 章教你"常量特征比对"是还原加密实现的永远的第一步。现在你在一个 App 上做这件事，<b>全部零命中</b>。' +
-          '请说明：① 为什么这些常量会全部消失？② 除了"零命中"之外，你还要观察到哪几件事，才能把它定性为白盒实现（而不是"运行时解密"或"自研算法"）？',
+        id: 'c11q2', depth: 2, threshold: 0.75,
+        q: '内核凭什么敢让用户写的代码在内核态执行？<b>验证器</b>具体检查哪些东西？请至少说出三项，并解释为什么它被称为 eBPF 安全性的基石。',
         concepts: [
-          { label: '常量被复合/吸收进表，原样不再存在（不是被加密、不是被隐藏）',
-            hint: 'S 盒和轮密钥是被"藏起来"了，还是被"用掉了"？',
-            any: ['复合', '融进', '吸收', '吃掉', '吃进', '不再存在', '不存在', '打散', '生成参数', '合并', '并入', '被用掉'] },
-          { label: '观察特征：存在大块连续数据（几 KB 到几百 KB 的表区）',
-            hint: '把多轮运算合并成查表，体积会变成什么样？',
-            any: ['大块', '巨大', '大片', '表区', '连续数据', '几十 kb', '几百 kb', 'kb', '体积', '内存块', '数据区'] },
-          { label: '观察特征：高频、单字节、以变量为索引的查表，且与异或紧邻出现',
-            hint: '表的"用法"是什么样的？看访问模式而不是看内容。',
-            any: ['查表', '查找表', '索引', '高频', '单字节', '异或', 'eor', 'ldrb', '访问模式', '变量索引', '密集'] },
-          { label: '观察特征：区域内存在大量"不等于标准 S 盒"的 256 字节完美置换',
-            hint: 'T 表是什么数学对象？它和标准 S 盒的关系是什么？',
-            any: ['置换', '双射', 'permutation', '256 字节', '256字节', '不等于标准', '不是标准', 's 盒', 's盒', 'sbox', '和标准不一样'] },
-          { label: '与"运行时解密"区分：动静态都做了，仍然找不到任何标准常量',
-            hint: '第 9 章那个"静态没有、动态有"的情况，在这里是什么结果？',
-            any: ['动态', '静态', '运行时', 'attach', '内存扫描', '两边', '都找不到', '都零命中', 'dump 内存', '也搜不到'] }
+          { label: '验证器做的是静态分析，不实际运行程序',
+            hint: '它是「跑一遍看看会不会崩」，还是「证明它不可能崩」？',
+            any: ['静态分析', '静态检查', '不运行', '不会真的执行', '不实际执行', '模拟执行', '符号执行', '证明', 'statically', 'static analysis', '遍历所有路径', '所有可能路径'] },
+          { label: '检查循环：老内核完全禁止，新内核要求能证明循环有界',
+            hint: '如果程序里有个永不结束的循环，内核会怎么样？',
+            any: ['循环', '死循环', '有界', '边界', '上界', '无限循环', 'loop', 'bounded', '有界循环', '循环次数', '不能无限'] },
+          { label: '检查内存访问：读写必须落在合法范围内，不能越界',
+            hint: '如果程序读了一个越界的地址会怎样？',
+            any: ['内存访问', '越界', '边界', '偏移', '范围', 'out of bound', 'bounds', '内存安全', '读写范围', '非法地址', '不能越界'] },
+          { label: '检查指针类型：ctx / Map value / 包指针不能混用，算术运算后类型会退化',
+            hint: '一个指向 Map value 的寄存器，能不能当上下文指针用？',
+            any: ['指针类型', '类型系统', '类型检查', '寄存器类型', 'ptr_to', '不能混用', '类型退化', 'pointer type', '类型不匹配', '类型安全'] },
+          { label: '检查 helper 调用是否在白名单内、参数类型是否匹配',
+            hint: 'eBPF 程序能不能随便调用内核函数？',
+            any: ['helper', '白名单', '受控', '调用限制', '参数类型', '允许调用的函数', '不能调用任意', 'helper 白名单'] },
+          { label: '它是安全性的基石：证明不通过就拒绝加载，把「信任作者」变成「证明程序安全」',
+            hint: '如果去掉验证器，eBPF 还能存在吗？',
+            any: ['基石', '基础', '根本', '拒绝加载', '加载失败', '不允许加载', '不信任作者', '证明安全', '安全保证', '没有它就不安全', '先决条件', '前提'] }
         ],
         hints: [
-          '先想清楚"零命中"有几种可能的原因（第 8 章列过三种），然后想：白盒属于哪一种？',
-          '白盒不是把常量藏起来，而是把常量<b>用掉了</b>。用掉之后留下的是什么？'
+          '换个角度问自己：如果内核直接执行用户提交的任意字节码，攻击者会怎么做？把你能想到的坏事列出来，每一条对应验证器的一项检查。',
+          '「循环、内存、指针」是三项核心检查；除此之外还有一类和「能调用什么函数」有关的检查。'
         ],
         probes: [
-          '追问：如果静态零命中、但 attach 之后能扫到标准 S 盒，你的结论会变成什么？下一步做什么？',
-          '追问：那些"256 字节的置换表"，你能只靠结构把它们全都扫出来吗？为什么这个办法比搜内容可靠？'
+          '你说验证器检查内存访问——那内核态程序想读用户态内存里的字符串，直接解引用行不行？为什么？',
+          '为什么旧内核干脆禁止循环，而不是想办法限制循环次数？后来为什么又放开了？'
         ],
-        model: '常量全部消失的原因不是"藏"，而是<b>"用掉"</b>。标准 AES 的 S 盒、轮密钥这些常量，在白盒实现里被<b>复合进了表的生成式</b>：' +
-          '<span class="mono">T[x] = S[x ^ k_in] ^ k_out</span>。这一步之后，<b>内存里再也不存在"标准 S 盒"这段字节序列</b>——' +
-          '它被"求值"进 256 个表项里了。所以第 8 章的常量比对不是"匹配失败"，而是<b>根本没有匹配的对象</b>。</p>' +
-          '<p>但仅凭"零命中"还不能定性，因为第 8、9 章讲过另外两种可能：常量被 OLLVM 拆散、或者常量运行时才解密出来。' +
-          '所以要补三件事：<b>① 动态也做一遍</b>——attach 上去扫可读写内存，如果还是零命中，就排除了"运行时解密"；' +
-          '<b>② 看有没有大块表区</b>——几 KB 到几百 KB 的连续数据，这是"把多轮运算合并成查表"的必然产物；' +
-          '<b>③ 看访问模式</b>——高频、单字节、以变量为索引，而且紧邻异或指令。</p>' +
-          '<p>其中最漂亮的一条证据是：<b>在那片区域里存在大量 256 字节的完美置换，但没有一个等于标准 S 盒。</b>' +
-          '为什么一定会这样？因为 T 表是三个双射（异或常量、S 盒、异或常量）的复合，<b>必然还是双射</b>；' +
-          '而它又和标准 S 盒不同（被密钥复合过了）。"是置换但不等于 S 盒"这个组合，是白盒 T 表最干净的签名。</p>' +
-          '<p>这里有一个思维上的升级值得点出来：<b>第 9 章教你的"置换特征"是用来找表的（内容无关），' +
-          '而在白盒场景里它同时承担了"定性"的功能。</b>内容特征会被编码洗掉，结构特征不会——' +
-          '这条判断在本章会被反复用到：<b>找表靠结构，认表靠差分谱，打表靠扩散结构。</b>',
-        after: '<p>补充一条实战提醒：如果那片表区在 <span class="mono">.rodata</span> 里，说明表是编译期就生成的（静态可分析）；' +
-          '如果在 <span class="mono">.bss</span>/堆上、且每次启动都不一样，那就是运行时随机化，见 25.13 节的决策演练。</p>'
+        model: '<b>验证器（verifier）要回答的是「凭什么信任」这个问题，而它的答案不是信任作者，而是证明程序安全。</b>注意它的工作方式是<b>静态分析</b>：<b>它不会真的把程序跑一遍看会不会崩</b>，而是模拟执行字节码的<b>所有可能路径</b>，逐条指令地证明这段代码不可能损坏内核。' +
+          '<br><br>核心检查有三项：<br>' +
+          '<b>① 循环。</b>最早的 eBPF <b>完全禁止循环</b>——因为内核态死循环等于整机卡死，而这个后果无法接受。后来内核放宽了限制：允许循环，但验证器<b>必须能证明它有界</b>（例如循环次数是常量，或被限定在某个可证明的范围内）。证明不了的，直接拒收。这就是为什么在 eBPF 里写 <code>while</code> 要格外小心。<br>' +
+          '<b>② 内存访问。</b>内核指针（ctx、Map value、数据包）的每次读写，偏移量都必须被证明落在合法范围内。越界一次，轻则信息泄露，重则内核 oops。特别地，<b>用户态指针在内核里绝对不能直接解引用</b>——用户态随时可能把那块内存 unmap 掉，必须改用 <code>bpf_probe_read_user()</code> 这类 helper 做安全拷贝。<br>' +
+          '<b>③ 指针类型。</b>验证器维护一套寄存器类型系统：这是 ctx 指针、那是指向 Map value 的指针、那只是个标量。类型是一道硬墙，不能混用；而且<b>指针一旦做算术运算，类型就会退化</b>，之后想再用它读写必须重新做边界检查。<br><br>' +
+          '此外还会检查 <b>helper 调用</b>：eBPF 程序不能调用任意内核函数，只能用内核提供的受控 helper，且不同程序类型开放的白名单不同。<br><br>' +
+          '<b>为什么说它是基石？</b>因为它是「允许用户代码进内核」这个决定的唯一担保。没有验证器，eBPF 就是一个任意内核代码执行漏洞——整个技术根本不可能被接受进主线内核。所以验证失败不是异常而是常态，排查顺序建议是：<b>先看循环有没有上界，再看有没有直接解引用用户态指针，最后看指针类型有没有用混。</b>',
+        after: '<p>能把这三项检查和「如果不管会出什么事」一一对应上，就说明你真的理解了 eBPF 的安全模型，而不是背了三条名词。</p>'
       },
-
       {
-        id: 'c25q3', depth: 2, threshold: 0.7,
-        q: '一张白盒 T 表 <span class="mono">T[x] = S[x ^ k] ^ k\'</span>，<b>对任意密钥 k、k\' 都必然是 256 字节的完美置换</b>。' +
-          '请解释为什么，并说明这个"必然性"对<b>防守方</b>和<b>攻击方</b>分别意味着什么。',
+        id: 'c11q3', depth: 2, threshold: 0.75,
+        q: 'eBPF 程序跑在内核态，它采到的数据是<b>怎么回到用户态</b>的？为什么一定要走这条路？另外，<code>ringbuf</code> 相比老的 <code>perf_event_array</code> 好在哪？',
         concepts: [
-          { label: '因为它是三个双射的复合：异或常量、S 盒代替、再异或常量；双射的复合仍是双射',
-            hint: '分别看三个步骤：各自是不是一一对应？复合之后呢？',
-            any: ['双射', '一一对应', '置换', '复合', '三个', '异或', 's 盒', 'sbox', '仍是双射', '保持双射', 'bijection'] },
-          { label: '对防守方：它让 T 表和随机表"看起来一样"，这是隐蔽性的来源',
-            hint: '如果 T 表长得一眼就能认出来，白盒还有什么意义？',
-            any: ['隐蔽', '看起来一样', '像随机', '看不出', '伪装', '掩盖', '不分', '难以识别', '混淆'] },
-          { label: '对攻击方：置换这个结构特征让表可以被全内存扫描出来（结构比内容抗魔改）',
-            hint: '第 9 章用什么特征在几 MB 内存里找表？',
-            any: ['扫描', '扫出来', '定位', '找表', '结构特征', '无重复', '不重复', '值域', '结构', '置换扫描'] },
-          { label: '更深一层：双射性意味着密钥的信息被完全确定，攻击只需找那 2 个字节而不是枚举 256! 种表',
-            hint: '生成这张表需要多少密钥材料？而它有多少种可能的形态？',
-            any: ['完全确定', '信息量', '信息', '2 个字节', '两个字节', '16 位', '256!', '阶乘', '表示冗余', '冗余', '唯一确定'] }
+          { label: '通过 BPF Map：内核态与用户态共享的键值存储，是两者通信的主要通道',
+            hint: '它不是「发消息」，那它是什么？',
+            any: ['map', 'bpf map', 'bpf maps', '共享', '键值', '键值对', '共享存储', '共享内存', '通信通道', '主要通道', 'kv', 'key value'] },
+          { label: '内核态用 helper 写：bpf_map_lookup_elem / bpf_map_update_elem / bpf_map_delete_elem 等',
+            hint: '内核侧是用什么 API 往 Map 里放东西的？',
+            any: ['helper', 'bpf_map_update_elem', 'bpf_map_lookup_elem', 'bpf_map_delete_elem', 'bpf_map_update', 'bpf_map_lookup', 'map_update_elem', '用 helper 写'] },
+          { label: '用户态按 fd 读：通过 bpf() 系统调用或 libbpf 提供的封装',
+            hint: '用户态拿到的是什么句柄？',
+            any: ['fd', '文件描述符', 'libbpf', 'bpf()', 'bpf 系统调用', '系统调用', 'bpf_map__fd', '用户态读', '轮询', 'poll', 'map fd'] },
+          { label: '内核态不能直接 printf，也不能直接把数据推给某个进程',
+            hint: 'eBPF 里有 printf 吗？',
+            any: ['不能 printf', '不能直接输出', '没有 printf', '不能打印', 'bpf_printk', '不能直接通信', '无法直接', '不能任意调用', '只能写 map', '没有 libc'] },
+          { label: 'ringbuf 是单生产者单消费者、无锁、高效，推荐用于流式数据',
+            hint: 'ringbuf 的核心卖点是它的并发模型。',
+            any: ['ringbuf', 'ring buffer', '环形缓冲', '单生产者', '单消费者', '无锁', 'lock free', 'lockless', '高效', 'spmc', '推荐'] },
+          { label: 'perf_event_array 是每 CPU 一份缓冲，会打乱事件顺序、fd 开销大，所以被 ringbuf 取代',
+            hint: '老方案在多核机器上有什么麻烦？',
+            any: ['perf_event_array', 'perf buffer', 'perf 缓冲', '每 cpu', 'per cpu', '每个 cpu', '顺序', '乱序', '打乱', '开销大', '文件描述符多', 'fd 多', '被取代', '老方案', '旧方案'] }
         ],
         hints: [
-          '分开看三步：<span class="mono">x→x^k</span>、<span class="mono">S</span>、<span class="mono">y→y^k\'</span>，每一步是不是一一对应？',
-          '再想一个反问题：如果某一步不是双射（比如把两个不同的输入映射到同一个输出），会有什么后果？'
+          '关键认识：Map 不是「内核发给用户态的消息」，而是双方都能按 fd 访问的<b>同一块存储</b>。先接受这一点，所有 API 就顺了。',
+          '想想多核：如果每个 CPU 都往自己那份缓冲里写，用户态读的时候，事件的全局顺序还保得住吗？'
         ],
         probes: [
-          '追问：如果实现者"自作聪明"把 T 表改成带轻微碰撞的形式（不再严格双射），加密结果会怎样？',
-          '追问：既然双射是必然的，那防守方有没有办法在保持双射的同时，让这张表"不像是 AES 造出来的"？代价是什么？'
+          '你说用 Map 传数据——那如果我要传的是「源源不断的事件流」而不是「一张统计表」，Map 类型该怎么选？为什么？',
+          '内核态程序往 Map 里写的时候，有没有可能写失败？失败了你该怎么办？（提示：验证器会盯着你）'
         ],
-        model: '分三步看：<b>① <span class="mono">x → x ^ k</span></b>：异或是一个对合（自己是自己的逆），所以它是双射；' +
-          '<b>② <span class="mono">S</span></b>：AES 规范里 S 盒本身就是 256 个字节的一个置换；' +
-          '<b>③ <span class="mono">y → y ^ k\'</span></b>：同样是双射。' +
-          '<b>三个双射的复合仍然是双射</b>——这是一个不依赖任何密钥取值的代数事实。</p>' +
-          '<p>对<b>防守方</b>来说：这个性质是他们的"隐蔽性"来源。正因为 T 表是双射，它的值域覆盖了全部 256 个值、' +
-          '看起来和一张随机表没有区别，常量比对和"值分布"类的检测全部失效。' +
-          '如果 T 表不是双射（值域有缺失或重复），它反而会变成一个非常显眼的目标。</p>' +
-          '<p>对<b>攻击方</b>来说：这条性质是礼物，而且送了两份。</p>' +
-          '<p><b>第一份是定位能力。</b>第 9 章教过"用置换特征全内存扫描"——n 个位置恰好覆盖 n 个值，无重复无缺失。' +
-          '随机内存通过这个检验的概率极低，所以你能在几 MB 内存里几秒钟筛出个位数候选。<b>内容被编码洗掉了，结构没有。</b></p>' +
-          '<p><b>第二份更深刻：双射性意味着"密钥被完全确定"。</b>' +
-          '生成这张表只需要 2 个字节（<span class="mono">k</span> 和 <span class="mono">k\'</span>），' +
-          '但它的可能形态有 <span class="mono">256!</span> 种。' +
-          '换句话说，<b>表带着巨大的"表示冗余"</b>——表面上有天文数字种可能，实际上只由 16 位决定。' +
-          '攻击方完全不需要枚举 <span class="mono">256!</span> 种表，只需要找到那 16 位。' +
-          '<b>DFA 干的就是这件事：绕过表面上的巨大可能性，直接求解背后那两个字节。</b></p>' +
-          '<p>把这两份礼物合起来看，你会得到一个对整章都成立的判断：' +
-          '<b>白盒实现越是努力把密钥"溶"进表里，就越是保证了表的数学结构（双射性、差分谱）被完整继承下来——' +
-          '而攻击方利用的恰恰是这些结构。</b>这是白盒密码最根本的张力。',
-        after: '<p>如果只说对了"三个双射复合"但说不出后面两层含义，说明你停在了代数层面。<b>这一章的技术判断都建立在"结构必然被继承"这句话上。</b></p>'
+        model: '<b>内核态和用户态之间只有一条主要通道：BPF Map。</b>先纠正一个常见误解——Map <b>不是「内核发给用户态的消息队列」</b>，而是<b>一块双方都能按 fd 访问的共享键值存储</b>。内核侧和用户态侧谁也不「发送」什么，只是各自往同一个 fd 上读写而已。理解这一点，后面所有 API 都不再别扭。' +
+          '<br><br><b>为什么必须走这条路？</b>因为 eBPF 程序的能力被刻意收窄了：它没有 libc，<b>不能调用 printf，也不能直接把数据交给某个用户态进程</b>。它唯一被允许的对外动作，就是通过 helper 操作内核对象。<br><br>' +
+          '<b>内核侧</b>用 helper 写：<code>bpf_map_lookup_elem()</code>、<code>bpf_map_update_elem()</code>、<code>bpf_map_delete_elem()</code>；流式场景则用 ringbuf 的 <code>reserve</code>/<code>submit</code> 配对。<br>' +
+          '<b>用户态侧</b>通过 <code>bpf()</code> 系统调用，或直接用 libbpf 的封装（如 <code>bpf_map__fd()</code>、<code>ring_buffer__poll()</code>）读同一块存储。' +
+          '<br><br><b>ringbuf 相比 perf_event_array 的改进</b>：老的 <code>perf_event_array</code> 是<b>每个 CPU 一份缓冲</b>，带来两个麻烦——多核下事件的<b>全局顺序会被打乱</b>，而且要开一大堆 fd、管理成本高。' +
+          '<code>ringbuf</code>（<code>BPF_MAP_TYPE_RINGBUF</code>）是<b>单生产者单消费者、无锁</b>的环形缓冲，所有 CPU 共享一个，既保序又高效，是<b>现代推荐的流式传输方式</b>。' +
+          '<br><br><b>实战提醒：</b>在 Map 上做操作必须<b>判空</b>、写 ringbuf 前 <code>reserve</code> 失败必须返回——验证器会检查这些分支。漏掉判空，加载就被拒。另外结构体大小和栈上临时变量都有尺寸上限，超出会直接失败。',
+        after: '<p>把「Map 是共享存储而不是消息通道」这句话记住，你就超过了大多数只会照抄 BCC 脚本的人。</p>'
       },
-
       {
-        id: 'c25q4', depth: 3, threshold: 0.6,
-        q: '<b>综合题。</b>本章第 25.7 节声称"白盒表看起来随机，但不是均匀随机，所以能被区分出来"。' +
-          '请把这条判断讲透：① <b>哪些统计量区分不出来，为什么</b>？② <b>哪个统计量能区分，它衡量的是什么</b>？' +
-          '③ <b>这个"能被区分"和"DFA 能成功"之间到底是什么关系</b>——是同一件事、还是两件不同的事？',
+        id: 'c11q4', depth: 3, threshold: 0.75,
+        q: '<b>综合题。</b>你手上有一台 Android 手机，想用 eBPF 观测某个 App 的行为。请说出至少<b>四重</b>限制，每重说明「挡住了什么、能不能绕过」；并说明你会按什么顺序去探测一台设备到底支不支持。',
         concepts: [
-          { label: '熵与双射性区分不出来：因为任何 256 字节的置换都有熵 8.0、都是双射，边缘分布完全一样',
-            hint: '熵算的是"值出现了几次"，也就是边缘分布。置换的边缘分布是什么？',
-            any: ['熵', 'entropy', '边缘分布', '都是 8', '8.0', '都一样', '相同', '区分不出', '无法区分', '每个值出现一次', '双射', '置换'] },
-          { label: '差分谱（最大差分计数）能区分：AES 系表是 4，随机置换在 10 以上',
-            hint: '哪个指标衡量"表内部的输入输出关系"而不是"表里有哪些值"？',
-            any: ['差分谱', '差分', 'ddt', '最大差分', '差分均匀', '差分分布', 'differential', '4', '10', '条件分布'] },
-          { label: '关系的本质一：统计可区分 = "AES 的代数结构还在"的旁证，说明表不是随机生成的而是 AES 造的',
-            hint: '如果目标真的用随机表，那说明什么？',
-            any: ['代数结构', '结构还在', 'aes 造的', '是 aes', '继承', '留下痕迹', '指纹', '旁证', '说明是', '结构没变'] },
-          { label: '关系的本质二：DFA 利用的正是同一份结构（扩散结构 = MixColumns 列混合 + ShiftRows 搬移），两者是"同一原因的两个后果"',
-            hint: '统计特征来自表继承了 AES 的结构；那 DFA 靠的是什么？',
-            any: ['同一', '一样的原因', '同一个原因', '扩散', '列混合', '列混淆', 'mixcolumns', 'shiftrows', '结构', '正因为', '都来自'] },
-          { label: '边界：如果防守方用非线性编码把差分谱洗掉，统计识别与 DFA 都会变难，但不会完全失效（扩散结构仍在）',
-            hint: '能不能把结构彻底洗掉？洗掉之后算法还能工作吗？',
-            any: ['非线性', '编码', '洗掉', '变难', '更难', '打乱', '不会失效', '仍然', '扩散还在', '代价', '仿射'] }
+          { label: '内核版本：老设备内核太旧，较完整的 eBPF 能力一般需要 4.14+',
+            hint: 'Android 9 对应哪个内核版本？更完整的 eBPF 能力需要多新？',
+            any: ['内核版本', 'kernel 版本', '版本太旧', '18.14', '18.9', 'kernel 4', '版本低', '内核太老', 'android 9', '内核基线'] },
+          { label: '厂商内核裁剪：BPF 相关配置可能未开启，CONFIG_BPF_SYSCALL 未开则完全无法加载',
+            hint: '厂商为了让内核变小、攻击面变小，会做什么？哪个配置是总闸？',
+            any: ['裁剪', '厂商', '定制内核', 'config', '内核配置', 'CONFIG_BPF_SYSCALL', 'BPF_SYSCALL', 'CONFIG_BPF_JIT', 'BPF_JIT', 'DEBUG_INFO_BTF', '未开启', '没开', '总闸', '编译选项', '阉割'] },
+          { label: 'SELinux 强制访问控制会限制 bpf() 系统调用，普通 App 无权调用',
+            hint: 'Android 上有一层强制访问控制，它会拦系统调用。',
+            any: ['selinux', '强制访问控制', 'mac', '策略', 'policy', '被拦', '拦截', '权限控制', 'enforcing', '无权调用', '普通 app 无权'] },
+          { label: '需要 root（或定制 ROM）：前面几条叠加的结果',
+            hint: '前面三条叠加起来，最后的现实门槛是什么？',
+            any: ['root', '超级用户', '提权', 'su', 'magisk', '定制 rom', '刷机', '高权限', 'cap_bpf', 'cap_sys_admin', '需要权限'] },
+          { label: 'Android 系统自身在用 eBPF（如按 UID 的网络流量统计），证明可行但这些程序由系统进程加载',
+            hint: 'Android 自己有没有在用 eBPF？这说明了什么、又没说明什么？',
+            any: ['android 自己', '系统自己在用', '流量统计', 'trafficController', 'traffic controller', '系统进程', '系统加载', '证明可行', '网络统计', 'uid 统计', '按 uid'] },
+          { label: '探测顺序与实测意识：不臆测，要在目标设备上按版本→配置→BTF→SELinux→root 逐项确认（且结果有时效性）',
+            hint: '不同厂商机型差异极大，你凭什么下结论？',
+            any: ['实测', '探测', '验证', '确认', 'uname', 'config.gz', 'btf', 'vmlinux', 'getenforce', '逐项', '顺序', '不确定', '差异大', '以实测为准', '时效', '不能假设', '不能臆测'] }
         ],
         hints: [
-          '先把"熵"和"差分谱"分别算的是什么分布说清楚：一个是边缘分布，一个是条件分布。',
-          '再问一句：如果统计上完全无法区分白盒表和随机表，那这张表还能正确实现 AES 吗？',
-          '最后把两条线并起来看：统计特征和扩散结构，是不是都来自同一个东西？'
+          '把「支持 eBPF」拆成四个独立维度来想：内核<b>有没有</b>这个特性、这个特性在这台机器上<b>有没有被编译进来</b>、你有<b>没有权限</b>调用它、你<b>是不是 root</b>。',
+          '还有一个反直觉的事实：Android 系统自己就在用 eBPF。想清楚这件事「证明了什么」和「没证明什么」。'
         ],
         probes: [
-          '追问：假设有个实现把每张 T 表都换成了真正的随机置换，同时"顺便"记录下正确的映射关系。它能正确加密吗？这样的实现还能用 DFA 打吗？',
-          '追问：如果我在输出侧加一层非线性编码，差分谱被洗到随机水平了。这时我的统计识别失效了——DFA 是不是也失效了？为什么？'
+          '你说要看内核配置——如果 <code>/proc/config.gz</code> 这个文件在设备上根本不存在，你还能怎么判断内核支不支持 BPF？',
+          '假设探测结果是没有 BTF，但 CONFIG_BPF_SYSCALL=y、也有 root。你会放弃吗？如果不放弃，方案要怎么改？'
         ],
-        model: '<b>① 区分不出来的指标：熵与双射性。</b>它们算的都是<b>边缘分布</b>——"表里每个值出现了几次"。' +
-          '而 T 表是双射，每个值恰好出现一次，所以无论密钥是什么、有没有套仿射编码，<b>熵恒为 8.0 比特</b>。' +
-          '标准 S 盒、白盒 T 表、随机置换，三者的熵完全一样。这两个指标只能回答"这是不是一张表"，回答不了"这是谁造的表"。</p>' +
-          '<p><b>② 能区分的指标：差分谱（最大差分计数）。</b>它算的是<b>条件分布</b>——"给定输入差分 a，输出差分的分布是什么样"。' +
-          '这是在问"表内部的输入输出关系"，而不是"表里有哪些值"。</p>' +
-          '<p>为什么它能区分？因为 AES 的 S 盒被<b>刻意设计</b>成差分均匀的：对任何非零输入差分，任何输出差分最多出现 <b>4</b> 次。' +
-          '而随机置换没有这个约束，会在某对差分上撞到 10~14 次。' +
-          '<b>所以"白盒表继承了 AES 的代数结构"这句抽象话，在这里被量化成一个数字：4 和 12 的区别。</b></p>' +
-          '<p>还有一层必须说到：<b>仿射编码洗不掉这个数字。</b>因为仿射映射作用在差分上是线性的（<span class="mono">L(u) ^ L(v) = L(u ^ v)</span>），' +
-          '对固定的输入差分 a，输出差分的计数分布只是被"重新标号"，最大值一格不变。' +
-          '<b>想真的把差分谱拉回随机水平，必须用非线性编码</b>——而那是要付性能与体积代价的。</p>' +
-          '<p><b>③ 这两件事的关系：同一原因的两个后果。</b>这是本问的重点，也是最容易答浅的地方。</p>' +
-          '<p>很多人会以为"统计可区分"和"DFA 能成功"是两条独立的证据，各自证明"白盒有弱点"。<b>其实它们是同一件事的两面：</b></p>' +
-          '<p>白盒实现为了能用可接受的体积实现 AES，<b>必须顺着 AES 的结构去切表</b>——逐字节的 SubBytes 按字节切，' +
-          '列内的 MixColumns 按列切，行置换的 ShiftRows 变成索引重排。' +
-          '这个"切法"就是 AES 结构被完整继承下来的原因。</p>' +
-          '<p>而结构被继承，同时导致两个后果：' +
-          '<b>a) 表的差分谱仍是 AES 的差分谱（所以统计上可区分）；' +
-          'b) 扩散结构仍然是一列变四字节、四行错开搬移（所以 DFA 的 4 字节斜线形状仍然成立）。</b></p>' +
-          '<p>换句话说：<b>统计特征和 DFA 是同一个结构事实的两个投影。</b>' +
-          '统计特征回答"这到底是不是 AES 造的"，DFA 利用"既然它是 AES 造的，那我知道故障会怎么扩散"。' +
-          '<b>如果你在统计上认出了它，你其实已经拿到了 DFA 的前提。</b></p>' +
-          '<p><b>边界也要说清楚：</b>如果防守方用非线性编码把差分谱洗到随机水平，' +
-          '<b>统计识别会失效，DFA 也会变难——因为外部编码把观测到的差分从 <span class="mono">D</span> 变成了 <span class="mono">L(D)</span></b>，' +
-          '方程左边不再是原来那个量。但注意：<b>它变难的原因不是"扩散消失了"</b>——' +
-          'MixColumns 还是列混合、ShiftRows 还是行搬移，扩散结构一格没变，只是你在输出端读到的差分被"扭"了一道。' +
-          '所以攻击仍然可行，只是需要额外把编码解出来（这也正是带外部编码的 DFA 成为独立研究课题的原因）。</p>' +
-          '<p><b>把这一问的结论压成一句话：编码能改"你看到的量"，改不了"内部发生的结构"；而凡是结构还在的地方，攻击就有立足点。</b></p>',
-        after: '<p>这道题答不完整是正常的——它要求你把 25.3（结构）、25.7（统计）、25.8（扩散）、25.12（编码与边界）四节串起来。' +
-          '<b>如果你只答出了"熵不行、差分谱行"，那还停留在知识点层面；能说出"两者是同一原因的两个后果"，才算真正把这一章读通了。</b></p>'
+        model: '<b>结论先说：eBPF 在 Android 上「理论可行，实际高度受限」。</b>Android 基于 Linux 内核，内核本身有 BPF 支持；Android 9（kernel 4.9）起内核配置就开了一部分 BPF 功能，较完整的 eBPF 能力一般需要 <b>4.14+</b>。但「内核里有」和「你能用」之间隔着四堵墙。' +
+          '<br><br><b>① 内核版本。</b>挡住的是「这个特性存不存在」。老设备内核太旧，BTF、ringbuf、有界循环支持等新能力压根没有。<b>绕不过</b>——这是硬件与固件层面的既成事实，只能换设备。' +
+          '<br><b>② 厂商内核裁剪。</b>挡住的是「这个特性有没有被编译进来」。厂商为减小体积、缩小攻击面，常把 BPF 相关配置裁掉：<code>CONFIG_BPF_SYSCALL</code>（总闸，没有它<b>完全无法加载</b> eBPF 程序）、<code>CONFIG_BPF_JIT</code>（没有它只能解释执行，性能大降）、<code>CONFIG_DEBUG_INFO_BTF</code>（没有它就没有 BTF，CO-RE 用不了）。<b>理论可自编译内核，但需解锁 bootloader、有变砖风险、多数机型源码不完整</b>，成本极高。' +
+          '<br><b>③ SELinux 策略。</b>挡住的是「你有没有权限调用」。Android 的强制访问控制会限制 <code>bpf()</code> 系统调用，普通 App 无权。<b>需 root 后调整策略</b>。' +
+          '<br><b>④ 需要 root。</b>这是前三条叠加的现实结果。没有银弹。' +
+          '<br><br><b>一个反直觉但重要的事实：Android 自己在用 eBPF</b>（例如按 UID 的网络流量统计、<code>trafficController</code> 相关模块）。这<b>证明</b>了真机上跑 eBPF 可行；但<b>不证明</b>你有权限——这些程序由系统进程在开机时加载。' +
+          '<br><br><b>探测顺序（顺序很重要，前一项不过后面做了也白做）：</b><b>①</b> <code>uname -r</code> 看内核版本；<b>②</b> <code>zcat /proc/config.gz | grep CONFIG_BPF</code>（文件不存在就改用 <code>bpftool feature probe</code> 直接问内核）；<b>③</b> <code>ls /sys/kernel/btf/vmlinux</code> 判断 CO-RE 可用性；<b>④</b> <code>getenforce</code> 看 SELinux；<b>⑤</b> 有没有 root。' +
+          '<br><br><b>最后必须强调时效性：</b>「哪些机型支持」这个问题，每一年、每个厂商、每个机型、每个内核版本的答案都不一样，厂商还会随系统更新调整策略。<b>以你自己的目标设备实测为准，不要相信任何固定结论</b>——包括我这段话。',
+        after: '<p>如果这道题你能把四重限制和探测顺序都讲出来，说明你已经具备「在真机上评估一项底层技术可行性」的能力——这比记住 eBPF 的 API 值钱得多。</p>'
       },
-
       {
-        id: 'c25q5', depth: 3, threshold: 0.6,
-        q: '<b>综合题。</b>目标是一个商业白盒实现，你侦查到三层防护：' +
-          '① <b>输出侧加了外部编码</b>（你按标准 DFA 解出的候选自洽但用起来不对）；' +
-          '② <b>表在每次启动时重新生成</b>；③ <b>改了表就崩</b>（有完整性校验）。' +
-          '请给出你的处理顺序：<b>先做什么、再做什么、每一步的产出是什么、哪一步可能让你决定放弃。</b>',
+        id: 'c11q5', depth: 3, threshold: 0.75,
+        q: '<b>综合题（本章灵魂）。</b>同样是观测目标 App 的一次函数调用，用 eBPF 和用 Frida 相比，<b>隐蔽性上的差别到底来自哪里</b>？请从「App 能做哪些自查」的角度具体说明，并谈谈这种隐蔽性有什么代价和边界。',
         concepts: [
-          { label: '先把攻击生命周期缩到单次运行内（对付随机化）：运行时定位表 + 运行时注入 + 运行时采样',
-            hint: '随机化让"跨运行的知识"作废，那攻击应该放在多长时间尺度内完成？',
-            any: ['单次运行', '一次运行', '运行时', '同一个进程', '一次 attach', 'attach 一次', '生命周期', '运行内', '不跨运行'] },
-          { label: '用结构特征而不是固定偏移定位表（置换扫描 / 访问模式），因为地址和内容每次都变',
-            hint: '既然偏移会变，你凭什么找到表？',
-            any: ['结构特征', '置换扫描', '置换', '扫描', '访问模式', '不靠偏移', '动态定位', '重新扫描', '找表'] },
-          { label: '测出并处理外部编码：逐点采样输入/输出编码，或者把方程搬到编码域里解',
-            hint: '编码是双射，所以可以用什么办法把它测出来？',
-            any: ['外部编码', '编码', '采样', '测出编码', '逐点', '双射', '逆变换', '编码域', '线性', '仿射', '拟合'] },
-          { label: '处理完整性校验：确认校验时机，在"校验之后、使用之前"改写并立即恢复；或先绕过/冻结校验',
-            hint: '你要改表项，但改了就崩——这说明校验发生在什么时候？你应该在哪个时间窗口动手？',
-            any: ['完整性校验', '校验', '校验和', '时机', '绕过', '冻结', '恢复', '校验之后', '使用之前', 'hook', 'patch'] },
-          { label: '工程判断：先上黑盒调用兜底，并明确止损条件（哪一步失败就转向黑盒方案）',
-            hint: '三层防护都齐了，你还应该先保证什么？什么时候该收手？',
-            any: ['黑盒', 'rpc', 'rpc 调用', '兜底', '止损', '放弃', '成本', '不值得', '先跑通', '业务', '权衡', '投入产出'] }
+          { label: 'Frida 需要注入目标进程，会在其地址空间里留下模块（/proc/self/maps 可见）',
+            hint: 'agent 被注入之后，目标进程里多了什么？',
+            any: ['注入', 'maps', '/proc/self/maps', '模块', 'so', 'frida-agent', '地址空间', '多了一个 so', '内存里', '进程内部', '要注入'] },
+          { label: 'Frida 会改写指令/内存来拦截执行，代码段与磁盘文件不一致，函数序言被改，可被完整性校验发现',
+            hint: 'inline hook 在内存里留下了什么痕迹？',
+            any: ['改写', '修改指令', 'inline hook', '序言', '代码段', '内存校验', '字节比对', '完整性', '改了内存', '篡改', 'prologue'] },
+          { label: 'Frida 可能留下线程名、监听端口、ptrace 痕迹（TracerPid）',
+            hint: '除了内存，进程表、端口表上还有没有线索？',
+            any: ['线程名', 'thread', 'comm', '端口', 'port', '27042', 'tracerpid', 'ptrace', 'task', '进程表', '句柄'] },
+          { label: 'eBPF 运行在<b>内核态</b>，在目标进程的地址空间之外，App 的这些自查全部失效',
+            hint: '核心差别不在于技术先进，而在于观测点在哪。',
+            any: ['内核态', 'kernel', '地址空间之外', '不在进程里', '进程外', '内核侧', '内核里', '观测点更底', '外层', '内核视角', 'all 失效', '看不到'] },
+          { label: 'eBPF 是只读观测，不修改目标进程的任何字节（不注入、不改指令、不加线程）',
+            hint: 'eBPF 会改目标进程的内存吗？',
+            any: ['只读', '不修改', '不改指令', '不注入', '不改变目标', '不加线程', '不改内存', 'read only', '无侵入', '非侵入', '零修改'] },
+          { label: '代价与边界：观测者自身（loader 进程、文件、root 状态）仍会在用户态留痕；加载需要高权限；对手也能用 eBPF 反制，是双向博弈',
+            hint: '内核态隐蔽的是「观测动作」，那「观测者」呢？',
+            any: ['代价', '边界', '局限', 'loader', '观测者', '进程可见', '文件', 'root 状态', '高权限', '双向', '对手也能', '反制', '博弈', '不是万能', '同样能', '需要 root', '留痕'] },
+          { label: '与课程的层级主线呼应：内核态观测（第 25 章）/ 内核态对抗（第 27 章）/ Hypervisor（第 20 章），逐层向下要控制权',
+            hint: '本章在课程里处在哪一层？再往下还有什么？',
+            any: ['第 27 章', '第 27 章', '27 章', '第 20 章', '第 20 章', 'hypervisor', '层级', '更低', '逐层', 'svc', '硬件断点', '更底层', '控制权'] }
         ],
         hints: [
-          '三层防护分别打的是 DFA 三个前提里的哪一个？把它们分开处理，不要混在一起。',
-          '随机化打的是"位置已知"，那你的应对是不是"在位置还已知的那段时间内把事做完"？',
-          '校验打的是"可控故障"——它是唯一能直接让你注入失败的一层，所以它决定了你的注入动作要多"轻"。'
+          '不要泛泛说「eBPF 更高级」。请具体列出 App 有哪几项自查手段，然后逐项判断：这条手段对 Frida 有效吗？对 eBPF 有效吗？为什么？',
+          '隐蔽性的来源可以用一句话概括——但它不是「eBPF 这个技术本身很隐蔽」，而是关于<b>观测发生在哪里</b>的一句话。'
         ],
         probes: [
-          '追问：如果校验的时机在"表生成之后、加密之前"各做一次，你的改写窗口还有吗？',
-          '追问：如果目标还有 Frida 检测（第 21、23 章的内容），你的处理顺序要往前插什么？',
-          '追问：这三层防护里，哪一层最可能让你决定"这个不值得做"？说出具体的判断依据。'
+          '你说 App 检测不到 eBPF——那 App 有没有可能检测到「有人在这台设备上加载 eBPF」这件事本身？注意区分「观测动作」和「观测者」。',
+          '如果对手也用 eBPF 来监控你的行为，你该怎么办？这个问题的答案和本章哪个章节有关联？'
         ],
-        model: '<b>先把三层防护对应到 DFA 的三个前提上，顺序自然就出来了。</b>' +
-          '外部编码打的是前提③（扩散结构被扭过）；运行时随机化打的是前提②（位置已知）；完整性校验打的是前提①（可控故障）。' +
-          '三层里<b>只有校验是"直接让攻击动作失败"</b>的，另两层只是"让信息不好拿"。所以顺序应该按依赖关系排，而不是按难度排。</p>' +
-          '<p><b>第一步：把整条流水线缩到一次运行内（针对②）。</b>' +
-          '产出是一个<b>运行时脚本</b>：attach 一次 → 用置换扫描与访问模式定位表 → 建立 "表 → (轮, 位置)" 映射 → 注入 → 采样 → 解方程，全部在同一个进程里连续完成。' +
-          '关键纪律是<b>不依赖任何跨运行的数据</b>（偏移、地址、dump 出来的表内容都可能在下次运行时失效）。' +
-          '这一步是<b>所有后续工作的地基</b>——它不解决编码问题，但没有它，后面每一步都在流沙上。</p>' +
-          '<p><b>第二步：测出外部编码（针对①）。</b>产出是那张编码表 / 那个线性映射。' +
-          '方法很直接：编码必须是双射（否则解密不成立），所以<b>喂 256 个不同的输入、逐点采样</b>就能把输入侧编码测出来；' +
-          '输出侧同理，用"已知正确密文"的对照组逐字节对照，如果是仿射编码，16 组样本就能拟合出那个线性映射。' +
-          '拿到之后有两条路：把观测到的密文差分<b>逆变换</b>回真实域再套标准 DFA（工程上更快），或者把编码合并进方程在编码域里解。</p>' +
-          '<p><b>第三步：处理完整性校验（针对③）。</b>产出是一个"能改表项且不被发现"的注入方案。' +
-          '核心是搞清楚<b>校验的时机</b>：如果校验发生在加密之前一次、之后一次，那么你的改写窗口就只有"加密过程中"这一段——' +
-          '必须在改完之后<b>立刻恢复</b>（采样一结束就写回原值）。' +
-          '如果校验是异步的（后台线程定期校验），窗口会更宽，但也更不可预测，这时候要么把整个攻击压进一个校验周期，' +
-          '要么直接 hook 掉校验函数（这就是第 23 章的活儿了）。</p>' +
-          '<p><b>第四步（其实是第零步）：并行做一个黑盒兜底。</b>' +
-          '在动第一行脚本之前，先用 RPC 把加密函数封成服务——<b>它保证你在前三步任何一步失败时都还有产出</b>，' +
-          '而且它天然是你最终实现的回归对照组。</p>' +
-          '<p><b>哪一步会让你放弃？</b>按本课 25.14 节的判断，止损点应该设在<b>第一/第二步之后</b>：' +
-          '如果测绘发现表的结构"不干净"（置换扫描命中数量极多、形状不符合斜线且找不到编码规律），' +
-          '或者采样窗口被校验压得不可用，那么继续投入的期望收益就低于把它做成黑盒服务。' +
-          '<b>放弃不是失败——在错误的判断上继续投入才是。</b></p>' +
-          '<p><b>最忌讳的做法</b>是：一上手就去啃校验（因为它最"技术"），结果在没有运行时定位能力的情况下反复被崩，' +
-          '三天过去连表都没编上号。<b>顺序错了，努力会以"看起来很有技术含量"的方式白费。</b></p>',
-        after: '<p>如果你给出的顺序是"先啃校验/先解编码"，说明你在按"技术难度"排序而不是按"依赖关系"排序。' +
-          '真实的攻击工程里，<b>顺序对了，每一步的产出都能被下一步复用；顺序错了，每一步都在返工。</b></p>'
-      },
-
-      {
-        id: 'c25q6', depth: 3, threshold: 0.6,
-        q: '<b>综合题（工程判断）。</b>需求方要"能自己算出这个 App 的请求签名"。你确认了它用的是白盒 AES，' +
-          '并且你评估出：完整提取密钥需要大约一到两周。' +
-          '请说明：<b>你会怎么安排？什么情况下"黑盒调用"就够了、什么情况下必须拿到密钥？以及你最终会怎么向需求方解释这个取舍。</b>',
-        concepts: [
-          { label: '黑盒调用（RPC 服务化）能解决大多数"要能算出签名"的需求，且当天可用',
-            hint: '需求方要的到底是"密钥"还是"能算出正确结果"？这两者在黑盒面前是同一个结果吗？',
-            any: ['黑盒', 'rpc', '服务', '接口', 'attach', '直接调用', '当天', '马上', '封装', '调用目标'] },
-          { label: '必须拿到密钥/离线实现的情形：需要离线批量、极高性能、构造特殊输入、或密钥本身就是目标（安全评估/取证）',
-            hint: '黑盒方案依赖什么？什么东西一旦缺失它就不成立了？',
-            any: ['离线', '不能依赖设备', '吞吐', '性能', '批量', '特殊输入', '安全评估', '取证', '密钥本身', '设备绑定', '版本更新'] },
-          { label: '方案安排：先交黑盒保底，同时并行推进白盒分析，并给白盒分析设一个明确的止损点',
-            hint: '两周的投入要不要和"当天可用"的方案并行？什么时候该收手？',
-            any: ['并行', '兜底', '先跑通', '保底', '止损', '阶段', '先交付', '同步推进', '两个方案', '预留'] },
-          { label: '说明白盒的定位：它是"提高成本"而不是绝对安全，所以攻破与否是成本问题不是可能性问题',
-            hint: '面对"白盒能不能攻破"这个问题，正确的表述是什么？',
-            any: ['提高成本', '成本', '时间', '不是绝对', '不是不可能', '几周', '成本问题', '门槛', '代价'] },
-          { label: '说明白盒实现是版本化的：一次性成果会失效，真正有价值的产出是可复用的工具链',
-            hint: '对方换个版本、加个随机化，你上个月的分析成果还有效吗？',
-            any: ['版本', '升级', '失效', '会变', '工具链', '流水线', '可复用', '自动化', '回归', '维护'] }
-        ],
-        hints: [
-          '先区分两个目标：<b>"能算出签名"</b>和<b>"拿到密钥"</b>。绝大多数需求是前者。',
-          '再问：黑盒方案依赖什么前提？把那个前提去掉，什么需求就变得必须离线实现了？',
-          '最后想：一个"一到两周"的投入，应该怎么切成"有产出的阶段"？'
-        ],
-        probes: [
-          '追问：如果需求方说"我们线上要跑百万级 QPS，RPC 扛不住"，你的方案怎么变？',
-          '追问：如果白盒实现每两个月更新一次表，你的两种方案各自的维护成本是多少？'
-        ],
-        model: '<b>核心判断：先分清需求方要的是"密钥"还是"能算出签名"。</b>' +
-          '在 90% 的情况下，答案是后者。而这两件事在黑盒调用面前是<b>同一个结果</b>——把目标当成一个函数，输入明文、拿回密文，' +
-          '通过 RPC 封装成 HTTP 服务，<b>当天就能交付</b>。花一到两周去提取密钥，对"要能算签名"这个需求来说是纯粹的浪费。</p>' +
-          '<p><b>什么情况下黑盒不够？</b>黑盒方案的本质依赖是"<b>目标进程还在跑、而且我能控制它</b>"。所以只要出现下面任何一条，就必须考虑离线实现：' +
-          '<b>① 需要离线批量生产</b>（对方设备不在手边、或者要在服务端跑）；' +
-          '<b>② 吞吐要求远超进程间通信能承受的量级</b>；' +
-          '<b>③ 需要理解算法本身</b>（构造边界输入、验证逻辑、做工单）；' +
-          '<b>④ 密钥本身就是目标</b>（安全评估、漏洞披露、密钥泄露取证）。</p>' +
-          '<p><b>方案安排：两条腿走，但要设止损点。</b>' +
-          '第一天：RPC 服务化，业务跑通（这一步无论后面怎么走都不会浪费——它还是你验证自研实现的对照组）。' +
-          '然后用剩余时间做可行性评估：结构测绘、统计识别、有没有编码与校验。' +
-          '评估完给白盒分析一个明确的止损条件——比如"如果外部编码无法在一天内测出来，就转黑盒产品化"。' +
-          '<b>把"可能做不完的事"排在"确定能交付的事"后面，并且提前说好什么时候收手。</b></p>' +
-          '<p><b>怎么向需求方解释？</b>三句话：</p>' +
-          '<p>① <b>白盒不是绝对安全，也不是攻不了——它是"提高成本"。</b>' +
-          '把"读内存就能拿密钥"变成"需要专门的密码学攻击、按周计的工作量"。所以攻破与否是一个成本问题，不是可能性问题。</p>' +
-          '<p>② <b>你要的结果，黑盒方案今天就能给你。</b>我会先把服务做出来让业务跑起来，' +
-          '同时评估彻底还原需要多少代价——如果两周内能拿到密钥，我们再决定要不要做。</p>' +
-          '<p>③ <b>白盒实现是版本化的。</b>对方加一层随机化、换一批表，我这次的分析成果可能就作废了。' +
-          '所以真正值钱的产出不是"这一次的密钥"，而是<b>可复用的工具链</b>（自动测绘 → 自动注入 → 自动解方程）。' +
-          '如果这项工作要长期做，我们应该按"建流水线"来立项，而不是按"攻破一次"来立项。</p>' +
-          '<p><b>最后一句判断：遇到白盒，先问"值不值得攻"，再问"怎么攻"。</b>' +
-          '这一章的十三节技术，是用来支撑这个判断的，不是用来取代它的。</p>',
-        after: '<p>这一题没有标准答案，只有"算得清账"和"算不清账"的区别。' +
-          '<b>如果你能主动说出"黑盒调用就够了"这句话，说明你没有被技术牵着走。</b></p>'
+        model: '<b>隐蔽性的差别不来自「eBPF 技术更先进」，而来自一句很朴素的话：观测发生在目标进程的地址空间之外。</b>把这句话想通，你就能自己推导出哪些检测有效、哪些天生无效。' +
+          '<br><br><b>先看 App 的常规自查有哪些，以及两条路各会露出什么：</b><br>' +
+          '<b>① 扫 <code>/proc/self/maps</code>。</b>Frida 注入后会多出一个 agent 模块，<b>命中</b>；eBPF 不往目标进程里放任何东西，<b>无效</b>。<br>' +
+          '<b>② 遍历 <code>/proc/self/task/*/comm</code> 查线程名。</b>Frida 会留下框架线程，<b>命中</b>；eBPF 一个线程都不加，<b>无效</b>。<br>' +
+          '<b>③ 扫监听端口（例如 27042 一类）。</b>Frida 可能开端口，<b>可能命中</b>；eBPF 根本不进这个进程，<b>无效</b>。<br>' +
+          '<b>④ 读 <code>/proc/self/status</code> 看 TracerPid / 查 ptrace 痕迹。</b>Frida 的某些接入方式会命中；eBPF 走的是内核探针机制，不是 ptrace 附着，<b>无效</b>。<br>' +
+          '<b>⑤ 把内存里的代码段与磁盘上的 <code>.so</code> 逐字节比对。</b>Frida 的 inline hook 会改写函数序言，<b>命中</b>；eBPF <b>不修改目标进程的任何字节</b>——它是只读观测，<b>无效</b>。<br>' +
+          '<b>⑥ 校验函数序言字节。</b>同上，Frida <b>命中</b>，eBPF <b>无效</b>。<br><br>' +
+          '<b>所以规律是：所有依赖「观测者必须在目标进程内部留下东西」的检测手段，对内核态观测一律失效。</b>' +
+          '<br><br><b>但这种隐蔽性有明确的代价与边界，不能神化：</b>' +
+          '<b>① 观测者本身不隐蔽。</b>你的 loader 是个跑在手机上的用户态进程，会被 <code>ps</code> 看见、会在文件系统里留下文件（<code>/data/local/tmp</code> 是重灾区）。内核态隐蔽的是「观测动作」，不是「观测者」。<br>' +
+          '<b>② 加载门槛极高。</b>要加载 eBPF 程序需要高权限，实际通常要 root（见 25.6）。你为了让观测更隐蔽，反而先要在设备上取得最高权限——这是很现实的成本，而且 root 状态本身就是 App 最容易检测的信号之一。<br>' +
+          '<b>③ 这是双向博弈。</b>对手同样可以用 eBPF 监控你的行为，甚至用 LSM 钩子加固自己的检测逻辑。<b>不存在一劳永逸的隐蔽</b>，加固与对抗的价值都在于抬高对方的成本。<br>' +
+          '<b>④ 观测粒度有取舍。</b>eBPF 看不到目标进程内部的任意内存和任意函数调用细节（Frida 可以），它擅长的是系统调用、文件、网络、以及通过 uprobe 挂到的特定函数入口/出口。' +
+          '<br><br><b>放回课程坐标系：</b>第 20 章的 Hypervisor 层比内核更低，第 25 章（本章）是内核态观测的标准手段，第 27 章讲内核态对抗（SVC 系统调用、硬件断点）。三章连起来是一条主线——<b>谁控制了更低的层，谁就拥有最终的观测权和控制权。</b>',
+        after: '<p>这道题是本章存在的理由。如果你只能记住本章的一件事，请记住：<b>内核态观测的隐蔽性来自「在目标进程的地址空间之外」，而不是来自 eBPF 本身有什么隐身魔法。</b></p>'
       }
     ]
   }

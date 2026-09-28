@@ -1,1937 +1,1589 @@
-/* 第 19 章 · 加固技术全景与壳的判定
-   分多次写入：本文件由 write + 多次 edit 拼装而成。
-   事实纪律：
-     · 厂商产品线、特征 so 名、字符串特征、版本号一律标注「待核实」，绝不编造；
-     · 判定结论由 pack19Judge() 的真实规则表算出，不写死结论字符串；
-     · 案例只收可访问、可复现来源（本文件收的是 GitHub 公开仓库，看雪帖子需登录+验证码，
-       无法在未登录状态取到正文，因此不作为案例来源，具体说明见 19.11/19.14 正文）。 */
-
-/* ==========================================================================
-   判定引擎 A —— /proc/self/maps 逐行分类
-   逐行给出「正常 / 可疑 / 有价值」判定与理由。
-   19.12 的判定器与 19.13 的实验都调用它，判分依据来自同一个函数。
-   ========================================================================== */
-function pack19Maps(text) {
-  var rows = [];
-  var lines = String(text == null ? '' : text).split(/\r?\n/);
-  for (var i = 0; i < lines.length; i++) {
-    var s = lines[i].replace(/\s+$/, '');
-    if (!s.trim()) continue;
-    var m = /^([0-9a-fA-F]+)-([0-9a-fA-F]+)\s+(\S{4})\s+(\S+)\s+(\S+)\s+(\d+)\s*(.*)$/.exec(s.trim());
-    if (!m) {
-      rows.push({ ln: i + 1, raw: s, perm: '-', path: '', kind: 'bad', label: '格式不合法', suspicious: false,
-        why: '这不是一行标准 maps 记录。标准格式是 <code>起址-止址 权限 偏移 dev inode 路径</code>，最后一段路径可以为空（匿名映射）。' });
-      continue;
-    }
-    var perm = m[3];
-    var rawPath = (m[7] || '').replace(/\s+$/, '');
-    var deleted = /\(deleted\)$/.test(rawPath);
-    var path = rawPath.replace(/\s*\(deleted\)$/, '');
-    var isAnon = (path === '' || path.charAt(0) === '[');
-    var r = { ln: i + 1, raw: s, perm: perm, path: path, deleted: deleted, kind: 'other',
-              label: '普通映射', suspicious: false, why: '没有命中任何已知的可疑模式，按正常映射处理。' };
-
-    if (isAnon && /dalvik|jit|zygote|region space|main space|non moving|rosalloc|art::|binder|stack|libc_malloc|scudo/.test(path)) {
-      r.kind = 'art'; r.label = 'ART / 系统运行时映射';
-      r.why = 'ART 为 JIT 代码缓存、GC 空间、线程栈、分配器建立的匿名映射。<b>其中 JIT 代码缓存常见 rwx 权限</b> —— 这是完全合法的来源，把它当壳是最常见的误报。';
-    } else if (/w/.test(perm) && /x/.test(perm)) {
-      r.kind = 'rwx'; r.suspicious = true; r.label = '可写可执行段（rwx）';
-      r.why = '同时具备写与执行权限。<b>正常的映射几乎不会这样</b>：它意味着这块内存可以在运行时被改写再执行 —— 自修改代码、跳转表热补丁、或壳把解密后的代码页直接标成可执行。';
-    } else if (/memfd:/.test(path)) {
-      r.kind = 'memfd'; r.suspicious = true; r.label = 'memfd 匿名内存文件';
-      r.why = '内核提供的匿名文件，不需要在磁盘上落地。把解密结果写进 memfd 再 <code>dlopen</code>，是内存加载型壳的常见做法 —— 你在文件系统里永远找不到那个 so。';
-    } else if (deleted && /\.so$/.test(path)) {
-      r.kind = 'deleted'; r.suspicious = true; r.label = 'so 已被删除但映射仍在';
-      r.why = '<b>最强的内存加载痕迹之一</b>：文件先被加载，随后被删除（或本来就是从内存造出来的），映射却还留着。正常安装的 APK 自带 so 不会处于这个状态。';
-    } else if (/\.dex$/.test(path) || /classes[0-9]*\.dex$/.test(path)) {
-      r.kind = 'dex'; r.label = '内存中被映射的 dex';
-      r.why = '路径直指一份 dex —— 它不算「可疑」，它是<b>你的 dump 目标</b>。这一段的起止地址之差就是这份 dex 的量级，可以直接拿来估算 dump 长度。';
-    } else if (/^\/(system|system_ext|apex|vendor|product|odm)\//.test(path)) {
-      r.kind = 'sys'; r.label = '系统 / 框架库';
-      r.why = '系统分区或 APEX 里的库。加固方改不动它们，出现这些映射属于进程的正常形态。';
-    } else if (/^\/data\/app\//.test(path)) {
-      r.kind = 'applib'; r.label = 'APK 自带 so';
-      r.why = '位于 <code>/data/app/</code> 下，是安装时由包管理器从 APK 解出来的 so。属正常分布 —— <b>注意它和 /data/data/ 下的 so 是两回事</b>。';
-    } else if (/^\/data\/(data|user|local|misc)\//.test(path) && /\.so$/.test(path)) {
-      r.kind = 'dataso'; r.suspicious = true; r.label = '数据目录里的 so';
-      r.why = 'so 出现在 App 的数据目录：说明它是运行时解密后落地、再加载进来的。系统库与 APK 自带 so 都不会落在这里。';
-    } else if (/^\/dev\//.test(path) && /x/.test(perm)) {
-      r.kind = 'dev'; r.suspicious = true; r.label = '/dev 下的可执行映射';
-      r.why = '从设备节点直接映射出可执行段，不符合普通 App 的加载方式。（<code>/dev/ashmem</code> 这类只读/可写映射很常见，属于正常，只有带 <code>x</code> 权限时才需要解释。）';
-    } else if (isAnon && /x/.test(perm)) {
-      if (path === '') {
-        r.kind = 'anonExec'; r.suspicious = true; r.label = '无名的可执行匿名段';
-        r.why = '<b>没有路径、没有名字，却有执行权限。</b>正常的库加载总会留下路径；ART 自己的匿名可执行段一般带 <code>[anon:...]</code> 名字。既无名又可执行，要么是运行时生成的代码，要么是有人手工造了一块可执行内存。';
-      } else {
-        r.kind = 'anonNamed'; r.suspicious = true; r.label = '具名匿名段（可执行）';
-        r.why = '带 <code>[anon:名字]</code> 且有执行权限。先看名字：dalvik / jit 相关属于运行时正常行为，其它名字需要人工确认是谁建的。';
-      }
-    }
-    rows.push(r);
-  }
-  return rows;
-}
-
-/* 判定引擎 A 的聚合统计 */
-function pack19MapsStat(text) {
-  var rows = pack19Maps(text);
-  var st = { rows: rows, total: 0, suspicious: [], anonExec: 0, rwx: 0, deleted: 0, memfd: 0,
-             dataso: 0, dex: 0, dev: 0, art: 0, normal: 0, bad: 0 };
-  for (var i = 0; i < rows.length; i++) {
-    var r = rows[i];
-    st.total++;
-    if (r.suspicious) st.suspicious.push(r);
-    if (r.kind === 'anonExec' || r.kind === 'anonNamed') st.anonExec++;
-    if (r.kind === 'rwx') st.rwx++;
-    if (r.kind === 'deleted') st.deleted++;
-    if (r.kind === 'memfd') st.memfd++;
-    if (r.kind === 'dataso') st.dataso++;
-    if (r.kind === 'dex') st.dex++;
-    if (r.kind === 'dev') st.dev++;
-    if (r.kind === 'art') st.art++;
-    if (r.kind === 'sys' || r.kind === 'applib' || r.kind === 'other') st.normal++;
-    if (r.kind === 'bad') st.bad++;
-  }
-  return st;
-}
-
-/* ==========================================================================
-   判定引擎 B —— 观测值 → 壳类型假设的真实打分
-   输入：读者填的 6 项观测（多 dex 数 / class_defs_size / dex 魔数命中数 /
-        attachBaseContext 是否被覆写 / 有无 native 注册 / maps 片段）
-   输出：每个假设的分数、触发的证据、下一步动作。
-   评的是「证据组合」，不是单个现象 —— 这是本章最想教的东西。
-   ========================================================================== */
-function pack19Judge(v) {
-  v = v || {};
-  var num = function (x) { var n = parseInt(String(x == null ? '' : x).replace(/[^0-9]/g, ''), 10); return isNaN(n) ? 0 : n; };
-  var yep = function (x) { return /^\s*(y|yes|true|1|是|有|被|已|覆写|覆盖|存在)/i.test(String(x == null ? '' : x)); };
-  var dexCount = num(v.dexCount);
-  var classDefs = num(v.classDefs);
-  var magicHits = num(v.magicHits);
-  var attach = yep(v.attach);
-  var nativ = yep(v.nativeReg);
-  var ms = pack19MapsStat(v.maps || '');
-
-  var H = [
-    { id: 'none', name: '未见明显加壳（更像轻量混淆 / 签名校验 / 普通 App）', score: 0, ev: [],
-      next: '不急着脱壳。先把这个结论坐实：用特征工具（apkid / ApkCheckPack 一类）交叉验证一次，再把「方法体是否完整」当成判据重新看一遍静态结果。' },
-    { id: 'gen1', name: '一代壳：整份 dex 整体加密 / 文件重定向', score: 0, ev: [],
-      next: '找 dump 时机。确认「真 dex 已被解密进内存、且 ART 已经接管（结构完整）」的那个时刻，抓内存里的 dex 区间；同时确认它落地了还是只在内存里。' },
-    { id: 'gen2', name: '二代壳：抽取壳（结构保留，方法体被抽走、运行时回填）', score: 0, ev: [],
-      next: '上主动调用。遍历所有 DexFile × 类 × 方法强制触发回填，再逐方法 dump；脱壳前先把 App 每个功能点都点一遍。' },
-    { id: 'gen3', name: '三代壳：DEX2C / Java2C / native 化', score: 0, ev: [],
-      next: '先去 native 侧定位入口。在 JNI_OnLoad / RegisterNatives 处记录「Java 方法 → native 地址」的绑定关系，判断关键函数是被 native 重写还是被翻译成 C，再决定 Trace 还是读汇编。' },
-    { id: 'vmp', name: 'VMP：自定义字节码 + 解释器', score: 0, ev: [],
-      next: '先量清 VMP 的边界：找到分发循环与 handler 表，估一下自定义指令集的规模。多数情况下「黑盒调用拿结果」比「完整还原指令集」性价比高。' },
-    { id: 'rt', name: '（附加维度）运行时防护强化：反调试 / 反 Hook / 环境检测', score: 0, ev: [],
-      next: '同步处理防护：先判断它挡在哪一层（Java / native / 内核），再决定是改环境、抢时序，还是换观测层。' }
-  ];
-  var add = function (id, n, why) {
-    for (var i = 0; i < H.length; i++) if (H[i].id === id) { H[i].score += n; H[i].ev.push(why); }
-  };
-
-  /* ---- 静态侧规则 ---- */
-  if (dexCount >= 2) add('gen2', 1, 'APK 里有 <b>' + dexCount + ' 份 dex</b>：多 dex 是抽取壳与多 dex 加固的常见形态（但它本身不是判决性证据，正常的大 App 也会分包）');
-  if (classDefs === 0 && dexCount > 0) add('gen1', 3, '<code>class_defs_size = 0</code>：静态看进去<b>一个类定义都没有</b> → 这份 dex 要么整体被加密，要么只是个占位文件');
-  if (classDefs > 0) {
-    add('none', 1, '<code>class_defs_size = ' + classDefs + '</code>：dex 结构完整可见');
-    add('gen2', 2, '结构完整（' + classDefs + ' 个类定义）却仍需要脱壳 → 典型形态是「结构留着、方法体被抽走」，也就是抽取壳');
-    if (classDefs >= 200) add('gen2', 1, '类数量级正常（' + classDefs + ' 个），说明你看到的是完整结构而不是残片 —— 这排除了「dex 被截断」的可能');
-  }
-  if (magicHits === 0) {
-    add('gen1', 2, '内存里搜不到任何 dex 魔数：要么真 dex 还没被解密加载，要么它的头部已经被改成非标准形态（CompactDex / 魔改魔数）');
-    add('gen3', 1, '内存中搜不到标准 dex 魔数，也符合「方法被搬进 native、Java 层不再有完整 dex」的形态');
-  } else {
-    add('none', 1, '内存里至少有 1 处明文 dex 魔数：dex 确实被解密进内存了');
-  }
-  if (magicHits >= 2) add('gen2', 2, '命中 <b>' + magicHits + ' 处</b> dex 魔数：内存里同时存在多份明文 dex（运行时加载），是抽取壳与多 dex 加固的常见组合');
-  if (magicHits >= 1 && classDefs === 0) add('gen1', 2, '「APK 里没有类定义 + 内存里却有明文 dex」这一组合，直接说明静态那份是假的、真 dex 由壳在运行时解密加载');
-  if (attach) {
-    add('gen1', 2, '<code>attachBaseContext</code> 被覆写：入口在 Application 层就被壳接管了 —— 这是所有壳的第一招，也是启动期解密与加载的发生地');
-    add('gen2', 2, '入口被覆写说明壳需要在进程早期动手（解密、自定义 ClassLoader、替换 mClassLoader），这是抽取壳与一代壳共同的前置动作');
-    add('rt', 1, '入口被覆写也常伴随环境检测（很多加固在这里做 root / 模拟器 / 多开检查）');
-  } else {
-    add('none', 1, '<code>attachBaseContext</code> 未见覆写：入口层没有明显的壳接管痕迹');
-  }
-
-  /* ---- native / SO 侧规则 ---- */
-  if (nativ) {
-    add('gen3', 2, '存在 native 动态注册（JNI_OnLoad + RegisterNatives 一类）：关键逻辑被搬进 so 并在运行时绑定，是 native 化的强特征');
-    add('vmp', 1, 'native 注册是 VMP 的前置条件之一（解释器与 handler 通常都在 so 里），但它本身只能说明「有 native」，不能直接判 VMP');
-  }
-
-  /* ---- maps 侧规则（全部来自 pack19Maps 的真实解析结果） ---- */
-  if (ms.total === 0) {
-    add('none', 0, 'maps 片段为空：这一路的证据暂时缺失，结论只能由静态现象支撑');
-  } else {
-    if (ms.anonExec > 0) {
-      add('gen1', 2, 'maps 里有 <b>' + ms.anonExec + ' 个可执行匿名段</b>：运行时才产生的代码页，常见于「解密器把加载逻辑造在内存里执行」或 JIT');
-      add('gen3', 1, '可执行匿名段也可能是 native 层的代码生成（DEX2C / 自解密 stub），需要与 native 注册证据合看');
-    }
-    if (ms.rwx > 0) {
-      add('vmp', 2, '有 <b>' + ms.rwx + ' 个 rwx（可写可执行）段</b>：VMP 解释器常需要自修改代码或热补丁跳转表（注意 ART 的 JIT 缓存也是 rwx，必须靠名字区分，别误报）');
-      add('gen3', 1, 'rwx 段同样可能来自 native 化的代码生成');
-    }
-    if (ms.deleted > 0) {
-      add('gen3', 2, '有 <b>' + ms.deleted + ' 个「已删除却仍在映射」的 so</b>：内存加载的典型痕迹 —— 加载完就把落地点删掉，抹掉磁盘证据');
-      add('gen1', 1, '自删 so 也常见于一代壳：解密 → 落地 → 加载 → 删除，一条龙做完不留文件');
-    }
-    if (ms.memfd > 0) {
-      add('gen1', 2, '存在 <b>memfd 匿名内存文件</b>映射：把解密结果塞进内存文件再 <code>dlopen</code>，全程不落地 —— 内存加载型壳的标准动作');
-      add('gen3', 2, 'memfd + dlopen 也说明 native 侧有完整的自定义加载逻辑，与 DEX2C / native 化高度相关');
-    }
-    if (ms.dataso > 0) add('gen2', 1, '数据目录里出现了 so 映射：解密落地后加载，多与抽取壳的 native 解密器相关');
-    if (ms.dex > 0) add('gen2', 2, 'maps 里直接能看到 <b>.dex 映射</b>：内存中已经有可 dump 的明文 dex，主动调用之后就在这里取货');
-    if (ms.suspicious.length === 0) add('none', 2, 'maps 里没有命中任何可疑模式（全是系统库 / APK 自带 so / ART 自身的匿名段）—— 这是正常进程的形态');
-  }
-
-  /* ---- 组合规则：多条证据同时指向「其实没加壳」 ---- */
-  if (!attach && !nativ && classDefs > 0 && magicHits === 1 && ms.total > 0 && ms.suspicious.length === 0) {
-    add('none', 3, '组合证据（结构完整 + 内存里只有一处明文 dex + 入口未覆写 + maps 干净）同时成立 → 更像「没加壳」或只有轻量混淆，而不是壳');
-  }
-  /* ---- 组合规则：抽取壳的「教科书组合」 ---- */
-  if (attach && classDefs > 0 && ms.dex > 0 && nativ) {
-    add('gen2', 2, '组合证据（入口被覆写 + 结构完整 + 内存里有 dex 映射 + native 注册）同时成立 → 抽取壳的教科书组合：Java 层解密器 + native 回填');
-  }
-
-  /* ---- 排序与归一 ---- */
-  H.sort(function (a, b) { return b.score - a.score; });
-  var sum = 0;
-  for (var k = 0; k < H.length; k++) sum += H[k].score;
-  for (var k2 = 0; k2 < H.length; k2++) H[k2].pct = sum > 0 ? Math.round(H[k2].score / sum * 100) : 0;
-  var top = H[0], second = H[1];
-  var tight = !!top && !!second && top.score > 0 && (top.score - second.score) <= 1;
-  return { rank: H, sum: sum, top: top, second: second, tight: tight, ms: ms,
-           obs: { dexCount: dexCount, classDefs: classDefs, magicHits: magicHits, attach: attach, nativ: nativ } };
-}
-
-/* 「结论关键词」表：判分时用读者写下的结论去匹配当前算出来的 top 假设 */
-var PACK19_KEYS = {
-  none: { type: ['没加壳', '未加壳', '无壳', '没有加壳', '未见加壳', '不像加壳', '混淆', '轻度'],
-          next: ['交叉验证', 'apkid', '特征库', '再确认', '确认', '静态', '方法体完整'] },
-  gen1: { type: ['一代', '整体加密', '文件重定向', '重定向', '整体', '整份加密'],
-          next: ['dump', '内存', '时机', '解密', '加载', '脱'] },
-  gen2: { type: ['抽取', '抽取壳', '二代', '回填', '方法体', 'code_item', 'insns'],
-          next: ['主动调用', '调用', '遍历', '跑一遍', '点一遍', '功能', '触发', '回填'] },
-  gen3: { type: ['三代', 'native', 'native化', 'dex2c', 'java2c', 'so', 'jni', '翻译'],
-          next: ['注册', 'registernatives', 'jni_onload', 'trace', 'hook', '定位', '动态', '绑定'] },
-  vmp: { type: ['vmp', '虚拟机', '字节码', '解释器', '自定义指令', '分发'],
-         next: ['handler', '分发', '黑盒', 'unidbg', 'trace', '边界', '指令集'] },
-  rt: { type: ['反调试', '反frida', '反 frida', '运行时防护', '检测', '强度', '对抗'],
-        next: ['内核', '时序', 'spawn', '改环境', '观测', '绕过'] }
-};
-
-/* 教学用的 maps 片段：格式与真实 /proc/self/maps 一致，内容为构造样本（含 3 条「看着可疑其实正常」的对照行） */
-var PACK19_MAPS_SAMPLE =
-  '7f9c100000-7f9c104000 r--p 00000000 fd:00 4321  /system/lib64/libc.so\n' +
-  '7f9c104000-7f9c114000 r-xp 00001000 fd:00 4321  /system/lib64/libc.so\n' +
-  '7f9c200000-7f9c204000 r--p 00000000 fd:00 9876  /apex/com.android.art/lib64/libart.so\n' +
-  '7f9c300000-7f9c302000 rwxp 00000000 00:00 0      [anon:dalvik-jit-code-cache]\n' +
-  '7f9c400000-7f9c406000 r-xp 00000000 00:00 0\n' +
-  '7f9c500000-7f9c508000 r-xp 00000000 fd:00 5555  /data/app/~~abc==/com.example.app-1/lib/arm64/libnative.so\n' +
-  '7f9c600000-7f9c604000 rw-p 00000000 00:00 0      [anon:libc_malloc]\n' +
-  '7f9c700000-7f9c711000 r-xp 00000000 fd:00 6666  /data/data/com.example.app/files/libpayload.so (deleted)\n' +
-  '7f9c800000-7f9c803000 rwxp 00000000 00:00 0\n' +
-  '7f9c900000-7f9c906000 r--p 00000000 fd:00 7777  /data/data/com.example.app/cache/00000000.dex\n' +
-  '7f9ca00000-7f9ca02000 r-xp 00000000 00:00 0      /memfd:payload (deleted)\n' +
-  '7f9cb00000-7f9cb01000 rw-p 00000000 00:00 0      [anon:dalvik-main space]\n' +
-  '7f9cc00000-7f9cc04000 r--p 00000000 fd:00 8888  /dev/ashmem';
-
+/* 第 19 章 · 彻底搞懂 OLLVM
+   数据文件：只依赖全局助手 T 与 chapter.js 的渲染器。
+   官方信息已核实：OLLVM = Obfuscator-LLVM，开源代码混淆器，当前版本基于 LLVM 4.0；
+   论文 = Junod / Rinaldini / Wehrli / Michielin, "Obfuscator-LLVM -- Software Protection for the Masses",
+   IEEE/ACM SPRO 2015。官方三大特性 = Instructions Substitution(-sub)、Bogus Control Flow(-bcf)、
+   Control Flow Flattening(-fla)，外加 Functions annotations（函数注解）。 */
 window.CHAPTER = {
   no: 19,
-  title: '加固技术全景与壳的判定',
-  lede: '第 2、4、10、12 章直接开讲 FART、ART 源码和 fdex2——它们默认你已经知道<strong>加固这张地图长什么样</strong>。' +
-        '这一章把地图补上：加固方在防谁、加固分成哪几个层次、壳已经演进到第几代，' +
-        '最后给你一套<strong>半小时内判定手里这个 App 用了哪类壳</strong>的流程。',
+  title: '彻底搞懂 OLLVM',
+  lede: 'OLLVM 是加固世界的“入门门面”：<strong>平坦化、虚假控制流、指令替换</strong>三件套几乎出现在每一份被加固的 so 里。' +
+        '本章从 <strong>LLVM Pass 机制</strong>讲起，拆开三大混淆的源码思路，自己编一个带混淆的 so 做对照实验，' +
+        '最后给出逆向 OLLVM 的<strong>通用与非通用两条路线</strong>。',
   meta: [
-    '核心问题：<b>拿到一个从没见过的加壳 App，你怎么用最便宜的手段判出它属于哪一类？</b>',
-    '关键机制：<b>威胁模型 → 四个层次 → 三代壳 → 静态/动态特征 → 判定表 → 下一步动作</b>',
-    '对手：<b>不是一个「更强的壳」，而是一组工程取舍——加固方在防护强度、兼容性、体积、启动耗时之间的平衡</b>',
-    '读法：<b>本章是第 2 章的前置地图。先在这里把壳分类判清楚，再回去看 FART 会顺得多</b>'
+    '核心问题：<b>OLLVM 到底对 IR 做了什么？为什么 IDA 反编译出来是一坨 switch？</b>',
+    '关键工具：<b>LLVM / Clang、FunctionPass、OLLVM、NDK(CMake / Android.mk)、D-810、HexRaysDeob、动态 Trace</b>',
+    '对手：<b>加固厂商定制的 OLLVM fork —— 加了字符串加密、间接跳转、打乱 Pass 顺序</b>'
   ],
 
   sections: [
-    /* ============================================================ 19.1 */
+    /* ============ 19.1 ============ */
     {
-      h: '19.1', title: '先问加固方在防谁：三个威胁模型',
+      h: '19.1',
+      title: 'LLVM 三阶段编译器：战场在 IR，不在汇编',
       intuition: {
-        tag: '直觉模型 · 保险柜、保安和假门牌',
-        body:
-          '<p>把 App 想成一间办公室，里面有一份值钱的文件（业务代码）。加固方要做的事只有三类，每一类对应一种完全不同的手段：</p>' +
-          '<ul>' +
-          '<li><strong>防你翻文件柜</strong>（静态分析）→ 把文件锁进保险柜：加密、抽取、混淆。<em>你拿到的是一个打不开或者开了也没内容的柜子。</em></li>' +
-          '<li><strong>防你蹲在办公室里看</strong>（动态调试）→ 装监控、贴封条、雇保安：反调试、反 Hook、环境检测。<em>你要么进不去，要么进去就被发现。</em></li>' +
-          '<li><strong>防你把文件复印一份带走重印</strong>（二次打包）→ 给每份文件盖一个和门牌绑定的钢印：签名校验、完整性校验。<em>文件一离开这间办公室就作废。</em></li>' +
-          '</ul>' +
-          '<p>记住这张三分类的意义在于：<strong>后面看到任何一个防护手段，你都能立刻回答「它属于哪一类、挡在哪一步」</strong>。' +
-          '判定壳类型之所以难，一半原因就是初学者把这三类混在一起看，于是看到什么现象都觉得「像是加壳了」。</p>'
+        tag: '直觉模型 · 装修队里的恶作剧设计师',
+        body: '<p>把编译器想成一支装修队：<b>前端</b>负责量房出图纸（源码 → IR），<b>中端</b>是一群设计师在图纸上反复改（一堆 Pass 做优化），' +
+              '<b>后端</b>才是按图纸施工的工人（IR → 机器码）。</p>' +
+              '<p>OLLVM 就是混进中端的一个恶作剧设计师：它不换材料、不改功能，只是把图纸上的走廊全画成迷宫。' +
+              '房子住起来一模一样（程序行为不变），但任何人拿到图纸都看不懂户型了。<b>它改的是图纸，不是房子</b> —— 这就是为什么' +
+              '你 dump 出来的字符串还是明文，代码却完全读不懂。</p>'
       },
       html:
-        T.note('key', '🔑 本章主线',
-          '<p style="margin-bottom:0">为什么加固方要这么做（<b>威胁模型</b>）→ 加固铺在哪几层（<b>四个层次</b>）→ ' +
-          '壳怎么一步步演进（<b>三代壳 + 混合型</b>）→ 每一代在静态和动态各留什么痕迹（<b>观测清单</b>）→ ' +
-          '把这些痕迹组合成结论（<b>判定表与判定器</b>）→ 结论决定下一步动作（<b>决策演练</b>）。</p>') +
-        T.tbl(['威胁模型', '加固方的核心手段', '它在什么地方动手', '对逆向者的直接后果'],
+        '<p><b>OLLVM</b> 全称 <b>Obfuscator-LLVM</b>，是一个基于 LLVM 的开源代码混淆器，论文是 Junod / Rinaldini / Wehrli / Michielin 的 ' +
+        '<i>Obfuscator-LLVM — Software Protection for the Masses</i>（IEEE/ACM SPRO 2015）。当前版本基于 <b>LLVM 4.0</b>。' +
+        '国内加固厂商几乎人手一个它的 fork，所以你遇到“看不懂的 so”，多半就是它的徒子徒孙。</p>' +
+        '<p>要逆向它，必须先接受一个反直觉的事实：<b>混淆发生在 IR 层，不发生在汇编层</b>。它的输入是 C/C++，' +
+        '它的手术对象是 LLVM IR，汇编只是它顺手吐出来的副产品。</p>' +
+        T.tbl(
+          ['阶段', '输入 → 输出', '谁在干活', 'OLLVM 在哪插刀'],
           [
-            ['<b>防静态分析</b>', 'dex 整体加密、方法体抽取、DEX2C / VMP、so 加密、字符串加密',
-             'APK 文件本身与 dex 结构', 'jadx 打不开、或者打开了也只有类名没有方法体、或者方法体是看不懂的跳转'],
-            ['<b>防动态调试</b>', '反调试（TracerPid / 断点检测）、反 Hook（函数序言校验）、反 Frida（端口 / 线程名 / maps / 字符串）、root / 模拟器 / 多开检测',
-             '进程运行时的 Java 层、native 层，部分下沉到内核层', 'Frida 挂不上、挂了就闪退、能挂上但一读关键内存就被检测'],
-            ['<b>防二次打包</b>', '签名校验（Java 层 + native 层双份）、dex / so 完整性校验、资源校验',
-             '启动早期到关键功能前', '改一行 smali 重打包后 App 直接拒绝运行——<b>这是很多加固产品的「默认开启项」</b>']
-          ]) +
-        T.note('', '🧭 为什么「防二次打包」值得单列一类',
-          '<p>因为它改变了加固的<b>目标</b>。前两类威胁的目标是「不让你看懂」，第三类的目标是「不让你改完还能用」。</p>' +
-          '<p style="margin-bottom:0">这也解释了一个常见困惑：<i>为什么有的 App 明明代码不难，却非要上加固？</i>' +
-          '因为对方要防的不是你分析，而是竞品改一改就上架、黑产加个广告 SDK 就分发。' +
-          '<span class="hit">理解了这一点，你就不会再把「加固强度」当成单一维度去比较——防护目标和取舍完全不同。</span></p>') +
-        T.grid(2, [
-          '<div class="card"><div class="card-title">🛡️ 加固方真正在算的账</div>' +
-          '<p>加固不是一个「越强越好」的选择题，而是四条曲线的交点：<b>防护强度</b>、<b>兼容性</b>（不能把正常机型跑崩）、' +
-          '<b>体积与启动耗时</b>（每多一层解密就多一次启动开销）、<b>维护成本</b>（厂商要为每个安卓大版本、每个 ABI 重新适配）。</p>' +
-          '<p>所以同一个厂商的不同产品线、甚至同一个 App 的不同版本，用的方案强度都可能不一样。' +
-          '<span class="pill warn">待核实</span> 具体到某个产品线的强度档位，以其官方文档和实测为准。</p></div>',
-          '<div class="card"><div class="card-title">🔍 你要算的账</div>' +
-          '<p>你面对的是同样的取舍：<b>半小时判定 + 一条可行路线</b>，比「把已知的所有脱壳工具都试一遍」便宜得多。</p>' +
-          '<p>判定之所以成立，是因为加固方为了兼容性和启动耗时，<b>必然要在某些地方留下结构性的痕迹</b>——' +
-          '它可以让痕迹很难读，但很难让痕迹不存在。<span class="hit">这些痕迹就是本章的判定依据。</span></p></div>'
-        ]),
-      quiz: {
-        id: 'q19-1', chapter: 19, answer: 2,
-        stem: '「防二次打包」之所以要和「防静态分析」「防动态调试」并列成第三类威胁模型，最根本的原因是？',
-        options: [
-          { t: '因为它用到的技术（签名校验）比前两类更复杂', why: '签名校验本身并不复杂，一行 Java 代码就能做。复杂度不是它单列的理由。' },
-          { t: '因为它是所有加固产品的默认开启项，强度最高', why: '「默认开启」是现象不是原因；而且它的强度并不比抽取壳、VMP 更高，只是目标不同。' },
-          { t: '因为它防的不是「被看懂」，而是「被改完还能用」——防护目标本身不同', why: '正确。前两类目标是提高理解成本，第三类目标是让篡改后的产物直接失效，因此它必须和「完整性」绑定，而不只是混淆。' },
-          { t: '因为它只在 Android 平台存在，iOS 没有对应手段', why: 'iOS 同样有签名与完整性校验（且更严格）。这与它是否单列无关。' }
-        ],
-        explain: '<b>三类威胁模型的差别不在技术强度，而在「防住什么算成功」。</b><br><br>' +
-          '防静态分析成功的标准是：你打开 APK 看不到有意义的方法体。<br>' +
-          '防动态调试成功的标准是：你没法在运行时安静地观察它。<br>' +
-          '防二次打包成功的标准是：<b>你把代码改完、重新签名、装上去，它拒绝运行</b>——注意这里的关键词是「改完还能用」。<br><br>' +
-          '所以这一类必须依赖<b>完整性校验</b>（签名摘要、dex/so 校验和）而不是混淆：混淆只让你难读，不影响你改完之后跑起来。' +
-          '<span class="hit">判定壳类型时，这一条会反复出现：只要你看到「双份签名校验（Java + native）」，' +
-          '基本可以确定对方的产品目标里有反二次打包这一项。</span>'
-      }
+            ['前端 Frontend', 'C/C++ 源码 → <b>LLVM IR</b>', 'Clang 词法/语法/语义分析', '不碰（它读不懂源码语义）'],
+            ['中端 Middle-end', '<b>IR → 优化后 IR</b>', '一串 <b>Pass</b>（内联、GVN、死代码消除…）', '<b>就在这里，注册三个自定义 Pass</b>'],
+            ['后端 Backend', 'IR → 目标机器码', '指令选择、寄存器分配、调度', '不碰（此时结构已被定型）']
+          ]
+        ) +
+        T.note('key', '🔑 一句话建立坐标',
+          '<p>OLLVM 的三大混淆，本质就是<b>往 LLVM 中端插了三个自定义 Pass</b>：<span class="pill acc">-fla</span> 控制流平坦化、' +
+          '<span class="pill acc">-bcf</span> 虚假控制流、<span class="pill acc">-sub</span> 指令替换。' +
+          '官方 wiki 里它们对应 <code>-mllvm -fla</code> / <code>-mllvm -bcf</code> / <code>-mllvm -sub</code> 三个开关。</p>') +
+        T.note('', '🧭 为什么逆向工程师要懂编译器',
+          '<p>因为三大混淆<b>都不是加密，而是结构变形</b>。加密你还能找密钥，结构变形你只能理解<b>生成规则</b>。' +
+          '不懂 IR 和 Pass，你就永远停留在“受害者视角”——只能抱怨 IDA 输出一坨 switch；' +
+          '懂了生成规则，你才知道那坨 switch 是<b>可还原的</b>，还原依据是它的状态变量。</p>') +
+        T.note('warn', '⚠️ 一个必须先纠正的常见误解',
+          '<p><b>字符串加密不是 OLLVM 官方特性。</b>官方 wiki 只列了三大混淆 + 函数注解（Functions annotations）。' +
+          '你看到的“字符串全被加密成 byte 数组”，是<b>后续 fork / 加固厂商自己加的</b>。' +
+          '课程把它和三大混淆并列讲，是因为国内加固实践里它们总是一起出现，但<b>归因别搞错</b>（详见 19.8）。</p>') +
+        '<p>术语先混个脸熟：' + T.term('IR', 'Intermediate Representation，中间表示。LLVM 的核心资产，一种类型化、SSA 形式的类汇编语言') + '、' +
+        T.term('Pass', '作用于 IR 的转换或分析单元，是 LLVM 里一切优化的基本砖块') + '、' +
+        T.term('OLLVM', 'Obfuscator-LLVM，把混淆做成 LLVM Pass 的开源项目') + '。</p>'
     },
 
-    /* ============================================================ 19.2 */
+    /* ============ 19.2 ============ */
     {
-      h: '19.2', title: '加固的四个层次：DEX / SO / 资源 / 运行时防护',
+      h: '19.2',
+      title: 'LLVM Pass 机制：OLLVM 的全部魔法都在这里（源码级）',
       html:
-        '<p>「加固」不是一个动作，而是<b>四个可以独立开关的层次</b>。理解这一点，你在判定时就能把观察到的现象分别归位，' +
-        '而不是笼统地说「这个 App 加固了」。</p>' +
-        T.tbl(['层次', '加固方在这里做什么', '你看到的现象', '对应后续章节'],
+        '<p>OLLVM 之所以“优雅”，是因为它<b>没有发明任何新东西</b>，只是把 LLVM 自带的 Pass 框架用到了极致。' +
+        '你只要看懂一个 <code>runOnFunction</code>，就等于看懂了三大混淆的骨架。</p>' +
+        T.tbl(
+          ['Pass 类型', '作用范围', '入口函数', '典型用途'],
           [
-            ['<b>DEX 层</b>', '整份加密、方法体抽取、DEX2C 翻译、VMP 字节码化、字符串加密、名字混淆',
-             'jadx 打不开 / 方法体为空 / 方法体是跳转与数据 / 字符串全是乱码',
-             '第 2 章（脱壳）、第 12 章（版本适配）、第 5 章（混淆）'],
-            ['<b>SO 层</b>', 'so 整体加密 + 内存加载、导出表抹除、JNI 动态注册、控制流平坦化（OLLVM）、反调试',
-             '<code>lib/</code> 下的 so 用 IDA 打开是乱码或没有导出符号；Java 层只剩 native 声明',
-             '第 4 章（RegisterNatives）、第 10 章（反 Frida）、第 5、6 章'],
-            ['<b>资源层</b>', '资源加密与运行时解密、资源名混淆、assets 里藏真 dex（或分片）',
-             '<code>assets/</code> 里有体积异常、命名无语义的文件；<code>res/</code> 打开是乱码',
-             '本章 19.11（静态特征）'],
-            ['<b>运行时防护层</b>', '反调试、反注入、反 Hook、root/模拟器/多开检测、完整性校验、反 Frida',
-             '启动就退、挂上调试器就闪退、重打包后拒绝运行',
-             '第 13 章（内核层绕过）、第 10 章（反 Frida）、第 15、16 章（环境检测）']
-          ]) +
-        T.note('key', '🔑 四个层次是「可组合」的，不是「四选一」',
-          '<p style="margin-bottom:0">一个真实的商用壳通常是：<b>DEX 层做抽取 + SO 层做整体加密与动态注册 + 资源层藏几个配置/证书 + ' +
-          '运行时防护层挂上反调试和签名校验</b>。所以「这是几代壳」和「有没有运行时防护」是两个独立的问题——' +
-          '<span class="hit">判定时要分开回答，混在一起就会得出「它既是二代壳又是三代壳」这类没法操作的结论。</span></p>') +
-        T.acc('为什么资源层也值得单独列一层（很多人会漏掉它）',
-          '<p>因为<b>它是壳的「行李箱」</b>。dex 太大、太显眼，所以壳常把真 dex、解密密钥、配置、证书塞进 <code>assets/</code> 或资源表，' +
-          '用无语义的名字藏起来（例如一个 8MB 的 <code>.bin</code>、一组分片文件）。</p>' +
-          '<p>你在静态侦察阶段看到「<code>assets/</code> 里有个体积远大于正常资源的文件」，这条线索的价值在于：' +
-          '<b>它同时指出了一代壳的存在和它的解密输入</b>。反过来，如果 <code>assets/</code> 干干净净、dex 又是空壳，' +
-          '那真 dex 更可能是从服务端下发或在 so 里生成的 —— 这是一个重要的方向分歧。</p>' +
-          '<p style="margin-bottom:0"><span class="pill warn">待核实</span> 具体的命名习惯（用 <code>.bin</code>、<code>.dat</code> 还是伪装成图片）每个厂商不同且会变，' +
-          '不要用文件名当判据，用<b>体积与熵值是否像加密数据</b>当判据。</p>') +
-        '<p>下面把四个层次摊到一张图上，看清它们各自拦在逆向流程的哪一步。这张图后面在 19.3 讲代际演进时还会用到。</p>',
-      stage: {
-        title: '加固四层 × 逆向流程：每层拦在哪一步',
-        speed: 1500,
-        render:
-          '<div class="flow-col" style="gap:10px">' +
-            '<div class="flow-row"><span class="pill mono">你的动作</span>' +
-              '<span class="blk" id="q1">反编译 APK</span><span class="arrow">→</span>' +
-              '<span class="blk" id="q2">读 dex 结构</span><span class="arrow">→</span>' +
-              '<span class="blk" id="q3">跑起来观察</span><span class="arrow">→</span>' +
-              '<span class="blk" id="q4">改代码重打包</span></div>' +
-            '<div class="flow-row"><span class="pill bad">DEX 层</span>' +
-              '<span class="blk" id="l1">加密 / 抽取 / DEX2C / VMP</span></div>' +
-            '<div class="flow-row"><span class="pill bad">SO 层</span>' +
-              '<span class="blk" id="l2">so 加密 / 抹导出表 / 动态注册</span></div>' +
-            '<div class="flow-row"><span class="pill bad">资源层</span>' +
-              '<span class="blk" id="l3">藏真 dex / 密钥 / 证书</span></div>' +
-            '<div class="flow-row"><span class="pill bad">运行时防护层</span>' +
-              '<span class="blk" id="l4">反调试 / 反 Hook / 完整性校验</span></div>' +
-            '<div style="margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill" id="concl">点「单步」看每一层拦住了你哪一步</span></div>' +
-          '</div>',
-        reset: function () {
-          ['q1','q2','q3','q4','l1','l2','l3','l4'].forEach(function (i) { S(i, ''); });
-          CLS('concl', 'pill'); SET('concl', '点「单步」看每一层拦住了你哪一步');
-        },
-        steps: [
-          { run: function () { S('q1', 'active'); S('l1', 'hot'); },
-            note: '<b>DEX 层拦你的第一步：反编译。</b>整份加密的壳让 jadx 连类名都看不到；抽取壳让你看得到类名、看不到方法体。<b>它挡的是「读懂静态代码」。</b>' },
-          { run: function () { S('q1', 'done'); S('q2', 'active'); S('l1', 'done'); S('l3', 'hot'); },
-            note: '<b>资源层拦你的第二步：找真 dex。</b>真 dex 藏在 <code>assets/</code> 里、还被加密或分片，' +
-              '你在 dex 结构里找不到任何线索——因为那份 dex 本来就不是真的。' },
-          { run: function () { S('q2', 'done'); S('q3', 'active'); S('l3', 'done'); S('l2', 'hot'); },
-            note: '<b>SO 层拦你的第三步：跑起来观察。</b>解密器、回填逻辑、关键算法都在 so 里。' +
-              'so 被整体加密 + 内存加载 + 导出表抹除 → 你在磁盘上拿到的是一个「加密的壳」，' +
-              '能看的东西只剩一堆没有符号的可执行段。' },
-          { run: function () { S('l2', 'done'); S('l4', 'hot'); },
-            note: '<b>运行时防护层拦你的第三步的后半段。</b>就算你成功挂上去，反调试、反 Hook、反 Frida 也在同一时刻工作。' +
-              '<span class="hit">注意差别：SO 层挡的是「你读不到代码」，运行时防护挡的是「你读不到内存」。</span>' },
-          { run: function () { S('q3', 'done'); S('q4', 'active'); S('l4', 'hot'); CLS('concl', 'pill bad'); SET('concl', '⚠️ 前三层还能靠技术硬啃，第四层常常直接让你「技术上做不到」'); },
-            note: '<b>最后一关：完整性校验。</b>你改完 smali 重新签名，装上去 App 直接拒绝运行。' +
-              '这一步通常发生在<b>启动早期</b>（Application 初始化时）或<b>关键功能之前</b>。' },
-          { run: function () { S('q4', 'done'); S('l1', 'cool'); S('l2', 'cool'); S('l3', 'cool'); S('l4', 'cool'); CLS('concl', 'pill ok'); SET('concl', '✅ 四层各自独立：判定时要把它们分开回答'); },
-            note: '<b>看清这张图的意义：</b>四层是<b>独立的开关</b>。你可以遇到「只做了一代壳、没有任何运行时防护」的样本' +
-              '（最好啃），也可以遇到「抽取壳 + so 加密 + 全套反调试」的样本（最难啃）。' +
-              '<span class="hit">判定壳类型只是第一问，第二问永远是：运行时防护开到了什么程度。</span>' }
-        ]
-      }
-    },
-
-    /* ============================================================ 19.3 */
-    {
-      h: '19.3', title: '壳的代际演进：本章的骨架',
-      html:
-        '<p>「一代壳 / 二代壳 / 三代壳」不是厂商的营销分类，而是<b>加固方针对「静态分析」不断加码的三个阶段</b>。' +
-        '每一代都在解决上一代的漏洞，而这个「解决方式」正好就是判定它的依据。</p>' +
-        T.tbl(['', '一代壳', '二代壳（抽取壳）', '三代壳（DEX2C / VMP）'],
-          [
-            ['<b>藏什么</b>', '整份 dex 文件', '方法体的字节码（<code>code_item</code> / <code>insns</code>）', '方法本身：字节码被翻译成 C 或自定义指令'],
-            ['<b>静态能看到什么</b>', '只有壳的代码，业务类完全不可见', '<b>完整的类名、方法名、字段、签名</b>，方法体为空', '类名方法名可能完整，方法体是 native 声明或「读数据 + 跳进循环」'],
-            ['<b>运行时做什么</b>', '解密 → 加载', '加载后，方法<b>首次被调用时</b>才把字节码回填进去', '调用时进入 so 里的解释器/翻译后代码'],
-            ['<b>破解的关键动作</b>', '<b>找 dump 时机</b>（解密完成 + ART 接管）', '<b>主动调用</b>，逼壳回填', '动态 Trace 找映射关系；或黑盒调用拿结果'],
-            ['<b>对应章节</b>', '第 2 章的 dex dump 部分', '第 2、12 章（FART 全套）', '第 6 章（VMP）、第 4 章（ART 插桩）'],
-            ['<b>在判定器里的假设</b>', '<code>gen1</code>', '<code>gen2</code>', '<code>gen3</code> / <code>vmp</code>']
-          ]) +
-        T.note('', '🧭 「混合型」不是第四代',
-          '<p style="margin-bottom:0">真实的商用壳常常是<b>组合</b>：多份 dex（其中一部分是抽取的、一部分是 native 化的）、' +
-          '多个 so（有一个负责解密、一个负责业务）、甚至「壳里还套一层壳」（外层壳负责解密，内层壳负责抽取）。' +
-          '把混合型单独放一节（19.7），是因为它<b>不是代际的延续，而是同一代技术在不同部位的重复使用</b>——' +
-          '判定时的处理方式完全不同：你要先<b>排顺序</b>，而不是先<b>定代际</b>。</p>') +
-        '<p>下面把五代形态（含 VMP 与混合型）逐个点亮。每一步都注意三件事：<b>它藏什么、你看到什么、该做什么</b>。</p>',
-      stage: {
-        title: '壳的代际演进 · 五代形态一轮过',
-        speed: 2400,
-        render:
-          '<div class="flow-row" style="flex-wrap:wrap;gap:8px;align-items:center">' +
-            '<span class="blk" id="b1">一代壳<br><span class="small">整体加密</span></span><span class="arrow">→</span>' +
-            '<span class="blk" id="b2">二代壳<br><span class="small">抽取 + 回填</span></span><span class="arrow">→</span>' +
-            '<span class="blk" id="b3">三代·DEX2C<br><span class="small">翻译成 native</span></span><span class="arrow">→</span>' +
-            '<span class="blk" id="b4">三代·VMP<br><span class="small">自定义指令集</span></span><span class="arrow">+</span>' +
-            '<span class="blk" id="b5">混合型<br><span class="small">多 dex / 多 so / 壳中壳</span></span>' +
-          '</div>' +
-          '<div style="margin-top:12px"><span class="pill" id="mark">点「单步」逐个展开</span></div>' +
-          '<div class="grid3" style="margin-top:12px">' +
-            '<div><div class="card-title">它藏什么</div><div class="small" id="c1" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
-            '<div><div class="card-title">你会看到什么</div><div class="small" id="c2" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
-            '<div><div class="card-title">下一步做什么</div><div class="small" id="c3" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
-          '</div>',
-        reset: function () {
-          ['b1','b2','b3','b4','b5'].forEach(function (i) { S(i, ''); });
-          CLS('mark', 'pill'); SET('mark', '点「单步」逐个展开');
-          SET('c1', '—'); SET('c2', '—'); SET('c3', '—');
-        },
-        steps: [
-          { run: function () { S('b1', 'active'); SET('c1', '整份 <code>classes.dex</code>（可能还有其它 dex）被加密或整体搬走'); SET('c2', 'jadx 只看到壳的代码；<code>assets/</code> 里可能有个体积异常的文件'); SET('c3', '找 dump 时机：解密完成、ART 已接管结构的那一刻抓内存'); },
-            note: '<b>一代壳：整体加密 / 文件重定向。</b>最朴素的做法——把真 dex 加密后换个位置存，' +
-              '启动时解密到内存再加载。<span class="hit">它的漏洞很明确：内存里一定会出现一份完整的明文 dex。</span>' },
-          { run: function () { S('b1', 'done'); S('b2', 'active'); SET('c1', '只抽走方法体的字节码（<code>insns</code>），结构全留着'); SET('c2', '<b>完整的类名/方法名/字段/签名</b>，但方法体是空的或只有 <code>return</code>'); SET('c3', '主动调用：遍历所有方法强制触发回填，再逐方法 dump'); },
-            note: '<b>二代壳（抽取壳）：静态抽取 + 动态回填。</b>针对的就是一代壳的漏洞——' +
-              '既然你总能 dump 到内存里的明文，那就<b>让内存里的那份本来就不完整</b>：实体结构给你，字节码等你要用时才给。' },
-          { run: function () { S('b2', 'done'); S('b3', 'active'); SET('c1', '方法体的执行逻辑被翻译成 C 再编译进 so'); SET('c2', 'Java 层可能只剩一个 native 声明，或者方法体是一小段「读参数 → 调用 native」的胶水代码'); SET('c3', '在 <code>JNI_OnLoad</code> / <code>RegisterNatives</code> 处记录绑定关系，再做动态 Trace'); },
-            note: '<b>三代壳第一支：DEX2C / Java2C。</b>针对的是二代壳的漏洞——既然你总能「主动调用逼它回填」，' +
-              '那就<b>干脆不在 Java 层准备字节码</b>：把字节码翻译成等价的 C 代码编进 so。回填这件事从根上不存在了。' },
-          { run: function () { S('b3', 'done'); S('b4', 'active'); SET('c1', '字节码被换成厂商自定义的指令集，配一个解释器'); SET('c2', '方法体不是空的，而是「读一串数据 + 跳进一个循环」；一段代码看不出语义'); SET('c3', '先找到分发循环与 handler 表，量清指令集规模；多数情况黑盒调用更划算'); },
-            note: '<b>三代壳第二支：VMP。</b>DEX2C 的编码量太大（每个方法都要翻），VMP 把这一步变成「换一套指令集 + 写一个解释器」，' +
-              '<span class="hit">保护强度更高、体积代价更小，代价是运行变慢。</span>这一支的深入内容在第 6 章，本章只要求你<b>能认出来</b>。' },
-          { run: function () { S('b4', 'done'); S('b5', 'active'); SET('c1', '同一份 APK 里多种保护并存：部分 dex 抽取、部分 native 化、多个 so 分工、甚至壳中壳'); SET('c2', '现象互相矛盾：某些类方法体正常、某些为空、某些是 native 声明'); SET('c3', '<b>先排顺序</b>：哪一层在最外面（决定你能拿到什么），哪一层在最里面（决定你最终能读什么）'); },
-            note: '<b>混合型：多 dex / 多 so / 壳中壳。</b>这不是第四代，而是<b>把前几代的技术在不同部位重复用了一遍</b>。' +
-              '判定它的难点不是「认不出」，而是「认出太多」——<span class="hit">这时候要问的不是「这是几代壳」，而是「先啃哪一层」。</span>' },
-          { run: function () { S('b5', 'cool'); CLS('mark', 'pill ok'); SET('mark', '✅ 五代形态的共同点：它们都必须让代码最终可执行'); },
-            note: '<b>收束到一句判定的底层逻辑：</b>无论哪一代壳，代码最终都要被 CPU 执行。' +
-              '要么以字节码形式（一代、二代 → 内存里一定有明文 dex），要么以机器码形式（三代 → 内存里一定有可执行代码）。' +
-              '<span class="hit">所以判定壳类型，本质上是在问：<b>它把「可执行的真相」放在了哪一层？</b>' +
-              '而你的每一种观测手段，都是在某一层找这个真相。</span>' }
-        ]
-      },
-      after:
-        T.note('ok', '✅ 这一节要带走的一句话',
-          '<p style="margin-bottom:0">后面所有判定规则，都是从这张代际表推出来的：' +
-          '<b>结构完整但方法体空 → 二代；连结构都看不到 → 一代；方法体是 native 或天书 → 三代；' +
-          '现象互相矛盾 → 混合，先排顺序。</b></p>')
-    },
-
-    /* ============================================================ 19.4 */
-    {
-      h: '19.4', title: '一代壳的完整启动链路：文件重定向到底改了什么',
-      html:
-        '<p>一代壳最容易被误解的一点是：<b>它通常不「加密」一个大文件藏起来，而是把 APK 本身的结构改掉</b>。' +
-        '典型做法是：把原始 <code>classes.dex</code> 换成一个只做引导的壳 dex，真 dex 加密后放在 <code>assets/</code> 或另起名字；' +
-        '再把 <code>AndroidManifest.xml</code> 里的入口 Application 换成壳的 Application。<b>这套动作叫文件重定向。</b></p>' +
-        T.tbl(['重定向的对象', '改成了什么', '你静态看到的后果'],
-          [
-            ['<code>classes.dex</code>', '壳自己的引导 dex（几百 KB 量级）', 'jadx 里只有壳的代码，业务包名下一个类都没有'],
-            ['真 dex', '加密后放进 <code>assets/</code> 或改名/分片', '反编译看不到；但 <code>unzip -l</code> 能看到体积异常的文件'],
-            ['<code>AndroidManifest.xml</code> 的 <code>application:name</code>', '壳的 Application（或一个继承自它的 Stub）', '你在 Manifest 里找不到业务方自己的 Application 类'],
-            ['组件（Activity/Service/Provider）', '部分情况下改成壳的代理组件，运行时再转发', '<span class="pill warn">待核实</span> 是否代理、代理到什么程度随厂商与版本变化']
-          ]) +
-        T.note('warn', '⚠️ 「重定向」和「加密」是两件事，别混着讲',
-          '<p style="margin-bottom:0">重定向只负责<b>换掉入口和文件位置</b>，加密负责<b>让你读不懂内容</b>。' +
-          '有些一代壳甚至不加密（只做重定向 + 混淆），你仍然能在 <code>assets/</code> 里直接捞到明文 dex，' +
-          '只是名字不叫 <code>classes.dex</code> 而已。<span class="hit">所以「看不到业务代码」不等于「内容被加密了」——' +
-          '这是判定时第一个要分清的岔路：<b>是找不到，还是读不懂？</b></span></p>') +
-        '<p>把一次完整的启动过程走一遍。注意第 5 步之后，<b>你已经在内存里拥有过一份完整的明文 dex 了</b>——这就是一代壳无法回避的窗口。</p>',
+            ['<b>ModulePass</b>', '整个模块（一个 .bc / 一个编译单元）', '<code>runOnModule</code>', '跨函数分析、插桩、全局重命名'],
+            ['<b>FunctionPass</b>', '<b>单个函数</b>', '<code>runOnFunction</code>', '<b>OLLVM 三大混淆全部属于这一类</b>'],
+            ['<b>BasicBlockPass</b>', '单个基本块', '<code>runOnBasicBlock</code>', '局部的窥孔式改写'],
+            ['<b>LoopPass</b>', '单个循环（自然循环）', '<code>runOnLoop</code>', '循环不变量外提、展开']
+          ]
+        ) +
+        T.note('key', '🔑 为什么 OLLVM 选 FunctionPass',
+          '<p>因为混淆的<b>合理作用域就是函数</b>：控制流平坦化要重排一个函数的全部基本块，虚假控制流要在函数内部造分支，' +
+          '指令替换只看单条指令。超过函数范围（ModulePass）会互相打架、签名对不上；小于函数范围（BasicBlockPass）又看不见全局结构。' +
+          '<b>基本块是它操作的原子单位</b>。</p>') +
+        '<p>四个必须记住的 API（后面读源码全靠它们）：</p>' +
+        '<ul>' +
+        '<li><code>Function::getBasicBlockList()</code> / 范围 for 循环 —— <b>拿到函数里所有基本块</b>，这是混淆的第一步。</li>' +
+        '<li><code>BasicBlock::getInstList()</code> —— 拿到块内指令链表，删改指令从这里下手。</li>' +
+        '<li><code>IRBuilder&lt;&gt;</code> —— <b>插入新指令的构造器</b>，比裸调 <code>new AddInst(...)</code> 干净得多，自动维护 SSA 与插入点。</li>' +
+        '<li><code>SplitBlock</code> / <code>SplitEdge</code>（位于 <code>Transforms/Utils/BasicBlockUtils.h</code>）—— <b>切分基本块与边</b>，' +
+        '这是插入“序言块”的关键工具。</li>' +
+        '</ul>' +
+        '<p>下面用一个 Pass 的完整骨架，把 <code>-fla</code> 的注册与改写流程走一遍。注意每一步都在动<b>同一个函数对象</b>。</p>',
       stepper: {
-        title: '一代壳启动链路：从点击图标到业务代码跑起来',
+        title: '一个 OLLVM 风格 Pass 的骨架：从注册到改写基本块',
         lines: [
-          { code: '<span class="c">// 1. 系统按 Manifest 拉起 Application</span>',
-            note: '<b>入口已经被换过了。</b>系统读到 <code>application:name</code>，实例化的是<b>壳的 Application</b>（或它的子类）。' +
-              '业务方自己的 Application 此刻还没出生——它要等信息从解密后的 dex 里被加载出来。<br>这是所有壳的共同起点。',
-            state: { '进程': 'com.example.app', 'Application': '壳的 Stub', '业务代码': '尚未加载' } },
-          { code: '<span class="k">@Override</span> <span class="k">protected void</span> <span class="f">attachBaseContext</span>(Context base) {',
-            note: '<b>★ 壳的动手点。</b><code>attachBaseContext</code> 早于 <code>onCreate</code>，是进程里最早能拿到 <code>Context</code> 的位置。' +
-              '壳在这里完成：读配置 → 解密 → 加载 → 替换。<b>判定时的含义：只要这个方法被覆写，就说明入口层被接管了。</b>',
-            state: { '调用时机': 'Application.onCreate 之前', '可用资源': 'Context / AssetManager', '脱壳阶段': '① 入口接管' } },
-          { code: '  <span class="f">super</span>.<span class="f">attachBaseContext</span>(base);',
-            note: '先调 super，保证 Context 正常初始化。<b>顺序本身也是特征</b>：如果解密逻辑写在 super 之前，往往说明它需要尽早拿到路径、或不想依赖父类初始化——' +
-              '这类细节在读逆向后壳源码时会看到，但<span class="pill warn">待核实</span>不能当成通用判据。',
-            state: { '脱壳阶段': '① 入口接管' } },
-          { code: '  <span class="k">byte</span>[] enc = <span class="f">readAsset</span>(<span class="s">"assets/xxxx.bin"</span>);',
-            note: '<b>读出加密数据。</b>数据源可能来自 <code>assets/</code>、<code>res/</code>、或另一个 <code>.dex</code>，' +
-              '也可能根本不在 APK 里（服务端下发 / 从 so 里生成）。<span class="hit">这一步的线索价值极高：它决定你后面能不能离线拿到密文。</span>',
-            state: { '密文来源': 'assets/xxxx.bin', '大小': '数 MB（量级与真 dex 相称）', '脱壳阶段': '② 取密文' } },
-          { code: '  <span class="k">byte</span>[] dex = <span class="f">decrypt</span>(enc, <span class="f">getKey</span>());',
-            note: '<b>★ 关键瞬间：明文 dex 出现在内存里。</b>此刻它还是一块裸数据，没被 ART 接管，所以没有 DexFile 对象、没有类定义。' +
-              '<span class="hit">这正是「dump 早了拿到密文、dump 晚了被壳藏回去」的那个窗口。</span>' },
-          { code: '  <span class="f">loadDex</span>(dex);   <span class="c">// 自造 DexClassLoader / InMemoryDexClassLoader</span>',
-            note: '<b>把明文交给自己造的加载器。</b>低版本常见「先落地成文件再 <code>DexClassLoader</code>」，高版本可用 <code>InMemoryDexClassLoader</code> 直接吃内存。' +
-              '<span class="pill warn">待核实</span> 具体用哪个 API 与该壳适配的 minSdk 有关，两种都能见到。',
-            state: { '加载器': '壳自定义（不是 PathClassLoader）', '落地与否': '可能落地也可能纯内存', '脱壳阶段': '③ 加载' } },
-          { code: '  <span class="f">replaceClassLoader</span>();   <span class="c">// 反射替换</span>',
-            note: '<b>替换掉系统的加载器引用。</b>社区通行做法是反射改掉 <code>ActivityThread</code> 持有的包信息里的 <code>mClassLoader</code>，' +
-              '并把新加载器的 <code>dexElements</code> 合并进原有列表。<br>' +
-              '<span class="pill warn">待核实</span> 具体字段名（<code>mPackages</code> / <code>mClassLoader</code> / <code>pathList</code> / <code>dexElements</code>）随安卓版本变化，' +
-              '高版本还受 hidden API 策略限制——<b>记机制，不要记字段名</b>。',
-            state: { '目标': '让系统后续加载业务类时走壳的加载器', '副作用': 'Java.use 用默认加载器看不到业务类', '脱壳阶段': '④ 接管' } },
-          { code: '}', note: '<b>attachBaseContext 结束。</b>此时壳已经把「业务代码这条路」修好了，接下来系统会继续走正常的 Application 生命周期。',
-            state: { '脱壳阶段': '④ 接管完成' } },
-          { code: '<span class="c">// 2. 壳在 onCreate 里把真正的 Application 唤起</span>',
-            note: '<b>业务 Application 被反射创建出来并接手。</b>常见做法是反射 <code>newInstance</code> 真 Application，再依次调用它的 <code>attachBaseContext</code> / <code>onCreate</code>。' +
-              '<b>这解释了一个高频困惑：为什么在真 Application 的 onCreate 里下断点，断到的时候「壳的东西早就跑完了」。</b>',
-            state: { '真 Application': '已实例化并接管', '脱壳阶段': '⑤ 接力' } },
-          { code: '<span class="f">launchMainActivity</span>();  <span class="c">// 业务逻辑开始执行</span>',
-            note: '<b>业务代码终于跑起来。</b>回到判定视角：如果你到这里才发现「原来真 dex 早就在内存里」，那说明你要的观测点应该在更早——' +
-              '<b>Application 初始化阶段，而不是业务逻辑阶段</b>。<span class="hit">脱壳的时机永远比你的直觉更早。</span>',
-            state: { '内存中': '存在完整明文 dex', '窗口状态': '可能仍然打开，也可能已被清理', '脱壳阶段': '✅ 结束' },
-            mem: '一代壳在内存里留下的两个窗口\n\n① attachBaseContext 中：解密后的裸 dex\n   特征：没有 DexFile 结构，只有一块数据\n   风险：这里 dump 要靠特征扫描，容易误判\n\n② 加载器接管之后：ART 眼中的完整 dex\n   特征：有 DexFile、有类定义、方法表齐全\n   优点：dump 出来直接可用（结构完整）\n   这就是「一次到位」的那个点（第 2 章 s5/s6）' }
-        ]
-      },
-      after:
-        T.note('ok', '✅ 这一节的判定产出',
-          '<p style="margin-bottom:0">看完这条链路，你应该能回答三个问题：<b>①</b> 入口层有没有被接管（看 <code>attachBaseContext</code> 与 Manifest 的 ' +
-          '<code>application:name</code>）；<b>②</b> 密文在不在 APK 里（看 <code>assets/</code>）；' +
-          '<b>③</b> 你有没有可能在启动早期就把明文 dex 拿到手。<b>这三问就是一代壳的全部判定内容。</b></p>')
-    },
-
-    /* ============================================================ 19.5 */
-    {
-      h: '19.5', title: '二代壳：抽取壳的「静态抽取 + 动态回填」',
-      intuition: {
-        tag: '直觉模型 · 图书馆把书页抽走，借书时才还给你',
-        body:
-          '<p>一代壳的漏洞太明显：内存里总会有一份完整的书。于是加固方换了个思路——<strong>不藏整本书，改抽书页</strong>。</p>' +
-          '<p>目录、章节名、页码全部照常印（这部分是「结构」），但每一章的正文被抽走了，只留一行「此页待补」。' +
-          '你想借哪一章，它当场把那一章的正文补印上去 —— <strong>你没借过的章节，永远是空的</strong>。</p>' +
-          '<p>这个类比的每一处都对应真实机制：<b>目录 = dex 的类/方法/字段表</b>（完整保留，所以 ART 能正常加载和链接类）、' +
-          '<b>正文 = 方法体的 <code>code_item</code></b>（被抽走）、<b>「借书时才补印」= 方法首次被调用时才回填</b>。</p>' +
-          '<p>而它的直接推论就是脱壳的全部难度：<strong>脱壳完整度 = 你触发过的代码路径覆盖度</strong>。这不是技巧，是机制决定的下限。</p>'
-      },
-      html:
-        '<p>抽取壳（二代壳）要解决的核心问题是：<b>如何在「结构必须完整」的前提下让「内容不可读」</b>。' +
-        'dex 的类定义、方法签名、字段表必须真实存在，否则 ART 无法链接类、无法调用方法；' +
-        '但方法体可以是一段「待回填」的占位。</p>' +
-        T.tbl(['环节', '抽取壳做了什么', '你观测到什么'],
-          [
-            ['<b>静态抽取</b>', '编译期/加固期把每个 <code>code_item</code> 的 <code>insns</code> 抽走，替换为空或 nop 填充；原始指令加密后另存',
-             'jadx 反编译成功、类名方法名齐全，方法体为空或只有 <code>return null</code>'],
-            ['<b>结构保留</b>', '类/方法/字段/字符串表原样保留（否则类加载会崩）',
-             '<code>class_defs_size</code> 正常（几百到几千）；你甚至能看到完整的调用关系'],
-            ['<b>运行时回填</b>', '方法首次被执行（或首次被解析）时，壳的解密逻辑把真指令写回该方法的 code item',
-             '调用过的方法有代码了；冷门分支/未走过的路径仍是空的'],
-            ['<b>native 解密器</b>', '回填逻辑与密钥通常在 so 里（配合 19.8 的 SO 加固）',
-             '你在 Java 层找不到「回填」这件事的代码；native 注册痕迹明显']
-          ]) +
-        T.note('key', '🔑 判定抽取壳的三个独立证据（凑齐两个就够用）',
-          '<p>① <b>结构完整但方法体空</b>——最直接的现象，jadx 里一眼可见；<br>' +
-          '② <b>跑过功能之后，某些方法「自己长出来了」</b>——同一个 dex 前后 dump 两次，非空方法数会变多；<br>' +
-          '③ <b>native 侧有解密/回填逻辑</b>——JNI 动态注册、可执行匿名段、或某个 so 在方法调用前后被访问。</p>' +
-          '<p style="margin-bottom:0"><span class="hit">第 ② 条是把「抽取壳」和「dex 本来就残缺」区分开的关键：' +
-          '抽取壳的缺失是<b>可变的</b>（随调用而减少），残缺是<b>恒定的</b>。</span></p>') +
-        T.acc('为什么「主动调用」是这件事的自然解法（衔接第 2 章）',
-          '<p>既然回填由「方法被执行」触发，那么最笨也最彻底的办法就摆在那里了：<b>把所有方法都执行一遍</b>。' +
-          '这正是 FART 主动调用的全部逻辑——遍历所有 DexFile × 所有类 × 所有方法，构造默认参数强行调用，' +
-          '让壳认为「这个方法要被用了」，从而完成回填，然后立刻把 code item dump 下来。</p>' +
-          '<p style="margin-bottom:0">这也解释了第 2 章那个反直觉的细节：<b>调用抛异常没关系</b>，' +
-          '因为你要的不是返回值，是「回填」这个副作用。<span class="pill warn">待核实</span> 更高版本的 ART 上，' +
-          '回填的触发点是「首次执行」还是「首次解析/验证」，随结构与实现变化——<b>但只要你把方法真的调用到，两种情况下它都必须给出真指令。</b></p>') +
-        '<p>最后分清一件事：抽取壳与「字符串加密」是两种独立保护，经常同时出现。方法体完整但字符串全是乱码，那是字符串加密（第 5 章）；' +
-        '方法体本身为空，才是抽取。</p>',
-      quiz: {
-        id: 'q19-2', chapter: 19, answer: 1,
-        stem: '你脱壳得到两份 dex：第一次 dump 时 <code>Crypto.a()</code> 是空的，' +
-              '点了一遍 App 所有界面再 dump，同一个类里 <code>Crypto.b()</code> 变成了有内容的、但 <code>Crypto.a()</code> 仍然是空的。' +
-              '最合理的解释是？',
-        options: [
-          { t: '<code>Crypto.a()</code> 属于 VMP 保护，<code>Crypto.b()</code> 属于抽取壳保护', why: '同一个类里混用两种代际保护技术上可能，但用这个现象无法推出——空方法本身就是抽取壳的特征，不需要引入 VMP。' },
-          { t: '抽取壳只回填「被调用过」的方法，<code>a()</code> 所在的代码路径没有被你的操作触发', why: '正确。回填由调用触发，完整度 = 触发覆盖度。' },
-          { t: '第二次 dump 覆盖了第一次的结果，<code>a()</code> 的内容被写坏了', why: '抽取壳的缺失是可变的（调用过才有），不是 dump 覆盖造成的；而且你也无法解释 b() 恢复。' },
-          { t: '<code>a()</code> 是一个从未被编译进 dex 的方法，本来就不存在', why: '方法在 dex 里存在（你能看到它的方法名和签名），只是 code item 为空——存在与有内容是两件事。' }
-        ],
-        explain: '抽取壳的回填发生在方法被真正执行（或被执行前必须解析）的时候。<b>你没走过的代码路径，它的方法体就还锁着。</b><br><br>' +
-          '所以脱壳前那一轮「把 App 每个界面、每个按钮都点一遍」不是玄学，它是在<b>提高触发覆盖度</b>。' +
-          '而如果某条路径没法自然触发（需要特定参数、特定服务端状态、特定分支条件），就只剩人工触发一条路：' +
-          '用 Frida 主动调用它一次（第 2 章讲过这个补触发手法）。<br><br>' +
-          '<b>注意这道题的判据价值：</b>「同一个 dex 前后两次 dump，非空方法数变多」——这个现象本身就是抽取壳的指认，' +
-          '而不是「壳没脱干净」这类模糊说法。<span class="hit">可变的缺失 = 抽取；恒定的缺失 = 残缺。</span>'
-      }
-    },
-
-    /* ============================================================ 19.6 */
-    {
-      h: '19.6', title: '三代壳：DEX2C / Java2C 与 VMP',
-      html:
-        '<p>二代壳的漏洞是「只要我调用，你就得给我真指令」。三代壳的应对是釜底抽薪：<b>Java 层干脆不再放字节码</b>。' +
-        'DEX2C 把字节码翻译成等价的 C 再编译进 so；VMP 把字节码换成一套自定义指令，再配一个解释器。' +
-        '<span class="hit">两者的共同点是：<b>回填这个动作从根上不存在了——没有东西可以回填。</b></span></p>' +
-        T.tbl(['', 'DEX2C / Java2C', 'VMP'],
-          [
-            ['<b>做什么</b>', '逐方法把 dalvik 字节码翻译成 C 源码（或直接生成机器码），编译进 so，Java 侧改成 native 声明', '把字节码转成厂商自定义的指令序列存在数据里，运行时由解释器逐条执行'],
-            ['<b>Java 层看到什么</b>', '一个 <code>native</code> 声明，或一小段「存参数、调 native」的胶水代码', '方法体有内容，但是「读一串数据 → 跳进一个循环」，看不出业务语义'],
-            ['<b>代价</b>', '每个方法都要翻一遍，so 体积与编译时间随方法数线性增长，<b>编码量大</b>', '体积小得多，但要自己写解释器；<b>运行变慢</b>（每条指令都要解码+分发）'],
-            ['<b>破解思路</b>', '先定位 JNI 绑定关系，再判断是「翻译后代码」还是「手写 native」；能 Trace 就 Trace', '找分发循环与 handler 表，还原「自定义 opcode → 原始操作」的映射（第 6 章）'],
-            ['<b>判定器里的假设</b>', '<code>gen3</code>', '<code>vmp</code>']
-          ]) +
-        T.note('warn', '⚠️ 三个易混现象，分清它们',
-          '<p>① <b>方法体为空</b> → 抽取壳（二代）。<br>' +
-          '② <b>方法体是 <code>native</code> 声明</b> → 要么这个 App 本来就用 NDK 写的（无害），要么是 DEX2C 的产物。<b>区分办法：</b>' +
-          '看它是不是「所有业务方法都变成 native」，以及是否存在 native 动态注册——只有少数几个 native 方法是正常工程，成片的才是加固。<br>' +
-          '③ <b>方法体有代码但语义不通</b>（读数据 + 大循环 + 表跳转）→ VMP。</p>' +
-          '<p style="margin-bottom:0"><span class="pill warn">待核实</span> 各厂商对这三条路线的取舍细节（翻多少方法、VMP 的指令集如何设计）属于内部实现，' +
-          '公开资料只能给出路线，不能给出参数。凡是你没实测过的，都别当结论用。</p>') +
-        T.card('为什么三代壳把「判定」和「还原」彻底分成了两件事',
-          '<p>对一代/二代壳，「脱壳」本身就是全部工作：拿到明文 dex，一切就结束了。<br>' +
-          '到三代壳，脱壳只是起点：你拿到了 so，但 so 里是一个由工具生成的、被混淆过的翻译结果或解释器。' +
-          '<span class="hit">这时候决定成败的不再是「你能不能 dump」，而是「你能不能读懂 native 代码」——也就是第 3、4、5、6 章的内功。</span></p>' +
-          '<p style="margin-bottom:0">这也是本课程把第 3～7 章放在脱壳之后的原因：<b>脱壳的下限靠工具，上限靠你能不能读汇编与源码。</b></p>'),
-      quiz: {
-        id: 'q19-3', chapter: 19, answer: 3,
-        stem: '下面哪一条现象组合最能区分「DEX2C 翻译」和「VMP 保护」？',
-        options: [
-          { t: '有没有 so 文件', why: '两者都会用到 so，这不是区分点。' },
-          { t: '方法体是不是空的', why: '空的属于抽取壳（二代）；DEX2C 与 VMP 的方法体都不是空的。' },
-          { t: 'AndroidManifest 里的 application:name 是否被替换', why: '入口被替换是几乎所有壳的共同前置动作，区分不了代际。' },
-          { t: 'Java 侧看到的是 native 声明/胶水代码，还是「读数据 + 跳进一个大循环」', why: '正确。DEX2C 把逻辑变成 native 代码（Java 侧退回声明）；VMP 保留了 Java 侧的执行入口，但执行的是自定义指令，因此表现为数据 + 解释循环。' }
-        ],
-        explain: '<b>关键差别在于「执行发生在哪里」。</b><br><br>' +
-          'DEX2C 走的是正常 JNI 路径：Java 调用 → native 函数 → 机器码。<b>Java 层的那个方法已经被 native 方法取代</b>，' +
-          '所以你在反编译里看到的是 <code>native</code> 声明或极小的一层胶水。<br><br>' +
-          'VMP 走的是自定义解释器路径：Java 层那个方法<b>仍然是一个普通方法</b>，只是它的字节码被换成了「加载一个数据指针 + 进入解释循环」，' +
-          '真正的指令序列存放在数据段里。<b>所以你看到的是「有代码、但读不出业务语义」。</b><br><br>' +
-          '顺带记住两者的还原代价差异：DEX2C 的产物是<b>正常编译出的机器码</b>，能用常规逆向手段（字符串、常量、调用关系）啃；' +
-          'VMP 需要先还原指令集映射，工作量高一个量级。<span class="hit">判定顺序上：先分清是哪一支，再决定投入多少时间。</span>'
-      },
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境三',
-            scenario: '<b>情境：</b>一个 App 里同时出现两种现象：<code>com.a.*</code> 这一片类的方法体是空的（跑过一遍后部分恢复），' +
-                      '<code>com.b.Pay</code> 这个类的方法体有代码，但内容全是「读取一个 int 数组 + 跳进一个两百行的 switch 循环」。' +
-                      '你只有一周时间，要拿到支付签名算法的逻辑。',
-            q: '先啃哪一块？',
-            choices: [
-              { t: '先啃 VMP——它最难，必须最早开始', next: 'n1' },
-              { t: '先啃抽取壳，把 Java 层恢复完整，拿到完整的调用图，再决定 VMP 那块值不值得啃', next: 'n2' },
-              { t: '两条线并行，两边同时开工以节省时间', next: 'n3' },
-              { t: '放弃还原代码，直接用 unidbg 这类方案黑盒调用支付签名函数', next: 'n4' }
-            ]
+          {
+            code: '<span class="c">// 一个 Pass 就是一个类，继承谁 = 声明作用范围</span>\n' +
+                  '<span class="k">namespace</span> { <span class="k">struct</span> <span class="t">FlaPass</span> : <span class="k">public</span> <span class="t">FunctionPass</span> {',
+            note: '<b>先立规矩：作用范围由基类决定。</b>继承 <code>FunctionPass</code>，LLVM 就会对模块里<b>每一个函数</b>各调用你一次。' +
+                  'OLLVM 的 fla / bcf / sub 三个 Pass 都是这么声明的。',
+            state: { '当前动作': '声明 Pass 类', '作用范围': '单个函数', '是否改写 IR': '否' }
           },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '排序依据错了：该先看依赖关系，而不是难度',
-            result: '<b>「最难所以要最早开始」听起来合理，但在逆向里通常不成立。</b><br><br>' +
-              '你现在啃 VMP，缺的是<b>坐标系</b>：<code>com.b.Pay</code> 是谁调用的？入参从哪来？那个 int 数组什么时候被初始化？' +
-              '这些答案全在 <code>com.a.*</code> 那批<b>方法体为空</b>的类里。<br><br>' +
-              '你会花掉三天，建立一堆「这个 handler 大概在做异或」的猜测，然后在第四天发现真正的入口是一个你还没恢复的方法。<br><br>' +
-              '<span class="hit">正确的问题是：<b>哪一块的产出能降低另一块的难度？</b>答案几乎总是「先把可恢复的那层恢复掉」。</span>'
+          {
+            code: '  <span class="k">static</span> <span class="k">char</span> <span class="t">ID</span>;\n' +
+                  '  <span class="t">FlaPass</span>() : <span class="f">FunctionPass</span>(ID) {}',
+            note: '<b>ID 是 Pass 的身份证。</b>LLVM 用这个静态 ID 在 Pass 注册表里唯一标识它；' +
+                  '命令行上的 <code>-mllvm -fla</code> 最终就是按名字找到这个 Pass 并调度它。',
+            state: { '当前动作': '分配 Pass ID', '注册名': 'fla', '是否改写 IR': '否' }
           },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先建立坐标系，再决定投入',
-            result: '<b>这是一条正确的排序。</b>抽取壳那一块虽然「不得不做」，但它的产出是确定的：' +
-              '跑功能 + 主动调用 → 回填 → dump → 修复，你能拿到一份完整的 Java 层调用图。<br><br>' +
-              '拿到之后你才能回答关键问题：<b><code>com.b.Pay</code> 的调用者是谁、入参怎么构造、返回值怎么用。</b>' +
-              '很多情况下这一步做完，你会发现真正需要还原的 VMP 函数只有一两个，而不是整个类。<br><br>' +
-              '<b>还有一层现实收益：</b>抽取壳的恢复工作可以脚本化、可以复用，而 VMP 的还原是纯脑力活。' +
-              '<span class="hit">先做能规模化的部分，把脑力留给真正硬的部分。</span>'
+          {
+            code: '  <span class="k">bool</span> <span class="f">runOnFunction</span>(<span class="t">Function</span> &amp;F) <span class="k">override</span> {',
+            note: '<b>唯一的必写入口。</b>参数是<b>引用</b>不是拷贝 —— 你改的 <code>F</code> 就是模块里那个函数本身，改完不需要“返回”什么，' +
+                  '所以逆向时看到的混淆是<b>原地发生</b>的。',
+            state: { '当前动作': '进入函数入口', '函数': '待处理', '是否改写 IR': '否' }
           },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '并行在这里是成本翻倍，不是时间减半',
-            result: '<b>逆向工作的并行成本远高于普通开发。</b><br><br>' +
-              '两条线的上下文都需要长时间驻留（一堆类名、一组 handler、一套寄存器约定），切一次上下文就要重新加载一次。' +
-              '而且抽取壳这条线本身是<b>有状态</b>的：你每次重新脱壳，产物都可能不同（回填取决于你触发了哪些路径）。' +
-              '两条线同时跑，你很容易分不清「这个差异是壳的行为还是我的操作顺序造成的」。<br><br>' +
-              '<b>如果真要并行，正确做法是拆人而不是拆脑：</b>一个人专做脱壳流水线（可脚本化），一个人专做 VMP 静态分析。' +
-              '自己一个人两条线同时开工，通常两头都做不深。'
+          {
+            code: '    <span class="k">if</span> (!<span class="f">toObfuscate</span>(flag, &amp;F, <span class="s">&quot;fla&quot;</span>)) <span class="k">return</span> <span class="n">false</span>;',
+            note: '<b>函数注解过滤（Functions annotations）。</b>OLLVM 支持只混淆被标注的函数，其余原样放过 —— ' +
+                  '所以同一个 so 里往往<b>只有一部分函数被混淆</b>，这正是你定位关键函数的突破口。' +
+                  '<span class="pill warn">注解的确切写法随 fork 而异，待核实</span>',
+            state: { '当前动作': '命中注解才继续', '未命中': '原样返回 false', '是否改写 IR': '否' }
           },
-          n4: {
-            label: '选D', terminal: true, verdict: 'good',
-            verdictTitle: '可能是性价比最高的一条路——但有前提',
-            result: '<b>如果你的目标只是「拿到支付签名的输入输出关系」，这条路确实可能最省时间。</b>' +
-              '在 PC 上模拟执行 so 里的目标函数、直接构造输入拿输出，绕开整套还原工作（第 7 章的方法）。<br><br>' +
-              '<b>但前提必须说清，缺一条这条路的成本就会反超：</b><br>' +
-              '① 目标函数能<b>独立复现</b>——它的输入输出不依赖大量 Java 层状态（否则你要补的「环境」比脱壳还贵）；<br>' +
-              '② 你能拿到函数的<b>入口地址或调用锚点</b>——在动态注册被隐藏的情况下，这本身需要一次运行时观测；<br>' +
-              '③ 你的目标允许「黑盒」——如果最终需要理解算法逻辑（而不是只调用它），黑盒调用给不了你逻辑。<br><br>' +
-              '<span class="hit">所以 D 不是一个偷懒选项，而是一个需要先验证前提的工程选择。先花半天验证这三条，再决定要不要投入。</span>'
+          {
+            code: '    <span class="t">std::vector</span>&lt;<span class="t">BasicBlock</span> *&gt; origBB;\n' +
+                  '    <span class="k">for</span> (<span class="t">BasicBlock</span> &amp;BB : F) origBB.<span class="f">push_back</span>(&amp;BB);',
+            note: '<b>第一步永远是“拍照存底”。</b>把函数当前的所有基本块按顺序存进 <code>origBB</code>，' +
+                  '后面建 switch、分配 case 编号、改跳转，全靠这张表。<span class="hit">列表顺序 = 原始基本块顺序</span>。',
+            state: { '当前动作': '收集基本块', '已收集块数': 'N（本函数全部分支）', '是否改写 IR': '否' }
+          },
+          {
+            code: '    <span class="t">BasicBlock</span> *disp = <span class="t">BasicBlock</span>::<span class="f">Create</span>(\n' +
+                  '        F.<span class="f">getContext</span>(), <span class="s">&quot;disp&quot;</span>, &amp;F, &amp;F.<span class="f">getEntryBlock</span>());',
+            note: '<b>造“分发器”基本块。</b>注意最后一个参数是“插在哪个块之前” —— 它被插到函数入口块<b>前面</b>，' +
+                  '将来全函数唯一的公共枢纽。IDB 里那个巨大的 <code>switch</code> 就在这个块里。',
+            state: { '当前动作': '创建分发器 disp', '已收集块数': 'N', '是否改写 IR': '是' }
+          },
+          {
+            code: '    <span class="t">IRBuilder</span>&lt;&gt; B(&amp;F.<span class="f">getEntryBlock</span>());\n' +
+                  '    <span class="t">Value</span> *switchVar = B.<span class="f">CreateAlloca</span>(<span class="t">Int32Ty</span>);',
+            note: '<b>造状态变量 switchVar。</b>它就是个普通局部变量（alloca 在栈上）—— ' +
+                  '但它是整个平坦化的<b>唯一真相来源</b>：程序下一步去哪，全看它的值。' +
+                  '<span class="hit">反混淆的核心就是追它</span>。',
+            state: { '当前动作': '创建状态变量', 'switchVar': '未初始化', '是否改写 IR': '是' }
+          },
+          {
+            code: '    <span class="t">SwitchInst</span> *sw = <span class="t">SwitchInst</span>::<span class="f">Create</span>(\n' +
+                  '        switchVar, disp, <span class="n">0</span>, disp);',
+            note: '<b>在分发器里建 switch。</b>第二个参数是默认目标，第四个是插入点。默认目标也指向 disp —— ' +
+                  '在 case 填满之前，它就是个<b>空转的死循环</b>，这也是静态看非常可疑的结构特征。',
+            state: { '当前动作': '创建 switch 指令', 'switchVar': '未初始化', 'case 数': '0' }
+          },
+          {
+            code: '    <span class="k">for</span> (<span class="k">unsigned</span> i = <span class="n">0</span>; i &lt; origBB.<span class="f">size</span>(); i++)\n' +
+                  '      sw-&gt;<span class="f">addCase</span>(<span class="t">ConstantInt</span>::<span class="f">get</span>(Int32Ty, i), origBB[i]);',
+            note: '<b>每个原始基本块变成一个 case。</b>块 0 = case 0、块 1 = case 1…… 编号与原始顺序一致。' +
+                  '到这里，<b>原来的 if / while 关系已经消失，只剩“编号 → 块”的映射表</b>。',
+            state: { '当前动作': '分配 case 编号', 'case 数': 'N', '映射': 'i → origBB[i]' }
+          },
+          {
+            code: '    <span class="k">for</span> (每个原始跳转边 from→to) {\n' +
+                  '      <span class="t">BasicBlock</span> *pro = <span class="f">SplitEdge</span>(from, to);\n' +
+                  '      <span class="k">new</span> <span class="t">StoreInst</span>(nextState, switchVar, pro);',
+            note: '<b>最关键的一刀：把每条边切成两块，在中间塞“序言块”。</b>序言块只做两件事：' +
+                  '<span class="pill acc">把下一状态写进 switchVar</span> → <span class="pill acc">跳回 disp</span>。' +
+                  '于是“跳去哪个块”变成了“给变量赋哪个值”。',
+            state: { '当前动作': '插入序言块', '序言块作用': '赋值 + 跳回 disp', '是否改写 IR': '是' }
+          },
+          {
+            code: '    <span class="k">return</span> <span class="n">true</span>;   <span class="c">// 告诉 PassManager：我改了 IR</span>\n' +
+                  '  }\n}; }\n<span class="k">static</span> <span class="t">RegisterPass</span>&lt;<span class="t">FlaPass</span>&gt; <span class="t">X</span>(<span class="s">&quot;fla&quot;</span>, <span class="s">&quot;Enable control flow flattening&quot;</span>);',
+            note: '<b>返回值语义别搞错：</b><code>true</code> = “我改过这个函数”，PassManager 据此让失效的分析结果重算，' +
+                  '并可能重跑后续 Pass。<code>false</code> = 我没动它。<b>谎报 false 会导致整个优化管线拿到过期数据</b>。' +
+                  '最后一行把 Pass 注册进 CLI，这就是 <code>-mllvm -fla</code> 的来源。',
+            state: { '当前动作': '收尾 + 注册', '返回值': 'true（已修改）', 'CLI': '-mllvm -fla' }
           }
-        }
-      }
-    },
-
-    /* ============================================================ 19.7 */
-    {
-      h: '19.7', title: '混合型壳：多 dex、多 so、壳中壳',
-      html:
-        '<p>混合型不是「第四代」，而是<b>同一批技术在不同部位的重复使用</b>。它出现的动机很实在：' +
-        '一个壳要同时满足「防护强」和「启动快、兼容好」，就得<b>分级保护</b>——核心算法上 VMP，普通业务用抽取，' +
-        '壳自身的引导代码只做加密。</p>' +
-        T.tbl(['混合形态', '典型现象', '处理顺序'],
-          [
-            ['<b>多 dex 分代保护</b>', '<code>classes.dex</code> 是壳、<code>classes2.dex</code> 是抽取过的业务、还有运行时动态加载的第三份',
-             '先把所有 dex 都枚举出来（含运行时加载的），再逐个判代际——<b>不要假设「业务代码只在某一个 dex 里」</b>'],
-            ['<b>多 so 分工</b>', '一个 so 负责解密与加载（壳 so），另一个 so 是业务 native 库，可能有第三个 so 做反调试',
-             '按 maps 里的加载时机区分角色：壳 so 出现得早、业务 so 出现得晚；先弄清谁加载了谁'],
-            ['<b>壳中壳</b>', '外层壳解密出内层壳，内层壳再解密业务 dex；表现为「脱一层还是壳」',
-             '<b>逐层验证</b>：每脱一层就问「这份 dex 里有业务类吗」——用类名/包名判断，不要用体积判断'],
-            ['<b>保护分级</b>', '同一个 App 里，登录流程是抽取壳、支付算法是 VMP、普通页面完全不保护',
-             '按<b>业务重要性</b>排优先级：你要分析的往往只是其中一小块，别把它当成「整个 App 都要脱」']
-          ]) +
-        T.note('key', '🔑 混合型的第一原则：先排顺序，不要先定代际',
-          '<p style="margin-bottom:0">面对混合型样本，「这是几代壳」这个问题本身就没有答案，也不重要。' +
-          '你要问的是：<b>哪一层在最外面（决定我现在能拿到什么）、哪一层在最里面（决定我最终能读到什么）、中间还隔着几层？</b><br>' +
-          '<span class="hit">一个实用的自检：如果你连续两次「脱壳成功」拿到的都是壳代码，那你面对的是壳中壳——' +
-          '此时正确的动作是回到判定流程，而不是换工具。</span></p>') +
-        T.card('一个反直觉但很重要的推论',
-          '<p>混合型把「判定」的价值放大了。<b>如果对手只有一种保护，你可以靠工具莽过去；有多种保护时，莽的代价是成倍的。</b></p>' +
-          '<p style="margin-bottom:0">因为不同保护对应的工具链、观测层、失败模式都不同：拿主动调用工具去啃 VMP 只会得到一堆看不懂的 native；' +
-          '拿静态反混淆工具去啃抽取壳只会看到空方法。<span class="hit">判定不是「为了严谨」，它是省时间的手段。</span></p>')
-    },
-
-    /* ============================================================ 19.8 */
-    {
-      h: '19.8', title: 'SO 加固：从加固方视角看它为什么必须做',
-      intuition: {
-        tag: '直觉模型 · 把说明书撕掉，再把门牌号码涂掉',
-        body:
-          '<p>你有一台进口设备（so），操作全靠一份说明书（导出符号表）。想阻止别人修它，有两个层次的手段：</p>' +
-          '<p><strong>第一种：把整台设备焊死在箱子里</strong>——so 整体加密，运行时才在内存里解出真正的 so 并加载。' +
-          '这就是「so 加固」的第一层。对手拿到的磁盘文件是一堆密文。</p>' +
-          '<p><strong>第二种：把门牌号码涂掉</strong>——设备还能用，但所有按钮都不标名字（抹除导出表），' +
-          '只有厂家的图纸（<code>RegisterNatives</code> 那几行）知道哪个按钮是哪个功能。' +
-          '这就是「JNI 动态注册」为什么是加固的标配。</p>' +
-          '<p>关键区别：第一种让你<strong>读不到代码</strong>，第二种让你<strong>读得到代码、但找不到入口</strong>。' +
-          '很多人的困惑「我拿到了 so，为什么全是没有符号的函数」就是第二种造成的。</p>'
-      },
-      html:
-        '<p>下面只讲<b>加固方在这里图什么、以及它这么做完之后留下什么特征</b>——具体的 ART/JNI 机制在第 4 章、反 Frida 细节在第 10 章，这里不重复。</p>' +
-        T.tbl(['SO 侧手段', '加固方图什么', '留下的特征（你的判定依据）', '深入章节'],
-          [
-            ['<b>so 整体加密</b>', '磁盘上不出现可分析的机器码。密钥与解密逻辑放在更早的一层（通常是另一个 so 或壳 dex 里）',
-             '<code>lib/</code> 下的 so 打开没有 ELF 魔数或没有节表；或者 so 体积正常但静态读不出任何有意义内容；运行时 maps 里出现自删/内存加载痕迹',
-             '第 10 章（脱壳进阶）'],
-            ['<b>自定义 Linker / 内存加载</b>', '不走系统 <code>dlopen</code>，自己把 so 映射进内存并修补重定位，让「加载」这件事不留下文件痕迹',
-             'maps 里出现无名可执行段、<code>memfd:</code>、<code>(deleted)</code> 的 so——这三条在 19.13 的实验里会被逐条对照',
-             '第 4 章（ART/加载流程）'],
-            ['<b>导出表抹除</b>', '让静态分析找不到函数入口：<code>JNI_OnLoad</code> 也不导出，或符号名被改成无意义串',
-             '<code>readelf -s</code> 几乎为空；IDA 里只有 <code>sub_xxxx</code>；但 .text 段依然有大量代码',
-             '第 3 章（汇编）、第 4 章'],
-            ['<b>JNI 动态注册</b>', '把「Java 方法名 → native 函数地址」的绑定关系从符号表挪到运行时，静态无从下手',
-             'Java 侧只剩 <code>native</code> 声明；so 里存在 <code>RegisterNatives</code> 的调用痕迹；绑定关系只在运行时存在',
-             '<b>第 4 章（本章的重要呼应点）</b>'],
-            ['<b>控制流平坦化 / 字符串加密</b>', '让即使拿到 so 也难以读懂：把控制流压成一个分发循环，把字符串加密',
-             '函数里出现统一的分发器结构；字符串引用指向一段密文再解密使用',
-             '第 5 章（OLLVM）'],
-            ['<b>so 内反调试</b>', '把检测放到 native 层，让你 hook Java 层的检测函数没有意义',
-             'so 里读 <code>/proc/self/status</code>、调 <code>ptrace</code>、扫描自身内存',
-             '第 10、13 章']
-          ]) +
-        T.note('key', '🔑 一句话记住 SO 加固的判定逻辑',
-          '<p style="margin-bottom:0">「SO 层加固」不是一个开关，而是<b>两条独立的能力</b>：' +
-          '<b>① 让我读不到你的代码</b>（加密 + 内存加载 + 混淆）；' +
-          '<b>② 让我找不到你的入口</b>（抹导出表 + 动态注册）。<br>' +
-          '判定时分别看：<span class="hit">so 文件本身是否可解析（决定 ① 的强度），以及 Java 侧 native 方法与 so 导出表是否对得上（决定 ② 的强度）。</span></p>') +
-        T.acc('为什么「导出表抹除」常常被误解成「so 坏了」',
-          '<p>最常见的误会：<i>我用 readelf 看符号表几乎是空的，是不是 so 被加密了？</i></p>' +
-          '<p>不是。<b>加密是「内容读不出来」，抹符号是「名字读不出来」</b>，两者完全不同。一个正常的、用 <code>-fvisibility=hidden</code> 编译' +
-          '并且 strip 过的 so，符号表一样可以是空的——它照样能正常加载运行。<br>' +
-          '<b>区分办法：</b>看 ELF 头是否合法、节表是否存在、<code>.text</code> 段里是否有成规模的代码。' +
-          '如果这些都正常，那只是「没名字」，不是「没内容」。</p>' +
-          '<p style="margin-bottom:0">这条区分的价值在于：<b>「没名字」时你的工作重心是动态观测（找绑定、找调用点）；' +
-          '「没内容」时你的工作重心是先拿到内存里解密后的那份。</b>方向完全不同。</p>'),
-      quiz: {
-        id: 'q19-4', chapter: 19, answer: [1, 3],
-        stem: '（多选）一个 so 的导出符号表被彻底清空，<code>JNI_OnLoad</code> 也不再导出。下面哪些说法是对的？',
-        options: [
-          { t: '说明这个 so 一定是被整体加密了', why: '错误。符号表为空只说明「没有名字」，与内容是否加密无关；strip + 隐藏可见性就能做到同样效果。' },
-          { t: '静态分析找不到入口，但运行时仍必须存在「Java 方法 → native 地址」的绑定过程，那里就是新的观测点', why: '正确。绑定关系无法被抹掉——虚拟机执行时必须知道地址；动态注册只是把它从静态符号表挪到了运行时。' },
-          { t: '用 IDA 打开只能看到 sub_xxxx，说明这个 so 无法分析', why: '错误。没有符号名不等于没有代码。可以从交叉引用、字符串、常量、JNI 调用约定入手重建语义。' },
-          { t: '它同时提高了静态分析成本与「找入口」成本，但换来的是运行时观测点的价值上升', why: '正确。这是加固的固有取舍：把信息从静态挪到动态，于是动态观测成为唯一可行的路径。' }
-        ],
-        explain: '<b>这道题考的是「信息守恒」这个判断。</b>加固能把信息藏起来、搬走，但很难真的消灭它——因为机器最终必须执行。<br><br>' +
-          '符号表可以清空，但 <code>RegisterNatives</code> 那个调用<b>必须在运行时发生</b>，否则 Java 层的方法根本找不到实现。' +
-          '所以你丢掉的是<b>静态可读的入口</b>，换来的是<b>运行时必然存在的绑定事件</b>。<br><br>' +
-          '<span class="hit">第 4 章做的事，正是把插桩点放在这个绑定事件上——这不是巧合，而是「判定出入口被隐藏」之后的必然下一步。</span>'
-      }
-    },
-
-    /* ============================================================ 19.9 */
-    {
-      h: '19.9', title: '运行时防护：五类防线分别挡在哪一层',
-      html:
-        '<p>运行时防护和「壳的代际」是两个独立维度：<b>一个 App 可以是二代壳 + 零运行时防护（最好啃），' +
-        '也可以是一代壳 + 全套防护（最难啃）。</b>这一节解决的是第二个维度。</p>' +
-        '<p>下面逐个点亮五类防线。注意每一步都问同一个问题：<b>它为什么要放在这一层，而不是上一层？</b></p>',
-      stage: {
-        title: '运行时防护 × 它挡在哪一层',
-        speed: 1700,
-        render:
-          '<div class="flow-col" style="gap:10px">' +
-            '<div class="card"><div class="card-title">① Java 层 —— 最容易写，也最容易被 hook</div>' +
-              '<div class="flow-row"><span class="blk" id="p1">环境检测：root / 模拟器 / 多开</span>' +
-              '<span class="blk" id="p2">签名校验（Java 侧）</span></div></div>' +
-            '<div class="card"><div class="card-title">② Native 层 —— 壳的主战场</div>' +
-              '<div class="flow-row"><span class="blk" id="p3">反调试</span>' +
-              '<span class="blk" id="p4">反 Hook / 完整性校验</span>' +
-              '<span class="blk" id="p5">反 Frida</span>' +
-              '<span class="blk" id="p6">JNI 动态注册（隐藏入口）</span></div></div>' +
-            '<div class="card"><div class="card-title">③ 内核层 / 绕过 libc —— 让用户态方案整体失效</div>' +
-              '<div class="flow-row"><span class="blk" id="p7">直接 SVC 系统调用</span>' +
-              '<span class="blk" id="p8">下沉到内核的观测与对抗</span></div></div>' +
-            '<div style="margin-top:6px"><span class="pill" id="mark">点「单步」，逐个看它挡在哪一层、绕它需要动哪一层</span></div>' +
-          '</div>',
-        reset: function () {
-          ['p1','p2','p3','p4','p5','p6','p7','p8'].forEach(function (i) { S(i, ''); });
-          CLS('mark', 'pill'); SET('mark', '点「单步」，逐个看它挡在哪一层、绕它需要动哪一层');
-        },
-        steps: [
-          { run: function () { S('p1', 'active'); },
-            note: '<b>环境检测（Java 层为主）。</b>读 <code>Build</code> 属性、检查包名/文件是否存在（su、magisk、常见模拟器路径）、查是否多开。' +
-              '<b>为什么放 Java 层：</b>写得快、覆盖大多数人的"随手改环境"；<b>代价：</b>纯 Java 检测是最容易被 hook 的一类——改一个返回值就过。' },
-          { run: function () { S('p1', 'done'); S('p2', 'active'); },
-            note: '<b>签名校验（Java 侧）。</b>读自身签名摘要与内置值比对。它防的是「改完重打包」，' +
-              '所以它必须在<b>启动早期</b>跑一遍——晚了你改的代码已经开始执行了。<span class="hit">这也是为什么它总是出现在 Application 初始化阶段。</span>' },
-          { run: function () { S('p2', 'done'); S('p3', 'active'); },
-            note: '<b>反调试（Native 层）。</b>读 <code>/proc/self/status</code> 的 TracerPid、尝试 <code>ptrace</code> 附加自己、检测断点。' +
-              '<b>为什么下沉到 native：</b>Java 层的检测函数会被 hook 掉，native 层的直接系统调用不会（除非你也下沉）。' },
-          { run: function () { S('p3', 'done'); S('p4', 'active'); },
-            note: '<b>反 Hook / 完整性校验（Native 层）。</b>校验关键函数的序言字节有没有被改成跳转、扫描 <code>/proc/self/maps</code> 找可疑注入模块、' +
-              '重新计算 dex/so 摘要。<br><span class="hit">这是最难缠的一类：它不是"检测你的工具"，而是"检测你的动作留下的物理痕迹"。</span>' },
-          { run: function () { S('p4', 'done'); S('p5', 'active'); },
-            note: '<b>反 Frida（Native 层）。</b>扫端口、遍历线程名、在 maps 里找 agent、在内存里搜特征字符串。' +
-              '<b>注意区分：</b>反 Frida 不等于加壳——很多不加壳的 App 也会做。它是<b>独立能力</b>，判定时要单独记一笔（第 10 章有完整对照表）。' },
-          { run: function () { S('p5', 'done'); S('p6', 'active'); },
-            note: '<b>JNI 动态注册（不是检测，是隐藏）。</b>它本身不拦你，但它把入口从静态挪到动态，' +
-              '让「读代码」这条路先断掉一半。<b>放在 native 层的原因：</b>它本来就是 native 的机制，成本为零。' },
-          { run: function () { S('p6', 'done'); S('p7', 'active'); CLS('mark', 'pill bad'); SET('mark', '⚠️ 到这一层，用户态 hook 整体失效'); },
-            note: '<b>直接 SVC（内核层 / 绕过 libc）。</b>用内联汇编直接发系统调用，不经过 libc 的封装函数。' +
-              '你以为 <code>open</code> 已经被你 hook 了，其实它走了另一条路。<span class="hit">第 13 章整章都在处理这一类对手。</span>' },
-          { run: function () { S('p7', 'done'); S('p8', 'active'); },
-            note: '<b>下沉到内核的观测与对抗。</b>用内核模块、eBPF，或借助虚拟化层做观测与拦截（第 11、15 章）。' +
-              '<b>为什么这是最后一道：</b>到了这一层，胜负不再取决于「你的脚本写得好不好」，而取决于<b>你有没有能力进入被观测目标之下的那一层</b>。' },
-          { run: function () { S('p8', 'cool'); CLS('mark', 'pill ok'); SET('mark', '✅ 五类防线分层独立：绕过一层 ≠ 绕过全部'); },
-            note: '<b>收束：判定运行时防护只需要回答三个问题。</b><br>' +
-              '① <b>有没有</b>（启动就退、改包就不跑，说明有）；<br>' +
-              '② <b>在哪一层</b>（Java 层好办，native 层要动真格，内核层要换武器）；<br>' +
-              '③ <b>和壳是什么关系</b>（是壳自带的，还是业务方另外买的 SDK —— 这两者绕过方式往往不同）。<br>' +
-              '<span class="hit">把这三个问题答完，你就知道该带什么武器上场，而不是把工具轮流试一遍。</span>' }
         ]
       },
-      after:
-        T.note('warn', '⚠️ 研发与安全边界',
-          '<p style="margin-bottom:0">本章所有内容面向<b>合法授权的安全研究、自有产品加固评估与教学</b>。' +
-          '不要针对未经授权的线上产品做绕过与篡改；<b>「技术上能做到」和「现在就该做」是两件事</b>——' +
-          '这个区分在本章最后的决策演练里会反复出现。</p>')
+      after: T.note('ok', '✅ 你已经掌握了 OLLVM 的“通用骨架”',
+        '<p>记住这个节奏：<b>收集基本块 → 造新块 → 用 IRBuilder 插指令 → 改跳转 → 返回 true</b>。' +
+        '三大混淆都是这个骨架的不同填法。另外注意版本差异：LLVM 4.0（OLLVM 当前基线）用旧的 ' +
+        '<code>legacy::PassManager</code> + <code>RegisterPass</code>；新版本 LLVM 已转向 <code>PassBuilder</code> + 新 Pass Manager' +
+        '（<code>run(Function &amp;, FunctionAnalysisManager &amp;)</code>）。' +
+        '所以拿新版 LLVM 直接编老 OLLVM 源码会<b>编译失败</b>，这不是你的问题。</p>')
     },
 
-    /* ============================================================ 19.10 */
+    /* ============ 19.3 ============ */
     {
-      h: '19.10', title: '市面加固方案简析：读路线，不读特征字符串',
+      h: '19.3',
+      title: '控制流平坦化 -fla：把 if/while 拆成 switch 状态机（动画拆解）',
       html:
-        '<p>这一节的内容有一个硬约束：<b>厂商产品线变动频繁、具体特征（so 名、类名、字符串）会随版本变化</b>，' +
-        '任何写死在教材里的「特征表」都会在半年内变成误导。所以这里只讲<b>可以长期成立的东西：技术路线的差异</b>。</p>' +
-        T.note('bad', '🚫 为什么本章不给厂商特征字符串',
-          '<p>三个理由，每一条都是实战教训：</p>' +
-          '<p>① <b>会变。</b>同一个厂商的不同版本、不同产品档位，so 名和类名都可能不同；你按特征去匹配，遇到新版本就是零命中。<br>' +
-          '② <b>会互相抄。</b>社区流传的特征表被大量转载，其中相当一部分从未被验证过，但你无法区分哪条是真的。<br>' +
-          '③ <b>会误导判定。</b>命中一个特征字符串只能说明「像某家的做法」，<b>它不能告诉你方法体是不是被抽走了、so 是不是在内存里加载的</b>——' +
-          '而后者才是决定你下一步动作的东西。</p>' +
-          '<p style="margin-bottom:0"><span class="hit">正确做法是：用特征库做<b>交叉验证</b>（它命中什么厂商），' +
-          '用<b>结构观测</b>做<b>判定</b>（它属于哪一代、防护开到什么程度）。两者不可互换。</span></p>') +
-        T.tbl(['厂商 / 产品（公开可查的名称）', '技术路线（可长期成立的观察）', '本章的判定提示'],
-          [
-            ['360 加固保', '历史悠久、覆盖面广，一代到三代方案都在演进，客户端与服务端能力并重',
-             '<span class="pill warn">待核实</span> 具体版本所用的代际与强度档位'],
-            ['腾讯乐固（后整合为御安全相关产品线）', '与自家生态结合紧密，签名校验与运行时防护是重点',
-             '<span class="pill warn">待核实</span> 产品线名称与归属变动频繁，以官方文档为准'],
-            ['梆梆安全', 'Native 保护见长，VMP 类方案是其重点方向',
-             '<span class="pill warn">待核实</span> 具体 VMP 覆盖范围与指令集形态'],
-            ['爱加密', '抽取壳与 DEX2C 路线都有公开讨论，多 dex 保护较常见',
-             '<span class="pill warn">待核实</span> 不同档位产品的差异'],
-            ['娜迦（Nagain）', '业内常见于金融/游戏类 App，运行时防护与完整性校验较完整',
-             '<span class="pill warn">待核实</span> 具体检测项清单'],
-            ['顶象', '风控与设备指纹方向与加固能力结合',
-             '<span class="pill warn">待核实</span> 加固模块与风控模块的边界'],
-            ['阿里聚安全 / 阿里云加固', '早期广泛使用，与阿里系生态绑定',
-             '<span class="pill warn">待核实</span> 当前在售形态与支持范围'],
-            ['百度加固', '早期产品，公开样本较多、社区分析资料相对丰富',
-             '<span class="pill warn">待核实</span> 新版是否仍在维护']
-          ]) +
-        '<p>把上表读成一条结论：<b>厂商之间的差别主要在三个维度上</b>——① 代际覆盖（做不做 VMP / DEX2C）；' +
-        '② native 保护强度（so 是否整体加密、是否自定义 Linker）；③ 运行时防护的完整度（检测项多少、是否下沉到内核）。' +
-        '<span class="hit">这三个维度恰好就是本章判定流程要回答的问题，所以你不需要背厂商表——你需要会读现象。</span></p>' +
-        T.grid(2, [
-          '<div class="card"><div class="card-title">🧰 特征库工具有没有用？有，但是「交叉验证」的用法</div>' +
-          '<p>社区有专门做加固特征检查的开源工具（本章案例里会拆一个），它们把「so 名 / 路径 / 类名 / 正则」做成规则库，' +
-          '命中率高、上手快。<b>它们擅长回答「这是谁家的」，不擅长回答「我该怎么办」。</b></p>' +
-          '<p style="margin-bottom:0">正确的用法：先用它拿到一个<b>厂商先验</b>，再用结构观测去验证。' +
-          '两者矛盾时，<b>永远信你自己观测到的结构</b>——因为你采的是现场证据，它采的是历史规则。</p></div>',
-          '<div class="card"><div class="card-title">📉 加固方其实也在权衡</div>' +
-          '<p>加固强度不是越高越好：<b>每加一层解密就多一次启动开销，每多一个 so 就多一份 ABI 适配成本</b>，' +
-          '而且一旦和某个定制 ROM 冲突，损失的是真实用户。</p>' +
-          '<p style="margin-bottom:0">所以同一个厂商的<b>不同 App 可能用不同档位</b>。你分析的这个样本用的方案，' +
-          '不代表这个厂商的「最强能力」，只代表<b>在这个 App 的约束下它选了哪一档</b>。</p></div>'
-        ]),
-      quiz: {
-        id: 'q19-5', chapter: 19, answer: [0, 2],
-        stem: '（多选）关于「用厂商特征字符串来判定壳类型」，下面哪些说法是对的？',
-        options: [
-          { t: '特征字符串能给出厂商先验，但不能替代结构观测——因为它无法回答「方法体是否被抽走」这类问题', why: '正确。特征匹配回答的是「像谁」，判定要回答的是「属于哪一代、防护到什么程度」。' },
-          { t: '只要特征库足够全，就可以完全依赖它来判定壳类型', why: '错误。规则库本质上是对历史样本的总结，新版本、定制版、以及「同一厂商不同档位」都会漏。' },
-          { t: '同一个厂商的不同产品档位、不同版本可能使用不同方案，因此「命中某厂商」不足以推出技术路线', why: '正确。厂商内部也有分级保护，且会随版本迭代调整。' },
-          { t: '因为特征会变，所以特征库工具没有使用价值', why: '错误。它作为交叉验证手段很有价值（快速确认方向），只是不能当唯一判据。' }
-        ],
-        explain: '<b>这道题要建立的判断是：区分「先验」与「证据」。</b><br><br>' +
-          '厂商特征库是<b>先验</b>——它来自别人对历史样本的总结，命中率高但会过期，而且不携带结构信息。<br>' +
-          '你自己的结构观测是<b>证据</b>——<code>class_defs_size</code> 是多少、方法体空不空、maps 里有什么，这些是你当场采到的。' +
-          '证据永远优先于先验。<br><br>' +
-          '<span class="hit">这条原则在真实工作里的价值：当特征库说「A 厂商」、而你的观测（结构完整、方法体空、有 native 注册）指向抽取壳时，' +
-          '你要按抽取壳的流程走，而不是去搜「A 厂商怎么脱」——因为后者可能对应的是它三年前的方案。</span>'
-      }
-    },
-
-    /* ============================================================ 19.11 */
-    {
-      h: '19.11', title: 'dex 壳的静态特征、动态特征与判定表',
-      html:
-        '<p>到这里，判定所需的所有零件都齐了。这一节把它们拼成<b>可执行的观察清单 + 判定表</b>：先看能零成本拿到的静态特征，' +
-        '再上需要跑起来的动态特征，最后把现象组合成结论。</p>' +
-        T.tbl(['静态侧观测（不装 App、不 root，成本最低）', '怎么拿', '它意味着什么'],
-          [
-            ['<b>APK 结构异常</b>：多 dex、<code>classes.dex</code> 异常小、<code>assets/</code> 里有体积异常的文件、<code>lib/</code> 下 so 数量与业务不符',
-             '<code>unzip -l</code> / 解包看目录', '存在壳的可能性很高；<code>assets/</code> 里那个大文件往往就是加密的真 dex 或密钥'],
-            ['<b>dex 体积与类数不符</b>：文件几 MB，<code>class_defs_size</code> 却是 0 或个位数',
-             '读 dex 头偏移 <code>0x60</code>（第 2 章的实验给过完整解析）', '整份 dex 是密文或占位文件 → 一代壳的强特征'],
-            ['<b>多 dex 且其中一份明显是引导性质</b>：类名带 <code>Stub</code> / <code>Proxy</code> / <code>Wrapper</code> 之类的语义，方法极少',
-             'jadx 打开逐个 dex 看', '壳的引导 dex；业务代码还在别处或还没解密'],
-            ['<b><code>AndroidManifest.xml</code> 的 <code>application:name</code> 被替换</b>，且该类不是业务方命名规范',
-             '<code>apktool d</code> 后看 Manifest', '入口层被壳接管——几乎所有壳的共同特征，<b>但它区分不了代际</b>'],
-            ['<b><code>attachBaseContext</code> 被覆写</b>，里面出现解密/加载/反射替换的调用',
-             '在入口类里搜这个方法名', '判定加固存在的第二强证据（仅次于「方法体空」）'],
-            ['<b>Java 层成片的 <code>native</code> 声明</b>，且方法名语义完整',
-             'jadx 里搜 <code>native</code>', 'native 化 / DEX2C 的方向；少量 native 是正常工程，成片才是保护'],
-            ['<b>字符串大面积不可读</b>（但方法体完整）',
-             'jadx 里翻任意一个业务类', '字符串加密（第 5 章），<b>不是壳</b>——别把它当脱壳任务'],
-            ['<b>so 无法解析</b>：没有合法 ELF 头或节表异常',
-             '<code>readelf -h</code> / <code>file</code>', 'so 被整体加密 → 需要先解决「怎么拿到内存里的明文 so」']
-          ]) +
-        T.note('key', '🔑 静态侧的三条最强证据（其余都是辅助）',
-          '<p style="margin-bottom:0">① <b>方法体空但结构完整</b> → 抽取壳（二代），最典型、最容易确认；<br>' +
-          '② <b>类数为 0 或 dex 不可解析</b> → 整体加密（一代）；<br>' +
-          '③ <b>Java 层成片 native + 无导出符号</b> → native 化（三代）。<br>' +
-          '<span class="hit">把这三条记牢，静态侦察这一步就已经能给出主要方向了——剩下的动态观测只是用来确认和量化。</span></p>') +
-        T.tbl(['动态侧观测（要跑起来，但不需要 root 的部分先做）', '怎么拿', '它意味着什么'],
-          [
-            ['<b><code>class_defs_size</code> 与实际可加载类数不符</b>',
-             '运行时枚举 ClassLoader 里能加载的类，与静态读到的数量比', '差异大说明有运行时加载的 dex（多 dex / 动态加载 / 壳中壳）'],
-            ['<b>方法体为空的比例</b>（抽取比例）',
-             'dump 后统计非空方法数 ÷ 总方法数；或跑功能前后各 dump 一次做对比', '空的比例高 = 抽取壳；<b>前后对比有变化 = 抽取壳的铁证</b>'],
-            ['<b><code>/proc/self/maps</code> 里的异常映射</b>：无名可执行段、<code>memfd:</code>、<code>(deleted)</code> 的 so、数据目录下的 so',
-             '读 maps 并逐行分类（19.13 的实验就是把这件事做成流程）', 'native 侧有自定义加载行为 → SO 层加固；三类痕迹指向的方案还不一样'],
-            ['<b>内存里的 dex 魔数命中数</b>：搜 <code>dex\\n035</code> 这类魔数（版本三位数字随系统变）',
-             '扫描目标进程内存（需要 root 或注入能力）', '命中 0 处：dex 可能还没加载 / 头部被魔改；命中 1 处：一份明文 dex；命中多处：多 dex 运行时加载'],
-            ['<b><code>cdex001</code> 一类的 CompactDex 魔数</b>',
-             '同一轮内存扫描里一并搜', '命中说明系统在用 CompactDex（数据与指令分离），<b>你 dump 到的可能是"半份"</b>（第 12 章展开）'],
-            ['<b>native 注册痕迹</b>：<code>JNI_OnLoad</code> / <code>RegisterNatives</code> 被调用',
-             'hook 这两个 API（第 4 章的方法）', '关键逻辑在 native，且入口被隐藏 → 三代壳方向']
-          ]) +
-        T.note('warn', '⚠️ 三条采样纪律（不遵守会得出错误结论）',
-          '<p>① <b>先跑功能再 dump。</b>抽取壳的完整度取决于你触发过的路径，不跑功能就 dump，等于测了个下限。<br>' +
-          '② <b>同一观测至少采两次。</b>「前后对比」是区分抽取壳与残缺 dex 的唯一手段；单次采样下这两者长得一模一样。<br>' +
-          '③ <b>把「可疑」和「有价值」分开记。</b>maps 里的 <code>.dex</code> 映射是<b>你的 dump 目标</b>（有价值），' +
-          '<code>(deleted)</code> 的 so 是<b>壳的痕迹</b>（可疑）。<span class="hit">混在一起记，判定就会糊掉。</span></p>') +
-        '<p>下面是把整套判定压缩成一条可执行流水线。八步走完，你应该能写出结论：<b>哪一代壳 + 运行时防护到什么程度 + 下一步做什么</b>。</p>',
+        '<p><code>-fla</code>（Control Flow Flattening）是三大混淆里<b>视觉冲击最大</b>的一个，也是你打开 IDA 第一眼看到的东西：' +
+        '一个巨大的 <code>switch</code> 套在 <code>while(1)</code> 里，几十个 <code>case</code> 互相跳来跳去。</p>' +
+        '<p>它的源码思路只有四步：<b>① 收集函数所有基本块 ② 造分发器 dispatcher，用 switch 按状态变量跳转 ' +
+        '③ 为每条原始边生成序言块（写下一状态 → 跳回分发器） ④ 原始基本块变成 switch 的 case</b>。</p>' +
+        '<p>下面这段代码就是要被平坦化的受害者，它的 CFG 只有 5 个基本块：</p>' +
+        T.code('<span class="k">int</span> <span class="f">check</span>(<span class="k">int</span> x) {\n' +
+               '  <span class="k">int</span> r = <span class="n">0</span>;\n' +
+               '  <span class="k">if</span> (x &amp; <span class="n">1</span>) r = <span class="n">10</span>;   <span class="c">// B1 条件分支 → B2 / B3</span>\n' +
+               '  <span class="k">else</span>        r = <span class="n">20</span>;\n' +
+               '  <span class="k">return</span> r;               <span class="c">// B4 汇合</span>\n' +
+               '}') +
+        '<p>点击播放，看着这 5 个块一步步变成“分发器 + 状态机”。<b>请特别留意右侧 switchVar 的取值序列</b> —— ' +
+        '那是后面反混淆的唯一钥匙。</p>',
       stage: {
-        title: '半小时判定法 · 八步流水线',
-        speed: 1900,
+        title: '控制流平坦化：从可读 CFG 到 switch 状态机',
+        speed: 2100,
         render:
-          '<div class="flow-row" style="flex-wrap:wrap;gap:7px;align-items:center">' +
-            '<span class="blk" id="s1">① unzip -l</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s2">② jadx 看结构</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s3">③ 读 dex 头</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s4">④ 看 assets / lib</span>' +
-            '<div style="width:100%;height:0"></div>' +
-            '<span class="blk" id="s5">⑤ 读 Manifest 入口</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s6">⑥ 跑起来读 maps / 搜魔数</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s7">⑦ 特征库交叉验证</span><span class="arrow">→</span>' +
-            '<span class="blk" id="s8">⑧ 写出结论 + 下一步</span>' +
-          '</div>' +
-          '<div style="margin-top:12px"><span class="pill" id="mark">点「单步」走完整条流水线</span></div>' +
-          '<div class="grid3" style="margin-top:12px">' +
-            '<div><div class="card-title">这一步在问什么</div><div class="small" id="c1" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
-            '<div><div class="card-title">看到什么说明什么</div><div class="small" id="c2" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
-            '<div><div class="card-title">这一步排除了什么</div><div class="small" id="c3" style="line-height:1.9;color:var(--fg-2)">—</div></div>' +
+          '<div class="grid2">' +
+            '<div class="card"><div class="card-title">混淆前 · 原始 CFG（5 个基本块）</div>' +
+              '<div class="flow-col">' +
+                '<span class="blk" id="c0">B0 · 入口 r=0</span>' +
+                '<span class="arrow">↓</span>' +
+                '<span class="blk" id="c1">B1 · if (x&amp;1)</span>' +
+                '<div class="flow-row">' +
+                  '<span class="blk" id="c2">B2 · r=10</span>' +
+                  '<span class="muted">◀ 二选一 ▶</span>' +
+                  '<span class="blk" id="c3">B3 · r=20</span>' +
+                '</div>' +
+                '<span class="arrow">↓</span>' +
+                '<span class="blk" id="c4">B4 · return r</span>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card"><div class="card-title">混淆后 · 平坦化状态机</div>' +
+              '<div class="flow-col">' +
+                '<span class="blk" id="d0">disp · switch(switchVar)</span>' +
+                '<span class="arrow">↑ ↓ 每条边都回到这里</span>' +
+                '<div class="flow-row">' +
+                  '<span class="blk" id="s0">case 0</span><span class="blk" id="s1">case 1</span>' +
+                  '<span class="blk" id="s2">case 2</span><span class="blk" id="s3">case 3</span>' +
+                  '<span class="blk" id="s4">case 4</span>' +
+                '</div>' +
+                '<span class="arrow">↓</span>' +
+                '<span class="blk" id="p0">序言块 · 写下一状态 然后跳回 disp</span>' +
+              '</div>' +
+              '<div class="memgrid" style="margin-top:10px">' +
+                '<div class="memrow"><span class="addr">switchVar</span><span class="cell" id="cellv">-</span></div>' +
+              '</div>' +
+            '</div>' +
           '</div>',
-        reset: function () {
-          ['s1','s2','s3','s4','s5','s6','s7','s8'].forEach(function (i) { S(i, ''); });
-          CLS('mark', 'pill'); SET('mark', '点「单步」走完整条流水线');
-          SET('c1', '—'); SET('c2', '—'); SET('c3', '—');
+        reset: () => {
+          S('c0', ''); S('c1', ''); S('c2', ''); S('c3', ''); S('c4', '');
+          S('d0', ''); S('s0', ''); S('s1', ''); S('s2', ''); S('s3', ''); S('s4', ''); S('p0', '');
+          CLS('cellv', 'cell'); SET('cellv', '-');
+          SET('d0', 'disp · switch(switchVar)');
+          SET('p0', '序言块 · 写下一状态 然后跳回 disp');
         },
         steps: [
-          { run: function () { S('s1', 'active'); SET('c1', 'APK 里到底装了什么？（文件层面的结构）'); SET('c2', '多 dex / <code>assets/</code> 下体积异常的文件 / <code>lib/</code> 下与业务不符的 so'); SET('c3', '排除了「这是一个干净的原生 APK」这个可能（但还不能定性）'); },
-            note: '<b>步骤一：<code>unzip -l</code>。</b>零成本、零风险，先看目录结构。' +
-              '重点不是「有什么」，而是<b>「什么不该在这儿」</b>——<span class="hit">一个 8MB 的 .bin 出现在 assets 里，比任何字符串特征都更能说明问题。</span>' },
-          { run: function () { S('s1', 'done'); S('s2', 'active'); SET('c1', '静态能读到多少业务代码？'); SET('c2', '只有壳代码 / 类名齐全但方法体空 / 成片 native / 代码完整但字符串乱码'); SET('c3', '这一步直接定主要方向：一代、二代、三代，或「不是壳」'); },
-            note: '<b>步骤二：jadx 看结构。</b>这是整条流水线里<b>信息量最大的一步</b>，一次点击就能定方向。' +
-              '判读口诀：<b>看不到类 → 一代；看到类看不到方法体 → 二代；看到 native 或天书 → 三代；都正常只是字符串乱 → 不是壳。</b>' },
-          { run: function () { S('s2', 'done'); S('s3', 'active'); SET('c1', 'dex 头怎么说？（把现象量化）'); SET('c2', '<code>class_defs_size</code> 是多少、<code>magic</code> 版本、<code>file_size</code> 与体积是否相符'); SET('c3', '排除了「文件损坏」这个借口——数字不会骗人'); },
-            note: '<b>步骤三：读 dex 头（第 2 章的 112 字节实验）。</b>这一步的价值在于<b>把印象变成数字</b>：' +
-              '「好像是空的」和「<code>class_defs_size = 0</code>」是两种证据强度。' +
-              '<span class="hit">写报告、和别人对齐结论时，数字是唯一不会吵架的东西。</span>' },
-          { run: function () { S('s3', 'done'); S('s4', 'active'); SET('c1', '密文和密钥在哪？（决定你能不能离线拿数据）'); SET('c2', '<code>assets/</code> 里的大文件、<code>lib/</code> 下的可疑 so、<code>res/</code> 里的异常资源'); SET('c3', '排除了「真 dex 必须联网才能拿到」这个最麻烦的分支（如果密文就在包里）'); },
-            note: '<b>步骤四：看 <code>assets/</code> 和 <code>lib/</code>。</b>这一步决定你的<b>可行性判断</b>：' +
-              '密文在包里 → 可以离线、可以反复试；密文来自服务端或由设备信息生成 → 你的脱壳流程必须能联网/能复现环境。' },
-          { run: function () { S('s4', 'done'); S('s5', 'active'); SET('c1', '入口被谁接管了？'); SET('c2', '<code>application:name</code> 指向一个非业务命名的类；<code>attachBaseContext</code> 被覆写'); SET('c3', '排除了「无壳」的可能——入口被替换是加固的第二强证据'); },
-            note: '<b>步骤五：读 Manifest 入口。</b>这一步的作用是<b>交叉确认</b>：如果步骤二看到方法体空、这里又看到入口被替换，' +
-              '那「加固存在」这个结论就有两条独立证据支撑了。<span class="hit">判定要的不是单条铁证，而是相互独立的证据链。</span>' },
-          { run: function () { S('s5', 'done'); S('s6', 'active'); SET('c1', '运行时到底把什么放进了内存？'); SET('c2', 'maps 里的异常映射 / dex 魔数命中数 / native 注册痕迹'); SET('c3', '排除了「纯静态可解」的幻想，同时给出 SO 层的判定'); },
-            note: '<b>步骤六：跑起来看内存。</b>到这一步才需要设备。三件事：读 maps 并逐行分类（19.13 的实验）、' +
-              '搜 dex 魔数命中数、观察 native 注册。<b>注意采样纪律：先跑功能，再采集。</b>' },
-          { run: function () { S('s6', 'done'); S('s7', 'active'); SET('c1', '像谁家的做法？（先验，不是证据）'); SET('c2', '特征库命中的厂商/方案名，以及你此前未考虑过的方向'); SET('c3', '排除了「我漏看了某个已知方案」的可能——但<b>不能排除版本差异</b>'); },
-            note: '<b>步骤七：特征库交叉验证。</b>用 apkid / ApkCheckPack 这类工具跑一遍。' +
-              '<b>它的作用是提醒你「还有这种可能」</b>，而不是给你结论。' +
-              '<span class="hit">与本步骤并列的是「搜一搜」——但要记住搜到的是别人的样本结论，你的样本未必一样。</span>' },
-          { run: function () { S('s7', 'done'); S('s8', 'cool'); CLS('mark', 'pill ok'); SET('mark', '✅ 八步走完：你手里应该有一句可执行的结论'); SET('c1', '结论怎么写才可执行？'); SET('c2', '写成三段：<b>壳类型 + 运行时防护程度 + 下一步第一个动作</b>'); SET('c3', '排除了一切「我觉得像是……」的模糊表述'); },
-            note: '<b>步骤八：写结论。</b>结论必须是可执行的三段式，例如：' +
-              '<b>「二代抽取壳（结构完整、方法体空、native 注册）；运行时防护中等（Java 侧环境检测 + native 反调试）；' +
-              '下一步：跑遍功能 + 主动调用脱壳，先拿完整 Java 层调用图。」</b><br>' +
-              '<span class="hit">这样写的好处是：明天换个人接手，他不需要重新判定一遍，也知道该做什么。</span>' }
+          {
+            run: () => { S('c0', 'active'); SET('cellv', '未分配'); },
+            note: '<b>起点：一个老实的 CFG。</b>B0 是入口。<code>switchVar</code> 这时候还不存在 —— ' +
+                  '混淆器还没动手，控制流由 <b>CPU 的跳转指令</b>直接表达：<code>if (x&amp;1)</code> 编译成一条条件跳转。'
+          },
+          {
+            run: () => { S('c0', 'done'); S('c1', 'active'); },
+            note: '<b>人眼读这个 CFG 毫无压力：</b>走过 B0 到 B1，判断 <code>x&amp;1</code>，然后二选一。' +
+                  'IDA 的 F5 之所以能还原出漂亮的 <code>if/else</code>，靠的就是这种“<b>一个块有两条出边</b>”的结构特征。'
+          },
+          {
+            run: () => { S('c1', 'done'); S('c2', 'active'); },
+            note: '<b>假设走 true 分支。</b>注意此刻“下一步去哪”这件事，是<b>写在跳转指令里</b>的（跳或不跳），' +
+                  '只有一个 bit 的信息，静态分析极易恢复。'
+          },
+          {
+            run: () => { S('c2', 'done'); S('c4', 'active'); },
+            note: '<b>B2 → B4 汇合。</b>到这里，一条完整的可读执行路径结束。' +
+                  '接下来我们要把这个结构<b>彻底抹掉</b>。'
+          },
+          {
+            run: () => { S('c0', 'cool'); S('c1', 'cool'); S('c2', 'cool'); S('c3', 'cool'); S('c4', 'cool'); },
+            note: '<b>第 ① 步：收集全部基本块。</b>源码就是 <code>for (BasicBlock &amp;BB : F) origBB.push_back(&amp;BB);</code>。' +
+                  '<span class="hit">绿色代表“这些块已经被登记，等待被重排”</span>。'
+          },
+          {
+            run: () => { CLS('cellv', 'cell hi'); SET('cellv', '0 → B0'); },
+            note: '<b>第 ② 步：创建状态变量 switchVar。</b>它就是个普通的栈上变量（<code>CreateAlloca</code>），' +
+                  '但从此以后<b>整个函数的控制权都交给它</b>。初值 0，代表“从头开始”。'
+          },
+          {
+            run: () => { S('d0', 'active'); },
+            note: '<b>第 ③ 步：造分发器 disp。</b>它被插到函数入口块前面，成为<b>全函数唯一的公共枢纽</b>。' +
+                  '所有块执行完都回这里，由它决定下一站。'
+          },
+          {
+            run: () => { S('d0', 'active'); SET('d0', 'disp · switch(switchVar) 5 cases'); },
+            note: '<b>第 ④ 步：在 disp 里建 switch 指令。</b>' +
+                  '<code>SwitchInst::Create(switchVar, disp, 0, disp)</code> —— 默认目标也指向 disp，' +
+                  '所以还没填 case 时它是个<b>空转死循环</b>。'
+          },
+          {
+            run: () => { S('s0', 'cool'); S('s1', 'cool'); S('s2', 'cool'); S('s3', 'cool'); S('s4', 'cool'); S('d0', 'active'); },
+            note: '<b>第 ⑤ 步：每个原始块变成一个 case。</b>块 0 = case 0、块 1 = case 1……编号顺序<b>就是原始顺序</b>。' +
+                  '此刻原来的 <code>if</code> 已经不存在了 —— 只剩下“<b>编号 → 块</b>”的映射表。'
+          },
+          {
+            run: () => { S('p0', 'active'); SET('p0', '序言块 · switchVar = ? 然后跳回 disp'); },
+            note: '<b>第 ⑥ 步（最关键）：拆边插序言块。</b>对每一条原始边 from→to，用 <code>SplitEdge</code> 把边切成两段，' +
+                  '中间塞一个只做两件事的小块：<span class="pill acc">写下一状态</span> + <span class="pill acc">跳回 disp</span>。'
+          },
+          {
+            run: () => { SET('cellv', '0'); S('s0', 'active'); S('d0', 'done'); S('p0', 'cool'); },
+            note: '<b>现在开始“动态跑一遍”。</b>switchVar=0 → disp 分发到 case 0（原 B0）。' +
+                  'B0 执行完不再直接跳 B1，而是经过序言块去改状态变量。'
+          },
+          {
+            run: () => { SET('cellv', '1'); S('s0', 'done'); S('s1', 'active'); },
+            note: '<b>序言块把 1 写进 switchVar，跳回 disp，分发到 case 1（原 B1）。</b>' +
+                  '“跳去 B1” 这件事，被翻译成了“把变量设成 1”。<span class="miss">跳转指令消失了，取而代之的是数据</span>。'
+          },
+          {
+            run: () => { SET('cellv', '2'); S('s1', 'done'); S('s2', 'active'); },
+            note: '<b>case 1 判断 x&amp;1，走 true，序言块写 2。</b>注意分支结果现在体现为<b>两个不同的常数</b>：' +
+                  '走 true 写 2、走 false 写 3。逆向时你看不到“条件跳转”，只看到“给变量赋值 2 或 3”。'
+          },
+          {
+            run: () => { SET('cellv', '4'); S('s2', 'done'); S('s4', 'active'); },
+            note: '<b>case 2 → 序言块写 4 → case 4（原 B4）。</b>至此一次完整执行的状态序列是：' +
+                  '<span class="hit">0 → 1 → 2 → 4 → 退出</span>。' +
+                  '<b>这就是全部真相</b>：路径被完整地编码进了一串整数。'
+          },
+          {
+            run: () => { S('d0', 'hot'); SET('cellv', '0 → 1 → 2 → 4'); },
+            note: '<b>IDA 的视角。</b>它看到的是：一个 <code>while(1)</code>，里面一个 <code>switch</code>，' +
+                  '几十个 <code>case</code>，每个 case 结尾都改一个变量再 <code>continue</code>。' +
+                  '<span class="miss">它没有任何理由认为这是 if/else</span>，只能老老实实输出 switch —— 这就是“反编译成一坨”的机制原因。'
+          },
+          {
+            run: () => { S('d0', 'cool'); S('s0', 'active'); S('s2', 'active'); S('s4', 'active'); SET('cellv', '0 → 1 → 2 → 4'); },
+            note: '<b>破法已经浮出水面。</b>静态看不懂没关系 —— ' +
+                  '<b>把 switchVar 的实际取值序列 Trace 出来</b>，按顺序把 case 0 → 1 → 2 → 4 拼起来，' +
+                  '真实路径就还原了。这正是动态 Trace 与 D-810 这类插件的立足点。'
+          }
         ]
       },
-      case: {
-        source: 'github',
-        title: 'ApkCheckPack —— apk加固特征检查工具（GitHub 仓库描述照抄：汇总收集已知特征和手动收集大家提交的app加固特征，支持40+厂商的加固检测）',
-        date: '2021-06-29（仓库创建，据 GitHub API；README 自述规则库更新于 20260618）',
-        author: 'moyuwa（GitHub 仓库所有者）',
-        target: 'ApkCheckPack（Go 实现，命令行 <code>ApkCheckPack.exe -f &lt;APK&gt;</code>）',
-        background:
-          '<p>这是本章「静态特征库」这条路线的一个完整实现：把已知加固方案的<b>特征 so 路径 / so 文件名 / 其它特征文件与字符串 / ' +
-          '有版本号的 so 正则 / dex 内的类名</b>整理成规则库，编译进一个 Go 二进制，扫描 APK 目录树后输出命中了谁。</p>' +
-          '<p>它同时做了几件与判定相关的事：加固检测、ROOT / 模拟器 / 反调试 / 代理等<b>反环境特征</b>检测、第三方 SDK 识别、' +
-          '证书扫描、硬编码扫描，并支持递归扫描内嵌 APK（XAPK 一类）。<b>规则内置在二进制里，不需要外部配置。</b></p>',
-        points: [
-          '加固规则的四类形态（README 原文）：<code>sopath</code> 绝对路径的特征 so、<code>soname</code> 仅特征 so 文件名、<code>other</code> 其它特征文件与字符串、<code>soregex</code> 对有版本号的特征 so 用正则、<code>jclass</code> dex 内类名字符串匹配。',
-          'README 自述支持检测的厂商（照录，未做删改）：360、百度、网易、盛大、CFCA、中国移动、通付盾、海云安、启明星辰、顶像科技、珊瑚灵御、瑞星、深盾安全、网秦、UU安全、蛮犀、能信安、DexProtect、Google Play、LIAPP 等 —— 厂商名后带「等」，说明列表本身是开放的。',
-          'README 自述<b>加固规则更新时间 20260618</b>、第三方 SDK 规则更新时间 20260111 —— 也就是规则库有明确的时间戳，这意味着「命中」的结论天然带保质期。',
-          '命令行参数覆盖了检测开关：<code>-root</code> / <code>-emu</code> / <code>-debug</code> / <code>-proxy</code> / <code>-sdk</code> / <code>-cert</code> 默认开启，<code>-hardcode</code> 默认关闭，<code>-maxsize</code> 默认 500（MB），<code>-r</code> 递归扫描内嵌 APK。',
-          '仓库元数据（GitHub API，抓取时 HTTP 200）：创建于 2021-06-29，默认分支 <code>main</code>，语言 Go，未声明 license。'
-        ],
-        method: [
-          '<b>第一步：收集特征。</b>作者的做法是「汇总已知特征 + 手动收集大家提交的 app 加固特征」——规则来自公开资料与社区投稿，而不是对每个厂商做完整逆向。',
-          '<b>第二步：把特征分成可匹配的形态。</b>按「绝对路径 / 文件名 / 其它文件与字符串 / 带版本号的正则 / dex 内类名」五类落地，这样同一家厂商的多个版本可以共用一条正则。',
-          '<b>第三步：编译进二进制。</b>规则不放在外部配置文件里，随程序一起分发，避免「规则和程序版本不匹配」这类问题。',
-          '<b>第四步：扫描时同时输出「命中厂商」与「反环境特征」。</b>后者（ROOT / 模拟器 / 反调试 / 代理）是运行时防护那一维度的静态近似。',
-          '<b>第五步：对未识别的样本开放投稿。</b>README 明确欢迎提交规则或提供无法识别的加固样本 —— 这等于承认「规则库的覆盖率是靠持续输入维持的」。'
-        ],
-        result:
-          '<p>工具能对一份 APK 输出：命中的加固方案、反环境特征、第三方 SDK、证书信息，并支持批量目录与内嵌 APK 递归扫描。' +
-          '对「这是谁家的加固」这个问题，它能给出一个快速的先验答案。</p>',
-        terms: ['加固特征库', 'YARA / 正则匹配', 'so 特征名', 'dex 类名匹配', '反环境检测', 'XAPK 内嵌 APK', 'Go 单文件分发'],
-        limits:
-          '<p>作者在 README 结尾自述的局限只有一句话，但信息量很足，照录如下：</p>' +
-          '<p><b>「工具只是辅助，新方式和厂商不断出现，特征查找方式可能遗漏，切勿完全依赖。」</b></p>' +
-          '<p>与这句并列的两条自述性质的信息也照录：① README 写明「欢迎提交规则，或提供无法识别的加固样本，争取持续更新」——' +
-          '说明规则覆盖率依赖社区投稿；② 规则库带明确更新时间（加固规则 20260618），<b>意味着任何「未命中」都不能当作「未加固」的证据</b>。</p>' +
-          '<p>另需说明：仓库未声明开源许可证（GitHub API 的 <code>license</code> 字段为空），使用前应自行确认授权范围。</p>',
-        analysis:
-          '<p><b>用本章方法论拆解：这个项目恰好落在 19.10 讲的那条纪律上——特征库是「先验」，不是「证据」。</b></p>' +
-          '<p>看它的规则形态就知道边界在哪：<code>sopath</code> / <code>soname</code> / <code>soregex</code> / <code>jclass</code> / <code>other</code> ' +
-          '全部是<b>字符串与文件名层面的匹配</b>。这类匹配能回答「像谁」，但<b>无法回答结构问题</b>——' +
-          '它不会告诉你 <code>class_defs_size</code> 是多少、方法体空的比例有多大、maps 里有没有 <code>(deleted)</code> 的 so。' +
-          '<span class="hit">也就是说，它能给判定流程的<b>第 ⑦ 步</b>提供输入，但替代不了第 ②③④⑥ 步。</span></p>' +
-          '<p>第二点值得学的是<b>作者对自己工具的定位</b>。他没有写「支持 40+ 厂商检测，可替代人工分析」，而是写「工具只是辅助……切勿完全依赖」。' +
-          '对照 19.10 讲的三条理由（会变 / 会互相抄 / 会误导判定），这句话是把第一条和第二条直接承认下来了：' +
-          '<b>规则库必然滞后于新版本，而且规则来源是社区投稿，质量参差</b>。教材里评价一个工具时，也应该照这个口径——' +
-          '说清它在流程里的位置，而不是给它一个「准不准」的总评。</p>' +
-          '<p>第三点是一个可以直接搬走的工程习惯：<b>给规则库打时间戳</b>。README 里「加固规则更新时间 20260618」这一行，' +
-          '让你的每一条「命中」结论都自动带上保质期。<span class="hit">判定结论必须可回溯、可过期——这是做安全分析报告时的基本卫生。</span></p>',
-        link: 'https://github.com/moyuwa/ApkCheckPack',
-        linkNote: 'GitHub 仓库（收录时以 web_fetch 取到 README 全文，并另取 GitHub API 元数据核对创建时间与语言）'
-      }
+      after: T.note('key', '🔑 平坦化的“可还原性”从哪来',
+        '<p>平坦化<b>不是加密</b>：状态变量是<b>确定性的</b>，同一条输入必然产生同一串状态值。' +
+        '所以还原路径有三条通用路子：<b>① 动态 Trace 状态变量</b>（最稳，见 19.9）；' +
+        '<b>② 静态识别分发器 + 追踪常量赋值</b>（D-810 的思路）；' +
+        '<b>③ 符号执行走一遍</b>。三条路都在回答同一个问题：<span class="hit">switchVar 的取值序列是什么</span>。</p>') +
+        T.note('warn', '⚠️ 别被“一个 switch”骗了',
+        '<p>真实加固样本里常见<b>多层嵌套平坦化</b>（混淆器跑多轮）和 <b>状态变量被拆成多个</b>（switchVar 与另一个变量异或后再算）。' +
+        '还有些 fork 把 case 编号<b>随机化</b>而不是 0..N 顺序。这些都不改变原理，但会让你手写脚本时踩坑：' +
+        '<b>不要假设编号连续、不要假设只有一个状态变量</b>。</p>')
     },
 
-    /* ============================================================ 19.12 */
+    /* ============ 19.4 ============ */
     {
-      h: '19.12', title: '动手实验：壳类型判定器',
+      h: '19.4',
+      title: '虚假控制流 -bcf：靠“恒真条件”把 1 条路变成 2 条',
       html:
-        '<p>这一节把 19.11 的判定表做成一台机器：你填入 6 项观测值，它按<b>真实规则表</b>给每个壳类型假设打分、列出触发了哪些证据，' +
-        '然后由你写出结论，系统用「结论关键词」判分。</p>' +
-        T.note('key', '🔑 为什么不是「查表得答案」',
-          '<p style="margin-bottom:0">因为真实的判定从来不是单条现象决定的：<b>同一个现象在不同组合下含义相反</b>。' +
-          '比如「<code>class_defs_size = 0</code>」单独看只是「dex 不可解析」，配上「内存里却有一处明文 dex 魔数」就变成一代壳的强证据；' +
-          '配上「内存里也搜不到任何 dex 魔数」则可能是「还没加载」或「头部被魔改」。' +
-          '<span class="hit">这台机器评的是<b>证据组合</b>，所以它给的是分数排序 + 证据清单，而不是一句断言。</span></p>'),
+        '<p><code>-bcf</code>（Bogus Control Flow）的目标和 <code>-fla</code> 不同：平坦化是<b>重排结构</b>，' +
+        '虚假控制流是<b>往结构里灌垃圾分支</b>，让任何静态分析都要多算几百条根本走不到的路。</p>' +
+        '<p>它的核心武器是 <b>不透明谓词（opaque predicate）</b>：一个<b>结果恒定、但编译器/反编译器静态难以化简</b>的表达式。' +
+        '把原基本块拆成“真块”和“假块”，假块塞满垃圾指令，再插一条 ' +
+        '<code>if (opaque) 正常路径 else 垃圾路径</code>。</p>' +
+        '<p>下面是 OLLVM 里最经典的几种不透明谓词构造，以及它们<b>为什么恒真</b>的数学证明：</p>' +
+        T.tbl(
+          ['构造式', '恒真/恒假', '证明（一句话）', '反编译器为什么看不穿'],
+          [
+            ['<code>y = x * x % 2 == 0</code>', '恒真（x 为整数）', '平方的奇偶性：<code>x²</code> 与 <code>x</code> 同奇偶，但 <code>x²</code> 的因子指数翻倍 —— 更直接的版本是 <code>x*(x+1) % 2 == 0</code>', '要先证明“平方不改变奇偶性”，再证明偶数模 2 为 0；GVN 通常只做局部化简，不做数论推理'],
+            ['<code>y = x * (x + 1) % 2 == 0</code>', '<b>恒真</b>', '<code>x</code> 与 <code>x+1</code> 是连续整数，必有一个是偶数 ⇒ 乘积必为偶数 ⇒ 模 2 恒为 0', '反编译器不会对 <code>x*(x+1)</code> 做“连续整数”这种代数归纳'],
+            ['<code>y = (x ^ (x - 1)) &gt; x</code>', '<b>恒假</b>（在常见变体中用于构造死分支）', '当 <code>x=0</code> 时为 <code>-1 &gt; 0</code> 即假；需按具体变体逐例验证 <span class="pill warn">具体变体待核实</span>', '涉及位运算与符号语义的混合推理'],
+            ['<code>y = ((x | 1) * (x | 1)) % 2 == 0</code>', '恒假（<code>x|1</code> 必为奇数，奇² 仍为奇数）', '强制低位为 1 ⇒ 奇数 ⇒ 平方仍是奇数 ⇒ 模 2 得 1', '同样需要“奇数平方仍是奇数”这一步推理']
+          ]
+        ) +
+        T.note('key', '🔑 不透明谓词的本质：把“数学事实”伪装成“运行时条件”',
+          '<p>编译器做的是<b>局部、保守、快</b>的化简（常量折叠、GVN、稀疏条件传播）。' +
+          '不透明谓词刻意选那些<b>需要一两步代数归纳才能证明</b>的恒等式 —— 证明成本略高于编译器的预算，它就活下来了。' +
+          '对逆向者而言这是好消息：<b>你不需要真的去证明它，你只需要跑一遍看它走哪条路</b>。</p>') +
+        T.note('ok', '✅ 破解关键：死代码永远不会出现在动态 trace 里',
+          '<p>这是 <code>-bcf</code> 最大的软肋。垃圾分支<b>结构上存在，执行上永远不进入</b>。' +
+          '所以只要你在真实设备上跑一遍并记录执行过的地址（模块基址 + 偏移），垃圾块的偏移<b>一次都不会出现</b>，' +
+          '把没出现过的块全部删掉，控制流立刻瘦身回可读状态。这也是为什么 <b>动态 Trace 是对付 bcf 性价比最高的手段</b>。</p>') +
+        T.note('warn', '⚠️ 反过来说：静态去 bcf 是“体力活”',
+          '<p>纯静态方案（D-810 / HexRaysDeob 这类）必须<b>先判定谓词恒真</b>，再删死分支。' +
+          '由于谓词构造是无限的（加固厂商会自己加变体），静态规则库总有漏网之鱼。' +
+          '更麻烦的是：<code>-bcf</code> 常和 <code>-fla</code> 叠加使用 —— 垃圾分支也被塞进 case 列表里，' +
+          '于是你面对的是一个“平坦化 + 一堆走不到的 case”的复合体。</p>')
+    },
+
+    /* ============ 19.5 ============ */
+    {
+      h: '19.5',
+      title: '指令替换 -sub：值一模一样，指令面目全非',
+      html:
+        '<p><code>-sub</code>（Instructions Substitution）是三件套里<b>最“温柔”</b>的一个：它不改控制流，只把一条二元运算' +
+        '换成<b>数学上等价</b>的一串更复杂的运算。官方支持 <code>add</code> / <code>sub</code> / <code>and</code> / <code>or</code> / <code>xor</code>。</p>' +
+        '<p>它的迷惑性在于：<b>你读到的东西和 CPU 实际算的东西对不上</b>。你在反编译窗口里看到五个操作，' +
+        '寄存器里其实只发生了一次加法。下面是几条必须刻进肌肉记忆的等价变形（全部是真实成立的数学等价式）：</p>' +
+        T.tbl(
+          ['原始运算', '等价变形', '验证要点'],
+          [
+            ['<code>a + b</code>', '<code>a - (-b)</code>', '减去相反数 = 加上本身'],
+            ['<code>a + b</code>', '<code>a - (~b) - 1</code>', '<code>~b = -b - 1</code> ⇒ <code>a - ~b - 1 = a + b + 1 - 1 = a + b</code>'],
+            ['<code>a + b</code>', '<code>(a ^ b) + 2 * (a &amp; b)</code>', '半加器思想：异或得无进位和，与运算得进位，进位左移一位相加'],
+            ['<code>a - b</code>', '<code>a + (~b) + 1</code>', '补码定义：<code>-b = ~b + 1</code>，减法即加补码'],
+            ['<code>a ^ b</code>', '<code>(a | b) - (a &amp; b)</code>', '并集减去交集 = 对称差'],
+            ['<code>a ^ b</code>', '<code>(~a &amp; b) | (a &amp; ~b)</code>', '按定义展开：恰好一个为 1 的位'],
+            ['<code>a | b</code>', '<code>(a &amp; ~b) + b</code>', '先把 a 中与 b 重叠的位清掉再加回来']
+          ]
+        ) +
+        '<p>下面把 <code>a + b</code> 展开成 <code>(a ^ b) + 2 * (a &amp; b)</code> 逐步跑一遍。' +
+        '案例取 <code>a = 0x3</code>、<code>b = 0x5</code>。<b>请盯住每一步的寄存器值，尤其最后两行。</b></p>',
+      stepper: {
+        title: '指令替换：a + b 的等价展开（盯着寄存器别眨眼）',
+        lines: [
+          {
+            code: '<span class="c">// 原始源码（人写的）</span>\n<span class="k">int</span> r = a + b;',
+            note: '<b>正常世界的样子。</b>一条加法，IDA 反编译出来就是一句话。' +
+                  '接下来 OLLVM 会把这条指令“替换”掉 —— 注意是<b>替换 IR 里的指令</b>，不是包一层函数，所以没有任何调用痕迹。',
+            state: { 'a': '0x3', 'b': '0x5', 'r': '未计算' },
+            mem: '原始指令序列:\nadd  r, a, b\n\n长度: 1 条'
+          },
+          {
+            code: '<span class="c">// -sub 替换后（编译器眼里的样子）</span>\n' +
+                  '<span class="k">int</span> t1 = a ^ b;\n' +
+                  '<span class="k">int</span> t2 = a &amp; b;\n' +
+                  '<span class="k">int</span> t3 = t2 &lt;&lt; <span class="n">1</span>;\n' +
+                  '<span class="k">int</span> r  = t1 + t3;',
+            note: '<b>替换发生了。</b>一条加法变成四条指令。' +
+                  '这是<b>半加器</b>的经典分解：<code>a ^ b</code> 给出<b>不进位的和</b>，<code>a &amp; b</code> 给出<b>进位</b>，' +
+                  '进位左移一位再相加。数学上完全等价，但<b>字面上已经认不出是加法了</b>。',
+            state: { 'a': '0x3', 'b': '0x5', 't1': '待算', 't2': '待算', 'r': '未计算' },
+            mem: '替换后指令序列:\nxor  t1, a, b\nand  t2, a, b\nshl  t3, t2, #1\nadd  r,  t1, t3\n\n长度: 4 条'
+          },
+          {
+            code: '<span class="c">// 二进制展开看清楚每一步</span>\n<span class="c">// a = 0x3 = 0011b</span>\n<span class="c">// b = 0x5 = 0101b</span>',
+            note: '<b>先把两个操作数写成二进制。</b>后面每一步都要按位看，十进制心算会出错。' +
+                  '<code>a</code> 的低两位是 11，<code>b</code> 是 01 —— 这正是进位的来源。',
+            state: { 'a': '0b0011', 'b': '0b0101' },
+            mem: 'a = 0011\nb = 0101\n    ^^^^\n    低位对齐'
+          },
+          {
+            code: '<span class="k">int</span> t1 = a ^ b;   <span class="c">// 不进位的和</span>',
+            note: '<b>t1 = 异或 = 无进位相加。</b>逐位看：<code>1^0=1</code>、<code>1^1=0</code>、<code>0^0=0</code>、<code>0^1=1</code> ⇒ <code>0110b = 6</code>。' +
+                  '<span class="hit">这一步已经算出了“如果完全不进位，和是多少”</span>。',
+            state: { 'a': '0b0011', 'b': '0b0101', 't1': '0x6 (0110b)' },
+            mem: '  0011\n^ 0101\n= 0110  → t1 = 6'
+          },
+          {
+            code: '<span class="k">int</span> t2 = a &amp; b;   <span class="c">// 哪些位要进位</span>',
+            note: '<b>t2 = 与 = 进位标志位。</b>某一位上 <code>a</code> 和 <code>b</code> 同时为 1，相加时这一位就会<b>向高位进位</b>。' +
+                  '这里只有最低位满足：<code>0011 &amp; 0101 = 0001b = 1</code>。',
+            state: { 'a': '0b0011', 'b': '0b0101', 't1': '0x6', 't2': '0x1 (0001b)' },
+            mem: '  0011\n& 0101\n= 0001  → t2 = 1\n(最低位需要进位)'
+          },
+          {
+            code: '<span class="k">int</span> t3 = t2 &lt;&lt; <span class="n">1</span>;   <span class="c">// 进位要去高一位</span>',
+            note: '<b>关键的一步：进位必须左移一位。</b>最低位产生的进位，加到的是<b>次低位</b>上，所以把 <code>0001b</code> 左移成 <code>0010b = 2</code>。' +
+                  '<span class="miss">忘了这个左移，公式就错了 —— 这是手写还原脚本最常见的 bug</span>。',
+            state: { 'a': '0b0011', 'b': '0b0101', 't1': '0x6', 't2': '0x1', 't3': '0x2 (0010b)' },
+            mem: 't2 = 0001\n<<1 = 0010 → t3 = 2\n(进位落到次低位)'
+          },
+          {
+            code: '<span class="k">int</span> r = t1 + t3;   <span class="c">// 和 + 进位 = 最终结果</span>',
+            note: '<b>合并：t1 + t3 = 6 + 2 = 8。</b>而正确答案本来就是 <code>0x3 + 0x5 = 8</code>。' +
+                  '<span class="hit">结果完全一致</span>。这就是 <code>-sub</code> 的全部秘密：' +
+                  '它<b>只改写法，不改结果</b>。',
+            state: { 't1': '0x6', 't3': '0x2', 'r': '0x8 ✅' },
+            mem: '  0110\n+ 0010\n= 1000  → r = 8\n\n验证: 0x3 + 0x5 = 8 ✔'
+          },
+          {
+            code: '<span class="c">// 换成 a - b，同一个套路（补码）</span>\n' +
+                  '<span class="k">int</span> r = a + (~b) + <span class="n">1</span>;',
+            note: '<b>减法被拆成“取反 + 加一 + 加”。</b>依据是补码定义 <code>-b = ~b + 1</code>。' +
+                  '所以 <code>a - b</code> 会被写成两次加法和一次取反 —— <b>反编译窗口里再也看不到 <code>sub</code> 指令</b>。',
+            state: { 'a': '0x3', '~b': '0xFFFFFFFA', '+1': '0xFFFFFFFB', 'r': '0xFFFFFFFE = -2' },
+            mem: 'a=3, b=5\n~b   = 0xFFFFFFFA\n+1   = 0xFFFFFFFB  (= -5)\n3 + (-5) = -2 ✔'
+          },
+          {
+            code: '<span class="c">// 更狠的变体：a ^ b 也不直接出现</span>\n' +
+                  '<span class="k">int</span> r = (a | b) - (a &amp; b);',
+            note: '<b>异或被拆成“并集减交集”。</b>依据：两位中<b>恰好一个为 1</b> 的位 = 至少一个为 1 的位 − 两个都为 1 的位。' +
+                  '到这里你应该放弃“按指令形式认算法”的念头了。',
+            state: { 'a | b': '0b0111 = 7', 'a & b': '0b0001 = 1', 'r': '0x6 ✅ (同 a^b)' },
+            mem: 'a|b = 0111 = 7\na&b = 0001 = 1\n7 - 1 = 6\n\n验证: 3 ^ 5 = 6 ✔'
+          },
+          {
+            code: '<span class="c">// 逆向者的正确姿势</span>\n<span class="c">// 不要读“形式”，要算“值”</span>',
+            note: '<b>破解关键：CPU 算出的寄存器值是等价的。</b>你不需要在脑子里还原成 <code>a+b</code>，' +
+                  '你需要的是知道“<b>这里算出 8</b>”。两条实战路径：' +
+                  '<span class="pill ok">① 常量折叠/污点传播，让脚本自动把已知输入的表达式求值</span> ' +
+                  '<span class="pill ok">② 直接动态调试，在关键点 dump 寄存器</span>。' +
+                  '当输入是密钥字节时，<b>动态值比对往往比静态还原更快出结果</b>。',
+            state: { '结论': '值等价，形式不等价', '推荐手段': '动态 Trace / 常量折叠' },
+            mem: '形式: 4 条指令 (看不懂)\n值  : 1 个结果 (看得懂)\n\n→ 关注最终值，别纠结指令形式'
+          }
+        ]
+      },
+      after: T.note('warn', '⚠️ -sub 的实战坑',
+        '<p><b>① 它会让代码膨胀 2-4 倍</b>，所以加了 <code>-sub</code> 的 so 往往明显变大、指令缓存压力上升 —— ' +
+        '这也是它常被加固厂商<b>限制比例</b>使用的原因（例如只替换一部分基本块）。</p>' +
+        '<p><b>② 有符号 / 无符号语义。</b>上面所有等价式都基于<b>定宽整数 + 补码</b>，在 C 语言里有符号溢出是 UB，' +
+        '但 IR 层面是 <code>add nsw</code> 这类带 flag 的指令。如果你自己写脚本做常量折叠，' +
+        '请按<b>无符号回绕</b>语义算，不要用高精度整数 —— 否则会在边界值上算错。</p>' +
+        '<p><b>③ 它不防你，它只拖慢你。</b><code>-sub</code> 是三大混淆里最容易被工具批量处理掉的一个，' +
+        '因为它<b>没有任何上下文依赖</b>，纯局部改写，模式匹配就能干掉一大半。</p>')
+    },
+
+    /* ============ 19.5L 动手实验 ============ */
+    {
+      h: '19.5L', title: '动手实验：验证等价变形，找出假变形',
+      html:
+        '<p>反混淆的第一步不是写脚本，而是<b>能一眼判断"这两段指令是不是等价的"</b>。' +
+        '下面这个实验让你亲手验证——而且里面混了<b>一个假的等价式</b>。</p>',
       lab: {
-        title: '实验：壳类型判定器（6 项观测 → 排序 + 证据链）',
-        goal: '目标：按真实规则表推出壳类型与下一步',
+        title: '实验：指令替换的等价性验证',
+        goal: '目标：用边界值戳穿假等价',
         intro:
-          '<p>下面已经预填了一组观测值（<b>你可以改，结论会跟着变</b>）：APK 里 2 份 dex、' +
-          '<code>classes.dex</code> 的 <code>class_defs_size</code> 是 0、内存里搜到 1 处 dex 魔数、' +
-          '入口 <code>attachBaseContext</code> 被覆写、未见 native 注册，maps 片段里藏了 4 条可疑映射。</p>' +
-          '<p><b>任务：</b>① 点「运行」看规则表算出来的排序和证据链；② 在最后一栏写下<b>你的结论</b>——' +
-          '要写清「这是哪一类壳」和「下一步第一个动作是什么」。</p>',
+          '<p><code>-sub</code> 会把 <code>a + b</code> 改写成各种等价形式。下面四个候选式，' +
+          '<b>其中三个与 <code>a + b</code> 等价，一个是错的</b>。</p>' +
+          '<p><b>任务：输入 a 和 b，逐个验证哪个式子在所有情况下都等于 a+b。</b></p>' +
+          '<p class="small muted">提示：不要只试 a=1, b=2。真正的等价必须在<b>边界值</b>（0、最大值、回绕点）上也成立。' +
+          '试试 <code>0xFFFFFFFF</code> 和 <code>0x80000000</code>。</p>',
         inputs: [
-          { key: 'dexCount', label: '① APK 里的 dex 份数', hint: 'unzip -l 数一下', ph: '例如 2', value: '2' },
-          { key: 'classDefs', label: '② classes.dex 的 class_defs_size', hint: 'dex 头偏移 0x60（第 2 章实验给过解析）', ph: '例如 0 或 573', value: '0' },
-          { key: 'magicHits', label: '③ 内存里搜 dex 魔数命中几处', hint: '搜 dex\\n035 一类魔数（需要 root 或注入能力）', ph: '例如 1', value: '1' },
-          { key: 'attach', label: '④ attachBaseContext 是否被覆写（是/否）', hint: '看入口 Application 有没有覆写它', ph: '是 / 否', value: '是' },
-          { key: 'nativeReg', label: '⑤ 有没有 native 动态注册痕迹（是/否）', hint: 'JNI_OnLoad / RegisterNatives（第 4 章）', ph: '是 / 否', value: '否' },
-          { key: 'maps', label: '⑥ /proc/self/maps 片段（可留空，但强烈建议填）', hint: '格式：起址-止址 权限 偏移 dev inode 路径', type: 'textarea', rows: 7, value: PACK19_MAPS_SAMPLE },
-          { key: 'verdict', label: '⑦ 你的结论：哪一类壳 + 下一步第一个动作', hint: '要能直接执行，不要写「疑似可能大概」', type: 'textarea', rows: 3, ph: '例如：这是一代……壳，下一步应该先……' }
+          { key: 'a', label: 'a（32 位无符号）', hint: '十六进制或十进制', ph: '0xFFFFFFFF', value: '0xFFFFFFFF' },
+          { key: 'b', label: 'b（32 位无符号）', hint: '十六进制或十进制', ph: '0x00000001', value: '0x00000001' }
         ],
-        runLabel: '🔍 运行判定器',
+        runLabel: '⚙️ 逐个求值',
         autorun: true,
-        run: function (v) {
-          var r = pack19Judge(v);
-          var html = '<div class="lab-kv">' +
-            '<span>观测：dex <b>' + r.obs.dexCount + '</b> 份</span>' +
-            '<span>class_defs_size <b>' + r.obs.classDefs + '</b></span>' +
-            '<span>魔数命中 <b>' + r.obs.magicHits + '</b> 处</span>' +
-            '<span>attachBaseContext 覆写 <b>' + (r.obs.attach ? '是' : '否') + '</b></span>' +
-            '<span>native 注册 <b>' + (r.obs.nativ ? '有' : '无') + '</b></span>' +
-            '<span>maps 可疑行 <b>' + r.ms.suspicious.length + '</b> / 共解析 <b>' + r.ms.total + '</b> 行</span></div>';
-
-          html += '<table class="lab-tbl"><tr><th>壳类型假设</th><th>分数</th><th>占比</th><th>触发的证据（规则命中）</th></tr>';
-          for (var i = 0; i < r.rank.length; i++) {
-            var h = r.rank[i];
-            var cls = i === 0 && h.score > 0 ? ' class="diff"' : '';
-            html += '<tr' + cls + '><td style="font-family:var(--sans);font-size:13px">' + h.name + '</td>' +
-              '<td>' + h.score + '</td><td>' + h.pct + '%</td>' +
-              '<td style="font-family:var(--sans);font-size:13px;line-height:1.75">' +
-              (h.ev.length ? h.ev.map(function (e) { return '· ' + e; }).join('<br>') : '<span class="muted">未命中任何规则（证据不足）</span>') +
-              '</td></tr>';
-          }
-          html += '</table>';
-
-          if (r.top.score === 0) {
-            html += '<div class="lab-msg warn"><b>⚠️ 没有任何假设拿到分数</b><div class="lab-note">' +
-              '说明你的观测值互相矛盾或过于笼统。先把第 ②③ 两项填准（它们是权重最高的证据），再看排序。</div></div>';
-          } else {
-            html += '<div class="lab-msg key"><b>🎯 当前排序第一：' + r.top.name + '（' + r.top.pct + '%）</b>' +
-              '<div class="lab-note"><b>下一步动作：</b>' + r.top.next + '</div>' +
-              (r.tight ? '<div class="lab-note">⚠️ 第一名与第二名的分差只有 ' + (r.top.score - r.second.score) +
-                ' 分（' + r.second.name + '）。这是<b>证据不足</b>的典型信号：别急着定路线，先补观测（maps、魔数扫描、native 注册三选二）。</div>' : '') +
-              '</div>';
-          }
-          html += '<div class="lab-msg model"><b>📐 规则表是怎么算的（可复现）</b><div class="lab-note">' +
-            '每一条规则都是「观测 → 假设 + 权重 + 理由」，权重是我按<b>判别力</b>定的（结构性证据 > 统计性证据 > 存在性证据）：' +
-            '例如「类数为 0 却有明文 dex」是 3 分（强），「多 dex」是 1 分（弱，正常 App 也会分包）。' +
-            '你把上表任何一条 <code>class_defs_size</code> 改成 500 再运行一次，能看到排序整体翻转 —— ' +
-            '<b>这就是「同一现象在不同组合下含义相反」的现场演示。</b></div></div>';
-          return html;
-        },
-        expected: function (v) {
-          var r = pack19Judge(v);
-          var text = String(v.verdict || '');
-          var keys = PACK19_KEYS[r.top.id] || PACK19_KEYS.none;
-          if (text.replace(/\s/g, '').length < 12) {
-            return { ok: false, detail: '结论太短了。判定结论至少要说清两件事：<b>这是哪一类壳</b>，以及<b>下一步第一个动作</b>。' };
-          }
-          var typeOk = window.AKKC_hasConcept(text, keys.type);
-          var nextOk = window.AKKC_hasConcept(text, keys.next);
-          var ok = typeOk && nextOk;
-          return {
-            ok: ok,
-            detail: '当前规则表算出的第一假设是：<b>' + r.top.name + '</b>（' + r.top.pct + '%，分差 ' +
-              (r.second ? (r.top.score - r.second.score) : r.top.score) + '）。<br>' +
-              (typeOk ? '✅ 壳类型判定正确。' : '❌ 壳类型没说对（或说得太笼统）。可以写：' + keys.type.slice(0, 3).join(' / ') + ' 一类表述。') + '<br>' +
-              (nextOk ? '✅ 下一步动作说到了点子上。' : '❌ 下一步动作缺失或跑偏。这一类壳该做的第一件事是：' + r.top.next)
+        run: (v) => {
+          const L = window.LABX;
+          const p = s => {
+            const t = String(s).trim();
+            if (/^0x/i.test(t)) return parseInt(t, 16) >>> 0;
+            const n = Number(t);
+            return isNaN(n) ? null : (n >>> 0);
           };
-        },
-        showAnswer:
-          '【判定原则（比答案更重要）】\n' +
-          '  判定 = 证据组合，不是单条现象。权重排序：\n' +
-          '    结构性证据（最高）：类数为 0 却有明文 dex / 结构完整但方法体空\n' +
-          '    统计性证据（中）：魔数命中处数、maps 里可疑映射的条数\n' +
-          '    存在性证据（最低）：多 dex、入口被覆写、有 native 注册\n\n' +
-          '【预填场景的结论】\n' +
-          '  观测：2 份 dex；class_defs_size = 0；内存里 1 处 dex 魔数；\n' +
-          '        attachBaseContext 被覆写；无 native 注册；maps 里 4 条可疑行\n' +
-          '  规则命中（按权重）：\n' +
-          '    · class_defs_size = 0 且 APK 里有 dex        → gen1 +3\n' +
-          '    · 类数为 0 但内存里存在明文 dex              → gen1 +2\n' +
-          '    · attachBaseContext 被覆写                   → gen1 +2 / gen2 +2\n' +
-          '    · maps 里有无名可执行段                      → gen1 +2 / gen3 +1\n' +
-          '    · maps 里有 memfd 映射                       → gen1 +2 / gen3 +2\n' +
-          '    · maps 里有 (deleted) 的 so                  → gen3 +2 / gen1 +1\n' +
-          '    · 多 dex                                     → gen2 +1\n' +
-          '    · maps 里有 .dex 映射                        → gen2 +2\n' +
-          '  排序第一：一代壳（整体加密 / 文件重定向）\n' +
-          '  下一步：找 dump 时机 —— 在「真 dex 已被解密进内存、且 ART 已经接管」\n' +
-          '          的那一刻抓 dex 区间；同时确认它是纯内存加载还是落地后加载。\n\n' +
-          '【把 ② 改成 500 再看一次】\n' +
-          '  同样的 maps、同样的 attach 覆写，排序第一会变成抽取壳（二代）——\n' +
-          '  因为「结构完整」这个事实把「整份加密」这个假设按了下去。\n' +
-          '  这就是判定器存在的意义：它演示的是规则，不是答案。',
-        hint:
-          '<b>先看权重最高的两条结构性证据。</b><br>' +
-          '① <code>class_defs_size</code>：0 说明静态那份 dex 里<b>没有类定义</b>（整体加密或占位）；几百以上说明<b>结构完整</b>（那就该往抽取壳方向想）。<br>' +
-          '② 内存里的 dex 魔数命中数：<b>0 处</b>说明连明文 dex 都没有；<b>1 处</b>说明解密过一次；<b>多处</b>说明运行时加载了多份。<br><br>' +
-          '把这两条组合起来看，方向基本就定了。maps 与 native 注册是<b>决定往哪条路走</b>的补充证据。',
-        after:
-          T.note('ok', '✅ 实验的收获',
-            '<p style="margin-bottom:0">你现在拥有的不是一张对照表，而是一台<b>能解释自己判断依据</b>的机器：' +
-            '每一条结论后面都拖着证据链。<span class="hit">这在实战里比结论本身更重要——' +
-            '因为结论要给别人看、要经得起追问，而证据链是唯一能回答「你凭什么这么说」的东西。</span></p>')
-      },
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境一',
-            scenario: '<b>情境：</b>你收到一个 APK：只有一份 <code>classes.dex</code>，<code>class_defs_size</code> 读到 <b>0</b>，' +
-                      '但 APK 体积 30MB，其中 <code>assets/</code> 下有一个 8MB 的 <code>xxxx.bin</code>。' +
-                      '用 jadx 打开只看到几个和业务无关的类。',
-            q: '你第一步做什么？',
-            choices: [
-              { t: '判定「这个包的业务代码被删了/是个空包」，回去让业务方重新提供一个包', next: 'n1' },
-              { t: '先确认 assets 里那个 .bin 是不是加密的 dex，然后用内存 dump 找解密后的明文 dex', next: 'n2' },
-              { t: '直接上 FART 一类的主动调用工具，先把方法体 dump 出来', next: 'n3' },
-              { t: '用 apktool 重新打包一份没有加固的 APK', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '证据就在你手上，你却没读它',
-            result: '<b>30MB 的包 + 8MB 的 assets 文件 + 类数为 0</b>，这三条放在一起已经是很清楚的信号了：' +
-              '业务代码没被删，它被<b>换了个位置并且加了密</b>。<br><br>' +
-              '判据很简单：如果业务代码真的被删了，谁会把一个 8MB 的无意义文件打进包里？' +
-              '<span class="hit">「体积和类数不符」是一代壳最典型的指纹——内容有多重，说明它就在那里，只是你还没解开。</span><br><br>' +
-              '回去要包只会浪费一轮沟通：对方给你的还是同一个加壳产物。'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先确认密文的性质，再决定在哪一层取货',
-            result: '<b>这是正确顺序。</b>先做两件零成本的事：<br>' +
-              '① 看 <code>xxxx.bin</code> 的头部有没有 <code>dex\\n</code> 魔数（有 → 没加密，只是重定向；没有 → 大概率被加密）；<br>' +
-              '② 看它的熵值/字节分布像不像压缩或加密数据（这也决定你要不要去猜算法）。<br><br>' +
-              '确认是加密数据之后，你的目标就从「找文件」变成「<b>找解密那一刻的内存</b>」——' +
-              '这正是 19.4 那条启动链路里第 5 步的窗口。<br><br>' +
-              '<b>注意这里的关键判断：</b>先别急着写脱壳脚本，先确认密文<b>在不在包里</b>。' +
-              '如果在包里，你的整个流程可以离线、可重复；如果不在（服务端下发），你后面每一步都要多考虑一个环境变量。'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '工具用在了错误的代际上',
-            result: '<b>主动调用解决的是「方法体为空」，不解决「整份加密」。</b><br><br>' +
-              '主动调用的前提是：你手上已经有一个<b>被 ART 加载过的 DexFile</b>，里面有类、有方法，只是方法体被抽走了。' +
-              '而现在的观测是 <code>class_defs_size = 0</code>——<span class="hit">连 DexFile 都不存在，你遍历什么？</span><br><br>' +
-              '结果只会是：工具跑完、什么也没拿到，你还得回头做「找 dump 时机」这件事，白白花掉半天。<br><br>' +
-              '这就是本章判定环节的直接价值：<b>先分类，再选工具。</b>'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '方向性误解：重打包不会解出加密内容',
-            result: '<code>apktool</code> 做的是<b>解码 APK 的结构</b>（资源、Manifest、smali），' +
-              '它不会、也无法解密壳在运行时才解开的密文。<br><br>' +
-              '你重新打包出来的 APK 里，<code>assets/xxxx.bin</code> 还是那个 8MB 的密文，' +
-              '而且因为签名变了 + smali 被重编，反而更容易触发完整性校验。<br><br>' +
-              '<b>一个有用的区分：</b>apktool 能解开的只有「结构层」（资源、Manifest、明文的 dex）；' +
-              '解密属于「运行时层」，必须在进程里解决。<span class="hit">工具的能力边界不清楚，就会把时间花在不可能成立的路径上。</span>'
-          }
-        }
-      }
-    },
+          const a = p(v.a), b = p(v.b);
+          if (a === null || b === null) return '<div class="lab-msg warn">a 和 b 都要填有效的数字（支持 0x 十六进制）。</div>';
+          const hex = n => '0x' + n.toString(16).toUpperCase().padStart(8, '0');
+          const truth = L.sub32(a, b);
 
-    /* ============================================================ 19.13 */
-    {
-      h: '19.13', title: '动手实验：从 /proc/self/maps 里挑出可疑映射',
-      html:
-        '<p>maps 是动态判定里<b>性价比最高的一个观测点</b>：一次读取就能同时看到「壳的痕迹」和「你的目标」。' +
-        '但它也是误报重灾区——ART 自己的 JIT 缓存就长得非常可疑（<code>rwx</code> + 匿名）。' +
-        '这个实验把「逐行分类」这件事做一遍。</p>' +
-        T.note('warn', '⚠️ 读 maps 前先记住三条对照关系',
-          '<p style="margin-bottom:0">① <b>正常但极像可疑：</b><code>[anon:dalvik-jit-code-cache]</code> 是 <code>rwx</code> 的、' +
-          '<code>[anon:libc_malloc]</code> 是无路径的 —— 它们都是 ART/分配器的合法映射，<b>看名字就能排除</b>；<br>' +
-          '② <b>可疑但不是「壳」：</b><code>/data/app/</code> 下的 so 是 APK 自带的（正常），' +
-          '<code>/data/data/</code> 下的 so 才是「运行时落地后加载」的（可疑）—— <b>只差一层路径，含义完全不同</b>；<br>' +
-          '③ <b>有价值但不是「可疑」：</b>maps 里的 <code>.dex</code> 映射是你的 dump 目标，' +
-          '<span class="hit">把它当「可疑」记下来，你的判定结论就会从「抽取壳」歪成「内存加载型壳」。</span></p>'),
-      lab: {
-        title: '实验：逐行判定 maps 片段（4 条可疑 + 3 条误报陷阱）',
-        goal: '目标：按真实规则逐行分类',
-        intro:
-          '<p>下面是一段教学构造的 maps 片段（<b>格式与真实一致</b>，行数精简过）。里面混了：系统库、ART 自身的匿名映射、' +
-          'APK 自带的 so、内存里被映射的 dex，以及 4 条真正可疑的映射。</p>' +
-          '<p><b>任务：</b>① 点「运行」看逐行分类与依据；② 填出所有<b>可疑行的行号</b>；' +
-          '③ 指出<b>哪一行最能说明「so 是从内存里加载的」</b>；④ 用一两句话说清这些痕迹指向什么加载方式。</p>',
-        inputs: [
-          { key: 'maps', label: 'maps 片段', hint: '可以直接改，判分会跟着变', type: 'textarea', rows: 13, value: PACK19_MAPS_SAMPLE },
-          { key: 'lines', label: '① 可疑行的行号', hint: '逗号分隔，例如 5,8', ph: '例如 5,8,9,11', value: '' },
-          { key: 'keyLine', label: '② 哪一行最能说明「so 是从内存里加载的」', hint: '给一个行号', ph: '例如 8', value: '' },
-          { key: 'why', label: '③ 这些痕迹指向什么加载方式？为什么？', type: 'textarea', rows: 3, ph: '例如：说明它不走系统加载器，而是……', value: '' }
-        ],
-        runLabel: '🔍 逐行判定',
-        autorun: false,
-        run: function (v) {
-          var rows = pack19Maps(v.maps || '');
-          var st = pack19MapsStat(v.maps || '');
-          if (!rows.length) return '<div class="lab-msg warn">先贴入一段 maps 内容。</div>';
-          var html = '<div class="lab-kv"><span>解析 <b>' + st.total + '</b> 行</span>' +
-            '<span>可疑 <b>' + st.suspicious.length + '</b> 行</span>' +
-            '<span>ART 合法映射 <b>' + st.art + '</b></span>' +
-            '<span>系统/APK 库 <b>' + st.normal + '</b></span>' +
-            '<span>dex 映射 <b>' + st.dex + '</b></span>' +
-            '<span>格式非法 <b>' + st.bad + '</b></span></div>';
-          html += '<table class="lab-tbl"><tr><th>行</th><th>权限</th><th>路径</th><th>判定</th><th>依据</th></tr>';
-          for (var i = 0; i < rows.length; i++) {
-            var r = rows[i];
-            html += '<tr' + (r.suspicious ? ' class="diff"' : '') + '><td>' + r.ln + '</td><td>' + r.perm + '</td>' +
-              '<td style="font-family:var(--mono);font-size:11.5px">' + (r.path || '(无名)') + (r.deleted ? ' (deleted)' : '') + '</td>' +
-              '<td style="font-family:var(--sans);font-size:12.5px">' + (r.suspicious ? '⚠️ ' : '') + r.label + '</td>' +
-              '<td style="font-family:var(--sans);font-size:12.5px;line-height:1.7">' + r.why + '</td></tr>';
+          const forms = [
+            ['a + b',                    L.sub32(a, b)],
+            ['(a ^ b) + 2 * (a & b)',    L.subVariant(a, b)],
+            ['a - (~b) - 1',             L.subVariant2(a, b)],
+            ['(a ^ b) + (a & b)',        ((a ^ b) + (a & b)) >>> 0],   // ← 漏了进位的 ×2，假的
+          ];
+
+          let html = '<div class="lab-kv"><span>a = <b>' + hex(a) + '</b></span>'
+            + '<span>b = <b>' + hex(b) + '</b></span>'
+            + '<span>标准 a+b = <b>' + hex(truth) + '</b></span></div>';
+
+          html += '<table class="lab-tbl"><tr><th>等价式</th><th>求值结果</th><th>与 a+b 相同？</th></tr>';
+          for (const [name, val] of forms) {
+            const same = val === truth;
+            html += '<tr class="' + (same ? 'same' : 'diff') + '"><td><code>' + name + '</code></td>'
+              + '<td>' + hex(val) + '</td><td>' + (same ? '✅ 相同' : '❌ <b>不同</b>') + '</td></tr>';
           }
           html += '</table>';
-          html += '<div class="lab-msg key"><b>📊 这一类样本告诉你的三件事</b><div class="lab-note">' +
-            '① <b>无名可执行段 ' + st.anonExec + ' 处</b>：运行时才产生的代码页 —— 可能来自壳，也可能来自 JIT，<b>要结合权限与相邻映射判断</b>；<br>' +
-            '② <b>自删的 so ' + st.deleted + ' 处 + memfd ' + st.memfd + ' 处</b>：这两条是<b>内存加载</b>的强证据，' +
-            '磁盘上找不到、文件系统里没有，只有进程自己知道；<br>' +
-            '③ <b>被映射的 dex ' + st.dex + ' 处</b>：这是你的 dump 目标，不是「壳的痕迹」。' +
-            '<span class="hit">把「可疑」和「有价值」分开记，是这一节最想让你养成的习惯。</span></div></div>';
-          return html;
-        },
-        expected: function (v) {
-          var rows = pack19Maps(v.maps || '');
-          var truth = [];
-          for (var i = 0; i < rows.length; i++) if (rows[i].suspicious) truth.push(rows[i].ln);
-          var got = String(v.lines || '').split(/[^0-9]+/).filter(function (s) { return s !== ''; })
-            .map(Number).filter(function (n, k, a) { return a.indexOf(n) === k; }).sort(function (a, b) { return a - b; });
-          var miss = truth.filter(function (x) { return got.indexOf(x) < 0; });
-          var extra = got.filter(function (x) { return truth.indexOf(x) < 0; });
-          var setOk = got.length > 0 && miss.length === 0 && extra.length === 0;
-          var key = parseInt(String(v.keyLine || '').replace(/[^0-9]/g, ''), 10);
-          var keyFloor = null;
-          for (var j = 0; j < rows.length; j++) {
-            if (rows[j].kind === 'deleted' || rows[j].kind === 'memfd') { keyFloor = rows[j].ln; break; }
-          }
-          var keyOk = !isNaN(key) && keyFloor !== null && key === keyFloor;
-          if (!isNaN(key) && !keyOk) {
-            for (var k2 = 0; k2 < rows.length; k2++) {
-              if (rows[k2].ln === key && (rows[k2].kind === 'deleted' || rows[k2].kind === 'memfd')) keyOk = true;
+
+          const mismatch = forms.filter(([, val]) => val !== truth);
+          if (mismatch.length) {
+            html += '<div class="lab-msg fail"><b>🔍 抓到了！这个式子在当前取值下不成立</b>'
+              + '<div class="lab-note"><code>' + mismatch[0][0] + '</code> 算出 ' + hex(mismatch[0][1])
+              + '，而 a+b 是 ' + hex(truth) + '。</div>'
+              + '<div class="lab-note"><b>为什么：</b><code>(a^b) + (a&amp;b)</code> 少了<b>进位的权重</b>。<br>'
+              + '<code>a ^ b</code> 给出"无进位和"，<code>a &amp; b</code> 标出"哪些位要进位"——'
+              + '但一个进位会让高一位加 1，价值是 2 而不是 1，<b>所以必须写成 <code>2 * (a &amp; b)</code></b>。<br>'
+              + '当前 <code>a &amp; b = ' + hex(a & b) + '</code>'
+              + ((a & b) ? '，不为 0，所以少了这一份就错了。' : '，恰好是 0 —— 换个值就会暴露！')
+              + '</div></div>';
+            if ((a & b) === 0) {
+              html += '<div class="lab-msg warn"><b>⚠️ 注意：这次刚好没暴露</b>'
+                + '<div class="lab-note">当前 a 和 b 没有重叠位（<code>a &amp; b == 0</code>），'
+                + '没有进位要处理，所以假式子碰巧也算对了。<br>'
+                + '<b>这正是它的危险之处</b>——你必须用<b>会产生进位</b>的值去测。<br>'
+                + '试试 <code>a=0xFFFFFFFF, b=0x00000001</code>，或者任意两个在同一位上都是 1 的数。</div></div>';
             }
+          } else {
+            html += '<div class="lab-msg pass"><b>✅ 当前取值下四个式子结果一致</b>'
+              + '<div class="lab-note">但别急着下结论——<b>把 a 换成 0xFFFFFFFF、b 换成 0x00000001 再跑一次</b>。'
+              + '有一项只有在<b>产生进位</b>时才会露馅。</div></div>';
           }
-          var whyOk = window.AKKC_hasConcept(v.why, ['内存加载', '内存里加载', '自删', '删除', '匿名', 'memfd', '自定义', 'linker', '不落地', 'dlopen', '映射', '解密']);
-          var ok = setOk && keyOk && whyOk;
-          return {
-            ok: ok,
-            detail: (setOk ? '✅ 可疑行找全了：<code>' + truth.join(', ') + '</code>。'
-                           : '❌ 可疑行不对。' + (miss.length ? '漏了：<code>' + miss.join(', ') + '</code>。' : '') +
-                             (extra.length ? '多算了：<code>' + extra.join(', ') + '</code>（回去看它的判定与依据——多半是 ART 合法映射或你的 dump 目标）。' : '')) + '<br>' +
-              (keyOk ? '✅ 关键那条抓准了。' : '❌ 第 ② 问：能说明「从内存里加载」的是 <code>(deleted)</code> 的 so（' +
-                (keyFloor === null ? '本片段里没有' : keyFloor) + ' 行）或 <code>memfd</code> 那行——它们表示<b>文件系统里没有可回溯源</b>。') + '<br>' +
-              (whyOk ? '✅ 加载方式说对了：不是走系统加载器从磁盘加载，而是运行时造内存/落地后自删再加载。'
-                     : '❌ 第 ③ 问还差一点。关键词方向：<b>内存加载 / 自删 / memfd / 自定义 linker / 不落地 / dlopen</b>，任选一个说清即可。')
+
+          html += '<div class="lab-msg key"><b>🔑 这就是反混淆的第一个技能</b>'
+            + '<div class="lab-note">判断"两条指令序列是否等价"，靠的不是读懂它，'
+            + '而是<b>代入边界值验证</b>。<br>'
+            + '<code>-sub</code> 的所有变形都是<b>数学上可证明等价</b>的（否则程序就跑错了），'
+            + '所以你不必理解它为什么等价——<b>只要能用一两组边界值确认它确实等价，就可以放心折叠掉它。</b></div></div>';
+          return html;
+        },
+        expected: (v) => {
+          const L = window.LABX;
+          const p = s => {
+            const t = String(s).trim();
+            if (/^0x/i.test(t)) return parseInt(t, 16) >>> 0;
+            const n = Number(t); return isNaN(n) ? null : (n >>> 0);
           };
+          const a = p(v.a), b = p(v.b);
+          if (a === null || b === null) return { ok: false, detail: '先填入 a 和 b 两个值。' };
+          const truth = L.sub32(a, b);
+          const bad = ((a ^ b) + (a & b)) >>> 0;
+          if (bad !== truth) {
+            return { ok: true, detail: '<b>正确 —— 你找到了假等价式 <code>(a^b) + (a&amp;b)</code>。</b><br>' +
+              '它漏掉了进位的权重：进位要写成 <code>2 * (a &amp; b)</code>，不是 <code>(a &amp; b)</code>。' +
+              '当前 <code>a &amp; b = 0x' + (a & b).toString(16).toUpperCase() + '</code>（非 0，有进位）。<br>' +
+              '另外三个式子是<b>真正等价</b>的，可以放心用于反混淆。' };
+          }
+          return { ok: false,
+            detail: '<b>还没戳穿它。</b>当前 a 和 b 没有重叠位（<code>a &amp; b == 0</code>），' +
+              '没有进位，四个式子碰巧结果一致。<br>' +
+              '换一组<b>会产生进位</b>的值试试 —— 例如 <code>a=0xFFFFFFFF, b=0x00000001</code>，' +
+              '或者任何两个在同一位上都是 1 的数（如 a=3, b=3）。' };
         },
         showAnswer:
-          '【① 可疑行】把每一行按「权限 + 路径 + 是否自删」三条一起看：\n\n' +
-          '  第 4 行  rwxp  [anon:dalvik-jit-code-cache]     → 正常（ART 的 JIT 代码缓存，合法 rwx）\n' +
-          '  第 5 行  r-xp  （无名）                          → 可疑：没有路径也没有名字，却有执行权限\n' +
-          '  第 6 行  r-xp  /data/app/.../libnative.so        → 正常（APK 自带 so）\n' +
-          '  第 7 行  rw-p  [anon:libc_malloc]                → 正常（分配器的匿名映射，且不可执行）\n' +
-          '  第 8 行  r-xp  /data/data/.../libpayload.so (deleted) → ★可疑：数据目录 + 已删除却仍在映射\n' +
-          '  第 9 行  rwxp  （无名）                          → 可疑：无名 + 同时可写可执行\n' +
-          '  第 10 行 r--p  /data/data/.../00000000.dex       → 有价值（不是壳的痕迹，是你的 dump 目标）\n' +
-          '  第 11 行 r-xp  /memfd:payload (deleted)          → 可疑：memfd 匿名内存文件\n' +
-          '  第 12 行 rw-p  [anon:dalvik-main space]          → 正常（ART 的 GC 空间）\n' +
-          '  第 13 行 r--p  /dev/ashmem                       → 正常（无执行权限）\n\n' +
-          '  答案：5、8、9、11 四行。\n\n' +
-          '【② 最能说明「从内存加载」的一行】\n' +
-          '  第 8 行：/data/data/.../libpayload.so (deleted)\n' +
-          '  理由：so 出现在数据目录（说明是运行时落地的），而且文件已被删除、映射仍然存在\n' +
-          '        —— 文件系统里已经没有任何可回溯源。这不是系统加载器的行为。\n' +
-          '  第 11 行（memfd）同样成立，而且更彻底：它从头到尾就没有落地过。\n\n' +
-          '【③ 指向的加载方式】\n' +
-          '  native 侧存在自定义加载逻辑：不走系统加载器从磁盘 dlopen，\n' +
-          '  而是「解密到内存 → 落地后立即删除」或「写进 memfd → dlopen」。\n' +
-          '  判定含义：SO 层做了整体加密或内存加载 → 需要先解决「怎么拿到内存里的明文 so」，\n' +
-          '  再谈静态分析。两份被映射的 rwx/无名可执行段是它的执行痕迹。\n\n' +
-          '【④ 别忘了排除误报】\n' +
-          '  ART 的 JIT 代码缓存是 rwx 的、分配器映射是无名的 —— 这也是这份样本里\n' +
-          '  第 4、7、12 行存在的意义：它们让你练习「先看名字再下判断」。',
+          '四个候选式中，【(a ^ b) + (a & b)】是假的。\n\n' +
+          '验证（a=0xFFFFFFFF, b=0x00000001）：\n' +
+          '  a + b                = 0x00000000  （回绕）\n' +
+          '  (a ^ b) + 2*(a & b)  = 0x00000000  ✅ 等价\n' +
+          '  a - (~b) - 1         = 0x00000000  ✅ 等价\n' +
+          '  (a ^ b) + (a & b)    = 0xFFFFFFFF  ❌ 不等价\n\n' +
+          '为什么假：\n' +
+          '  a ^ b  = 无进位和（每一位不考虑进位的加法结果）\n' +
+          '  a & b  = 哪些位会产生进位\n' +
+          '  一个进位会让"高一位"加 1，其权重是 2 而不是 1，\n' +
+          '  所以必须写成 2 * (a & b)。漏掉这个 2，就等于把进位算少了一半。\n\n' +
+          '正确分解式：(a ^ b) + 2 * (a & b)\n' +
+          '另一个真恒等式：(a | b) + (a & b)  ← 这个是对的，别搞混。',
         hint:
-          '<b>三条判据按顺序过，一条不过就放下：</b><br>' +
-          '① 这行有<b>执行权限</b>吗（权限串里有 <code>x</code>）？没有 → 基本可以放过。<br>' +
-          '② 它有<b>名字或路径</b>吗？名字是 <code>[anon:dalvik...]</code> 一类 → 是 ART 自己建的，放过。<br>' +
-          '③ 它的路径在<b>哪里</b>？<code>/system</code> / <code>/apex</code> / <code>/data/app</code> → 正常；' +
-          '<code>/data/data</code> 或没有路径 → 可疑。<br><br>' +
-          '另外注意行尾的 <code>(deleted)</code> 和 <code>memfd:</code> 前缀 —— 这两个词直接等于「文件系统里没有」。',
+          '别用 a=1, b=2 这种"太干净"的值——它们无法暴露进位错误。<br>' +
+          '真正的考验是<b>边界</b>：<code>0xFFFFFFFF + 1</code>（回绕到 0），' +
+          '或者让 a 和 b 在<b>同一位上都是 1</b>（产生进位）。<br>' +
+          '想想哪个式子在"有进位"时会算错。',
         after:
-          T.note('ok', '✅ 实验的收获',
-            '<p style="margin-bottom:0">你现在能拿着一份 maps 说清三件事：<b>哪些是壳的痕迹、哪些是 ART 的正常行为、哪一块是我的 dump 目标。</b><br>' +
-            '这个能力在第 10 章（反 Frida 的 maps 过滤）和第 13 章（内核层观测）里会直接复用——' +
-            '<span class="hit">过滤脚本写得好不好，取决于你能不能分清「该删的」和「不该动的」。</span></p>')
-      },
-      term: {
-        title: '一次完整的静态侦察会话（命令 + 该看什么）',
-        lines: [
-          { t: 'd', s: '# ── 第一轮：静态看结构（零成本，先做） ──' },
-          { t: 'p', s: 'unzip -l target.apk' },
-          { t: 'o', s: '  classes.dex   classes2.dex   assets/xxxx.bin   lib/arm64/libxxx.so   res/...', note: '<b>看三件事：</b>dex 有几份、<code>assets/</code> 下有没有体积异常的文件、<code>lib/</code> 下的 so 数量与业务是否相称。<b>这一步不需要任何工具链，却常常给出最关键的方向。</b>' },
-          { t: 'p', s: 'unzip -p target.apk classes.dex | xxd | head -2' },
-          { t: 'o', s: '00000000: 6465 780a 3033 3900 0000 0000 ...', note: '<b>看魔数。</b><code>64 65 78 0a</code> 就是 <code>dex\\n</code>。是标准魔数 → 至少这份是明文 dex；不是 → 要么被加密，要么是 CompactDex/魔改（<code>cdex001</code> 一类）。<span class="pill warn">待核实</span> 三位版本数字与 CompactDex 魔数随安卓版本变化，以实测为准。' },
-          { t: 'p', s: 'apkid target.apk' },
-          { t: 'o', s: '[*] target.apk!classes.dex\n |-> compiler : dx\n |-> packer   : <命中某加固方案>', note: '<b>特征库交叉验证。</b>它靠 YARA 规则匹配编译器/壳/混淆器，输出格式就是「文件 → 命中项」。<b>记住它的定位：给先验，不给结论</b>（19.10 讲的三条理由）。命中的方案名随规则版本变化。' },
-          { t: 'p', s: 'apktool d -f -o out target.apk && grep -o \'application[^>]*\' out/AndroidManifest.xml | head -3' },
-          { t: 'o', s: 'android:name="com.xxxx.StubApplication"', note: '<b>入口被替换了。</b>业务方的 Application 类名不会长这样。<b>这是「加固存在」的第二强证据</b>（第一强是方法体为空）。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 第二轮：跑起来看内存（到这一步才需要设备） ──' },
-          { t: 'p', s: 'adb shell "pidof com.target.app"' },
-          { t: 'o', s: '12345', note: '<b>先拿到 pid。</b>注意：很多加固会做反调试/反注入，<b>用调试器附加本身就可能触发检测</b>——所以第二轮的前置问题往往不是"怎么读"，而是"怎么不被发现地读"（第 10、13 章）。' },
-          { t: 'p', s: 'adb shell "cat /proc/12345/maps | grep -E \'(deleted|memfd|\\.dex)\'"' },
-          { t: 'o', s: '7f9c700000-7f9c711000 r-xp ... /data/data/com.target.app/files/libpayload.so (deleted)' },
-          { t: 'o', s: '7f9c900000-7f9c906000 r--p ... /data/data/com.target.app/cache/00000000.dex' },
-          { t: 'o', s: '7f9ca00000-7f9ca02000 r-xp ... /memfd:payload (deleted)', note: '<b>三条证据同时到齐：</b>自删的 so、被映射的 dex、memfd。<br>· 自删 so + memfd → <b>SO 层做了内存加载</b>；<br>· 被映射的 dex → <b>你已经有一个可 dump 的目标</b>，注意它不是"壳的痕迹"而是"你的战利品"。' },
-          { t: 'w', s: '↑ 内存搜索 dex 魔数需要 root 或注入能力（示意，不是单条命令能完成的事）', note: '<b>把这一条当成提醒：</b>凡是写着"扫一下内存就知道了"的说法，都要补一句前提——<b>你需要先有读那块内存的能力</b>。而这个能力本身，正是运行时防护要拦的东西。' },
-          { t: 'd', s: '' },
-          { t: 'd', s: '# ── 第三轮：把结论写下来（这一步最容易被跳过，却最值钱） ──' },
-          { t: 'o', s: '结论：二代抽取壳（结构完整/方法体空/native 注册）；SO 层做了内存加载；运行时防护中等。下一步：先跑遍功能，再主动调用脱壳。', note: '<b>三段式结论：壳类型 + SO/防护程度 + 下一步第一个动作。</b>写成这样，明天换人接手不用重新判定。' }
-        ]
+          T.note('ok', '✅ 这个实验训练的是什么',
+            '<p style="margin-bottom:0">不是让你背等价式，而是建立<b>"用边界值验证等价性"的直觉</b>。' +
+            '这套直觉有两个用途：<br>' +
+            '① <b>反混淆</b>：确认一段复杂指令确实等价于简单运算，就可以安全折叠；<br>' +
+            '② <b>算法还原</b>：当你怀疑"这段位运算在算什么"时，代入几组值就能反推出来，' +
+            '比逐条读指令快得多。<br>' +
+            '<span class="hit">这是第 22 章"常量比对"之外的另一种识别手段：行为比对。</span></p>')
       }
     },
 
-    /* ============================================================ 19.14 */
+    /* ============ 19.6C 实战案例 ============ */
     {
-      h: '19.14', title: '壳的动态加载与 dump 后的修复：为什么「全空」不等于「脱不了」',
-      html:
-        '<p>19.4 讲了一代壳的加载链路（解密 → 加载 → 反射替换）。抽取壳的加载链路<b>多了两个动作</b>：' +
-        '在「反射替换」之后还要挂上回填逻辑（通常是 native 侧拦截方法调用），并在方法首次执行时把指令写回 code item。' +
-        '<span class="hit">判定时必须把这两条链路分开：<b>你拿到的 dex 是「加载时的那份」还是「回填后的那份」？</b></span></p>' +
-        T.tbl(['dump 得到的东西', '它是什么', '你看到的现象', '该怎么办'],
-          [
-            ['解密后、加载前的原始数据', '壳的中间产物，没有 DexFile 结构', 'jadx 直接拒绝：没有合法魔数或结构损坏', '这不是失败的产物，是「dump 早了」——把观测点后移到加载完成之后'],
-            ['加载后、回填前的 dex', 'ART 已接管，结构完整，方法体空', '<b>能打开、类名齐全、方法体全空</b>', '「dump 早了」的第二种形态：先触发回填（跑功能 / 主动调用），再 dump'],
-            ['回填后的 dex', '方法体已被写回', '部分方法有内容，非空比例取决于你触发了多少路径', '✅ 这才是目标产物；接下来是修复（校验值、map 段）'],
-            ['只有部分方法有内容', '回填覆盖率不足', '最关心的方法仍然是空的', '补触发：跑遍功能 → 主动调用 → 冷门方法手动调用（第 2 章的第 6 步）']
-          ]) +
-        T.note('key', '🔑 修复这一步为什么绕不开（与第 2 章的呼应）',
-          '<p>dump 出来的 dex 必然要过修复：<b>checksum（Adler-32）与 signature（SHA-1）覆盖的是文件内容</b>，' +
-          '而 dump 改变了内容（方法体被回填），这两个字段却还是旧值 → 校验必然失配。' +
-          '此外还要注意 <code>map</code> 段是否完整、code item 的对齐是否正确。</p>' +
-          '<p style="margin-bottom:0"><span class="hit">第 2 章已经推导过「为什么 jadx 会报 checksum 错误」，这里只补一句判定上的用法：' +
-          '<b>「只有校验错」说明内容是对的；「连魔数都不对」才是没脱到东西。</b>这两句话决定了你该重脱还是该修复。</span></p>') +
-        T.acc('一个容易被误判的形态：什么叫「全空」',
-          '<p>如果连 <code>Application.onCreate</code>、构造函数这类<b>启动必跑</b>的方法都是空的，那通常不是「覆盖率不足」——' +
-          '覆盖率不足的表现是<b>部分空、部分有</b>。</p>' +
-          '<p style="margin-bottom:0"><b>「全空」更可能是这三种情况之一：</b>① 你 dump 的是加载前/回填前的那份内存；' +
-          '② 你 dump 的对象不是 ART 正在用的那个 DexFile（多份 dex / 多加载器时很常见）；③ 壳的回填发生在另一个副本上，' +
-          '你 dump 到的是它的「影子」。<span class="hit">判据是同一个：<b>对照 maps 找到那个真正被映射的 dex 区间，' +
-          '并在触发前后各采一次，看 <code>insns_size</code> 有没有变化。</b></span></p>'),
+      h: '19.6C', title: '实战案例：某企鹅 App 的 OLLVM 平坦化还原',
       case: {
-        source: 'github',
-        title: 'BlackDex —— Android unpack(dexdump) tool（GitHub 仓库名：CodingGay/BlackDex）',
-        date: '2021-05-21（仓库创建，据 GitHub API；README 对应的最近一次 push 为 2023-11-09）',
-        author: 'CodingGay（GitHub 仓库所有者；LICENSE 署名为 Milk）',
-        target: 'BlackDex（运行在 Android 手机上的脱壳工具，README 自述支持 5.0～12；32 位与 64 位是两个不同的 APK）',
+        source: 'kanxue',
+        title: '[原创]26企鹅ollvm混淆去除',
+        date: '2026-9-7',
+        author: '北袅',
+        target: '某企鹅（腾讯系）App 的 JNI_OnLoad（IDA 0x5370）',
         background:
-          '<p>README 的自我定位很干脆：<b>「一个运行在 Android 手机上的脱壳工具，支持 5.0～12，无需依赖任何环境任何手机都可以使用，' +
-          '包括模拟器。只需几秒，即可对已安装包括未安装的 APK 进行脱壳。」</b>环境要求一栏把 Xposed、Frida、Magisk、Root、定制系统全部划掉。</p>' +
-          '<p>它把覆盖范围写成：<b>「本项目针对一（落地加载）、二（内存加载）、三（指令抽取）代壳」</b>——' +
-          '这句话本身就值得单独讲，见下面的「局限」与方法论拆解。</p>',
+          '<p>2026 年的一篇看雪原创帖。目标是一个腾讯系 App 的 <code>JNI_OnLoad</code>（IDA 里位于 <code>0x5370</code>），' +
+          '函数被 OLLVM 处理过，作者主攻其中的 <b>FLA（控制流平坦化）</b>。</p>' +
+          '<p>这个案例值得精读的地方在于：<b>面对一个 D-810 这类现成脚本吃不动的样本，作者用纯静态分析把平坦化还原了回来</b>，' +
+          '而且整条路线里的每一步都是可复用、可验证的。</p>',
         points: [
-          '脱壳原理自述：<b>通过 DexFile cookie 进行脱壳，理论兼容 art 开始的所有版本</b>；作者同时注明「可能少数因设备而异，绝大部分是支持的」。',
-          '产物分两类（照录 README）：<code>hook_xxxx.dex</code> 是 hook 系统 api 脱壳的 dex，<b>深度脱壳不修复</b>；<code>cookie_xxxx.dex</code> 是利用 dexFile cookie 脱壳的 dex，<b>深度脱壳时会修复此 dex</b>。',
-          '深度脱壳自述：<b>「会自主修复被抽取的方法指令，将指向其他内存块的指令回填至 DEX 内，解决 nop 问题」</b>，但「不会确保一定会有用」。',
-          '本节重点：README 对「深度脱壳」给了四条后果预告（脱壳时间大幅上升、可能闪退、失败几率增加、不一定 100% 还原），并明确说明<b>不包含任何解密与主动调用</b>。'
+          '不透明谓词形如 <code>((((_BYTE)dword_68068-1)*(_BYTE)dword_68068)&amp;1)==0 || dword_6807C&lt;10</code>；代入 <code>dword_68068=2</code>，左式恒真。',
+          '另一路 <code>dword_6807C</code>（<code>.bss:6807C</code>）的交叉引用清一色 offset/read、<b>零 write</b> ⇒ 初值 0 ⇒ 该条件恒真。',
+          '谓词对应汇编从 <code>.text:6C70</code> 起：<code>ADRP X8,#off_61D30@PAGE</code> / <code>LDR W8,[X8]</code> / <code>SUB</code> / <code>MUL</code> / <code>TST</code> / <code>CSEL W20,W9,W8,LT</code>。',
+          '<b>最小改动</b>：只把 <code>CSEL W20,W9,W8,LT</code> 换成 <code>MOV W20,W9</code> —— 因为它在给状态寄存器 <code>W20</code> 写值，前面十几条计算指令一行都不用动。',
+          'patch 脚本用 <code>idautils.XrefsTo(idc.get_name_ea_simple("off_61D30"))</code> <b>只认 ADRP</b>，否则 ADRP 与 LDR 两个 xref 会把同一个点处理两遍。',
+          '从命中点向后 40 条指令扫 <code>CSEL</code>，途中遇到 <code>B</code>/<code>BL</code>/<code>RET</code> 就放弃，命中后写 <code>ida_bytes.patch_dword(ea, 0x2A0003E0|(rm&lt;&lt;16)|20)</code>。',
+          '清掉 BCF 之后，被垃圾分支撑开的代码<b>塌陷到 300 多行</b>。',
+          '分发器 <code>loc_53EC</code> 是 <code>MOV W8,#imm</code> / <code>CMP W20,W8</code> / <code>B.EQ</code> 组成的比较链；<code>W20</code> 的赋值只有 MOV / MOV+MOVK / CSEL 三种形态。',
+          '三段脚本 <code>collect()</code>/<code>build_succ()</code>/<code>solve_exit()</code>/<code>do_patch()</code> 共解出 <b>122 个真实块</b>，回填用 <code>enc_b=0x14000000|(((dst-src)&gt;&gt;2)&amp;0x3FFFFFF)</code>、<code>enc_bcond=0x54000000|((((dst-src)&gt;&gt;2)&amp;0x7FFFF)&lt;&lt;5)|COND_CODE</code>。',
+          '两个特例：Tail merging 生成的 fallthrough 尾块 <code>loc_53E0</code>；真实块前驱里找不到 <code>CMP W20</code> 时，用 <code>ida_gdl.FlowChart(f, flags=ida_gdl.FC_PREDS)</code> 查第二前驱。'
         ],
         method: [
-          '<b>第一步：不依赖任何注入环境。</b>工具以普通 App 形式运行在手机上，用系统允许的方式拿到目标进程的 DexFile 信息，按 README 的说法是走 DexFile cookie 这条路。',
-          '<b>第二步：区分两类产物。</b>一条路是 hook 系统 API 取 dex（对应 hook_ 前缀），另一条走 cookie（对应 cookie_ 前缀）——两条路的产物在「深度脱壳时是否被修复」上不同。',
-          '<b>第三步：深度脱壳时做指令回填。</b>把「指向其他内存块」的指令搬回 DEX 内部，消除 nop；这一步是黑盒回填，不含解密、不含主动调用。',
-          '<b>第四步：把边界写在明处。</b>README 主动列出四条副作用，并提示遇到问题提 issue（自述「资源有限无法大量测试」）。'
+          '先清 BCF：把恒真谓词找齐 —— 一路靠代入 <code>dword_68068=2</code> 直接证明，另一路靠 <code>.bss:6807C</code> 零 write 推出初值 0。',
+          '只改状态写入点：定位到 <code>CSEL W20,W9,W8,LT</code>，替换为 <code>MOV W20,W9</code>，前面整串等价计算原样保留。',
+          '脚本化定位：把 ADRP 的 xref 唯一化 → 向后 40 条扫 <code>CSEL</code> → 遇 <code>B</code>/<code>BL</code>/<code>RET</code> 放弃 → <code>patch_dword</code> 写入。',
+          '分析分发器：读 <code>loc_53EC</code> 的 <code>CMP W20,W8</code> 比较链，确认 <code>W20</code> 的赋值形态只有 MOV / MOV+MOVK / CSEL。',
+          '状态值反查后继并建图：用 <code>collect()</code>/<code>build_succ()</code>/<code>solve_exit()</code>/<code>do_patch()</code> 解出 122 个真实块，按 <code>enc_b</code>/<code>enc_bcond</code> 两种编码回填跳转。',
+          '处理特例收尾：<code>loc_53E0</code> 这类 Tail merging 尾块单独处理；前驱缺 <code>CMP W20</code> 时用 <code>ida_gdl.FlowChart(..., FC_PREDS)</code> 补出第二前驱。'
         ],
         result:
-          '<p>对「结构化完整但指令被抽走（nop）」这一类样本，工具提供一个不依赖 root / Frida 的一次性脱壳路径，' +
-          '产物按是否修复分成两类落在设备上。</p>',
-        terms: ['DexFile cookie', '深度脱壳', '指令回填', 'nop', '落地加载', '内存加载', '指令抽取', '模拟器兼容'],
-        limits: '<p>作者的局限交代是这份 README 里最有价值的部分，逐条照录：</p>' +
-          '<p>① <b>项目声明：</b>「本项目并不针对任何加固，在遇到检测环境等均不处理，仅供安全领域分析用途。」<br>' +
-          '② <b>测试覆盖：</b>「资源有限无法大量测试，遇到问题请提issues.」「可能少数因设备而异，绝大部分是支持的。」<br>' +
-          '③ <b>深度脱壳的预告（原文四条）：</b>脱壳时间会大幅度上升，预计几分钟到十几分钟不等；脱壳期间有可能会出现应用闪退（遇到反检测等）；会增加脱壳失败几率；不一定能够 100% 还原。<br>' +
-          '④ <b>深度脱壳的能力边界：</b>「并不包含任何解密、主动调用等操作」「例如：指令需要主动调用才解密等则无法回填或者说是无效回填」。<br>' +
-          '⑤ <b>架构限制：</b>32 位与 64 位是两个不同的 app，安装列表里找不到目标应用说明该架构版本不支持。</p>',
+          '<p>去 BCF 后代码从上千行塌陷到 300 多行；脚本最终解出 <b>122 个真实块</b>并完成跳转回填，' +
+          '原本散落在比较链里的二分派发节点被自动消掉。</p>' +
+          '<p>作者给出的关键结论是：<b>不吃 D-810 的样本也能纯静态还原 FLA</b> —— 只要状态值是以 MOV / MOVK / CSEL 立即数写进 <code>W20</code>，' +
+          '用「主分发器所有前驱 + 赋值形态筛选」这套判据，就能区分真实块与二分派发链的内部节点。这个判据可以套用到绝大多数魔改 FLA 上。</p>',
+        terms: ['控制流平坦化', '不透明谓词', '状态变量', 'IDAPython', 'idautils', 'CSEL', 'Tail merging'],
+        limits:
+          '<p>三点要如实说明：① 作者明说 <b>D810 在这个样本上不好使</b>，但没有深究原因；' +
+          '② 这套脚本的规则吃死了「状态值是 MOV/MOVK/CSEL 这类简单形态」的前提，换成寄存器间接写入就要重写；' +
+          '③ <b>帖子末节被论坛门控挡住</b>，本篇能逐条核对的是到跳转回填为止的部分。</p>',
         analysis:
-          '<p><b>这份 README 一共给本章送了三件礼物。</b></p>' +
-          '<p><b>礼物一：它把「运行时防护」显式排除在能力之外。</b>「本项目并不针对任何加固，在遇到检测环境等均不处理」——' +
-          '这一句正好印证 19.9 的判定纪律：<b>壳的代际与运行时防护是两个独立维度</b>。' +
-          '一个只看代际的工具，遇到「抽取壳 + 全套反调试」的样本会表现得很差，' +
-          '<span class="hit">而这不是工具不行，是它从设计上就只覆盖了其中一个维度。</span>所以你做判定时必须分开问，选工具时也才知道自己在选什么。</p>' +
-          '<p><b>礼物二：它诚实地写出了「回填」的成本结构。</b>「指令需要主动调用才解密等则无法回填或者说是无效回填」，' +
-          '加上四条副作用（时间上升、可能闪退、失败率上升、不保证 100%），把 19.5 那条结论钉死了：' +
-          '<b>不主动调用时，回填覆盖率存在上限；而主动调用本身要付出时间与稳定性代价。</b>' +
-          '作者最后那句「愿世上再无nop」，是这句话最生动的注脚——nop 正是抽取壳留给你的空方法体。</p>' +
-          '<p><b>礼物三（最值得记的一条）：代际命名在社区并不统一。</b>BlackDex 说的「一代（落地加载）/ 二代（内存加载）/ 三代（指令抽取）」，' +
-          '与我们本章的分类<b>不是同一把尺子</b>：它的「一代/二代」区分的是<b>加载方式</b>（落不落地），' +
-          '它的「三代」才是我们说的抽取壳（二代壳）。' +
-          '<span class="hit">结论：引用任何资料时，先说清对方的「代际」口径，再谈技术路线。' +
-          '判定表本身比代号重要得多——代号会撞车，结构现象不会。</span></p>' +
-          '<p>最后一点方法论对照：BlackDex 的深度脱壳是「<b>把指向其他内存块的指令搬回 DEX</b>」（黑盒回填），' +
-          'FART 的主动调用是「<b>逼壳自己回填，然后取走</b>」（白盒触发）。' +
-          '两条路都在解决同一件事，但适用条件不同：前者不需要注入环境、覆盖面受回填机制限制；' +
-          '后者需要能注入并遍历方法，但拿到的是一致的、可复现的产物。<b>这正是 19.12 判定器要教你的：先分类，再选路线。</b></p>',
-        link: 'https://github.com/CodingGay/BlackDex',
-        linkNote: 'GitHub 仓库（收录时以 web_fetch 取到 README 全文，并另取 GitHub API 元数据核对创建时间与 License）'
-      },
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境二',
-            scenario: '<b>情境：</b>静态特征（结构完整、方法体空、有 native 注册）指向抽取壳。' +
-                      '你用某个通用 dump 工具抓到一份 dex，修复后 jadx 能正常打开，' +
-                      '但<b>所有</b>方法体都是空的——连 <code>Application.onCreate</code> 和构造函数都空。',
-            q: '下一步做什么？',
-            choices: [
-              { t: '换一个更强的脱壳工具再脱一次', next: 'n1' },
-              { t: '先核对 dump 的时机与对象：确认抓的是 ART 已接管、方法已被调用过的那个 DexFile', next: 'n2' },
-              { t: '判定这个壳无法脱壳，转向黑盒调用方案', next: 'n3' },
-              { t: '先把空方法体的伪代码手工补上，凑一份能读的代码', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '换工具换不掉错误的观测点',
-            result: '<b>「全空」这个现象与工具强弱无关，它与你的观测点有关。</b><br><br>' +
-              '抽取壳在内存里同时存在多个版本的 dex：解密后的原始数据、被 ART 加载的结构、回填后的实体、以及可能的副本。' +
-              '工具只是「取哪一块内存」的实现，取错块，再强的工具也给你空方法。<br><br>' +
-              '<span class="hit">在换工具之前，成本更低的一步是：对照 maps 找到那个真正的 dex 映射区间，' +
-              '在触发功能前后各采一次，看 <code>insns_size</code> 有没有变化。</span>这一步十分钟，能直接告诉你「是不是取错了块」。'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：把「全空」当成观测点问题来查',
-            result: '<b>这条思路是对的，而且它是可验证的。</b>三个检查按顺序做：<br>' +
-              '① <b>对象对不对：</b>maps 里有几处 <code>.dex</code> 映射？你 dump 的是哪一处？多加载器场景下很容易抓错。' +
-              '（这也是为什么 19.13 的实验要把「被映射的 dex」单独标成<b>有价值</b>而不是可疑。）<br>' +
-              '② <b>时机对不对：</b>先跑遍功能再 dump，然后在同样的位置再 dump 一次做对比——' +
-              '如果非空方法数变多，说明你在正确的对象上、只是时机偏早。<br>' +
-              '③ <b>回填是不是被触发了：</b>看 <code>insns_size</code> 是否从 0 变成非 0。' +
-              '如果一直是 0，说明这个对象的回填逻辑没有跑，可能壳用的是另一个副本。<br><br>' +
-              '<span class="hit">「全空」和「部分空」是两个不同的诊断结论：部分空 = 覆盖率不足（去补触发）；' +
-              '全空 = 观测点错了（去核对对象与时机）。</span>'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '跳步了：现象还没有被解释',
-            result: '<b>黑盒调用是一条真实路线，但现在转过去是「用一个未解释的失败换一个未验证的方案」。</b><br><br>' +
-              '黑盒方案（模拟执行 so 里的目标函数）需要你先知道<b>目标函数在哪</b>——而你现在连 Java 层调用图都没有，' +
-              '因为方法体全空。<b>你会从一个坑跳进另一个更深的坑。</b><br><br>' +
-              '正确顺序是：先把「全空」解释掉（对象/时机），拿到至少一份部分可读的 Java 层；' +
-              '如果那时发现关键函数确实在 native 里、且难以还原，再评估黑盒。<span class="hit">路线的排序依据是依赖关系，不是难度。</span>'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '最危险的一条：把猜测写成证据',
-            result: '<b>手工补全的伪代码不是「可读性优化」，是伪造证据。</b><br><br>' +
-              '你补出来的逻辑基于「这段代码大概应该是这样」，一旦后续同事或下游流程基于它做判断，' +
-              '错误会被放大到无法追溯——因为最终没有人能分清哪一行是 dump 出来的、哪一行是你写的。<br><br>' +
-              '如果确实需要临时沟通「逻辑大概长什么样」，正确做法是<b>写成独立的推测文档</b>，标注清楚依据，' +
-              '而不是混进反编译产物里。<span class="hit">脱壳产物必须是可回溯的原始事实，这是这个工种的底线。</span>'
-          }
-        }
+          '<p><b>本课第 19 章的元原则是：混淆改变的是代码的长相，改变不了运行结果 —— 因为 OLLVM 从不销毁信息，它只是把信息搬了个家。</b>' +
+          '这个案例就是这句话的实拍：那一串 <code>ADRP</code>/<code>LDR</code>/<code>SUB</code>/<code>MUL</code>/<code>TST</code>/<code>CSEL</code> 算得煞有介事，' +
+          '净效果却只是把一个常量塞进 <code>W20</code>，等价于一条 <code>MOV</code>。</p>' +
+          '<p>案例里最妙的一步，是<b>只改 <code>CSEL</code> 一条指令</b>。作者没有去「逐条还原」那十几条等价计算，而是先问了一句：' +
+          '这串指令到底影响了什么？答案是——它唯一有意义的出口，就是给状态寄存器 <code>W20</code> 赋值的那条 <code>CSEL</code>，' +
+          '而状态变量正是控制流的关键节点。<b>「找最小充分改动点」比「逐条还原」高明：逐条还原等于把混淆器的活重做一遍，' +
+          '而掐住一个节点，是直接接管它的输出。</b>这也顺带解释了为什么 <code>-bcf</code> 是三大混淆里最容易死的一个 —— ' +
+          '它的全部信息都在「哪条路是假的」上，一旦证明谓词恒真，剩下的分支就是纯噪声。</p>' +
+          '<p>还有一条动手纪律值得抄走：<b>先证明，再动手。</b>案例里每一次 patch 前面都有一句「为什么这里恒真」的证明' +
+          '（代入 <code>dword_68068=2</code>、靠 <code>.bss</code> 零 write 推初值），<b>没有证明就 patch，等于拿猜测去改二进制</b>。</p>',
+        link: 'https://bbs.kanxue.com/thread-292886.htm',
+        linkNote: '看雪论坛原创帖'
       }
     },
 
-    /* ============================================================ 19.15 */
+    /* ============ 19.6 ============ */
     {
-      h: '19.15', title: '自己编译 AOSP 做脱壳机 / 沙箱：这是分水岭，但要先算账',
-      intuition: {
-        tag: '直觉模型 · 租房子和盖房子',
-        body:
-          '<p>用 Frida / Xposed 是在<strong>租来的房子里摆家具</strong>：你能改变的东西，受房东（ART 虚拟机）允许你改的东西限制。</p>' +
-          '<p>自己编译 AOSP 是<strong>自己盖房子</strong>：你可以在承重墙里埋传感器。' +
-          '方法的每一次注册、每一个 dex 的每一次加载，都从你写的代码里经过——<strong>你不需要去"发现"它，因为它就发生在你手里</strong>。</p>' +
-          '<p>但盖房子有成本：地基很大（源码）、图纸要对得上（版本与机型匹配）、盖错一次要重来（刷机、变砖风险）。' +
-          '所以这一节只回答一个问题：<strong>什么情况下值得盖，什么情况下租房更划算。</strong></p>'
-      },
+      h: '19.6',
+      title: '字符串加密：一个必须先讲清的归因问题',
       html:
-        '<p>本节与第 4 章直接呼应——第 4 章讲的是「怎么在 ART 源码里插桩」，这里只讲<b>选型与前提</b>：两者本质差别在哪、代价是什么、什么时候该上。</p>' +
-        T.tbl(['维度', '用户态 hook（Frida / Xposed）', '源码层插桩（自己编译 AOSP）'],
+        T.note('bad', '⚠️ 重要澄清：字符串加密不是 OLLVM 官方特性',
+          '<p>这是全网教程里<b>最容易误导人</b>的一点。翻 OLLVM 官方 wiki，特性列表只有四项：' +
+          '<span class="pill acc">Instructions Substitution -sub</span> ' +
+          '<span class="pill acc">Bogus Control Flow -bcf</span> ' +
+          '<span class="pill acc">Control Flow Flattening -fla</span> ' +
+          '<span class="pill acc">Functions annotations（函数注解）</span>。</p>' +
+          '<p><b>官方没有字符串加密。</b>你看到“字符串全变成 byte 数组、运行时解密”的样本，' +
+          '那是<b>后续 fork 或加固厂商的定制版本</b>自己加的。课程把它和三大混淆并列讲，' +
+          '是因为国内加固实践里它们总是一起出现 —— 但<b>归因必须准确</b>：' +
+          '看到字符串加密，说明对方用的是<b>魔改版</b>，不是原版 OLLVM，这本身就是一条情报。</p>') +
+        '<p>为什么这个区分对逆向有用？因为它决定了你<b>对付它的手段</b>。三大混淆是<b>结构变形</b>，' +
+        '需要你理解 IR 生成规则；字符串加密是<b>数据变换</b>，它有明确的<b>解密点（解密函数）</b>，' +
+        '可以用完全不同的思路解决：</p>' +
+        T.tbl(
+          ['维度', '三大混淆（-fla/-bcf/-sub）', '字符串加密（fork 定制）'],
           [
-            ['<b>时序</b>', '必须比目标先到位。晚了就被反调试拦住，或者关键动作已经发生（<b>时序问题</b>）',
-             '<b>没有时序问题</b>：插桩代码就在流程里，事件发生的那一刻你必然在场'],
-            ['<b>隐蔽性</b>', '需要与检测对抗（端口、线程名、maps、函数序言校验），<b>你的存在本身是破绽</b>',
-             '检测的是「进程有没有被注入」，而你<b>没有注入</b>——你就是那个进程。但同时：你得自己解决「改动是否被发觉」的问题（完整性校验）'],
-            ['<b>覆盖面</b>', '只能拦截「有符号、可 hook」的调用。直接 SVC、内联、自实现加载器会绕过你',
-             '覆盖到你插桩的那一层的<b>全部</b>调用，包括没有符号的内部函数'],
-            ['<b>成本</b>', '低：装上就能用，脚本可迭代', '<b>高</b>：源码同步、编译、刷机、每个版本重新适配（第 12 章整章都在讲这件事）'],
-            ['<b>适用判断</b>', '目标是「快速搞清一个 App 的行为」', '目标是「反复、批量、深入观测同类样本」，或要拿到的信息在用户态根本不可见']
-          ]) +
-        T.note('key', '🔑 一句话的选型判据',
-          '<p style="margin-bottom:0">问自己一个问题：<b>我要观测的那个事实，在用户态能不能被观测到？</b><br>' +
-          '能（比如某方法被调用、某个返回值为真）→ 用户态 hook 更快。<br>' +
-          '不能（比如 JNI 绑定发生的那一刻、dex 被加载进 ART 的那一刻、没有符号的内部调用）→ 只有源码层。<br>' +
-          '<span class="hit">这不是「谁的方案更高级」的问题，是「哪个观测点能看到你要的事实」的问题。</span></p>') +
-        T.card('前提清单（缺一条都会让整件事变成消耗战）',
-          '<p>① <b>版本与机型匹配</b>：要有与目标设备内核/驱动适配的源码分支，否则编译出来的镜像跑不起来。' +
-          '<span class="pill warn">待核实</span> 具体分支、内核源码与设备的对应关系必须查该机型的官方/社区资料，不能用"同芯片通用"来猜。<br>' +
-          '② <b>编译环境</b>：源码体积与编译时间随分支和机器差异极大，<span class="pill warn">待核实</span>具体数字，' +
-          '但需要相当规模的磁盘与内存是共识。<br>' +
-          '③ <b>刷机风险自担</b>：解锁 bootloader、anti-rollback、分区结构变化都可能让设备不可恢复——' +
-          '这一点在第 2 章的案例里作者也专门强调过。<br>' +
-          '④ <b>维护意识</b>：源码插桩不是一次性投入。目标一旦升级安卓大版本，插桩点就要重新定位（第 12 章）。<br>' +
-          '⑤ <b>合法授权</b>：改系统镜像意味着你对自己手上的设备做研究；不要把这套能力用在未授权的目标与设备上。</p>' +
-          '<p style="margin-bottom:0"><b>沙箱脱壳机的核心原理</b>只有一个：<b>让虚拟机自己招供</b>。' +
-          '你不是在进程外面偷看，而是让 ART 在加载 dex、注册 JNI、编译方法时，主动把信息写到你指定的地方。' +
-          '这套思路的延伸就是第 24 章的「自吐沙箱」——在算法 API 上插桩，让输入输出自己吐出来。</p>')
+            ['改的是什么', '<b>控制流 / 指令形式</b>（代码结构）', '<b>数据</b>（常量字符串的存放形态）'],
+            ['静态可见性', '明文字符串<b>依然可见</b>（因为没动数据）', '明文字符串<b>消失</b>，只剩密文 byte 数组'],
+            ['主要逆向手段', '还原控制流、折叠常量', '<b>定位解密函数 + 动态 dump</b>'],
+            ['典型工具思路', 'D-810 / HexRaysDeob / 符号执行', 'Frida hook 解密函数返回值、内存搜索'],
+            ['是否官方特性', '<b>是</b>', '<b>否</b>（fork / 厂商自研）']
+          ]
+        ) +
+        T.note('key', '🔑 一个立刻可用的侦察动作',
+          '<p>拿到样本先做一件事：<b>在 so 里搜明文字符串</b>。' +
+          '如果关键字符串（URL、日志、错误提示）能直接搜到 ⇒ 对方<b>只用了三大混淆</b>；' +
+          '如果全搜不到、只看到一堆高熵字节 ⇒ <b>有字符串加密</b>，切到“找解密函数”的赛道。' +
+          '这一步花 10 秒，能省你半天方向性错误。</p>') +
+        T.note('ok', '✅ 字符串加密的常见破法（简版）',
+          '<p><b>① 找解密函数：</b>特征通常是“循环 + 异或/加减 + 写回内存”，且<b>被大量调用</b>。' +
+          '<b>② Frida hook 它的返回值</b>，或 hook 调用点 dump 参数，直接拿明文。' +
+          '<b>③ 内存搜索：</b>解密后的明文一定在内存里出现过，扫内存找特征字符串。</p>' +
+          '<p>注意：本课程第 20 章之后的壳与 VMP 会把它做得更狠（按需解密、解密后立刻擦除），' +
+          '本章先建立“它有解密点”这个认知即可。</p>'),
+      quiz: {
+        id: 'q5-1',
+        chapter: 5,
+        answer: 2,
+        stem: '你在一个 so 里发现：所有关键字符串都变成了 byte 数组、运行时才解密；同时函数里是巨大的 switch 状态机。以下哪个判断是<b>准确</b>的？',
+        options: [
+          {
+            t: '这说明 OLLVM 的官方特性被全开了，包括字符串加密',
+            why: '❌ 错在归因。<b>OLLVM 官方 wiki 没有字符串加密</b>，只有 -sub / -bcf / -fla 和函数注解。字符串加密来自后续 fork 或加固厂商的定制版本。'
+          },
+          {
+            t: '字符串加密属于 -fla 的副产物，因为平坦化时顺手把常量也打散了',
+            why: '❌ 混淆因果关系。-fla 只重排<b>基本块与跳转</b>，它不碰数据段、不碰常量。字符串加密是独立的、额外的一层处理。'
+          },
+          {
+            t: 'switch 状态机对应官方 -fla；字符串加密说明用的是定制 fork，两者要分开处理',
+            why: '✅ 对。结构变形（-fla）走“还原控制流”的路线；字符串加密走“定位解密函数 + 动态 dump”的路线。归因清楚了，手段才不会用错。'
+          },
+          {
+            t: '既然字符串被加密了，说明 -fla 也是假的，整个样本都是别的东西伪装的',
+            why: '❌ 逻辑跳跃。两种技术可以共存，且共存恰恰是国内加固的常态。看到 A 不能否定 B。'
+          }
+        ],
+        explain: '<b>这一题考的是归因能力，不是记忆力。</b>混淆技术是<b>分层</b>的：<code>-fla</code> / <code>-bcf</code> / <code>-sub</code> 是 OLLVM 官方的三层（改代码结构），' +
+                 '字符串加密是厂商额外加的一层（改数据形态）。把层分清楚，你才能给每一层匹配正确的手段 —— ' +
+                 '对结构变形用动态 Trace / 控制流还原，对数据加密用 hook 解密点。<br><br>' +
+                 '更重要的实战意义：<b>归因即情报</b>。如果样本只有三大混淆，你面对的是“公开工具能打”的目标；' +
+                 '一旦出现字符串加密、间接跳转、自定义不透明谓词，就说明对方 <b>fork 过 OLLVM 并做过二次开发</b>，' +
+                 '你需要准备自研脚本，而不是指望 D-810 一键搞定。'
+      }
     },
 
-    /* ============================================================ 19.16 */
+    /* ============ 19.7 ============ */
     {
-      h: '19.16', title: '收尾：遇到加壳 App，我该怎么走',
+      h: '19.7',
+      title: '在 NDK 里用 OLLVM：亲手编一个带混淆的 so 做对照实验',
       html:
-        '<p>把整章压成一棵决策树。它的每一次分支都在回答同一个问题：<b>我现在看到的这个现象，能排除掉哪些可能，剩下最该做的第一件事是什么。</b></p>' +
-        '<p>请先自己走一遍再点选项——这棵树里的每一个错误分支，都对应真实工作里一种具体的浪费。</p>',
+        '<p>看再多文章，不如<b>自己编两个 so 摆在一起对比</b>。这一步的价值有三层：' +
+        '<b>① 建立对混淆强度的真实预期</b>（哪个 Pass 影响多大）；' +
+        '<b>② 验证你的反混淆手段是否真的有效</b>（用已知答案的样本练手，比拿真实样本瞎试快十倍）；' +
+        '<b>③ 拿到“混淆器指纹”</b>，以后看到真实样本能一眼认出来。</p>' +
+        '<p>整体流程：<b>先自己编译 OLLVM 的 clang → 再让 NDK 构建系统用这个 clang → 通过 <code>-mllvm</code> 传混淆开关</b>。' +
+        '注意 <code>-mllvm</code> 是<b>把参数透传给 LLVM 后端</b>的通用开关，后面跟的才是 Pass 名。</p>',
+      term: {
+        title: '从源码编译 OLLVM 到产出带混淆的 so',
+        lines: [
+          { t: 'p', s: '# 1) 取 OLLVM 源码（当前基线为 LLVM 4.0）', note: '<b>OLLVM 是 LLVM 的一个分支</b>，不是一个独立小工具 —— 所以你要编的是<b>整个编译器</b>，耗时较长（几十分钟到数小时，取决于机器）。仓库路径可能已变更，<span class="pill warn">请自行搜索确认</span>。' },
+          { t: 'p', s: 'git clone -b llvm-4.0 https://github.com/obfuscator-llvm/obfuscator.git', note: '拉取 OLLVM 的 <code>llvm-4.0</code> 分支。如果这条命令 404，说明仓库已迁移或改名 —— <b>不要硬猜地址，去搜官方 wiki</b>。' },
+          { t: 'p', s: 'mkdir build && cd build', note: '<b>一定要 out-of-tree 编译</b>（在源码目录外建 build 目录）。LLVM 的 in-tree 编译会污染源码树，出问题很难清理。' },
+          { t: 'p', s: 'cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD="X86;ARM;AArch64" ../obfuscator', note: '<b>只编你需要的那几个后端。</b><code>LLVM_TARGETS_TO_BUILD</code> 里加上 <code>ARM</code> / <code>AArch64</code>（安卓真机）和 <code>X86</code>（本机测试）。支持的后端越少，编译越快。', mem: '关键变量:\nCMAKE_BUILD_TYPE  = Release\nLLVM_TARGETS_TO_BUILD\n  = X86;ARM;AArch64' },
+          { t: 'p', s: 'make -j$(nproc)', note: '<b>编译本体。</b>这一步最容易失败的地方是<b>宿主编译器版本过新</b> —— 用 GCC/Clang 的新版本编 LLVM 4.0 常报 C++ 标准相关错误。' },
+          { t: 'e', s: 'error: no member named \'xxx\' in namespace \'std\'', note: '<b>典型症状：老 LLVM 撞上新标准库。</b>解法是换一个较老的宿主编译器（或容器内构建）。<span class="pill warn">具体可用版本组合待核实</span>' },
+          { t: 'p', s: 'ls bin/clang bin/clang++', note: '<b>验证产物。</b>编完你会得到自己的 <code>clang</code> / <code>clang++</code>。下面要让 NDK 用它们，而不是 NDK 自带的工具链编译器。' },
+          { t: 'd', s: '--- 接下来：让 NDK 使用这个 clang ---', note: '关键点：<b>NDK 的 toolchain file 默认会选它自带的 clang</b>，所以必须显式覆盖 <code>CMAKE_C_COMPILER</code> / <code>CMAKE_CXX_COMPILER</code>。' },
+          { t: 'p', s: 'cmake -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \\', note: '<b>加载 NDK 的 CMake 工具链</b>，这一步负责注入 sysroot、ABI 相关的 flags。' },
+          { t: 'p', s: '  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-21 \\', note: '指定 ABI 与最低 API。<b>ABI 要和你测试的设备一致</b>，否则装上去直接崩。' },
+          { t: 'p', s: '  -DCMAKE_C_COMPILER=$OLLVM/bin/clang \\\n  -DCMAKE_CXX_COMPILER=$OLLVM/bin/clang++ ..', note: '<b>核心一步：把编译器换成 OLLVM 的 clang。</b>从这一刻起，所有编译都经过混淆 Pass。' },
+          { t: 'd', s: '--- 在 CMakeLists.txt 里打开混淆开关 ---', note: '<b>混淆开关是编译选项，不是 CMake 变量。</b>写法是 <code>-mllvm &lt;Pass名&gt;</code>，每个 Pass 一个 <code>-mllvm</code>。' },
+          { t: 'p', s: 'target_compile_options(native-lib PRIVATE\n    -mllvm -fla -mllvm -bcf -mllvm -sub)', note: '<b>三件套全开。</b>做对照实验时建议<b>先一个个单独开</b>：只开 <code>-fla</code> 看平坦化、只开 <code>-sub</code> 看指令膨胀，最后再三个一起开。' },
+          { t: 'p', s: 'LOCAL_CFLAGS := -mllvm -fla -mllvm -bcf -mllvm -sub', note: '<b>Android.mk 的等价写法</b>（老式 ndk-build 项目用这个）。两种构建系统传参方式不同，但开关名字完全相同。' },
+          { t: 'p', s: 'cmake --build . --target native-lib', note: '开始构建。<b>加混淆后编译会明显变慢</b>，因为 Pass 在做大量 IR 改写与重算。' },
+          { t: 'p', s: 'llvm-readelf -s libnative-lib.so | head', note: '<b>先确认编出来了、符号表正常</b>。注意混淆<b>不会隐藏导出符号</b> —— JNI 函数名（<code>Java_...</code>）依然可见，这是你定位入口的路标。' },
+          { t: 'o', s: 'libnative-lib.so    (arm64-v8a)', note: '产物就绪。下一步是<b>对照</b>：把未混淆版本一起拖进 IDA。' },
+          { t: 'd', s: '--- 对照实验：两个 so 并排看 ---', note: '<b>实验设计很重要。</b>同一份源码，编两次：一次不加开关（对照组），一次加开关（实验组）。' },
+          { t: 'p', s: 'objdump -d libnative-lib.so | wc -l\nobjdump -d libnative-ollvm.so | wc -l', note: '<b>量化对比指令数。</b><code>-sub</code> 会让指令数膨胀，<code>-fla</code> 会引入大量跳转与状态赋值 —— 数字会直观地告诉你“混淆的代价”。' },
+          { t: 'w', s: 'note: 混淆后 so 体积通常明显增大，且执行性能下降', note: '<b>没有免费的混淆。</b>加固厂商会权衡强度与性能，所以真实样本往往<b>只对关键函数</b>开混淆 —— 这也是你的突破口。' },
+          { t: 'p', s: '# 把两个 so 一起拖进 IDA，对同一个函数按 F5', note: '<b>最关键的一步。</b>对照组能看到漂亮的 <code>if/else</code>；实验组是一坨 switch + 看不懂的位运算。' },
+          { t: 'o', s: '对照组: if (x & 1) r = 10; else r = 20;\n实验组: while(1) switch(state){ case 0: ... }', note: '<span class="hit">亲眼看到差异，你对 OLLVM 的认知才算落地。</span>从此再看到真实样本的那坨 switch，你不会有任何慌乱。' }
+        ]
+      },
+      quiz: {
+        id: 'q5-2',
+        chapter: 5,
+        answer: 1,
+        stem: '你已按 19.7 的流程编好了 OLLVM，并在 <code>CMakeLists.txt</code> 里写了 <code>target_compile_options(native-lib PRIVATE -fla -bcf -sub)</code>，编译成功，但 IDA 里看代码<b>完全没有混淆</b>。最可能的原因是什么？',
+        options: [
+          {
+            t: 'OLLVM 的 Pass 需要额外的 Python 脚本在编译后触发',
+            why: '❌ 不存在这种机制。OLLVM 的混淆发生在编译<b>过程中</b>（LLVM 中端 Pass），不是后处理脚本。'
+          },
+          {
+            t: '少了 <code>-mllvm</code> 前缀，这些参数根本没被透传给 LLVM',
+            why: '✅ 对。<code>-fla</code> 单独写会被当成普通编译选项，clang 不认识就忽略/警告，LLVM 中端收不到任何 Pass 注册请求。<b>正确写法是 <code>-mllvm -fla</code></b>。'
+          },
+          {
+            t: '必须用 Android.mk，CMake 不支持 OLLVM',
+            why: '❌ 错。CMake 和 Android.mk 都只是<b>传递编译选项</b>的工具，与 OLLVM 是否生效无关。真正决定生效的是“编译器是不是 OLLVM 的 clang”+“选项有没有透传给 LLVM”。'
+          },
+          {
+            t: '混淆只对 C++ 生效，如果源码是 C 就不会被混淆',
+            why: '❌ 错。OLLVM 作用于 <b>LLVM IR</b>，C 和 C++ 都会先变成 IR，与源语言无关。'
+          }
+        ],
+        explain: '<b>核心知识点：<code>-mllvm</code> 是“透传给 LLVM 层”的专用通道。</b><br><br>' +
+                 '驱动的参数解析是分两层的：<code>clang</code> 自己认识的选项（<code>-O2</code>、<code>-g</code>、<code>-I</code>…）用它；' +
+                 '而 LLVM 中端/后端自己的参数，必须通过 <code>-mllvm &lt;arg&gt;</code> 前缀传进去。' +
+                 'OLLVM 用 <code>RegisterPass</code> 把 <code>fla</code> / <code>bcf</code> / <code>sub</code> 注册成 LLVM 的命令行参数，' +
+                 '所以只有 <code>-mllvm -fla</code> 这种形式才能被它的 Pass 注册表看到。<br><br>' +
+                 '<b>排错顺序（照这个顺序查，别乱试）：</b><br>' +
+                 '① <b>编译器对不对</b> —— 看 CMake 有没有真的用上 OLLVM 的 clang（<code>-DCMAKE_C_COMPILER=...</code> 是否被 toolchain file 覆盖了）；<br>' +
+                 '② <b>选项有没有传下去</b> —— 加 <code>-mllvm --help</code> 或看编译日志里的完整命令行，确认 <code>-mllvm -fla</code> 在里面；<br>' +
+                 '③ <b>函数有没有被跳过</b> —— OLLVM 支持函数注解只混淆指定函数，如果源码/配置里做了限制，没被标注的函数当然不会变；<br>' +
+                 '④ <b>你 F5 看的是不是那个函数</b> —— 导出符号和实际被混淆的函数可能不是同一个。<br><br>' +
+                 '这四步背后的通用方法论：<b>任何“工具没生效”的问题，都先确认“输入对不对 → 参数到没到 → 作用域命中没命中”</b>，而不是急着换工具。'
+      }
+    },
+
+    /* ============ 19.8 ============ */
+    {
+      h: '19.8',
+      title: '反混淆的第一层认知：通用方法与“非通用”方法',
+      html:
+        '<p>面对 OLLVM，逆向工程师分两派：一派到处找“一键反混淆插件”，另一派先问“<b>我要的是看懂，还是拿到结果</b>”。' +
+        '这两派的差别对应两条路线：</p>' +
+        T.grid(2, [
+          '<div class="card"><div class="card-title">通用方法（针对混淆模式本身）</div>' +
+          '<p>不关心具体样本在算什么，只针对<b>混淆技术本身的结构特征</b>下手：</p>' +
+          '<ul><li>识别平坦化的<b>分发器</b>（while(1) + switch + 状态变量）</li>' +
+          '<li>用符号执行 / 常量折叠求<b>不透明谓词</b>的值，删死分支</li>' +
+          '<li>常量折叠消除<b>指令替换</b>的等价序列</li></ul>' +
+          '<p><b>优点：</b>换个样本还能用。<b>缺点：</b>厂商一改构造（换谓词、拆状态变量、多层嵌套）就失效。</p></div>',
+          '<div class="card"><div class="card-title">非通用方法（针对具体样本 / 绕开）</div>' +
+          '<p>不试图“理解混淆”，而是<b>针对这个样本的特征</b>拿结果：</p>' +
+          '<ul><li><b>动态 Trace</b>：跑一遍，记录真实执行路径，绕开一切静态迷雾</li>' +
+          '<li>针对某样本写<b>一次性脚本</b>（匹配它的特征常量、模式）</li>' +
+          '<li>直接 hook 关键函数，<b>不还原算法，只要结果</b></li></ul>' +
+          '<p><b>优点：</b>见效快、几乎不可防。<b>缺点：</b>换样本要重来，且需要能跑起来的环境。</p></div>'
+        ]) +
+        T.note('key', '🔑 选路线的判断标准：你要的是“算法”还是“结果”',
+          '<p>如果任务是“<b>搞懂它怎么算的</b>”（比如要做注册机、要写协议文档）⇒ 走<b>通用方法</b>，你需要可读的控制流。' +
+          '如果任务是“<b>拿到某个输入下的输出</b>”或“<b>绕过判断</b>”（比如过校验、抓密钥）⇒ 走<b>非通用方法</b>，' +
+          '动态 Trace + hook 往往十分钟出结果，而静态还原可能花你三天。</p>' +
+          '<p><span class="miss">新手最常见的错误：不管任务是什么，一律先上静态还原。</span>' +
+          '这不是勤奋，这是没想清楚目标。</p>') +
+        '<p>工具层面，两个名字绕不过去（都是 IDA 生态里的反混淆插件）：</p>' +
+        T.tbl(
+          ['工具', '类型', '原理要点', '备注'],
+          [
+            ['<b>D-810</b>', 'IDA Pro 插件', '识别平坦化的<b>分发器</b>、追踪<b>状态变量</b>的赋值、重建原始控制流', '作者 GuideM。仓库路径可能已变更，<span class="pill warn">请自行搜索确认</span>'],
+            ['<b>HexRaysDeob</b>', 'IDA Hex-Rays 反编译器插件', '在反编译层面自动化还原 OLLVM 混淆（表达式级还原）', '仓库地址同样 <span class="pill warn">请自行搜索确认</span>'],
+            ['<b>符号执行（如 angr 等）</b>', '通用框架', '对谓词求值、枚举可行路径', '<span class="pill warn">具体适用性因样本规模而异，待核实</span>'],
+            ['<b>动态 Trace（自研）</b>', '非通用方法', '记录实际执行的基本块地址序列', '<b>本章最推荐先掌握的</b>，见 19.9']
+          ]
+        ) + '<p>先分清概念：' + T.term('不透明谓词', '结果恒定但静态难以化简的表达式，-bcf 的核心构造') + '、' +
+        T.term('分发器', 'dispatcher，平坦化后全函数唯一的跳转枢纽，内含大 switch') + '、' +
+        T.term('状态变量', 'switchVar，决定下一步去哪个 case 的栈上变量，是还原路径的钥匙') + '。</p>',
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '入口',
-            scenario: '<b>情境：</b>你拿到一个 APK，手上只有半小时，还不知道它有没有加壳、是第几代。',
-            q: '第一步做什么？',
+            label: '情境一 · 一个被 -fla 保护的校验函数',
+            scenario: '<b>情境：</b>你拿到一个 so，JNI 入口很快定位到了。核心校验函数被 <code>-fla</code> 平坦化：' +
+                      '一个巨大的 <code>while(1) switch</code>，40 多个 case，全是状态变量赋值。' +
+                      '你的任务是<b>写注册机</b>，需要完全理解校验算法。<br><br>' +
+                      '你手上有：能跑的目标 App（真机 root）、IDA Pro、一周时间。你会先做什么？',
             choices: [
-              { t: '直接上 Frida / Xposed，先把业务类 hook 起来看看', next: 'n1' },
-              { t: '先做静态侦察（unzip -l + jadx + 读 dex 头 + 看 Manifest 入口），用现象给壳分类', next: 'n2' },
-              { t: '不管三七二十一，先跑一遍全量脱壳工具再说', next: 'n3' },
-              { t: '先搜这个 App 用的是哪家加固，按厂商方案找攻略', next: 'n4' }
+              { t: '直接上 D-810，先让插件把平坦化还原成 if/else，还原后再慢慢读算法', next: 'n1' },
+              { t: '先不还原，用 Frida/Stalker 把状态变量的取值序列 Trace 出来，看看真实路径长什么样', next: 'n2' },
+              { t: '用 angr 从函数入口符号执行到返回，让它自动求解', next: 'n3' },
+              { t: '既然静态看不懂，就纯靠人工逐个 case 阅读，硬啃 40 个块', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'bad',
-            verdictTitle: '你在没有地图的情况下开车',
-            result: '<b>两个必然的浪费。</b><br><br>' +
-              '① 如果它加壳了，业务类由壳的自定义加载器加载，<code>Java.use</code> 用默认加载器<b>根本看不到</b>——' +
-              '你会先花时间排查「类名是不是写错了」。<br>' +
-              '② 如果它有运行时防护，你可能连进程都留不住（spawn 就被检测）。<br><br>' +
-              '<span class="hit">静态侦察零成本、五分钟，却能让你在动手之前就知道该带什么武器。' +
-              '跳过它省下的五分钟，通常会在后面变成一个下午。</span>'
+            label: '选A · 先上 D-810', terminal: true, verdict: 'bad',
+            verdictTitle: '方向不算错，但顺序错了：你在没验证“真实路径”之前就动结构',
+            result: '<b>为什么错：</b>D-810 这类插件是<b>通用方法</b>，它重建的控制流是“<b>结构上可能的所有路径</b>”，' +
+                    '而不是“这个样本实际走的那条”。对于 <code>-fla</code> + <code>-bcf</code> 叠加的样本，' +
+                    '插件很可能重建出一张<b>依然庞大且含有大量死分支</b>的图，你花在阅读上的时间并没有省下来。<br><br>' +
+                    '<b>认知根源：</b>把“反混淆”当成了“点一下按钮”，忽略了<b>反混淆也需要验证手段</b>。' +
+                    '没有动态 Trace 作为参照，你甚至无法判断插件还原得对不对 —— 还原错了你也不会发现，' +
+                    '然后在这张错误的图上推导出错误的算法。<br><br>' +
+                    '<b>正确做法：</b>先用动态 Trace 拿到<b>真实执行的基本块序列</b>（这就是标准答案），' +
+                    '再上 D-810，<b>拿 Trace 结果去校准插件的输出</b>。工具的产出必须可验证，否则就是不可信的。<br><br>' +
+                    '<span class="pill ok">推荐顺序：动态 Trace 定标准 → 通用工具做重活 → 人工读剩下的硬骨头</span>'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先分类，再动手',
-            result: '<b>这一步做对了，后面每一步都会便宜很多。</b>四件事，五分钟：<br>' +
-              '① <code>unzip -l</code>：dex 几份、<code>assets/</code> 有没有体积异常的文件、<code>lib/</code> 下有几个 so；<br>' +
-              '② jadx 打开：<b>看不到类 → 一代；看到类看不到方法体 → 二代；成片 native 或天书 → 三代；都正常只是字符串乱 → 不是壳</b>；<br>' +
-              '③ 读 dex 头的 <code>class_defs_size</code>：把印象变成数字；<br>' +
-              '④ 看 Manifest 的 <code>application:name</code> 与 <code>attachBaseContext</code>：确认入口有没有被接管。<br><br>' +
-              '做完这四步，你就有了一个<b>可执行的结论</b>。继续往下走，看抽取壳这一支该怎么处理。'
+            label: '选B · 先动态 Trace 状态变量', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先拿到“标准答案”，再决定要不要动静态结构',
+            result: '<b>为什么对：</b>平坦化的状态变量序列是<b>确定性的</b>，Trace 一次就得到了真实路径的“真值”。' +
+                    '这件事有三个连锁收益：<br>' +
+                    '① <b>立刻缩小战场</b> —— 40 个 case 里可能只有 12 个真正被执行过，另外 28 个是死代码或错误分支，' +
+                    '你可以直接不看了；<br>' +
+                    '② <b>给后续工具当标尺</b> —— D-810 还原出来的图对不对，拿 Trace 一比就知道；<br>' +
+                    '③ <b>有时直接就到答案了</b> —— 如果 Trace 里能看到完整的比较/运算过程，算法可能不用还原就能推出来。<br><br>' +
+                    '<b>更深一层：</b>这个选择体现了“<b>先降维，再攻坚</b>”的逆向方法论。' +
+                    '面对被刻意复杂化的对象，第一反应不该是“怎么把复杂度还原”，而是“<b>能不能先把它变小</b>”。' +
+                    '动态执行天然携带了“哪些代码真的重要”这个信息，代价只是需要一个能跑的环境 —— 而你有。<br><br>' +
+                    '<span class="pill ok">注意前提：这条路的成本是“必须能跑起来”。如果样本有强反调试/环境检测，先解决反调试。</span>'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '工具会在错误的假设下给你一个「看起来成功」的结果',
-            result: '<b>这是最隐蔽的一种浪费。</b>全量脱壳工具跑完了、产物也有了，你以为成功了，' +
-              '然后花两天分析一份不完整的 dex，最后发现关键方法全是空的。<br><br>' +
-              '更糟的情况是：你用一个「针对整体加密」的工具去处理抽取壳，它给你一份结构完整但方法体全空的 dex——' +
-              '<b>而这份产物看起来「能打开」，于是错误被带进了后续所有环节。</b><br><br>' +
-              '<span class="hit">判定之所以要放在最前面，就是因为它能防止这种「静默的错误结论」。</span>'
+            label: '选C · angr 符号执行', terminal: true, verdict: 'bad',
+            verdictTitle: '工具选型过早：符号执行在混淆代码上往往爆炸',
+            result: '<b>为什么错：</b>平坦化会引入<b>大量状态变量的赋值与分支</b>，符号执行的路径数会随 case 数快速膨胀，' +
+                    '再叠加 <code>-bcf</code> 的垃圾分支和 <code>-sub</code> 的指令膨胀，' +
+                    '求解器很容易陷入“跑一晚上没结果”的境地。<br><br>' +
+                    '<b>认知根源：</b>把符号执行当成“<b>万能求解器</b>”，忽略了它有明确的<b>适用边界</b>：' +
+                    '它擅长<b>路径少、约束清晰</b>的小函数（比如一个纯粹的校验片段），' +
+                    '不擅长<b>被刻意膨胀过的大函数</b>。而且这个样本你可能连入口参数怎么传、返回怎么判成功都没搞清楚，' +
+                    '约束都建不对。<br><br>' +
+                    '<b>正确姿势：</b>符号执行是<b>精确制导武器</b>，不是地毯式轰炸。' +
+                    '先用 Trace 把范围缩小到“真正的校验那 20 条指令”，<b>再把这一小段</b>丢给符号执行求解，成功率会高得多。' +
+                    '<span class="pill warn">具体工具的能力边界随版本变化很大，请以自己的实测为准</span>'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '厂商信息是先验，不能当结论',
-            result: '<b>搜一搜没错，但把它当成判定结果就错了。</b><br><br>' +
-              '① <b>同一家厂商不同档位、不同版本可能完全不同</b>——你搜到的攻略可能对应它三年前的方案；<br>' +
-              '② <b>多个方案混用很普遍</b>，一篇帖子说的「这家用抽取壳」不代表你手上这个样本也是；<br>' +
-              '③ 最关键的：<b>厂商名不决定你下一步做什么，「结构现象」才决定。</b><br><br>' +
-              '<span class="hit">正确用法：把搜索结果当<b>候选假设</b>，然后用你自己的观测去验证或推翻它。' +
-              '验证的方向就是选项 B 那四步。</span>'
+            label: '选D · 人工硬啃 40 个 case', terminal: true, verdict: 'bad',
+            verdictTitle: '最贵的错：用人力去对抗机器生成的复杂度',
+            result: '<b>为什么错：</b>混淆器的产出是<b>机器批量生成</b>的，你用人眼逐块阅读，是在打一场<b>成本完全不对等</b>的仗。' +
+                    '40 个 case 读三天，如果对方开了多层嵌套平坦化，就是 200 个 case。<br><br>' +
+                    '<b>认知根源：</b>把“勤奋”当成了方法。人工阅读在<b>有结构的信息</b>上很强，' +
+                    '在<b>被刻意打散的信息</b>上极弱 —— 而平坦化干的就是打散结构这件事。<br><br>' +
+                    '<b>更隐蔽的害处：</b>人工逐块读，你会在脑子里<b>隐式地假设</b>“case 3 之后应该去 case 7”，' +
+                    '一旦这个假设错了，你会基于错误的路径推出错误的算法，而且<b>很难自查</b>。' +
+                    '动态 Trace 给出的路径不带任何主观假设，这是它比人眼可靠的地方。<br><br>' +
+                    '<b>什么时候才该人工啃：</b>Trace 已经把范围缩到<b>最后十几个块</b>，而且这些块里的运算' +
+                    '需要人的语义理解（比如它在拼一个协议头）—— 那时候人工阅读才是高价值投入。'
           }
         }
       }
     },
 
+    /* ============ 19.9 ============ */
+    {
+      h: '19.9',
+      title: '反混淆第二层：把真实路径“问”出来（动态 Trace 实操）',
+      html:
+        '<p>上一节我们把路线分成了通用与非通用。这一节把<b>性价比最高的那条</b>落到可执行步骤上：' +
+        '<b>动态 Trace 真实执行过的基本块</b>。</p>' +
+        '<p>核心思路一句话：<b>被混淆的代码结构是假的，但执行痕迹是真的。</b>' +
+        '平坦化把“跳转”变成了“给变量赋值”，可它<b>无法阻止 CPU 按真实顺序执行</b>。' +
+        '你只要记录下执行了哪些块、按什么顺序，就得到了混淆器<b>不可能撒谎</b>的那份路径。</p>' +
+        T.note('key', '🔑 通用三问：任何 OLLVM 样本都可以用这三问开局',
+          '<p><b>问 1：哪些基本块<b>真的执行过</b>？</b>（Trace 采集）⇒ 删掉从未出现的垃圾块，<code>-bcf</code> 直接失效大半。<br>' +
+          '<b>问 2：状态变量取了哪些值、按什么顺序？</b>⇒ 把平坦化的 case 序列拼成线性路径。<br>' +
+          '<b>问 3：关键运算点上的<b>寄存器/内存值</b>是什么？</b>⇒ 绕开 <code>-sub</code>，不还原形式只要值。</p>' +
+          '<p>这三问都不需要你理解混淆器的实现，只需要你<b>能观察运行时</b>。这就是“非通用方法”的威力。</p>') +
+        '<p>实操上，安卓平台常见的采集手段有三类（按侵入性从低到高）：</p>' +
+        T.tbl(
+          ['手段', '原理', '优点', '代价 / 坑'],
+          [
+            ['<b>指令级 Stalker 追踪</b>（Frida Stalker）', '逐条指令动态翻译执行，记录执行过的地址', '粒度最细，能看到完整指令流', '开销极大，慢到可能触发超时/反调试；大函数上容易卡死'],
+            ['<b>基本块级插桩</b>（在块首插桩）', '在每个基本块入口埋点，记录“块被走过”', '开销可控，块级信息足够还原平坦化路径', '需要先知道块的起始地址（可从 IDA 导出）'],
+            ['<b>断点 / 单步</b>（调试器）', '在分发器或特定 case 下断，人工记录', '最精确，可同时看寄存器', '<b>不可扩展</b>，适合已缩小范围后的验证阶段']
+          ]
+        ) +
+        T.note('warn', '⚠️ 动态 Trace 的三个真实坑',
+          '<p><b>① 环境检测。</b>很多样本会检测 Frida、调试器、root。Trace 前先解决反调试，' +
+          '否则你拿到的可能是“检测分支”的路径，而不是真实业务路径。</p>' +
+          '<p><b>② 路径依赖。</b>Trace 出来的只是<b>这一次输入</b>的路径。' +
+          '校验函数往往“输入错就早退”，如果你随便喂一个错输入，只会看到最前面几个块。' +
+          '<b>要用有意义的输入去跑</b>，甚至要跑多组输入对比路径差异。</p>' +
+          '<p><b>③ 地址要归一化。</b>记录的是运行时地址，必须先<b>减去模块基址</b>换算成偏移，' +
+          '否则和 IDA 里的地址对不上。这一步不做，你的 Trace 数据等于废纸。</p>') +
+        '<p>回到工具：<b>D-810</b> 走的是静态路线（识别分发器 + 追踪状态变量赋值 + 重建控制流），' +
+        '<b>HexRaysDeob</b> 走的是反编译表达式级还原。两者都是<b>通用方法</b>，' +
+        '都能被“厂商改构造”绕过，所以实战里最常见的组合是：' +
+        '<span class="pill ok">动态 Trace 定标</span> + <span class="pill ok">通用插件干重活</span> + ' +
+        '<span class="pill ok">人工读最后几块</span>。</p>' +
+        '<p>补充两个必须知道的概念：' + T.term('基本块', 'Basic Block，只有一个入口一个出口、中间没有分支的一段指令，是 OLLVM 操作的原子单位') + '、' +
+        T.term('Stalker', 'Frida 的动态指令追踪引擎，可逐条指令回调，用于采集执行流') + '。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境二 · 只有固件，App 跑不起来',
+            scenario: '<b>情境：</b>这次你拿到的是一个<b>嵌入式设备上的 ARM 二进制</b>（不是安卓 App）。' +
+                      '它被 OLLVM 保护，你怀疑里面有一段<b>私有加密协议</b>。麻烦在于：' +
+                      '设备固件可以 dump，但<b>你无法在上面跑 Frida</b>，也没有可用的调试接口。<br><br>' +
+                      '你手上只剩：<b>IDA Pro + 一个被 -fla/-bcf/-sub 三重保护的二进制</b>。没有动态手段了。你会怎么推进？',
+            choices: [
+              { t: '先写脚本做静态识别：找出所有“分发器”特征（while(1)+switch+单一状态变量），把它们标记出来', next: 'n1' },
+              { t: '先做静态常量折叠：把 -sub 生成的等价表达式尽可能算回常量，让代码先“瘦”一圈', next: 'n2' },
+              { t: '放弃静态，想办法把二进制跑在 QEMU 用户态里做仿真 Trace', next: 'n3' },
+              { t: '直接开始逐个函数人工阅读，反正只有几百个函数', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选A · 先静态识别分发器', terminal: true, verdict: 'bad',
+            verdictTitle: '顺序反了：最贵的活先干，最容易见效的活没干',
+            result: '<b>为什么错：</b>“识别分发器”是<b>针对 -fla 的重活</b>，它需要你处理多层嵌套、多个状态变量、随机化的 case 编号。' +
+                    '在没有其它线索的情况下先啃它，你很可能花两天写出一个只能处理“教科书式平坦化”的脚本，' +
+                    '而样本里正好有<code>-bcf</code> 的垃圾分支混在 case 列表里。<br><br>' +
+                    '<b>认知根源：</b>把三大混淆当成了<b>同等难度</b>。事实上它们的破解成本差距极大：' +
+                    '<code>-sub</code> 是局部改写、无上下文依赖，<b>最容易自动化消除</b>；' +
+                    '<code>-bcf</code> 的死分支一旦识别出来就能整块删掉，<b>收益极高</b>；' +
+                    '<code>-fla</code> 才是真正需要重建结构的硬骨头。<br><br>' +
+                    '<b>正确顺序：</b><b>先摘低垂的果实</b> —— 先折叠 <code>-sub</code>（代码变短、可读性立刻提升），' +
+                    '再删 <code>-bcf</code> 死分支（CFG 立刻瘦身），<b>最后</b>才用剩下的精力对付平坦化。' +
+                    '每一步都在<b>降低下一步的难度</b>，这才是有复利的顺序。'
+          },
+          n2: {
+            label: '选B · 先做静态常量折叠', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先降低复杂度，再攻坚结构',
+            result: '<b>为什么对：</b>在没有动态手段的情况下，你唯一的武器就是<b>静态化简</b>，而化简必须<b>从依赖最少的技术开始</b>。<br><br>' +
+                    '<b>① <code>-sub</code> 最适合打头阵：</b>它是纯局部改写，<code>a+b</code> → <code>(a^b)+2*(a&b)</code> 这类模式' +
+                    '既稳定又有限（官方就那几种运算、固定几套等价式），<b>模式匹配 + 常量折叠脚本就能批量干掉</b>。' +
+                    '做完这一步，函数体量可能直接掉三成，后面所有分析都受益。<br><br>' +
+                    '<b>② 紧接着做 <code>-bcf</code>：</b>不透明谓词恒真恒假，很多情况下<b>折叠后常量就暴露了</b> —— ' +
+                    '一旦条件算成常数，那条垃圾分支就是纯粹的死代码，删起来毫无风险。<br><br>' +
+                    '<b>③ 最后才碰 <code>-fla</code>：</b>此时你面对的分发器，case 数量已经被前两步削减过，' +
+                    '状态变量的赋值源头也更干净，重建难度大幅下降。<br><br>' +
+                    '<b>方法论：</b>反混淆和做菜一样有<b>下锅顺序</b>。先处理“无依赖、收益高”的变换，' +
+                    '让剩余问题变小变清晰。<span class="hit">永远不要第一个去啃最难的那块。</span>'
+          },
+          n3: {
+            label: '选C · QEMU 仿真 Trace', terminal: true, verdict: 'good',
+            verdictTitle: '正确但反直觉：没有动态手段，就自己造一个动态手段',
+            result: '<b>为什么对（而且这是本题最反直觉的答案）：</b>“跑不起来”经常只是指<b>跑不了 Frida</b>，' +
+                    '而不等于“无法执行”。QEMU 用户态仿真可以在<b>没有设备、没有 root、没有调试接口</b>的情况下，' +
+                    '把 ARM 二进制在你的 PC 上跑起来 —— 一旦能跑，<b>19.9 的三问就全部重新可用了</b>：' +
+                    '能记录执行过的块、能读状态变量、能在关键点 dump 寄存器。<br><br>' +
+                    '<b>认知根源的转变：</b>把“动态分析”等同于“必须有真机 + Frida”，这是一种<b>手段绑定</b>的思维。' +
+                    '动态分析的本质是<b>观察运行时</b>，只要能执行，观察方式是自由的：QEMU 插件、仿真器 trace、' +
+                    '甚至把关键函数<b>抽出来单独编译成宿主程序</b>跑一遍，都算动态。<br><br>' +
+                    '<b>真实代价（必须说清）：</b>仿真不是免费的 —— 你需要处理系统调用、外设寄存器、' +
+                    '以及<b>样本可能带的环境检测</b>；私有协议如果依赖硬件外设，纯用户态仿真可能拿不到完整上下文。' +
+                    '<span class="pill warn">可行性因样本而异，请先做小规模验证再投入</span><br><br>' +
+                    '<b>正确姿势：</b>把 QEMU 仿真和静态化简<b>并行推进</b> —— 仿真验证结论，静态负责理解。' +
+                    '只靠其中一条都会偏。'
+          },
+          n4: {
+            label: '选D · 直接人工阅读', terminal: true, verdict: 'bad',
+            verdictTitle: '回到了成本最不对等的打法',
+            result: '<b>为什么错：</b>“只有几百个函数”不是安慰，而是<b>陷阱</b>。混淆后的函数<b>单位阅读成本</b>被放大了数倍，' +
+                    '几百个函数乘以数倍成本，人力上是不可行的。<br><br>' +
+                    '<b>认知根源：</b>用“数量不多”来安慰自己，忽略了混淆改变的正是<b>单个函数的阅读成本</b>。' +
+                    '这和“只有一页纸，但它是用你不认识的语言写的”是同一种困境。<br><br>' +
+                    '<b>更关键的判断失误：</b>你其实<b>还不确定</b>目标在哪。在没有缩小范围之前投入人工阅读，' +
+                    '很可能读完 200 个无关函数才找到那 3 个真正干活的。' +
+                    '而“缩小范围”这件事有便宜得多的办法：<b>搜字符串、看导入表、看交叉引用、从外部行为反推入口</b>。' +
+                    '<span class="pill ok">先定位，再阅读 —— 这是所有逆向工作的铁律</span>'
+          }
+        }
+      }
+    },
+
+    /* ============ 19.10 ============ */
+    {
+      h: '19.10',
+      title: '实战组合：工具、Trace 与人工的接力顺序',
+      quiz: {
+        id: 'q5-3',
+        chapter: 5,
+        answer: [0, 1, 3],
+        stem: '<b>多选。</b>以下哪些做法属于“针对混淆模式本身”的<b>通用</b>反混淆方法？（即：不是只对这一个样本有效）',
+        options: [
+          {
+            t: '识别分发器结构：查找 while(1) 中包含 switch、且所有 case 都回写同一个变量的模式，据此重建控制流',
+            why: '✅ 属于通用方法。它针对的是 <code>-fla</code> 这个<b>技术的结构特征</b>，而不是某个样本的具体逻辑。换成另一个被 -fla 保护的函数，同样的规则依然成立。'
+          },
+          {
+            t: '对不透明谓词做符号执行或常量折叠，求出条件的恒定值，据此删除死分支',
+            why: '✅ 属于通用方法。它针对 <code>-bcf</code> 的<b>本质</b>（恒真/恒假），只要你能求解出来，删分支就是通用操作 —— 不依赖于谓词长什么样。'
+          },
+          {
+            t: '为该样本特有的魔改 VIP 指令序列写一段一次性脚本，把它的加密常量硬编码进脚本里',
+            why: '❌ 这是<b>非通用方法</b>。硬编码了本样本的特征常量，换个样本立刻失效。'
+          },
+          {
+            t: '常量折叠 / 局部化简，把 -sub 生成的等价运算序列算回原值',
+            why: '✅ 属于通用方法。它针对 <code>-sub</code> 的<b>数学等价性</b>，用通用的代数化简规则即可处理，与样本无关。'
+          },
+          {
+            t: '在真实设备上跑一遍，记录实际执行过的基本块偏移序列，删掉从未出现的块',
+            why: '❌ 严格说这是<b>非通用方法</b>。它不针对混淆模式，而是<b>绕开</b>混淆 —— 靠“这一次运行的实际路径”得到答案。换了样本要重新跑，换了输入路径还可能不同。它极其有效，但不属于“通用”。'
+          }
+        ],
+        explain: '<b>通用 vs 非通用的分界线在于：你的方法是针对“混淆技术”，还是针对“这一次运行/这一个样本”。</b><br><br>' +
+                 '<b>通用方法</b>（识别分发器、求解不透明谓词、常量折叠）的共同点是：它们建立在<b>混淆技术的数学/结构性质</b>上。' +
+                 '只要对方还用这套技术，方法就有效 —— 代价是，厂商一改构造（换谓词形式、拆状态变量、加多层嵌套）就可能失效。<br><br>' +
+                 '<b>非通用方法</b>（动态 Trace、一次性脚本、直接 hook）的共同点是：它们建立在<b>具体样本的运行时事实</b>上。' +
+                 '优势是几乎不可防（你改不了我实际执行了什么），劣势是换样本要重来、依赖能跑起来的环境。<br><br>' +
+                 '<b>实战结论：两者是接力关系，不是二选一。</b>典型接力顺序是：' +
+                 '<span class="pill ok">① 动态 Trace 拿到真实路径（定标准）</span> → ' +
+                 '<span class="pill ok">② 通用工具/脚本做批量还原（干重活）</span> → ' +
+                 '<span class="pill ok">③ 拿 Trace 校准工具输出（验证）</span> → ' +
+                 '<span class="pill ok">④ 人工阅读剩余硬骨头（收尾）</span>。' +
+                 '很多人的失败在于跳过 ①，于是既不知道工具还原得对不对，也不知道人工阅读该读哪几块。'
+      }
+    },
+
+    /* ============ 19.11 ============ */
+    {
+      h: '19.11',
+      title: '把 OLLVM 放回加固技术谱系里看',
+      html:
+        '<p>学完本章，你必须对 OLLVM 在加固谱系里的<b>位置</b>有清晰判断 —— 这决定了后续章节的难度预期。</p>' +
+        T.tbl(
+          ['技术', '改的是什么', '你的主要对手', '破解难度', '对应章节'],
+          [
+            ['<b>OLLVM 三大混淆</b>', 'IR 结构（控制流 + 指令形式）', '机器生成的复杂度', '中（工具可打大半）', '<b>第 19 章（本章）</b>'],
+            ['<b>字符串加密</b>（fork 定制）', '数据形态', '解密函数 + 调用点', '中低（hook 即得）', '本章 19.6 已建立认知'],
+            ['<b>VMP / 虚拟化保护</b>', '把指令翻译成自研字节码', '自定义虚拟机解释器', '高（要做指令语义还原）', '第 20 章'],
+            ['<b>抽取壳 / 指令抽取</b>', 'DEX 方法体抽取，运行时回填', '壳的还原时机', '中高（要抓回填点）', '第 16 章已学'],
+            ['<b>反调试 / 环境检测</b>', '运行条件', '检测点本身', '低到中（绕过即可）', '贯穿全书']
+          ]
+        ) +
+        T.note('key', '🔑 为什么 OLLVM 是“必修课”而不是“选修课”',
+          '<p>因为它是<b>所有高级加固的思想底座</b>。VMP 做的事情，本质上是<b>把 OLLVM 的平坦化推到极致</b> —— ' +
+          '平坦化只是把跳转变成状态变量赋值，VMP 干脆把<b>每条指令的语义</b>都变成由解释器查表执行。' +
+          '你在本章学到的“<b>结构是假的，运行时痕迹是真的</b>”这条方法论，在第 20 章会<b>原封不动地再用一次</b>。</p>' +
+          '<p>换句话说：<b>不会打 OLLVM，就不可能打得动 VMP</b>。这不是难度递进，这是同一招的两次应用。</p>') +
+        T.note('ok', '✅ 遇到 OLLVM 样本的排查清单（照着做）',
+          '<p><b>Step 1 · 侦察</b>：搜明文字符串 → 有 ⇒ 只用了三大混淆；无 ⇒ 有字符串加密，先解决它。<br>' +
+          '<b>Step 2 · 定位</b>：从 JNI 导出符号（<code>Java_...</code> / <code>JNI_OnLoad</code>）进，' +
+          '找交叉引用最多的那个函数 —— 被混淆的函数往往是核心函数，也常是调用最密集的。<br>' +
+          '<b>Step 3 · 分流</b>：只被 <code>-sub</code> 影响 ⇒ 常量折叠即可；有 <code>-bcf</code> ⇒ 找死分支；' +
+          '有 <code>-fla</code> ⇒ 找分发器和状态变量。<br>' +
+          '<b>Step 4 · 定标准</b>：条件允许就先动态 Trace，拿到真实块序列。<br>' +
+          '<b>Step 5 · 上工具</b>：D-810 / HexRaysDeob，用 Step 4 的结果校准输出。<br>' +
+          '<b>Step 6 · 收尾</b>：人工读剩下的硬骨头，重点看<b>数据流</b>而不是控制流。</p>') +
+        '<p>三个必须区分的概念：' + T.term('OLLVM', 'Obfuscator-LLVM，把混淆做成 LLVM Pass 的开源混淆器，当前基于 LLVM 4.0') + '、' +
+        T.term('反混淆', 'deobfuscation，把被刻意复杂化的代码还原成可读形式，分通用与非通用两条路') + '、' +
+        T.term('函数注解', 'Functions annotations，OLLVM 官方特性之一，用于指定哪些函数参与混淆') + '。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境三 · 老板要“三天出算法”，但样本是魔改版',
+            scenario: '<b>情境：</b>样本分析到一半，你发现对方<b>不是原版 OLLVM</b>：' +
+                      '字符串被加密了、case 编号是随机化的、状态变量有两个并且互相异或、还叠加了 <code>-bcf</code>。' +
+                      '你试了 D-810，<b>还原出错的图</b>（拿 Trace 一比就对不上）。<br><br>' +
+                      '老板要求<b>三天内交出加密算法</b>。你手上有一台 root 真机、能跑 Frida。你会怎么安排这三天？',
+            choices: [
+              { t: '继续深挖静态还原，改造 D-810 的规则去适配这个魔改版本，直到还原正确', next: 'n1' },
+              { t: '先问清“算法交付物”到底是什么：要的是公式，还是“给定输入能算出输出”的能力', next: 'n2' },
+              { t: '并行推进：一条线用 Frida 做输入输出对拍，另一条线尝试 hook 中间层（密钥派生/核心运算）拿中间值', next: 'n3' },
+              { t: '先花一天把字符串加密解决掉，再看情况', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选A · 改造静态规则硬啃', terminal: true, verdict: 'bad',
+            verdictTitle: '把自己绑死在一条最慢的路上，还无视了三天这个约束',
+            result: '<b>为什么错：</b>魔改版的特征是<b>规则会持续失效</b>。你改好“随机化 case 编号”，它还有“双状态变量异或”；' +
+                    '你改好这个，它还有“多层嵌套平坦化”。这是在和<b>对方的开发迭代速度</b>赛跑，而对方只要改一行符号名，' +
+                    '你的规则就废了。三天根本不够。<br><br>' +
+                    '<b>认知根源：</b>把“<b>还原出可读代码</b>”当成了唯一目标，忽略了任务其实可能有更弱的交付形式。' +
+                    '而且这里有一个更严重的信号被你忽略了：<b>你已经知道 D-810 的图是错的</b> —— ' +
+                    '在一个<b>已知不可信</b>的图上继续加规则，风险极高，你无法验证最终结论。<br><br>' +
+                    '<b>正确做法：</b>先<b>明确交付物</b>，再选路线。如果交付物只是“能算出结果”，静态还原根本不是必需的。' +
+                    '把三天投在一个可能永远做不完的通用还原上，是典型的<b>目标失焦</b>。'
+          },
+          n2: {
+            label: '选B · 先确认交付物', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先定义“完成”，再选择“路径”',
+            result: '<b>为什么对：</b>这一问能<b>直接改变整个技术路线的成本</b>：<br>' +
+                    '· 如果交付物是“<b>一个能算出正确结果的程序/脚本</b>” ⇒ 你只需要<b>输入输出对拍 + 中间值观察</b>，' +
+                    '可能一天就能拿出可用的实现，完全不需要还原控制流。<br>' +
+                    '· 如果交付物是“<b>完整的算法公式文档</b>”（要做协议兼容、要被审计）⇒ 那就必须还原，' +
+                    '但要和老板讲清<b>魔改版的工期风险</b>，争取时间或缩小范围。<br><br>' +
+                    '<b>认知根源的升级：</b>技术人最容易犯的错，是<b>把手段当目标</b>。' +
+                    '“反混淆”是手段，“拿到算法”是目标 —— 而在很多真实需求里，目标其实更弱：' +
+                    '“<b>能在给定输入下复现输出</b>”。一旦发现目标更弱，你就能合法地绕开最贵的那部分工作。<br><br>' +
+                    '<b>这不是偷懒，这是工程判断。</b>把三天花在满足真实需求上，比花在自我感动式的“完整还原”上更有价值。' +
+                    '<span class="pill ok">沟通成本极低，收益极高 —— 永远是第一个该做的动作</span>'
+          },
+          n3: {
+            label: '选C · 双线并行（对拍 + 中间层 hook）', terminal: true, verdict: 'good',
+            verdictTitle: '正确：用动态事实替代静态理解，同时向中间层要信息',
+            result: '<b>为什么对：</b>这是<b>在“必须出结果”的约束下最务实的打法</b>，两个方向互补：<br>' +
+                    '<b>① 输入输出对拍：</b>构造大量输入、记录输出，做差分分析。' +
+                    '当你观察到“改一个 bit，输出变化的位数”这类统计特征，往往能<b>反推出运算类型</b>' +
+                    '（比如呈现雪崩效应 ⇒ 可能是分组密码/哈希；呈现线性 ⇒ 可能是异或/线性变换）。' +
+                    '这条路<b>完全不需要读代码</b>。<br>' +
+                    '<b>② hook 中间层：</b>核心运算前后一定有可 hook 的点（密钥派生函数、AES 轮函数、内存中的中间缓冲）。' +
+                    '拿到<b>中间值</b>，你就把“一个大黑箱”拆成了“两个小黑箱”，每个都可以独立对拍。<br><br>' +
+                    '<b>关键洞察：</b>魔改版把<b>静态结构</b>搞得很复杂，但它<b>没法改变运行时一定会产生中间值</b>这个事实。' +
+                    '动态手段的攻击面在<b>数据流</b>上，而厂商的混淆主要投资在<b>控制流</b>上 —— ' +
+                    '<span class="hit">攻击对方投入最少的那一面</span>，这是逆向里最重要的策略直觉之一。<br><br>' +
+                    '<b>风险提示：</b>双线并行对个人精力有要求，建议以 ① 为主线（更容易出交付物）、② 为增益。'
+          },
+          n4: {
+            label: '选D · 先花一天解决字符串加密', terminal: true, verdict: 'bad',
+            verdictTitle: '典型的“顺手先干个简单的”，但顺序上它不是当前瓶颈',
+            result: '<b>为什么错：</b>字符串加密确实相对好解决（找解密函数 + hook），但它<b>不能推进“拿到加密算法”这个目标</b>。' +
+                    '解密出来的字符串最多给你<b>线索</b>（日志、错误提示、密钥名），而你的瓶颈是<b>核心运算逻辑</b>。<br><br>' +
+                    '<b>认知根源：</b>这是很常见的<b>舒适区偏移</b> —— 人会不自觉地先做“有明确解法、能做出来”的任务，' +
+                    '以获得进度感，哪怕它不是关键路径。三天工期里花掉整整一天（33%）在一个非瓶颈上，' +
+                    '是典型的<b>优先级误判</b>。<br><br>' +
+                    '<b>正确做法：</b>字符串解密应该作为<b>顺手动作</b>穿插进行 —— 比如在写 hook 脚本时顺便扫一遍解密后的字符串，' +
+                    '成本几乎为零。但要把它当成<b>独立的一天任务</b>，就本末倒置了。<br><br>' +
+                    '<b>通用原则：</b>排优先级看<b>“它是否在关键路径上”</b>，而不是看<b>“它是否容易做”</b>。' +
+                    '容易做的事做完，瓶颈还在那里，工期照样超。<span class="pill warn">记住：进度感 ≠ 进度</span>'
+          }
+        }
+      }
+    },
+
+    /* ============ 19.12 ============ */
+    {
+      h: '19.12',
+      title: '本章自测与主线回顾',
+      quiz: {
+        id: 'q5-4',
+        chapter: 5,
+        answer: 2,
+        stem: '关于 <code>-fla</code> 控制流平坦化，下列说法<b>正确</b>的是？',
+        options: [
+          {
+            t: '它通过加密跳转指令的目标地址来隐藏控制流，所以需要找到解密算法才能还原',
+            why: '❌ 混淆了不同技术。“加密跳转目标”是<b>间接跳转 / 跳转表加密</b>那一类技术。平坦化不加密任何东西，它<b>把跳转改写成了数据赋值</b>。'
+          },
+          {
+            t: '它生成了新的基本块并打乱了顺序，因此原始的执行顺序已经无法确定',
+            why: '❌ 后半句错。顺序<b>完全可确定</b> —— 状态变量的取值序列就是顺序。混淆改变了“表达方式”，没有销毁“顺序信息”。'
+          },
+          {
+            t: '它把边的跳转改写为对状态变量的赋值，真实路径被完整编码进状态变量的取值序列，因此可被 Trace 或静态追踪还原',
+            why: '✅ 对。这正是平坦化<b>既可混淆又可还原</b>的原因：信息没有丢失，只是从“控制流”搬到了“数据流”里。'
+          },
+          {
+            t: '它只对含有循环的函数生效，因为平坦化本质是把循环改写成状态机',
+            why: '❌ 错。平坦化对<b>任何有分支的函数</b>都适用，不要求原函数含循环。它是在函数外层<b>新造</b>一个循环（分发器），而不是改写已有的循环。'
+          }
+        ],
+        explain: '<b>理解这一题，就理解了整章的核心。</b>混淆技术的强度取决于它<b>销毁了多少信息</b>，而不是它让代码<b>看起来多乱</b>。<br><br>' +
+                 '<code>-fla</code> 做的事情是<b>搬家</b>：把“下一步去哪”这条信息，从 CPU 的跳转指令里，搬到栈上一个整数变量里。' +
+                 '信息<b>一点没少</b>，只是换了个地方存 —— 所以它<strong>必然可还原</strong>，只是还原需要你<b>换个地方找</b>：' +
+                 '不去读跳转，去读状态变量的赋值序列。<br><br>' +
+                 '<b>对比一下真正强的保护：</b>VMP 把指令语义搬到自研字节码里，你连“这条指令在算什么”都要先还原；' +
+                 '而平坦化只是把控制流搬了个家，指令本身还是 ARM 指令，运算还是那些运算。' +
+                 '这就是为什么 OLLVM 被定位为“<b>入门级到中级的保护</b>”——它能有效挡住<b>纯静态的快速分析</b>，' +
+                 '但在动态手段面前几乎没有还手之力。<br><br>' +
+                 '<b>记住这条判据：看一个保护强不强，问“它销毁了哪些信息，还是仅仅搬走了信息”。</b>'
+      },
+      after: T.note('key', '🔑 本章主线（一句话版本）',
+        '<p><b>OLLVM 是三个 LLVM FunctionPass</b>：<code>-fla</code> 把跳转搬进状态变量、' +
+        '<code>-bcf</code> 用恒真谓词灌垃圾分支、<code>-sub</code> 用等价式改写指令形式。' +
+        '三者<b>都不销毁信息，只是把信息搬了家或加了噪声</b> —— 所以都有对应的“把信息找回来”的手段：' +
+        '<b>Trace 状态变量、删死分支、折叠常量</b>。</p>' +
+        '<p>而字符串加密<b>不是官方特性</b>，是 fork/厂商加的，要单独用“找解密点”的思路处理。</p>') +
+        T.note('ok', '✅ 你现在应该能做到的三件事',
+          '<p><b>① 看到一坨 switch 不慌</b> —— 你知道那是分发器，知道要找状态变量。<br>' +
+          '<b>② 知道先干什么</b> —— 先侦察（搜字符串）、先定标准（Trace）、先摘低垂果实（<code>-sub</code> → <code>-bcf</code> → <code>-fla</code>）。<br>' +
+          '<b>③ 能自己做实验</b> —— 自己编 OLLVM、自己产混淆 so、自己验证反混淆手段。' +
+          '<span class="hit">能自己造样本的人，才真正理解样本。</span></p>') +
+        T.note('warn', '⚠️ 下一章的伏笔',
+          '<p>第 20 章 VMP 会把本章的平坦化“推到极致”：不再是“跳转变成状态变量”，而是' +
+          '<b>“整个指令集变成自研字节码，由解释器逐条执行”</b>。' +
+          '你会发现本章学到的所有方法论 —— 找分发器、追状态、动态 Trace、先降维再攻坚 —— ' +
+          '<b>一条都不用改，全部继续适用</b>。区别只是：这次的“状态”复杂到需要你先还原一套指令语义。</p>')
+    }
   ],
 
-  /* ============================================================== 名词表 */
   glossary: [
-    { t: 'App 加固', d: '在 APK 被分发之前对代码与资源做的保护性处理，目的有三：提高静态分析成本、提高动态调试成本、让篡改后的产物无法运行。注意这三类目标是独立的，可分别取舍。' },
-    { t: '壳 / 加壳', d: '对 App 做加固的那一层代码与它带来的运行时机制。壳负责在启动早期接管入口、解密、加载真代码，并把「业务代码什么时候可见」控制在自己手里。' },
-    { t: '威胁模型', d: '加固方在设计方案时假设的对手能力与攻击方式。本章把它分为三类：防静态分析、防动态调试、防二次打包。判定任何防护手段时先问「它属于哪一类」。' },
-    { t: '一代壳（整体加密壳）', d: '把整份 dex 加密或整体搬移，运行时解密到内存再加载。静态看不到业务类（只有壳的代码）；破解关键是找 dump 时机。' },
-    { t: '文件重定向', d: '把 APK 的结构改掉以接管入口：替换 <code>classes.dex</code>、把真 dex 加密后放进 <code>assets/</code>、把 Manifest 的 <code>application:name</code> 换成壳的类。<b>重定向不等于加密</b>——它只负责换位置和换入口。' },
-    { t: '抽取壳（二代壳）', d: '保留 dex 完整结构（类名、方法名、字段、签名都在），只抽走方法体的字节码（<code>code_item</code> 里的 <code>insns</code>），运行时首次调用才回填。直接 dump 得到的是「结构完整、方法体空」的 dex。' },
-    { t: 'code_item / insns', d: 'dex 中存放方法体的结构。核心字段是 <code>insns_size</code> 与 <code>insns</code>（dalvik 字节码指令数组）。抽取壳抽的就是它，回填的也是它——所以 <code>insns_size</code> 是不是 0，是判定回填有没有发生的直接证据。' },
-    { t: '动态回填', d: '抽取壳在方法首次被执行（或首次必须被解析）时，把真指令写回该方法 code item 的过程。回填由「调用」触发，因此脱壳完整度 = 你触发过的代码路径覆盖度。' },
-    { t: '主动调用（Active Call）', d: '遍历所有 DexFile × 所有类 × 所有方法，用默认参数强制调用每个方法，逼壳完成回填，然后立即 dump code item。FART 的核心机制（第 2 章）。调用抛异常不影响——要的是回填这个副作用。' },
-    { t: '三代壳（DEX2C / Java2C）', d: '把 dalvik 字节码翻译成等价的 C 代码（或直接生成机器码）编译进 so，Java 侧退化成 <code>native</code> 声明或一层胶水代码。因为 Java 层不再有字节码，<b>「回填」这件事从根上不存在</b>。' },
-    { t: 'VMP（虚拟机保护）', d: '把字节码转成厂商自定义的指令序列，运行时由解释器逐条执行。现象是「方法体有代码、但语义不通」（读一串数据 + 跳进一个分发循环）。比 DEX2C 保护强度更高、体积代价更小、运行更慢。' },
-    { t: '混合型壳', d: '同一份 APK 里多种保护并存：多 dex 分代保护、多 so 分工、壳中壳。它不是「第四代」，而是把前几代技术在不同部位重复使用。判定时的第一原则是<b>先排顺序</b>，而不是先定代际。' },
-    { t: 'attachBaseContext', d: 'Application 生命周期里早于 <code>onCreate</code> 的回调，是壳在进程早期拿到 <code>Context</code> 的标准位置。被覆写是「加固存在」的第二强证据（第一强是方法体为空）。' },
-    { t: '内存加载（自定义 Linker）', d: '不走系统 <code>dlopen</code>，由壳自己把 so 映射进内存并修补重定位。观测特征是 maps 里出现无名可执行段、<code>memfd:</code> 映射、或 <code>(deleted)</code> 的 so。' },
-    { t: '导出表抹除', d: '用隐藏可见性 + strip 让 so 的符号表变空，使静态分析找不到函数入口。<b>它是「名字没了」，不是「内容没了」</b>——代码照样能正常加载执行。' },
-    { t: 'JNI 动态注册', d: '用 <code>JNI_OnLoad</code> + <code>RegisterNatives</code> 在运行时建立「Java 方法 → native 函数地址」的绑定，把入口从静态符号表挪到运行时。第 4 章的插桩点就选在这个绑定发生时。' },
-    { t: '运行时防护', d: '与壳的代际<b>互相独立</b>的一个维度：反调试、反注入、反 Hook、root/模拟器/多开检测、完整性校验、反 Frida。判定时要单独回答「有没有、在哪一层、和壳是什么关系」。' },
-    { t: '完整性校验', d: '校验自身签名摘要、dex/so 内容摘要或代码段字节，用于让「改完重新打包」的产物拒绝运行。这是「防二次打包」这一类威胁模型的技术落点。' },
-    { t: '可执行匿名段', d: 'maps 里没有路径、却带执行权限的映射（<code>r-xp</code> / <code>rwxp</code>）。ART 的 JIT 代码缓存会合法地产生这种映射（名字形如 <code>[anon:dalvik-jit-code-cache]</code>），<b>无名的那种才最可疑</b>。' },
-    { t: 'memfd', d: '内核提供的匿名内存文件，不需要在磁盘上落地。把解密结果写进 memfd 再 <code>dlopen</code>，是内存加载型壳的典型做法——文件系统里找不到任何来源。' },
-    { t: '判定表', d: '把「观测到的现象组合」映射到「最可能的壳类型 + 下一步动作」的规则表。本章的判定器（19.12）是它的可执行版本：每一条结论都带分数与证据链，而不是一句断言。' }
+    { t: 'OLLVM', d: 'Obfuscator-LLVM 的简称，基于 LLVM 的开源代码混淆器。论文为 Junod / Rinaldini / Wehrli / Michielin 的《Obfuscator-LLVM — Software Protection for the Masses》(IEEE/ACM SPRO 2015)。当前版本基于 LLVM 4.0。国内加固厂商大量基于它的 fork 做二次开发。' },
+    { t: 'LLVM IR', d: 'Intermediate Representation，LLVM 的中间表示。一种类型化、SSA 形式的类汇编语言，是前端（Clang）与后端（机器码生成）之间的通用货币，也是 OLLVM 所有混淆手术的操作对象。' },
+    { t: 'Pass', d: 'LLVM 中作用于 IR 的转换或分析单元，是一切优化的基本砖块。按作用范围分 ModulePass / FunctionPass / BasicBlockPass / LoopPass。OLLVM 三大混淆都注册为 FunctionPass。' },
+    { t: 'FunctionPass', d: '作用范围为单个函数的 Pass，入口函数是 runOnFunction(Function &F)，返回值 true 表示“我修改了这个函数”。OLLVM 的 -fla / -bcf / -sub 均属此类。' },
+    { t: '基本块 (Basic Block)', d: '只有一个入口、一个出口，中间不含分支的一段指令序列。它是控制流图的基本节点，也是 OLLVM 各类混淆操作的原子单位。' },
+    { t: '控制流平坦化 (-fla)', d: 'Control Flow Flattening。OLLVM 官方特性之一。把函数所有基本块变成 switch 的 case，用状态变量决定下一步跳转，为每条原始边生成“写下一状态 + 跳回分发器”的序言块。结果是 IDA 只能反编译出巨大 switch。' },
+    { t: '虚假控制流 (-bcf)', d: 'Bogus Control Flow。OLLVM 官方特性之一。用不透明谓词构造恒真/恒假条件，把原基本块拆成真块与假块，假块填入垃圾指令，从而向控制流中注入大量永远走不到的分支。' },
+    { t: '指令替换 (-sub)', d: 'Instructions Substitution。OLLVM 官方特性之一。把二元运算替换为数学等价的复杂序列，支持 add / sub / and / or / xor。例如 a + b 可写成 (a ^ b) + 2 * (a & b)。只改形式与长度，不改计算结果。' },
+    { t: '分发器 (Dispatcher)', d: '平坦化后全函数唯一的跳转枢纽基本块，内部包含根据状态变量做多路选择的 switch。所有 case 执行完毕都回到它。是识别 -fla 的首要结构特征。' },
+    { t: '状态变量 (switchVar)', d: '平坦化引入的栈上局部变量，其取值决定分发器下一步跳转到哪个 case。真实执行路径被完整编码为它的一串取值，因此是反混淆（Trace 或静态追踪）的核心目标。' },
+    { t: '不透明谓词 (Opaque Predicate)', d: '结果恒定（恒真或恒假）但静态难以化简的表达式，是 -bcf 的核心构造。经典例子：x*(x+1) % 2 == 0（连续整数乘积必为偶数）。破解不靠证明它，而靠动态执行观察实际走哪条路。' },
+    { t: '函数注解 (Functions annotations)', d: 'OLLVM 官方特性之一，用于指定哪些函数参与混淆，未标注的函数原样保留。因此同一个 so 里可能只有一部分函数被混淆 —— 这也是定位关键函数的突破口。' }
   ],
 
-  /* ============================================================== 严师 */
   teacher: {
-    id: 't19', chapter: 19,
-    name: '壳判定教官',
-    sub: '分不清「像哪一家」和「是第几代」，我不放你走',
-    intro: '<p style="margin:0">我不考你背厂商名单，也不考你记得住哪个 so 名——那些东西半年就过期。<br>' +
-           '我考的是：<b>看到现象，你能不能推出它属于哪一类保护、你下一步该做什么、以及你凭什么这么说。</b><br>' +
-           '答的时候把「观测」和「推论」分开说。含糊我会追问，追问三次我直接给答案——但那不算你过关。</p>',
+    id: 'ch5',
+    chapter: 5,
+    name: '追问老师 · 第 19 章',
+    sub: '专治“看了教程会，上手就懵”：逼你说清 OLLVM 每一步到底改了什么',
+    intro: '<p style="margin:0">这一章我不考你背参数，我考你<b>因果链</b>。你说“-fla 让代码变乱”不算答案，' +
+           '我要你说清它<b>在 IR 上动了哪几刀</b>、为什么动完 IDA 就废了、以及你<b>凭什么</b>能还原。' +
+           '答不上来我会一层层追问，直到你说出机制为止。</p>',
     questions: [
       {
-        id: 'c19q1', depth: 1, threshold: 0.7,
-        q: '加固方到底在防谁？请说出三类威胁模型，并解释为什么「防二次打包」必须单独算一类。',
+        id: 'c5q1', depth: 1, threshold: 0.6,
+        q: 'OLLVM 的三大混淆 <code>-fla</code> / <code>-bcf</code> / <code>-sub</code>，本质上是往编译流程的哪一环插入了什么？<b>为什么偏偏是这个位置</b>——而不是源码层，也不是最终的汇编层？',
         concepts: [
-          { label: '防静态分析：用加密、抽取、混淆提高「读懂代码」的成本', hint: '最直接的一类：不让你看懂代码。', any: ['静态', '反编译', 'jadx', '读代码', '看不懂', '混淆', '加密', '抽取'] },
-          { label: '防动态调试：反调试、反注入、反 Hook、环境检测，提高「观察运行时」的成本', hint: '你在运行时观察它，它就在运行时发现你。', any: ['动态', '调试', '反调试', 'hook', 'frida', '注入', '环境检测', '反注入', 'root', '模拟器'] },
-          { label: '防二次打包：签名校验 / 完整性校验，让篡改后的产物直接失效', hint: '改完重新签名装上去，它还跑得起来吗？', any: ['二次打包', '重打包', '重签名', '签名校验', '完整性', '篡改', '改包', '校验和'] },
-          { label: '三类目标不同：前两类是「不让你看懂」，第三类是「不让你改完还能用」', hint: '成功的标准不一样。', any: ['目标不同', '目的不同', '标准不同', '失效', '拒绝运行', '不能用', '不是一回事', '不是混淆'] }
+          { label: '插在 LLVM 的中端（middle-end），做成自定义 Pass',
+            hint: '不是前端也不是后端。它挂在三阶段编译器的哪一段？',
+            any: ['中端', 'middle end', 'middle-end', 'middleend', '中间端', '优化器', 'optimizer', '中端优化', 'IR 层', 'IR层', 'llvm pass', '自定义 pass', '自定义pass', 'pass'] },
+          { label: '三个混淆都注册为 FunctionPass（函数粒度）',
+            hint: '按作用范围分类：ModulePass / FunctionPass / BasicBlockPass，它属于哪种？',
+            any: ['functionpass', 'function pass', '函数级 pass', '函数级pass', '函数 pass', 'runonfunction', '单函数', '以函数为单位', '函数粒度', '函数作用域', '函数为单位'] },
+          { label: '操作对象是 LLVM IR：类型化、SSA 形式的中间表示',
+            hint: '它改写的东西叫什么？长什么样？',
+            any: ['IR', '中间表示', 'intermediate representation', 'bitcode', 'llvm ir', '字节码', '中间代码'] },
+          { label: '只改结构/形式，不改变程序语义（行为等价）',
+            hint: '混淆前后，程序跑出来的结果变了吗？',
+            any: ['语义不变', '功能不变', '行为不变', '逻辑不变', '结果不变', '行为等价', '功能等价', '等价变换', 'semantics', '不改变语义', '不影响功能'] },
+          { label: '因此它与源语言、目标架构都无关，同一套 Pass 通吃',
+            hint: '为什么同一份混淆代码能同时用于 ARM 和 x86、C 和 C++？',
+            any: ['架构无关', '平台无关', '不依赖架构', '跨架构', '可移植', 'target independent', '与源语言无关', '和源语言无关', 'c 和 c++', 'arm 和 x86', '处理器无关'] }
         ],
         hints: [
-          '先从「加固方最怕什么后果」反推手段：怕被看懂、怕被观察、怕被改。',
-          '第三类的成功标准不是「你看不懂」，而是「你改完就崩」。想想混淆能不能达到这个效果。'
+          '先回忆 LLVM 的三阶段：前端 Clang 把源码变成什么？中端对什么做优化？后端输出什么？',
+          '再想一个事实：OLLVM 的 Pass 里能拿到的是 BasicBlock、Instruction、IRBuilder —— 这些都是什么层次的概念？'
         ],
         probes: [
-          '追问：字符串混淆和签名校验都能提高逆向成本，为什么前者不能替代后者？',
-          '再追问：如果一个 App 只做了资源加密、没做任何校验，它能不能防住「加个广告 SDK 重新分发」？'
+          '既然它只在中端工作，那它能不能理解“这个函数是在做 AES 加密”？为什么这个限制对你有利？',
+          '如果加固厂商想把混淆做得更强，为什么“继续往中端加 Pass”很快就到瓶颈了？'
         ],
-        model: '<b>三类威胁模型，按「加固方怕什么」分：</b><br><br>' +
-          '<b>① 防静态分析。</b>怕你打开 APK 就把业务逻辑读明白。手段是加密、抽取、混淆、native 化。成功标准：<b>你读不出有意义的方法体。</b><br><br>' +
-          '<b>② 防动态调试。</b>怕你在运行时安静地观察它。手段是反调试（TracerPid、断点检测）、反注入、反 Hook、反 Frida、root/模拟器/多开检测。' +
-          '成功标准：<b>你要么进不去，要么一进去就被发现。</b><br><br>' +
-          '<b>③ 防二次打包。</b>怕你改一改就重新分发。手段是签名校验、dex/so 完整性校验、资源校验。' +
-          '成功标准：<b>你把代码改完、重新签名、装上设备，它拒绝运行。</b><br><br>' +
-          '<b>为什么第三类必须单算：</b>因为它的「成功」定义和前两类根本不同。混淆和加密是<b>提高理解成本</b>——它们让你读得慢、读得累，' +
-          '但完全不阻止你修改并重新打包；你改完的包照样能启动，只是启动的是你改过的版本。' +
-          '而第三类防的是「<b>篡改这件事本身</b>」，所以它必须依赖<b>完整性</b>这个概念：' +
-          '把当前内容和一个预期值比对，比对失败就走失败分支。<br><br>' +
-          '<span class="hit">这条区分在判定时的直接用途：只要你在 Java 和 native 两侧都看到签名摘要比对，' +
-          '基本可以断定对方的产品目标里有反二次打包，那么你后面任何「改 smali 重打包验证」的做法都会先被这一关拦下——' +
-          '要改就得连校验一起处理，或者换用不改包的方式。</span>'
+        model: 'LLVM 是模块化的三阶段编译器：<b>前端</b>（Clang）把 C/C++ 源码变成 <b>LLVM IR</b>；' +
+               '<b>中端</b>由一串 <b>Pass</b> 对 IR 反复做转换与优化；<b>后端</b>把优化后的 IR 降级成目标机器码。' +
+               '<b>Pass</b> 就是“作用于 IR 的转换或分析单元”，按作用范围分 ModulePass（整个模块）、FunctionPass（单函数，入口 runOnFunction）、' +
+               'BasicBlockPass（单基本块）、LoopPass（单循环）。<br><br>' +
+               'OLLVM 做的事情非常朴素：<b>往中端插了三个自定义 Pass，而且全部注册为 FunctionPass</b>。' +
+               '为什么选这个位置？三个理由。' +
+               '① <b>信息刚刚好</b>：到了 IR 层，源码的语义已经被打散成基本块和指令，混淆器不需要理解“这段在算 MD5”；' +
+               '而再往后到汇编层，寄存器分配和调度已经做完了，插桩会破坏正确性。' +
+               '② <b>结构还在</b>：IR 层的基本块与控制流图清晰可读，正是平坦化、造分支所需要的粒度 —— 基本块就是它操作的原子单位。' +
+               '③ <b>与源语言、目标架构完全无关</b>：无论源文件是 C 还是 C++、目标是 ARM 还是 x86，最终都会变成 IR，' +
+               '所以同一套 Pass 通吃一切。<br><br>' +
+               '<b>这个位置同时定义了它的能力边界</b>：因为完全不懂源码语义，它只能做<b>结构层面的变形</b>（重排控制流、' +
+               '替换指令形式），无法做“语义级”的保护；又因为它不改变运行结果，<b>信息只是被搬家或加了噪声，没有被销毁</b>——' +
+               '这正是所有 OLLVM 混淆都能被还原的根本原因。而“选 FunctionPass”则决定了它的合理作用域：' +
+               '混淆一个函数是自洽的，跨函数重排会破坏调用约定与签名。',
+        after: '<p>补一句：老版本 LLVM（含 4.0）用 <code>legacy::PassManager</code> + <code>RegisterPass</code> 注册；' +
+               '新版本 LLVM 转向 <code>PassBuilder</code> + 新 Pass Manager，入口签名变成 <code>run(Function &amp;, FunctionAnalysisManager &amp;)</code>。' +
+               '所以拿新版 LLVM 直接编老 OLLVM 源码会编译失败，这不是你的操作问题。</p>'
       },
+
       {
-        id: 'c19q2', depth: 2, threshold: 0.7,
-        q: '一代壳和抽取壳，从「你能观测到什么」这一层怎么区分？为什么这个区分决定了完全不同的技术路线？',
+        id: 'c5q2', depth: 2, threshold: 0.7,
+        q: '详细讲 <code>-fla</code> 平坦化的<b>源码级步骤</b>：它到底动了哪几刀，才让 IDA 从“漂亮的 if/else”变成“一坨 switch”？' +
+           '并且说清：<b>为什么这坨 switch 是可还原的</b>？',
         concepts: [
-          { label: '一代壳：连 dex 结构都看不到（<code>class_defs_size</code> 为 0 / 只有壳代码 / dex 不可解析）', hint: '打开 APK，你能不能看到业务的类名？', any: ['一代', '整体加密', '结构看不到', 'class_defs_size', '类数为0', '打不开', '没有类', '重定向', '占位'] },
-          { label: '抽取壳：结构完整（类名/方法名/字段都在），但方法体为空', hint: '能看到类名吗？能看到方法体里的指令吗？', any: ['抽取', '结构完整', '方法体', '空的', 'code_item', 'insns', '类名', '能打开'] },
-          { label: '一代壳的解法是「找 dump 时机」：在解密完成 + ART 接管的那一刻抓内存', hint: '内存里一定会有一份完整的明文 dex，问题是何时抓。', any: ['dump', '时机', '内存', '解密', '加载', '窗口', '时刻'] },
-          { label: '抽取壳的解法是「主动调用触发回填」：遍历方法强行调用，逼它给出真指令', hint: '光等没用，它只在你调用时才给。', any: ['主动调用', '回填', '触发', '遍历', '跑一遍', '点一遍', '调用'] },
-          { label: '关键判据：抽取壳的缺失是「可变的」（随调用减少），残缺是「恒定的」', hint: '同一个 dex 前后 dump 两次，有什么会变？', any: ['可变', '恒定', '前后对比', '两次', '变多', '恢复', '长出来'] }
+          { label: '第一步：收集函数全部基本块（如 getBasicBlockList / 遍历 F）',
+            hint: '动手前它先做了什么准备工作？',
+            any: ['收集基本块', '遍历基本块', '所有基本块', '全部基本块', 'origbb', 'getbasicblocklist', '基本块列表', '存起来', '记录下来', '保存原来的块'] },
+          { label: '创建分发器（dispatcher）基本块，内含 switch',
+            hint: '平坦化之后，所有块执行完都会回到哪里？',
+            any: ['分发器', 'dispatcher', 'dispatch', '枢纽', 'disp', '中枢', '汇聚块', '中心块', '公共块'] },
+          { label: '引入状态变量（switchVar），用它的取值决定跳转目标',
+            hint: '“下一步去哪”这条信息，被搬到了什么地方？',
+            any: ['状态变量', 'switchvar', 'state', '状态值', '控制变量', 'state 变量', '状态机变量', 'switch 变量'] },
+          { label: '为每条原始边生成序言块：写入下一状态 + 跳回分发器',
+            hint: '原来的 A→B 这条边，被拆成了什么？中间多了个什么块？',
+            any: ['序言块', 'prologue', '序言', '中间块', '插入块', 'splitedge', '拆边', '切边', '边拆分', '写状态', '赋值再跳回', '跳回分发器'] },
+          { label: '原始基本块变成 switch 的 case，原 if/while 结构消失',
+            hint: '最终每个基本块在反编译里表现成什么？',
+            any: ['case', '分支', '变成 case', 'switch case', '拉平', '拍平', '原有结构消失', 'if 消失', '结构被抹掉', '顺序打乱'] },
+          { label: '可还原的原因：信息没丢，只是从控制流搬进了数据流，状态序列确定',
+            hint: '为什么说“可还原”是有理论保证的，而不是碰运气？',
+            any: ['信息没丢', '信息未丢失', '搬到数据', '数据流', '确定', '确定性', '取值序列', '可还原', '可恢复', 'trace', '追踪', '序列固定', '顺序确定'] }
         ],
         hints: [
-          '先问自己两个问题：打开 jadx 能看到业务类名吗？能看到方法体里的指令吗？这两个答案的组合就能定位代际。',
-          '再问第三个问题：内存里到底有没有出现过一份完整的明文 dex？这决定了你要不要「抢时间」。'
+          '回忆那个 Pass 骨架：收集 → 造块 → IRBuilder 插指令 → 改跳转 → return true。平坦化就是这套骨架的具体填法。',
+          '想一想：平坦化之后，“下一步去哪”这个信息存储在哪里？它是被加密了，还是被搬了个地方？'
         ],
         probes: [
-          '追问：抽取壳的方法体是什么时候被回填的？这个时机怎么影响你的脱壳顺序？',
-          '再追问：你把同一份 dex 前后 dump 两次，发现非空方法数变多了。这个现象排除了哪些可能？'
+          '你说状态变量可 Trace —— 那如果厂商把 case 编号随机化、或者用两个变量异或后再算呢？你的还原思路要不要改？',
+          '为什么 OLLVM 要给“每条边”都插入序言块，而不是直接让每个 case 结尾自己算下一个编号？这样做的代价是什么？'
         ],
-        model: '<b>先给观测层面的分界：</b><br><br>' +
-          '<b>一代壳：你看不到结构。</b>jadx 打开只有壳的代码，业务包名下一个类都没有；或者 <code>classes.dex</code> 的 <code>class_defs_size</code> 读到 0、' +
-          '魔数不是标准 dex。这是因为<b>整份文件被加密或整体搬走了</b>，静态那一份根本不是真代码。<br><br>' +
-          '<b>抽取壳：你看得到结构，看不到内容。</b>类名、方法名、字段、签名全都在（所以 ART 能正常链接类），' +
-          '但每个方法的 <code>code_item</code> 是空的、或只有 <code>return</code>。<b>原因在于加固方只抽走了字节码，保留了骨架。</b><br><br>' +
-          '<b>为什么这个区分决定路线：</b><br>' +
-          '· 一代壳的问题是<b>时间问题</b>——真 dex 必然会以明文形式出现在内存里，你要做的是把观测点放在「解密完成 + ART 接管」的那个窗口。' +
-          '它是一个「抢时间」的问题。<br>' +
-          '· 抽取壳的问题是<b>触发问题</b>——dex 早就在你手上了（结构完整），但光有它没用，因为方法体是空的，而回填只在方法被调用时发生。' +
-          '你要做的是「逼它给」：跑遍功能、主动调用、必要时手动调用冷门方法。它是一个「覆盖度」的问题。<br><br>' +
-          '<b>再加一条最实用的判据：可变的缺失 vs 恒定的缺失。</b>把同一份 dex 在「跑功能之前」和「跑功能之后」各 dump 一次：' +
-          '如果非空方法数变多了，那就是抽取壳（缺失随调用减少）；如果两次完全一样地空着，那更可能是 dex 本身就残缺，或者你的观测点取错了对象。<br><br>' +
-          '<span class="hit">这条判据的价值在于：它用一个可重复的实验，把「我猜是抽取壳」变成了「我证明它是抽取壳」。</span>'
+        model: '<b>平坦化的四刀，每一刀都在削弱 CFG 的可读性。</b><br><br>' +
+               '<b>第一刀：收集基本块。</b>源码是 <code>for (BasicBlock &amp;BB : F) origBB.push_back(&amp;BB);</code>，' +
+               '把函数当前所有基本块按顺序存进一个表。这张表后面用来分配 case 编号 —— 编号顺序<b>就是原始顺序</b>。' +
+               '（OLLVM 还支持函数注解，没被标注的函数会直接 return false 放过。）<br>' +
+               '<b>第二刀：造分发器。</b>用 <code>BasicBlock::Create</code> 新建一个块并插在函数入口之前，成为全函数唯一的公共枢纽；' +
+               '再用 <code>IRBuilder</code> 在其中 <code>CreateAlloca</code> 出<b>状态变量 switchVar</b>（一个普通的栈上局部变量），' +
+               '然后 <code>SwitchInst::Create(switchVar, disp, 0, disp)</code> 建 switch。注意默认目标也指向 disp，' +
+               '所以 case 没填满时它是个<b>空转死循环</b>——这个结构在静态上极其可疑，是识别的强特征。<br>' +
+               '<b>第三刀：每个原始块变一个 case。</b>按 <code>origBB</code> 的顺序 <code>addCase(i, origBB[i])</code>。' +
+               '从这一刻起，原来的 <code>if</code>/<code>while</code> 关系<b>彻底消失</b>，只剩“编号 → 块”的映射。' +
+               'IDA 看到的就是一个 while(1) 套 switch，它没有任何理由判定这是 if/else，只能老实输出 switch —— ' +
+               '这就是“反编译成一坨”的<b>机制原因</b>，不是 IDA 不够强。<br>' +
+               '<b>第四刀（最狠）：拆边插序言块。</b>对每一条原始边 from→to，用 <code>SplitEdge</code> 把边切成两段，' +
+               '中间插入一个只做两件事的小块：<b>把“下一状态”写进 switchVar，然后跳回 disp</b>。' +
+               '于是“跳去 B1”被翻译成“把变量设成 1”。跳转指令退役了，取而代之的是一次赋值。<br><br>' +
+               '<b>为什么可还原？</b>因为信息<b>一点没少，只是搬了家</b>：从 CPU 的跳转指令里，搬到栈上一个整数里。' +
+               '而且这个搬家是<b>确定性的</b>——同一输入必然产生同一串状态值。所以还原路径有三条：' +
+               '① 动态 Trace 记录 switchVar 的实际取值序列（最稳）；② 静态识别分发器并追踪常量赋值（D-810 的思路）；' +
+               '③ 符号执行。三条路都在回答同一个问题：<span class="hit">switchVar 的取值序列是什么</span>。',
+        after: '<p><b>实战注意：</b>真实加固样本常见<b>多层嵌套平坦化</b>（Pass 跑多轮）和<b>多状态变量</b>（两个变量异或后再作为 switch 条件）。' +
+               '这些不改变原理，但会让脚本失效：<b>不要假设 case 编号连续、不要假设只有一个状态变量</b>。</p>'
       },
+
       {
-        id: 'c19q3', depth: 2, threshold: 0.7,
-        q: '「so 被整体加密」和「导出表被抹除」是两件不同的事。请分别说清：加固方图什么、你会观测到什么、下一步动作有什么不同。',
+        id: 'c5q3', depth: 2, threshold: 0.7,
+        q: '<code>-bcf</code> 虚假控制流靠什么构造分支？请<b>至少举出一个不透明谓词的具体例子并证明它恒真/恒假</b>。' +
+           '最后说清：为什么这类混淆在<b>动态 Trace 面前几乎失效</b>？',
         concepts: [
-          { label: '整体加密：内容读不出来——没有合法 ELF 结构 / 节表异常 / 静态看不到有意义的代码', hint: '用 readelf / file 看，它像不像一个正常 ELF？', any: ['整体加密', '加密', 'elf', '节表', '读不出来', '密文', '文件头', '不可解析'] },
-          { label: '导出表抹除：内容可读但名字没了（隐藏可见性 / strip）', hint: '符号表空了，但代码段还在不在？', any: ['导出表', '符号表', '符号', 'strip', '隐藏', '名字', 'readelf', 'sub_'] },
-          { label: '抹符号后的下一步：走动态——在 JNI 绑定发生时记录「Java 方法 → native 地址」', hint: '绑定关系只能在运行时存在，那里就是观测点。', any: ['动态', '注册', 'registernatives', 'jni_onload', '绑定', '调用点', 'hook', 'trace'] },
-          { label: '加密后的下一步：先解决「怎么拿到内存里的明文 so」，必要时修复 dump 出来的 so', hint: '磁盘上没有可分析的东西，那就去内存里拿，拿到还可能要靠修复。', any: ['内存', 'dump', '明文', '修复', 'sofixer', '加载', '脱壳'] },
-          { label: '区分办法：看 ELF 头 / 节表 / 代码段规模是否正常——「没名字」不等于「没内容」', hint: '这两件事的观测点完全不同。', any: ['elf头', '节表', 'text段', '代码段', '文件头', '正常', '规模'] }
+          { label: '使用不透明谓词（opaque predicate）：结果恒定但静态难化简的表达式',
+            hint: '这个“看起来像条件、实际上恒定”的表达式有专门的术语，叫什么？',
+            any: ['不透明谓词', 'opaque predicate', '不透明表达式', '恒真谓词', '谓词', 'opaque', '永真条件', '恒真条件'] },
+          { label: '构造恒真/恒假的判断，例如 x*(x+1) % 2 == 0（连续整数乘积必为偶数）',
+            hint: '能否写出一个具体的、能证明的不透明谓词？',
+            any: ['x*(x+1)', 'x * (x + 1)', '连续整数', '连续两个整数', '必为偶数', '偶数', '平方', 'x*x', 'x * x', '奇偶', '模 2', 'mod 2', '% 2', '恒真', '恒假', '永真', '永假', '不透明'] },
+          { label: '把原基本块拆成“真块”和“假块”，假块填垃圾指令',
+            hint: '插入分支之后，原本那一个块变成了几个块？多出来的块里放什么？',
+            any: ['拆块', '拆分基本块', '真块', '假块', '垃圾代码', '垃圾指令', '死代码', '无用指令', '垃圾块', '无效分支', '两条路'] },
+          { label: '插入 if (opaque) 正常路径 else 垃圾路径，使 CFG 膨胀',
+            hint: '最终在控制流图上表现成什么？',
+            any: ['插入分支', '注入分支', '伪造分支', '虚假分支', '膨胀', '控制流复杂', '路径爆炸', '多了分支', '假分支'] },
+          { label: '破解关键：垃圾分支永远不会被执行，死代码不出现在动态 trace 里',
+            hint: '那些假路径，在真实运行时会不会被走到？这对你有什么用？',
+            any: ['不会执行', '永不执行', '走不到', '不可达', '死代码', '不出现在 trace', '不在 trace', 'trace 里没有', '没被执行', '从未执行', '动态看不见', '运行时不可达', '永久不可达'] },
+          { label: '所以先跑一遍、删掉未出现的块，控制流立刻瘦身',
+            hint: '具体怎么利用“它走不到”这个事实？',
+            any: ['跑一遍', '执行一次', '删掉', '删除未执行', '过滤', '筛掉', '瘦身', '简化控制流', '去掉死分支', '排除', '剔除'] }
         ],
         hints: [
-          '先问：我拿到的是「一堆读不懂的字节」，还是「一段能读的代码但没有名字」？',
-          '再去想：如果代码是完好的，只是没有名字，那我还能从哪里找到入口？'
+          '关键术语是“结果恒定、但静态难以化简”。为什么编译器不能直接把它折叠成常量？',
+          '换个角度想：垃圾分支的作用是让“读代码的人”多算几条路。那它能不能让“跑代码的 CPU”多走几步？'
         ],
         probes: [
-          '追问：很多人看到符号表是空的就说「so 被加密了」。这个判断错在哪？',
-          '再追问：如果 <code>JNI_OnLoad</code> 也不导出，你要怎么找到动态注册发生的位置？'
+          '既然不透明谓词是恒真的，为什么 OLLVM 不直接用 <code>if (1)</code>？编译器会在哪个 Pass 把它优化掉？',
+          '如果厂商把垃圾分支里塞进“看起来有用”的假计算（比如假的密钥派生），你的动态 Trace 策略还成立吗？会受到什么干扰？'
         ],
-        model: '<b>先把两件事分开：一件是「内容没了」，一件是「名字没了」。</b><br><br>' +
-          '<b>① so 整体加密。</b>加固方图的是：<b>磁盘上不存在可分析的机器码</b>。密钥和解密逻辑放在更早的一层（另一个 so、或壳的 dex 里）。<br>' +
-          '你会观测到：<code>file</code> / <code>readelf</code> 识别不出正常 ELF 结构，节表异常或缺失，静态看不到成规模的代码。<br>' +
-          '下一步：目标从「读它」变成「<b>拿内存里的那一份</b>」——也就是说，你要先解决内存加载/解密这件事（19.13 实验里那三类 maps 痕迹就是为它准备的），' +
-          '拿到之后可能还要修复 dump 出来的 so（节表、重定位一类）。<br><br>' +
-          '<b>② 导出表被抹除。</b>加固方图的是：<b>让你读得到代码、但找不到入口</b>。做法是隐藏符号可见性 + strip，' +
-          '常见结果是 <code>JNI_OnLoad</code> 也不再是导出符号。<br>' +
-          '你会观测到：符号表几乎为空，IDA 里全是 <code>sub_xxxx</code>，但 <code>.text</code> 段有大量代码、文件能正常加载运行。<br>' +
-          '下一步：<b>走动态</b>。绑定关系（Java 方法 → native 地址）无法被永久隐藏——虚拟机执行时必须知道地址，' +
-          '所以 <code>RegisterNatives</code> 一定会被调用。在那里记录映射，你就能把「一堆没有名字的函数」重新贴上标签。<br><br>' +
-          '<b>区分办法（一条就够）：</b>看 ELF 头和节表是否正常。<b>正常 → 只是没名字；异常 → 内容被处理过。</b><br><br>' +
-          '<span class="hit">为什么这个区分很关键：它决定了你的第一件事是「去内存里抢」还是「在运行时挂钩」。' +
-          '判断错了，你会用一半时间去做根本不需要的事。</span>'
+        model: '<b>核心武器是“不透明谓词”（opaque predicate）</b>：一个<b>结果恒定、但静态难以化简</b>的表达式。' +
+               'OLLVM 用它构造恒真/恒假的条件，再把原基本块拆成“真块”和“假块”，假块塞满垃圾指令，' +
+               '插入 <code>if (opaque) 正常路径 else 垃圾路径</code>。结果是 CFG 膨胀数倍，任何静态分析都要多算几百条根本走不到的路。<br><br>' +
+               '<b>具体例子与证明：</b><br>' +
+               '① <code>y = x * (x + 1) % 2 == 0</code>，<b>恒真</b>。<code>x</code> 与 <code>x+1</code> 是连续整数，' +
+               '其中必有一个是偶数，因此乘积必为偶数，模 2 恒等于 0。<br>' +
+               '② <code>y = x * x % 2 == 0</code>：平方与自身同奇偶，需按具体变体验证 <span class="pill warn">具体变体待核实</span>。<br>' +
+               '③ <code>y = ((x | 1) * (x | 1)) % 2 == 0</code>，<b>恒假</b>：<code>x | 1</code> 强制最低位为 1，必为奇数；' +
+               '奇数的平方仍是奇数，模 2 得 1，所以条件恒为假。<br><br>' +
+               '<b>为什么编译器看不穿？</b>编译器做的是<b>局部、保守、快</b>的化简（常量折叠、GVN、稀疏条件传播）。' +
+               '不透明谓词刻意选那些需要一两步<b>代数归纳</b>才能证明的恒等式 —— 证明成本略高于编译器的预算，它就活下来了。' +
+               '也正因如此，OLLVM 不能用 <code>if (1)</code>：那会被常量折叠直接干掉。<br><br>' +
+               '<b>为什么动态 Trace 面前它几乎失效？</b>因为垃圾分支<b>结构上存在，执行上永远不进入</b>。' +
+               '在真实设备上跑一遍、记录执行过的基本块偏移（模块基址 + 偏移），垃圾块的偏移<b>一次都不会出现</b>；' +
+               '把这些从未出现的块全部删掉，控制流立刻瘦身回可读状态。对逆向者来说这是好消息：' +
+               '<b>你根本不需要去证明谓词恒真，你只需要观察它实际走了哪条路</b>。<br><br>' +
+               '<b>代价提醒：</b>纯静态去 bcf 是体力活 —— 谓词构造无限（厂商会加变体），规则库总有漏网之鱼；' +
+               '而且 <code>-bcf</code> 常与 <code>-fla</code> 叠加，垃圾分支也被塞进 case 列表，变成复合体。',
+        after: '<p><b>排错向：</b>如果动态 Trace 出来发现垃圾块<b>居然被执行了</b>，先别怀疑原理 —— ' +
+               '大概率是你 Trace 的是“环境检测分支”（检测到 Frida 后走的假路径），而不是真实业务路径。' +
+               '先解决反调试，再谈还原。</p>'
       },
+
       {
-        id: 'c19q4', depth: 3, threshold: 0.7,
-        q: '<b>综合题：</b>给你一个从没见过的加固样本。请完整说出你的判定流程（至少五步），并说清每一步「如果跳过或者做错，会导致什么后果」。',
+        id: 'c5q4', depth: 2, threshold: 0.7,
+        q: '<code>-sub</code> 指令替换会把 <code>a + b</code> 改写成什么？请写出<b>至少两种等价形式并说明依据</b>。' +
+           '更重要的是：作为逆向者，你<b>应该怎样对付它</b>——是把它还原回加法，还是别的思路？',
         concepts: [
-          { label: '先做零成本的静态侦察（unzip -l、jadx、读 dex 头）', hint: '最便宜的一步应该最先做。', any: ['静态', 'unzip', 'jadx', 'dex头', 'class_defs_size', '先看', '第一', '侦察'] },
-          { label: '按现象给代际定性：看不到类→一代；方法体空→二代；native/天书→三代', hint: 'jadx 一打开就能定方向。', any: ['一代', '二代', '三代', '方法体', '空', 'native', 'vmp', '看不到'] },
-          { label: '再看动态侧：maps 逐行分类、dex 魔数命中数、native 注册痕迹', hint: '到这一步才需要设备。', any: ['maps', '魔数', '内存', '注册', '动态', '设备'] },
-          { label: '采样纪律：先跑功能再采、至少采两次做对比、把「可疑」与「有价值」分开记', hint: '抽取壳的缺失是可变的，只采一次看不出。', any: ['跑一遍', '功能', '两次', '对比', '采样', '分开', '可疑'] },
-          { label: '特征库只做交叉验证（先验），结论以自己的结构观测为准', hint: '厂商表半年就过期，你的观测是现场证据。', any: ['特征库', 'apkid', '交叉', '先验', '以观测', '厂商', '验证'] },
-          { label: '跳过判定的后果：用错工具，拿到一份「看起来能打开」的不完整产物，错误被带进后续所有环节', hint: '最贵的错误不是失败，是看起来成功。', any: ['不完整', '误判', '选错工具', '静默', '看起来成功', '浪费时间', '带进'] }
+          { label: '数学等价变形：如 a - (-b)、(a ^ b) + 2*(a & b)、a - (~b) - 1',
+            hint: '能否写出一两个具体的等价表达式？',
+            any: ['a - (-b)', 'a-(-b)', 'a - (~b) - 1', 'a - ~b - 1', '(a ^ b) + 2', 'a^b + 2', 'a & b', 'a&b', '进位', '半加器', '补码', '~b + 1', '~b+1'] },
+          { label: '支持的运算类型：add / sub / and / or / xor',
+            hint: '官方支持替换哪几类运算？',
+            any: ['add', 'sub', 'and', 'or', 'xor', '加法', '减法', '与', '或', '异或', '位运算', '二元运算'] },
+          { label: '只改形式不改结果，指令数膨胀 2-4 倍',
+            hint: '程序跑出来的结果变了吗？代码量呢？',
+            any: ['等价', '结果相同', '结果不变', '值相同', '膨胀', '变长', '指令变多', '代码变大', '形式不同', '不改结果', '语义等价'] },
+          { label: '破解思路一：常量折叠 / 局部代数化简，把表达式算回去',
+            hint: '静态上能做什么，让表达式重新变简单？',
+            any: ['常量折叠', 'constant folding', '折叠', '化简', '代数化简', '模式匹配', 'pattern', '优化', 'gvn', '局部化简', '规则匹配'] },
+          { label: '破解思路二：关注最终值而非指令形式，靠动态 dump 寄存器/内存',
+            hint: '如果静态还原太慢，能不能换个目标？',
+            any: ['动态', 'trace', '寄存器', 'dump', '值等价', '看值不看形式', 'hook', '调试', '执行时', '运行时', '不还原形式'] },
+          { label: '它是纯局部改写、无上下文依赖，所以最容易被自动化处理',
+            hint: '三大混淆里，哪一个的破解成本最低？为什么？',
+            any: ['局部', '无上下文', '上下文无关', '独立', '最容易', '成本最低', '好处理', '好对付', '模式固定', '有限'] }
         ],
         hints: [
-          '第一步不是脱壳，是「花五分钟把对手分类」。先想清楚：哪一步是零成本的、能排除最多可能的？',
-          '再想：哪一步只做一次是不够的？（提示：与「可变性」有关）'
+          '回忆补码的定义：<code>-b</code> 用位运算怎么表示？减法和加法是什么关系？',
+          '注意它替换的是<b>指令</b>。指令是局部的还是全局的？这个性质决定了它好不好自动化处理。'
         ],
         probes: [
-          '追问：如果你发现 maps 里有 <code>(deleted)</code> 的 so，但 jadx 里方法体是完整的，你该怎么解释这个组合？',
-          '再追问：如果静态看到的是「结构完整 + 方法体完整」，但字符串全是乱码，你会把它列入脱壳任务吗？为什么？'
+          '你说要“关注最终值”。那如果输入是运行时才知道的用户密钥，你打算怎么拿到那个值？',
+          '为什么 <code>-sub</code> 经常被加固厂商<b>限制比例</b>使用？他们担心什么？'
         ],
-        model: '<b>完整流程（六步，每步都带失败后果）：</b><br><br>' +
-          '<b>第一步：静态侦察（零成本，先做）。</b><code>unzip -l</code> 看目录结构（dex 几份、<code>assets/</code> 有没有体积异常的文件、<code>lib/</code> 下 so 数量）、' +
-          'jadx 打开看能不能读到业务代码、读 dex 头把印象变成数字。<br>' +
-          '<b>跳过的后果：</b>你不知道自己在对付什么，后面每一步都在猜。<br><br>' +
-          '<b>第二步：按现象定性。</b>看不到类 → 一代（整体加密/重定向）；看得到类、方法体空 → 二代（抽取）；' +
-          '成片 native 或方法体是「读数据 + 大循环」→ 三代（DEX2C / VMP）；都正常只是字符串乱 → 不是壳，是字符串加密。<br>' +
-          '<b>做错的后果：</b>用主动调用工具去啃整体加密（遍历不到任何 DexFile），或用静态反混淆工具去啃抽取壳（只看到空方法）。<br><br>' +
-          '<b>第三步：动态侧观测（这一步才需要设备）。</b>读 maps 并逐行分类、搜 dex 魔数命中数、观察 native 注册。' +
-          '三件事分别回答：SO 层有没有做内存加载、内存里有几份明文 dex、关键逻辑是不是在 native。<br>' +
-          '<b>跳过的后果：</b>你会漏掉 SO 层加固，直到在静态分析上卡住才发现「so 也是加密的」。<br><br>' +
-          '<b>第四步：守住采样纪律。</b>先跑遍功能再采集；同一观测至少采两次做对比；把「可疑」和「有价值」分开记（<code>(deleted)</code> 的 so 是壳的痕迹，' +
-          '被映射的 <code>.dex</code> 是你的 dump 目标）。<br>' +
-          '<b>违反的后果：</b>只采一次时，抽取壳和「本身就残缺的 dex」长得一模一样，你会得出错误结论并据此选错路线。<br><br>' +
-          '<b>第五步：交叉验证，但以观测为准。</b>用特征库工具给一个厂商先验，提醒你「还有这种可能」；' +
-          '但如果它和你的结构观测矛盾，<b>永远信你自己的观测</b>——因为它采的是历史规则，你采的是现场证据。<br>' +
-          '<b>做反的后果：</b>去搜「某厂商怎么脱」的攻略，结果按三年前的方案操作，浪费时间还怀疑工具。<br><br>' +
-          '<b>第六步：写出可执行的三段式结论。</b>壳类型 + SO/运行时防护程度 + 下一步第一个动作，例如：' +
-          '「二代抽取壳（结构完整、方法体空、native 注册）；SO 层做了内存加载；下一步先跑遍功能，再主动调用脱壳」。<br>' +
-          '<b>不写的后果：</b>结论留在你脑子里，明天换人接手要从头再来一遍——<b>而判定这件事每次都要花半小时</b>。<br><br>' +
-          '<span class="hit">整个流程的核心思想：<b>用最便宜的手段先分类，再选路线；每完成一步都用现象验证，' +
-          '而不是靠「我觉得应该是」推进。</b>最贵的错误从来不是「脱不出来」，而是「拿着一份看起来成功的错误产物继续往下做」。</span>'
+        model: '<b>子替换的本质是“数学等价改写”。</b>OLLVM 官方支持 <code>add</code> / <code>sub</code> / <code>and</code> / ' +
+               '<code>or</code> / <code>xor</code> 五类二元运算，把它们换成更复杂但等价的序列。<br><br>' +
+               '<b>必须刻进肌肉记忆的等价式：</b><br>' +
+               '· <code>a + b</code> ≡ <code>a - (-b)</code>（减去相反数）<br>' +
+               '· <code>a + b</code> ≡ <code>a - (~b) - 1</code>（依据 <code>~b = -b - 1</code>）<br>' +
+               '· <code>a + b</code> ≡ <code>(a ^ b) + 2 * (a &amp; b)</code>（<b>半加器</b>：异或得无进位和，与运算得进位，' +
+               '进位左移一位再相加。以 a=3, b=5 验证：t1=6, t2=1, t3=2, 6+2=8 ✔）<br>' +
+               '· <code>a - b</code> ≡ <code>a + (~b) + 1</code>（补码定义）<br>' +
+               '· <code>a ^ b</code> ≡ <code>(a | b) - (a &amp; b)</code>（并集减交集 = 对称差）<br>' +
+               '· <code>a ^ b</code> ≡ <code>(~a &amp; b) | (a &amp; ~b)</code>（按定义展开）<br><br>' +
+               '<b>结果完全一致</b>——以 3+5 为例，替换后依然算出 8。这就是它的全部秘密：只改写法，不改结果。' +
+               '但它让一条指令变成四条，可读性急剧下降。<br><br>' +
+               '<b>怎么对付它？两条路，别死磕第一条。</b><br>' +
+               '<b>路线一（静态）：常量折叠 + 局部代数化简。</b>因为 <code>-sub</code> 是<b>纯局部改写、无上下文依赖</b>，' +
+               '模式既稳定又有限（官方就那几套等价式），写个模式匹配脚本批量折叠就能干掉一大半。' +
+               '<b>这也是三大混淆里破解成本最低的一个</b>，应该<b>最先处理</b>——做完之后函数体量下降，后面所有分析都受益。<br>' +
+               '<b>路线二（动态）：关注最终值，而不是指令形式。</b>CPU 算出来的寄存器值是等价的：' +
+               '你不需要在脑子里把 <code>(a^b)+2*(a&amp;b)</code> 还原成 <code>a+b</code>，你只需要知道“这里算出了 8”。' +
+               '当输入是运行时密钥时，<b>动态 dump 寄存器/内存往往比静态还原快得多</b>——' +
+               '混淆能改指令形式，改不了运算结果。<br><br>' +
+               '<b>两个实战坑：</b>① 所有等价式都基于<b>定宽整数 + 补码</b>，自己写折叠脚本要按<b>无符号回绕</b>语义算，' +
+               '别用高精度整数，否则边界值会算错；② <code>a&amp;b</code> 的进位必须<b>左移一位</b>，漏掉这个左移是最常见的手写 bug。',
+        after: '<p><b>为什么厂商要限制 <code>-sub</code> 的比例：</b>它让代码膨胀 2-4 倍，指令缓存压力上升、性能明显下降。' +
+               '所以真实样本往往只对关键函数开 —— 而“哪些函数被开了”，反过来就是“哪些函数是核心”的线索。' +
+               '<span class="hit">混淆强度本身会泄露设计者的重视程度。</span></p>'
       },
+
       {
-        id: 'c19q5', depth: 2, threshold: 0.7,
-        q: '运行时防护可以分成几类？它们分别挡在哪一层？为什么说「绕过一层不等于绕过全部」？',
+        id: 'c5q5', depth: 3, threshold: 0.6,
+        q: '<b>综合题。</b>你拿到一个 so：关键字符串全部消失（只剩 byte 数组）、核心函数是一坨 <code>switch</code>、' +
+           '里面夹杂大量恒真恒假的分支、运算全是看不懂的位运算。老板要你<b>三天内交出加密算法</b>。<br><br>' +
+           '请给出你的<b>完整作战计划</b>：先做什么、按什么顺序、每一步的依据是什么、' +
+           '哪些地方必须<b>警惕工具会骗你</b>。同时说清：样本里哪一部分<b>不是 OLLVM 官方能力</b>，这个判断如何影响你的方案？',
         concepts: [
-          { label: 'Java 层：环境检测（root/模拟器/多开）、签名校验——写好写、也最容易被 hook', hint: '最容易被你改返回值的那一层是哪层？', any: ['java', '环境检测', '签名', 'root', '模拟器', '多开', '属性'] },
-          { label: 'Native 层：反调试、反 Hook / 完整性校验、反 Frida——壳的主战场', hint: '检测下沉到 native，hook Java 就没用了。', any: ['native', '反调试', '反hook', '完整性', 'frida', 'so', '端口', '线程名', 'maps', '序言'] },
-          { label: '内核层 / 绕过 libc：直接发 SVC 系统调用，让用户态 hook 整体失效', hint: '不经过 libc 的调用，你 hook libc 有什么用？', any: ['内核', 'svc', '系统调用', 'syscall', 'inline', '内核模块', 'ebpf', '硬件断点'] },
-          { label: '各层相互独立：绕过一层不影响其它层，必须逐层判定与逐层处理', hint: '把五类检测当成一条链，还是五个独立的锁？', any: ['独立', '逐层', '每层', '分开', '不等于', '都要', '分别', '五个'] },
-          { label: '绕过手段取决于所在层：Java 层改返回值；native 层抢时序或换观测层；内核层要换武器', hint: '同一招能不能打穿三层？', any: ['改返回', '时序', 'spawn', '观测层', '换武器', 'hook', '注入'] }
+          { label: '归因：字符串加密不是 OLLVM 官方特性，是 fork/厂商定制，要单独走“找解密点”路线',
+            hint: '三大官方特性里有没有字符串加密？没有的话，它从哪来？',
+            any: ['字符串加密不是官方', '不是官方', '非官方', 'fork', '厂商定制', '定制版', '魔改', '自研', '额外加的', '解密函数', '解密点', 'hook 解密'] },
+          { label: '先侦察定位：搜明文字符串、从 JNI 导出符号进、看交叉引用热点，缩小战场',
+            hint: '动手还原之前，怎么先确定“该看哪个函数”？',
+            any: ['搜字符串', '字符串搜索', '导出符号', 'jni', 'jni_onload', 'java_', '交叉引用', 'xref', '定位', '缩小范围', '先侦察', '入口'] },
+          { label: '先拿到动态事实：Trace 真实执行的基本块 / 状态变量序列，作为“标准答案”',
+            hint: '在动静态结构之前，有没有更便宜的办法知道真实路径？',
+            any: ['trace', '动态', '跟踪', '执行路径', '真实路径', '状态变量序列', 'frida', 'stalker', '跑一遍', '标尺', '校准', '标准答案', '动态事实'] },
+          { label: '处理顺序：先易后难 —— 先 -sub 折叠，再 -bcf 删死分支，最后 -fla 重建控制流',
+            hint: '三大混淆的破解成本并不相同，应该按什么顺序摘果子？',
+            any: ['先易后难', '先 sub', '先-sub', '先做替换', '再 bcf', '再bcf', '最后 fla', '最后平坦化', '顺序', '先简化', '降维', '低垂的果实', '由易到难', '先常量折叠'] },
+          { label: '警惕工具不可信：D-810/HexRaysDeob 的还原结果必须用 Trace 校准，不可盲信',
+            hint: '插件给你的图，你凭什么认为它是对的？',
+            any: ['校准', '验证', '不可信', '不能盲信', '要核对', '对照', '交叉验证', '工具会出错', '还原错误', 'd-810', 'hexraysdeob', '存疑'] },
+          { label: '先确认交付物：要“算法公式/可读代码”还是“给定输入能算出输出”的能力，两者成本天差地别',
+            hint: '在投入技术方案之前，有没有一件非技术的、但更关键的事要先做？',
+            any: ['交付物', '明确需求', '确认目标', '沟通', '问清', '需求', '目标是什么', '要什么', '对齐', '范围'] },
+          { label: '关键判据：厂商的混淆主要投资在控制流，而动态手段打的是数据流',
+            hint: '如果对方把控制流做得很强，你应该往哪个方向找突破口？',
+            any: ['数据流', '中间值', '对拍', '输入输出', '攻击面', '打数据流', '控制流被保护', '中间层', 'hook 中间', '差分'] }
         ],
         hints: [
-          '先按「它检测的是你的存在，还是你的动作留下的痕迹」把手段分一遍。',
-          '再问：如果检测代码在 native 里直接发系统调用，你在 Java 层 hook 它的意义是什么？'
+          '计划的第一条不应该是技术动作。想清楚“交付物”再动手，可能会让整个方案的成本差一个数量级。',
+          '把三大混淆按“破解成本”排个序：哪一个无上下文依赖、最容易自动化？哪一个需要重建结构、最贵？'
         ],
         probes: [
-          '追问：反 Frida 和「加壳」是什么关系？一个不加壳的 App 能不能做反 Frida？',
-          '再追问：如果一个 App 启动就退，你怎么判断是「反调试」还是「签名校验失败」还是「它真的崩了」？'
+          '你说先用 Trace 定标准。但如果样本带强反调试、Trace 一开就被检测到自杀，你的计划要怎么改？',
+          '如果对方把垃圾分支里塞进“看起来有意义的假计算”，你的“删掉未执行的块”这招还够用吗？需要补什么？'
         ],
-        model: '<b>五类，按所在层排：</b><br><br>' +
-          '<b>① Java 层：环境检测 + 签名校验。</b>读 <code>Build</code> 属性、查 su/magisk/模拟器路径、看是否多开、比对签名摘要。' +
-          '放这一层的原因很简单：写得快。代价是<b>最容易被 hook</b>——改个返回值就过去了。<br><br>' +
-          '<b>② Native 层（壳的主战场）：反调试、反 Hook / 完整性校验、反 Frida。</b>' +
-          '反调试读 TracerPid、尝试 ptrace、检测断点；反 Hook 校验函数序言字节、扫 maps 找注入模块、重算摘要；' +
-          '反 Frida 扫端口、线程名、agent 模块、内存特征串。<b>下沉到 native 就是为了躲开你的 Java 层 hook。</b><br><br>' +
-          '<b>③ 内核层 / 绕过 libc：直接 SVC 系统调用，或把观测与对抗下沉到内核（内核模块、eBPF、硬件断点）。</b>' +
-          '到了这一层，胜负不再取决于你的脚本写得好不好，而取决于<b>你有没有能力进入被观测目标之下的那一层</b>。<br><br>' +
-          '<b>为什么「绕过一层不等于绕过全部」：</b>因为这五类是<b>五个独立的锁</b>，不是一条链上的一环。' +
-          '你把 Java 层的环境检测改掉了，native 层的 ptrace 检测照样能让你退出；你把 ptrace hook 掉了，' +
-          '它直接发 SVC 让 libc hook 失效；你把注入藏好了，它算一遍 dex 摘要发现你改过。<br><br>' +
-          '<b>所以判定时必须回答三个问题：</b>① 有没有（启动就退、改包不跑，说明有）；② 在哪一层（决定你带什么武器）；' +
-          '③ 和壳是什么关系（壳自带的还是业务方另买的 SDK，绕过方式往往不同）。<br><br>' +
-          '<span class="hit">最后一条要单独记住：反 Frida 与「加壳」是两个独立能力。很多不加壳的 App 也会做反 Frida——' +
-          '所以「脱壳失败」和「挂不上 Frida」是两个问题，别混成一件事去排查。</span>'
-      },
-      {
-        id: 'c19q6', depth: 3, threshold: 0.7,
-        q: '<b>综合题：</b>什么时候值得自己编译 AOSP 做脱壳机 / 沙箱？请说清「源码层插桩」与「用户态 hook」的本质差别（至少三条），以及这个决定要付出什么代价。',
-        concepts: [
-          { label: '时序：源码插桩没有「迟到」问题；用户态 hook 必须抢在检测与关键动作之前', hint: '谁先到场？', any: ['时序', '迟到', '抢', 'spawn', '先到位', '那一刻', '顺序'] },
-          { label: '隐蔽性与检测面：用户态方案的存在本身就是破绽；源码层不注入，但仍要面对完整性校验', hint: '一张是「藏好自己」，一张是「成为它的一部分」。', any: ['隐蔽', '检测', '注入', '破绽', '特征', '完整性', '没注入', '就是它'] },
-          { label: '覆盖面：用户态只能拦有符号、可 hook 的调用；源码层能覆盖到内部调用，包括没有符号的函数', hint: '直接 SVC 和内部函数，用户态看到吗？', any: ['覆盖', '符号', '内部', '直接svc', '绕过', '全部', '没有符号'] },
-          { label: '代价：源码/分支/机型匹配、编译与刷机成本、每个安卓大版本重新适配、设备风险自担', hint: '盖房子比租房子贵在哪里？', any: ['成本', '编译', '刷机', '适配', '版本', '机型', '维护', '变砖', '风险'] },
-          { label: '选型判据：我要观测的那个事实，在用户态能不能被观测到', hint: '这不是「谁更高级」的问题。', any: ['判据', '能不能看到', '用户态', '观测点', '目标', '值不值得', '能不能观测'] }
-        ],
-        hints: [
-          '把两种方案放在「时序、隐蔽性、覆盖面」三个维度上比，就能看出它们各自的天花板在哪。',
-          '再想清楚：源码插桩解决了「你在场」的问题，但它有没有引入新的问题？'
-        ],
-        probes: [
-          '追问：源码插桩之后，App 的完整性校验还能发现你吗？为什么？',
-          '再追问：如果你的目标只是搞清一个 App 某个按钮背后的网络请求，你会为了它去编译 AOSP 吗？说说你的判断依据。'
-        ],
-        model: '<b>本质差别（三条）：</b><br><br>' +
-          '<b>① 时序。</b>用户态 hook 必须「抢在目标之前到位」——晚一步，检测已经跑完、或者关键动作（比如 dex 加载、JNI 注册）已经发生。' +
-          '源码层插桩没有这个问题：<b>插桩代码本身就是流程的一部分</b>，事件发生的那一刻你必然在场。' +
-          '这是两条路线最不可替代的差别。<br><br>' +
-          '<b>② 隐蔽性 / 检测面。</b>用户态方案要花大量精力「藏好自己」（改端口、改名、过滤 maps、反检测），' +
-          '因为你的存在本身就是破绽。源码层方案不走注入那条路——<b>你就是那个进程</b>，所以「检测注入」这一类手段对你无效。' +
-          '但要清楚它没有解决所有问题：<b>完整性校验仍然可能发现你改过系统或代码</b>，这是两回事。<br><br>' +
-          '<b>③ 覆盖面。</b>用户态只能拦到「有符号、能 hook」的调用；对手只要直接发 SVC、把调用内联、或自实现加载器，就能绕过你。' +
-          '源码层插桩覆盖到你插的那一层的<b>全部</b>调用，包括没有符号的内部函数——这正是第 4 章在 <code>RegisterNatives</code> 处插桩的意义。<br><br>' +
-          '<b>代价（必须一起算）：</b>要有和目标设备匹配的源码分支与内核、要付出编译环境成本、刷机有不可恢复的风险（第 2 章案例里作者专门强调过 anti-rollback），' +
-          '<b>而且这不是一次性投入</b>——每个安卓大版本来了都要重新定位插桩点（第 12 章整章都在讲这件事）。<br><br>' +
-          '<b>选型判据（一句话）：</b>问自己「我要观测的那个事实，在用户态能不能被观测到？」' +
-          '能 → 用户态 hook 更快更便宜；不能（JNI 绑定的那一刻、dex 被加载进 ART 的那一刻、没有符号的内部调用）→ 只有源码层。<br><br>' +
-          '<span class="hit">这不是「谁的方案更高级」，而是「哪个观测点能看到你要的事实」。' +
-          '把这句判据用熟了，你就不会在「该用脚本的时候去刷机、该刷机的时候死磕脚本」之间来回浪费。</span>',
-        after: '<p style="margin-bottom:0">到这一题，你应该能把整章串起来了：<b>判定解决「对手是什么」，选型解决「我该站在哪里看」。</b>' +
-               '两个问题都答完，脱壳这件事才从「碰运气」变成「有流程」。</p>'
+        model: '<b>作战计划（按动作顺序，每一步都说明依据）：</b><br><br>' +
+               '<b>第 0 步 · 先确认交付物（非技术动作，但最关键）。</b>“交出加密算法”至少有两种含义：' +
+               '① <b>完整算法公式</b>（要写文档、做协议兼容）；② <b>给定输入能算出输出</b>的能力（要做批量处理/过校验）。' +
+               '两者的技术成本差一个数量级：②往往只需要输入输出对拍 + 中间值观察，可能一天就够。' +
+               '<b>先问清，再动手</b>——这可能是整个计划里投入产出比最高的一个动作。<br><br>' +
+               '<b>第 1 步 · 归因，把样本分层。</b>关键字符串消失 ⇒ 有<b>字符串加密</b>；' +
+               '而<b>字符串加密不是 OLLVM 官方特性</b>（官方只有 <code>-sub</code> / <code>-bcf</code> / <code>-fla</code> 和函数注解），' +
+               '说明对方用的是<b>魔改 fork</b>。这个判断直接改变方案：' +
+               '结构变形（三大混淆）走“还原控制流”路线；数据加密走完全不同的“<b>找解密函数 + hook 拿明文</b>”路线。' +
+               '归因清楚，手段才不会用错。<br><br>' +
+               '<b>第 2 步 · 定位，缩小战场。</b>从 JNI 导出符号（<code>Java_...</code> / <code>JNI_OnLoad</code>）进，' +
+               '看交叉引用找调用密集的热点函数。<b>被混淆的函数往往就是核心函数</b>——' +
+               '而且混淆本身会泄露设计者的重视程度：只对关键函数开混淆是加固厂商的常态。<br><br>' +
+               '<b>第 3 步 · 先拿动态事实，作为“标准答案”。</b>跑一遍，记录<b>真实执行过的基本块序列</b>和' +
+               '<b>状态变量的取值序列</b>。这份数据的价值是双重的：立刻删掉从未执行的垃圾块（<code>-bcf</code> 大半失效），' +
+               '同时它成为后面<b>校准一切静态工具输出的标尺</b>。<br><br>' +
+               '<b>第 4 步 · 按“先易后难”处理，绝不先啃最贵的。</b>' +
+               '<code>-sub</code> 是纯局部改写、无上下文依赖，模式有限，<b>最容易自动化折叠</b>，先做它——做完函数体量下降，' +
+               '后面全部受益；再处理 <code>-bcf</code>，谓词折叠成常量后死分支可无风险删除；' +
+               '<b>最后</b>才碰 <code>-fla</code>，此时分发器的 case 已被前两步削减，重建难度大幅下降。' +
+               '每一步都在<b>降低下一步的难度</b>，这才是有复利的顺序。<br><br>' +
+               '<b>第 5 步 · 警惕工具骗你。</b>D-810 / HexRaysDeob 都是<b>通用方法</b>，' +
+               '在魔改样本上<b>完全可能还原出错误的图</b>——而错误比“没有结果”更危险：你会基于错误的控制流' +
+               '推出错误的算法，且很难自查。所以：<b>工具输出必须用第 3 步的 Trace 校准，不可盲信</b>。<br><br>' +
+               '<b>贯穿全程的关键判据：</b>厂商的混淆投资几乎全在<b>控制流</b>上，' +
+               '而动态手段打的是<b>数据流</b>——运行时的中间值他们藏不住。' +
+               '<b>攻击对方投入最少的那一面</b>，这是本题最重要的策略直觉。<br><br>' +
+               '<b>风险与备案：</b>① 若样本带强反调试，第 3 步要先解决检测，否则 Trace 到的是假路径；' +
+               '② 若对方在垃圾分支里塞了“看起来有意义的假计算”，仅靠“删未执行块”不够，还需结合数据流污点分析；' +
+               '③ <span class="pill warn">魔改版的还原工期难以预估，务必在第一天就和老板对齐范围与风险</span>。',
+        after: '<p><b>评分自检：</b>如果你上来就说“先上 D-810 反混淆”，那你跳过了“定标准”与“确认交付物”两步 —— ' +
+               '这是本章最想纠正的思维习惯。<b>工具是放大器，不是判断力。</b></p>'
       }
     ]
   }

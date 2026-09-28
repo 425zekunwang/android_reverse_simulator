@@ -1,1126 +1,2193 @@
+/* 第 11 章数据 —— Xposed / LSPosed 开发指南 */
 window.CHAPTER = {
   no: 11,
-  title: 'eBPF 环境搭建与热门源码赏析',
-  lede: '前面几章你一直在<strong>用户态</strong>里和对手贴身肉搏：Frida 注入、脱壳、反调试，招招都在对方的视野里。这一章把观测点整体往下压一层——<strong>eBPF</strong> 让一小段受限程序直接跑在 Linux 内核中，用内核的视角去看系统调用、文件访问和函数调用。本章先讲清 eBPF 的安全模型（内核凭什么敢执行你写的代码），再落到 Android 的真实限制（为什么大多数手机根本跑不起来），最后回答一个绕不开的问题：<strong>这对逆向到底有什么用</strong>。',
+  title: 'Xposed / LSPosed 开发指南',
+  lede: '前 18 章里没有 Xposed，它只在几个案例里作为"检测目标"被顺带提到。但它是与 Frida 并列的另一条主线，' +
+        '而且工作方式与 Frida <strong>有本质不同</strong>：Frida 是<strong>按需注入一个进程</strong>，' +
+        'Xposed / LSPosed 是<strong>常驻 Zygote、让每个 App 进程"出生即带模块"</strong>。' +
+        '这个差异决定了它们各自适合什么场景，也决定了各自会被谁发现。',
   meta: [
-    '核心问题：<b>一段用户写的代码，凭什么被允许跑在内核里？</b>',
-    '关键工具：<b>clang -target bpf + libbpf / CO-RE / BCC / bpftrace / bpftool</b>',
-    '对手：<b>被观测的 App（看不见你）＋ 厂商裁剪过的内核（它挡得住你）</b>'
+    '核心问题：<b>要在什么时机、在哪一层介入，才能既拿到数据又不惊动目标？</b>',
+    '关键机制：<b>Zygote 注入 / 入口声明 / XC_MethodHook / 类加载器 / 主动调用</b>',
+    '对手：<b>环境检测、方法入口自校验、Zygisk 痕迹检查</b>'
   ],
 
   sections: [
-    /* ================= 11.1 直觉 ================= */
+    /* ============================================================ 11.1 */
     {
-      h: '11.1',
-      title: '先建立直觉：内核里为什么要装一个虚拟机',
+      h: '11.1', title: '世界观差异：临时进现场，还是给整栋楼换门禁',
       intuition: {
-        tag: '直觉模型 · 传送带上的安检机器人',
+        tag: '直觉模型 · 现场取证 vs 门禁改造',
         body:
-          '<p>你是一家机场的安保负责人。传统做法是：<b>站在出口拦人翻包</b>——这相当于用户态 hook（Frida、PLT hook），你在行李已经离开传送带之后才动手，动作大、容易被看见。</p>' +
-          '<p>eBPF 的做法是：<b>把一台只会执行你写的检查清单的机器人，直接装到传送带内部</b>。这台机器人上岗前要过机场自己的严格审查（<b>验证器</b>），上岗后只能用机场指定的几件工具（<b>helper 函数</b>），只能把结果写进一本共享登记本（<b>BPF Map</b>），而且明令禁止三件事：<b>不许搬走行李、不许改动行李、不许赖着不走（不许死循环、不许睡眠阻塞）</b>。</p>' +
-          '<p>机器人被锁死在传送带里，旅客（App）根本看不见它——这就是 eBPF 对逆向最大的价值，也是它最大的风险来源。</p>'
+          '<p>Frida 像<strong>鉴识人员进现场</strong>：案子发生后，你带着工具箱进去，拍照、取样、装探头。你走了，探头也撤了——' +
+          '现场恢复原样，别的房间你根本没进去过。</p>' +
+          '<p>Xposed / LSPosed 像<strong>给整栋楼换一套门禁系统</strong>：你不动任何一个房间里的东西，' +
+          '改的是出入口本身。此后每一个进门的人（每一个 App 进程）从刷卡那一刻起，就被你的系统记了一笔。</p>' +
+          '<p>这两件事不是"哪个更强"，而是<strong>两种完全不同的工作形态</strong>：一种是一次性取证，一种是长期值守。' +
+          '选错了形态，你会发现自己的脚本永远差那么一点——要么够不着，要么太吵。</p>'
       },
       html:
-        '<p><b>BPF</b>（Berkeley Packet Filter）不是什么新概念——1992 年就提出了，它是 <code>tcpdump</code> 背后那套' + T.term('包过滤', '在网络栈中按规则筛掉不需要的报文，只把关心的包交给上层，避免无谓的数据拷贝') + '机制的底座，干的事很窄：从网络包里按规则挑出你要的那些。</p>' +
-        '<p>2014 年（Linux 3.18）内核把 BPF 整个重做了一遍，从「包过滤器」升级成了<strong>一个运行在内核中的' + T.term('通用虚拟机', '这里指 eBPF 不再是某个固定用途的过滤器，而是能执行通用字节码、挂到多种事件源上的执行引擎') + '</strong>，这就是 <b>eBPF</b>（extended BPF）。它今天被用来做' + T.term('可观测性', 'Observability：通过系统调用、函数调用、网络等外部信号推断系统内部正在发生什么，而不是靠加日志') + '（性能分析、系统调用追踪）、网络（负载均衡、DDoS 防护）和安全监控（运行时检测、LSM 策略）。</p>' +
-        T.tbl(['阶段', '是什么', '典型使用者'], [
-          ['BPF（1992）', '网络包过滤的字节码，只处理网络包', 'tcpdump、libpcap'],
-          ['eBPF（2014，Linux 3.18）', '内核中的通用虚拟机，可挂到几十种事件源上', '性能分析、网络安全、可观测性']
-        ]) +
-        T.note('key', '🔑 本章主线', '<p>记住三件事就够了：<b>①</b> eBPF 程序是<b>内核态</b>运行的；<b>②</b> 它能运行的前提是内核的<b>验证器</b>静态证明它安全；<b>③</b> 它和用户态通信用的是 <b>BPF Map</b>。全章的动画、代码和题目都围绕这三点转。</p>') +
-        T.note('warn', '⚠️ 时效性警告（务必先读）',
-          '<p>本章内容以 <b>2023 年前后</b>的 Linux / Android 生态为背景撰写。eBPF 本身和它在 Android 上的支持情况演进非常快——<b>内核版本、厂商配置、SELinux 策略在不同设备上差异极大</b>。</p>' +
-          '<p>所以本章中任何涉及「当前支持情况」「最新内核版本」「某配置项默认是否开启」的表述，<b>都请当成线索而不是结论</b>，一律以你自己设备上的实测结果为准。文中不确定的点会用 ' + T.pill('warn', '待核实') + ' 标出。</p>') +
-        T.note('', '📌 一句话记住 eBPF 和 Frida 的分工',
-          '<p>' + T.term('Frida', '用户态动态插桩框架，需要注入目标进程，改变其内存与指令') + ' 是「<b>进到敌人家里装摄像头</b>」——看得细，但你要先破门而入，家里的人一定知道有人来过。eBPF 是「<b>在小区门口的电线杆上装摄像头</b>」——看不清家里沙发的花纹，但能看清谁几点进出、拎了什么包，而且住户完全不知道摄像头存在。</p>' +
-          '<p>两者的观测粒度和隐蔽性是一组<b>此消彼长</b>的权衡，不是谁替代谁。第 13 章讲的内核态对抗里，eBPF 是标准观测手段。</p>')
-    },
-
-    /* ================= 11.2 生命周期 stage ================= */
-    {
-      h: '11.2',
-      title: '一个 eBPF 程序的完整生命周期（本章最重要的动画）',
-      html:
-        '<p>下面这台动画把 eBPF 从「一段 C 源码」到「用户态看见结果」的全过程拆成 14 步。' +
-        '请特别留意两个地方：<b>第 ④ 步（' + T.term('验证器', '内核在加载 eBPF 程序时做静态分析，证明它不会崩溃内核、不会无限循环、内存访问不越界') + '）为什么能保证安全</b>，以及<b>第 ⑧⑨ 步（数据怎么从内核回到用户态）</b>。' +
-        '把这两处想通，eBPF 的整个设计哲学就通了。</p>',
+        '<p>先给出五个维度的硬差异。这五点决定了后面所有章节的技术选择，也是本章的立论基础。</p>' +
+        T.tbl(
+          ['维度', 'Frida', 'Xposed / LSPosed'],
+          [
+            ['<b>进程模型</b>',
+             '一个 server 或 gadget 注入到<b>你指定的那个进程</b>；其它进程完全不受影响',
+             '代码注入到 ' + T.term('Zygote', 'Android 所有 App 进程的母体进程。它预加载框架类与资源，之后每个 App 进程都由它 fork 出来。') +
+             '，此后从它 fork 出来的<b>每个进程都带着模块</b>'],
+            ['<b>注入时机</b>',
+             '<b>你决定</b>：spawn 抢跑（进程第一条指令之前）或 attach 事后补挂',
+             '<b>系统决定</b>：进程 fork 出来即生效，早到 App 第一行 Java 代码之前。你无法"事后"选择，只能通过作用域决定<b>给谁装</b>'],
+            ['<b>作用域</b>',
+             '进程级、会话级：这次连上谁，改的就是谁',
+             '应用级、可配置：LSPosed 里逐个勾选生效的 App（11.2 会讲它为什么是安全边界）'],
+            ['<b>可持久性</b>',
+             '会话级：脚本 detach、或 App 重启，改动全部消失',
+             '常驻：装一次，重启后依然生效，直到你关掉模块并重启设备'],
+            ['<b>可检测性</b>',
+             '特征集中在<b>进程</b>：注入线程、agent 映射、端口、被改写的函数头（第 24、10 章）',
+             '特征集中在<b>环境</b>：Zygote 阶段的注入痕迹、模块 so 的映射、方法入口被替换、ClassLoader 链异常（11.11）']
+          ]
+        ) +
+        T.note('key', '🔑 一句话把两者的检测面分开',
+          '<p style="margin-bottom:0"><b>Frida 的检测面在"进程"，LSPosed 的检测面在"环境"。</b><br>' +
+          '进程检测问的是"你现在有没有被接上"；环境检测问的是"<b>这台机器的系统还是不是原装的</b>"。<br>' +
+          '后者更麻烦：它不需要你正在被 hook，只需要证明这台机器被改过。这就是为什么 11.11 会专门讲检测，' +
+          '也是为什么本章最后要承认一条边界——<b>装过模块的机器与原装机之间的差异，不可能被完全抹平。</b></p>') +
+        '<p>下面这个动画把两种进程模型摆在一起。请特别关注第 5 步：<b>你没有 attach 任何进程，但三个 App 都变了</b>。</p>',
       stage: {
-        title: 'eBPF 程序生命周期：从 C 源码到内核机器码，再回到用户态',
-        speed: 2600,
+        title: '进程模型对照：谁被注入、什么时候被注入',
+        speed: 1600,
         render:
-          '<div class="flow-row" style="align-items:flex-start;gap:16px;flex-wrap:wrap">' +
-            '<div class="flow-col" style="flex:1 1 300px">' +
-              '<div class="blk" id="e1">① 写 eBPF 程序（C 的受限子集）</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e2">② clang -target bpf 编译 → eBPF 字节码 .o</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e3">③ 用户态 bpf(BPF_PROG_LOAD) 提交字节码</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e4">④ 内核验证器 verifier 逐项静态检查</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e5">⑤ JIT 编译成本机机器码</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e6">⑥ attach 到钩子点（kprobe / tracepoint…）</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e7">⑦ 事件触发，内核执行你的程序</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e8">⑧ 用 helper 写 BPF Map / ringbuf</div>' +
-              '<div class="arrow">▼</div>' +
-              '<div class="blk" id="e9">⑨ 用户态读 Map，拿到结果</div>' +
-            '</div>' +
-            '<div class="flow-col" style="flex:1 1 340px">' +
-              '<div class="card" style="margin-top:10px"><div class="card-title">事件记录（ringbuf 里的内容）</div>' +
-              '<div class="term-box" id="ebuf" style="min-height:100px">[ 空 ]</div></div>' +
-              '<div class="term-box" id="elog" style="margin-top:10px">$ 等待开始…</div>' +
-              '<div class="card" style="margin-top:10px"><div class="card-title">这一步为什么重要</div>' +
-              '<div id="ewhy"><p class="muted">点「下一步 ▶」或「自动播放」开始。</p></div></div>' +
-            '</div>' +
+          '<div class="flow-col" style="gap:9px">' +
+            '<div class="flow-row"><span class="pill mono">Frida 路线</span>' +
+              '<span class="blk" id="fa">App A 进程</span>' +
+              '<span class="blk" id="fb">App B 进程</span>' +
+              '<span class="blk" id="fc">App C 进程</span></div>' +
+            '<div class="flow-row"><span class="pill mono">Xposed / LSPosed 路线</span>' +
+              '<span class="blk" id="xz">zygote（母体）</span>' +
+              '<span class="arrow">→</span>' +
+              '<span class="blk" id="xa">App A</span>' +
+              '<span class="blk" id="xb">App B</span>' +
+              '<span class="blk" id="xc">App C</span></div>' +
+            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
+              '<span class="pill bad" id="note1">准备阶段：两边都还没介入</span></div>' +
           '</div>',
         reset: () => {
-          for (let i = 1; i <= 9; i++) S('e' + i, '');
-          SET('elog', '$ 等待开始…');
-          SET('ebuf', '[ 空 ]');
-          SET('ewhy', '<p class="muted">点「下一步 ▶」或「自动播放」开始。</p>');
+          ['fa','fb','fc','xz','xa','xb','xc'].forEach(i => S(i, ''));
+          CLS('note1', 'pill bad');
+          SET('note1', '准备阶段：两边都还没介入');
         },
         steps: [
-          {
-            run: () => { S('e1', 'active'); SET('elog', '$ vim minimal.bpf.c'); SET('ewhy', '<p><b>① 写程序。</b>eBPF 程序用什么语言写？答案是 <b>C 的一个受限子集</b>（也可以用 Rust，通过 Aya 之类的框架）。</p><p>「受限」体现在：不能调用任意内核函数（只能调内核白名单里的 <b>helper</b>）、不能动态分配内存、不能无限循环、不能睡眠。你写的是一个<b>看见事件就处理、处理完就退出</b>的小函数。</p>'); },
-          },
-          {
-            run: () => { S('e1', 'done'); S('e2', 'active'); SET('elog', '$ clang -O2 -g -target bpf -c minimal.bpf.c -o minimal.bpf.o\\n$ file minimal.bpf.o\\nminimal.bpf.o: ELF 64-bit LSB relocatable, eBPF'); SET('ewhy', '<p><b>② 编译。</b>关键参数是 <code>-target bpf</code>：让 clang 生成的是 <b>eBPF 字节码</b>，而不是你宿主机的 x86/ARM 机器码。</p><p>产物是一个普通的 <b>ELF 文件</b>（<code>.o</code>），里面装着字节码、Map 定义、以及<b>重定位信息</b>。注意：此时它还是「平台无关」的中间产物，没跟任何具体内核绑定。</p>'); },
-          },
-          {
-            run: () => { S('e2', 'done'); S('e3', 'active'); SET('elog', '用户态：bpf(BPF_PROG_LOAD, &attr, sizeof(attr))\\n  prog_type  = BPF_PROG_TYPE_KPROBE\\n  insns      = <字节码数组>\\n  license    = "GPL"\\n→ 返回 fd = 7'); SET('ewhy', '<p><b>③ 提交内核。</b>字节码不会自己跑进内核。必须由用户态程序通过 <code>bpf()</code> 系统调用、以 <code>BPF_PROG_LOAD</code> 命令把字节码连同元信息一起交给内核。</p><p>两个容易被忽略的点：<b>①</b> 加载<b>需要权限</b>（内核里检查 <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code> 一类的能力），普通进程根本没资格；<b>②</b> 要提供 <b>license</b>，声明为 <code>GPL</code> 才允许调用某些 GPL-only 的 helper——许可证不匹配时加载会直接失败。</p>'); },
-          },
-          {
-            run: () => { S('e3', 'done'); S('e4', 'active'); SET('elog', '内核对字节码做静态分析（不是运行它）…\\n  · 控制流可达性\\n  · 循环是否有界\\n  · 每条内存访问的边界\\n  · 寄存器/指针类型\\n  · helper 调用是否合法'); SET('ewhy', '<p><b>④ 验证器（verifier）。这是 eBPF 安全性的基石，没有之一。</b></p><p>内核面对的是一个哲学问题：<b>凭什么允许一段用户写的代码在内核态执行？</b>答案不是「信任作者」，而是「<b>用程序证明程序安全</b>」。验证器会模拟执行字节码的<b>所有可能路径</b>，逐条指令检查——它不是沙箱里跑一遍看会不会崩，而是<b>静态地证明</b>这段代码不可能把内核搞坏。</p><p>接下来的三步是验证器最重要的三项检查。</p>'); },
-          },
-          {
-            run: () => { S('e4', 'hot'); SET('elog', '  [检查 1] 循环\\n   旧内核：完全禁止循环，直接拒绝\\n   新内核：允许，但必须能证明循环「有界」\\n  → 无法证明上界的循环：REJECTED'); SET('ewhy', '<p><b>④a 检查循环。</b>最早的 eBPF <b>完全禁止循环</b>，因为循环意味着「可能永不结束」，而内核态死循环等于<b>整机卡死</b>。</p><p>后来的内核放宽了这一限制：允许循环，但验证器必须能<b>证明它有界</b>（例如循环次数是常量、或由 Map 里的值限定在某个范围内的有界循环）。证明不了的，直接拒收。</p><p>这就是为什么 eBPF 程序里写 <code>while</code> 要格外小心——它可能是你被拒的最常见原因。</p>'); },
-          },
-          {
-            run: () => { S('e4', 'hot'); SET('elog', '  [检查 2] 内存访问\\n   寄存器 R1 = ctx 指针，偏移 0 → 允许\\n   寄存器 R2 = 用户态指针 → 禁止直接解引用\\n  → 必须改用 bpf_probe_read_user*() 一类的 helper'); SET('ewhy', '<p><b>④b 检查内存访问。</b>这是最容易踩坑、也最能体现 eBPF 设计意图的一项。</p><p>内核指针（<code>ctx</code>、Map value、数据包）的每一次读写，偏移量都必须被验证器证明<b>落在合法范围内</b>。越界一次就是内核崩溃或者信息泄露。</p><p>而<b>用户态指针在内核里绝对不能直接解引用</b>——因为用户态可以随时把这块内存 unmap 掉，直接读会触发内核 oops。必须用 <code>bpf_probe_read_user()</code> 这类 helper，由内核替你做「安全拷贝」并在失败时返回错误码。你在写 eBPF 时的别扭感，多半来自这条规则。</p>'); },
-          },
-          {
-            run: () => { S('e4', 'hot'); SET('elog', '  [检查 3] 指针类型\\n   R1 = PTR_TO_CTX    → 不能当 PTR_TO_MAP_VALUE 用\\n   R1 += 100          → 类型退化为标量，需重新验证边界\\n  → 类型不匹配：REJECTED'); SET('ewhy', '<p><b>④c 检查指针类型。</b>验证器内部维护一套<b>寄存器类型系统</b>：这个寄存器是 ctx 指针、这个指向 Map 的 value、那个是数据包指针、那个只是个标量数字。</p><p>类型是一道<b>硬墙</b>：ctx 指针不能当 Map value 用，数据包指针不能当栈指针用。更微妙的是，<b>指针一旦做算术运算（加偏移），类型就会退化</b>，之后想再用它读写，必须重新做边界检查。</p><p>此外验证器还会检查 helper 的<b>调用白名单和参数类型</b>——不是所有 helper 对所有程序类型都开放。</p>'); },
-          },
-          {
-            run: () => { S('e4', 'hot'); SET('elog', '  [补充] 验证通过 → 内核返回 prog fd\\n  [失败]   EACCES / EPERM + verifier log\\n\\n  $ cat /sys/kernel/debug/tracing/... 可查看日志'); SET('ewhy', '<p><b>验证失败是常态，不是异常。</b>真写起来你会发现，第一次加载 eBPF 程序几乎一定会被拒。好消息是验证器会输出一份<b>逐指令的日志</b>（通常通过 <code>libbpf_set_print()</code> 或环境变量打开），告诉你第几条指令、哪个寄存器、哪条规则没过。</p><p><b>排查口诀：先看循环有没有上界，再看有没有直接解引用用户态指针，最后看指针类型有没有用混。</b></p>'); },
-          },
-          {
-            run: () => { S('e4', 'done'); S('e5', 'active'); SET('elog', 'JIT：字节码 → 本机机器码（x86-64 / arm64）\\n  bpf_jit_enable = 1\\n加载后即成为内核里一段真实可执行的函数'); SET('ewhy', '<p><b>⑤ JIT 编译。</b>验证通过后，内核把它<b>即时编译成本机机器码</b>（Just-In-Time）。这一步是性能的关键：eBPF 不是解释执行的，跑起来和手写的内核代码是同一个量级。</p><p>如果设备内核没开 JIT（<code>CONFIG_BPF_JIT</code>），程序只能解释执行，性能差一大截——这也是厂商裁剪内核时的一个常见受害项。</p>'); },
-          },
-          {
-            run: () => { S('e5', 'done'); S('e6', 'active'); SET('elog', 'attach：把程序挂到事件源上\\n  kprobe/do_sys_open      → 内核函数被调用时\\n  tracepoint/syscalls/... → 系统调用进入/退出时\\n  uprobe:/lib/libc.so:fn  → 用户态函数被调用时'); SET('ewhy', '<p><b>⑥ 挂载（attach）。</b>程序本身不知道自己要干什么，必须先<b>绑定到一个钩子点</b>。这是 eBPF 灵活性的来源——同一段逻辑换个 attach 点，就从「追踪文件打开」变成「追踪网络连接」。</p>' + T.tbl(['钩子类型', '挂在哪里', '对逆向的价值'], [
-            ['kprobe / kretprobe', '内核函数入口 / 返回', '看内核替 App 做了什么（文件、网络、权限检查）'],
-            ['uprobe / uretprobe', '用户态函数入口 / 返回', '<b>最高</b>：直接盯 so 里的加密、解密、校验函数'],
-            ['tracepoint', '内核预定义的静态追踪点', '稳定，不依赖内核函数名；<b>推荐优先用</b>'],
-            ['XDP', '网络驱动层最早的处理点', '高性能包处理、DDoS 防护'],
-            ['tc', '流量控制层', '网络过滤、限速'],
-            ['perf_event / socket filter / LSM', '性能事件 / socket / 安全策略', '采样分析、包过滤、安全策略钩子']
-          ]) + '</p>'); },
-          },
-          {
-            run: () => { S('e6', 'done'); S('e7', 'active'); SET('e7', 'hot'); SET('elog', '[事件发生] 某个进程调用 openat()\\n→ 进入内核 do_sys_open\\n→ 内核发现这里挂着 BPF 程序\\n→ 调用 JIT 后的机器码（微秒级）'); SET('ewhy', '<p><b>⑦ 触发执行。</b>现在你的代码是内核执行路径的一部分了：只要有进程碰这个事件，内核就会调用你。</p><p><b>关键点：触发是「被动」的。</b>eBPF 没有轮询、没有定时器，它只在<b>事件发生的那一刻</b>被内核叫起来。程序本身极短——读几个字段、写进 Map、返回。这也是它能做到微秒级开销的原因。</p>'); },
-          },
-          {
-            run: () => { S('e7', 'done'); S('e8', 'active'); SET('ebuf', '{\\n  pid  : 4821,\\n  comm : "browser",\\n  fname: "/proc/self/maps"\\n}'); SET('elog', 'e->pid  = bpf_get_current_pid_tgid() >> 32;\\nbpf_get_current_comm(&e->comm, sizeof(e->comm));\\nbpf_probe_read_user_str(&e->fname, ...);\\nbpf_ringbuf_submit(e, 0);   // → 推给用户态'); SET('ewhy', '<p><b>⑧ 回传结果。</b>程序在内核态，怎么把数据交出来？答案只有一条路：<b>BPF Map</b>——内核态和用户态共享的键值存储，是两者通信的<b>主要</b>通道。</p><p>内核态这边用 helper 操作：<code>bpf_map_lookup_elem()</code>、<code>bpf_map_update_elem()</code>、<code>bpf_map_delete_elem()</code>。</p><p>流式数据（比如源源不断的事件）现在推荐用 <b>ringbuf</b>（<code>BPF_MAP_TYPE_RINGBUF</code>），它取代了老式的 <code>perf_event_array</code>：<b>单生产者单消费者、无锁、高效</b>，也不会像 perf buffer 那样给每个 CPU 开一份缓冲。</p>'); },
-          },
-          {
-            run: () => { S('e8', 'done'); S('e9', 'active'); SET('ebuf', '[ 已被用户态读走，槽位释放 ]'); SET('elog', '$ sudo ./minimal\\npid=4821  comm=browser  file=/data/local/tmp/x.bin\\npid=4821  comm=browser  file=/proc/self/maps'); SET('ewhy', '<p><b>⑨ 用户态收割。</b>用户态通过 <code>bpf()</code> 系统调用（或者直接用 <b>libbpf</b> 封装好的 API）读 Map，拿到内核递出来的结构体，打印、写日志、发给分析平台。</p><p>到这里整个闭环完成：<b>源码 → 字节码 → 验证 → JIT → 挂载 → 触发 → 写 Map → 用户态读取</b>。这九步就是 eBPF 的全部骨架，后面所有复杂项目（Cilium、Falco、各种 tracing 工具）都是它加了不同的钩子和 Map 类型。</p>'); },
-          },
-          {
-            run: () => { S('e9', 'done'); SET('elog', '✓ 闭环完成。\\n整个过程中，目标进程:\\n  · 没有被注入\\n  · 没有新增模块\\n  · 没有新增线程\\n  · 没有新增监听端口'); SET('ewhy', '<p><b>回头看一个关键事实：</b>在这整条链路里，<b>被观测的那个进程从头到尾不知道发生了什么</b>。它的内存没被改、模块列表没变、线程表没变、端口没开。</p><p>这就是下一节要展开的核心价值。但先泼一盆冷水：<b>上面这套流程在 PC 的 Linux 上很顺，在 Android 手机上会撞上四堵墙</b>——11.6 节细说。</p>'); }
-          }
+          { run: () => S('fa', 'active'),
+            note: '<b>① Frida attach 到 App A。</b>只有 A 的进程里多出了 agent 与注入线程；B、C 一模一样，' +
+                  '连一个字节都没变。<br><span class="hit">Frida 的作用域单位就是"进程"</span>——这一点后面会反复引用。' },
+          { run: () => { S('fa', 'done'); S('fb', 'active'); },
+            note: '<b>② 换目标就再 attach 一次。</b>粒度细是优点也是负担：每换一个目标都要重来。<br>' +
+                  '但它换来一个极重要的性质——<b>暴露面只有你碰过的那一个进程</b>。' },
+          { run: () => { S('fb', 'done'); CLS('note1', 'pill warn'); SET('note1', 'Frida：改动只存在于被 attach 过的进程里'); },
+            note: '<b>③ 关键性质：可持久性 = 会话级。</b>脚本 detach，或者 App 自己重启，一切复原。<br>' +
+                  '所以"我昨天 hook 过它"这句话在 Frida 里没有意义——<b>每次都要重新建立现场</b>。' },
+          { run: () => { S('xz', 'cool'); CLS('note1', 'pill acc'); SET('note1', 'Xposed / LSPosed：模块装进 zygote'); },
+            note: '<b>④ LSPosed 把模块装进 zygote。</b>它自己就是一个跑在 Zygisk 或 Riru 之上的模块（11.2 讲）。<br>' +
+                  '注意这一步发生在<b>任何 App 启动之前</b>——时机上它比你早得多。' },
+          { run: () => { S('xa', 'done'); S('xb', 'done'); S('xc', 'done'); },
+            note: '<b>⑤ zygote fork 出 App 进程时，模块代码已经在里面了。</b>' +
+                  '你没有 attach 任何进程，但 A、B、C 三个都带着它。<br>' +
+                  '<span class="hit">这就是 11.1 全部差异的源头：一个注入母体，一个注入个体。</span>' },
+          { run: () => { CLS('note1', 'pill ok'); SET('note1', '✅ 一个注入 zygote，一个按需 attach —— 差异从这一行开始'); },
+            note: '<b>⑥ 反过来，改动也变成"持久"和"全局"的。</b>关掉模块要重启；而且所有 fork 出来的进程都被覆盖。<br>' +
+                  '这既是力量（装一次，处处生效，迭代成本极低），也是最大风险（<b>暴露面从 1 个进程变成一整台机器</b>）。' }
         ]
       },
-      after:
-        T.note('ok', '✅ 把九步压成一句话',
-          '<p><b>用 C 写、clang 编译成字节码、bpf() 系统调用送进内核、验证器证明它安全、JIT 编译、挂到钩子上、事件触发时执行、结果写进 Map、用户态读取。</b></p>' +
-          '<p>面试或讨论里，只要你能把这九步顺着说下来，并说清「验证器保证了什么」，就已经超过大多数只会背名词的人。</p>')
+      after: T.note('ok', '✅ 这一节的收获',
+        '<p style="margin-bottom:0">如果你只记住一句话：<b>Frida 管一个进程，LSPosed 管一套环境。</b><br>' +
+        '接下来所有"该用哪个"的问题，都可以用这一句话推下去——包括 11.11 那个真实工程权衡。</p>')
     },
 
-    /* ================= 11.3 BPF Maps 数据流 ================= */
+    /* ============================================================ 11.2 */
     {
-      h: '11.3',
-      title: 'BPF Maps：数据怎么从内核态回到用户态',
+      h: '11.2', title: '三条演进路线与安装：Xposed → EdXposed → LSPosed',
       html:
-        '<p>上一节的第 ⑧⑨ 步值得单独拉出来做一台动画。原因很简单：<b>eBPF 程序什么都干不了，它只能把结果塞进 Map</b>。' +
-        '你写 eBPF 时 90% 的挫败感都来自这一层——数据明明采到了，用户态就是读不出来。</p>' +
-        '<p>先记住一个反直觉的事实：<b>Map 不是「内核发给用户态的消息」</b>，它是<b>一块双方都能按 fd 访问的共享存储</b>。' +
-        '内核侧和用户态侧谁也不「发送」什么，只是各自往同一个 fd 上读写而已。理解这一点，后面所有的 API 都顺了。</p>',
+        '<p>这条线路上有三代实现，关系是<b>继承</b>而不是"竞争"：</p>' +
+        T.tbl(['实现', '它的位置', '挂载方式', '维护状态'],
+          [
+            ['<b>原始 Xposed</b>（rovo89）',
+             '共同祖先。替换 <code>app_process</code> 并把 <code>XposedBridge.jar</code> 塞进 Zygote，' +
+             '定义了 <code>IXposedHookLoadPackage</code> 这一整套 API；LSPosed 的 README 在 Credits 里把它写成 ' +
+             '<code>XposedBridge: the OG Xposed framework APIs</code>',
+             '改系统文件 / 刷入',
+             '官方版本停在 Android 8.1 时代 <span class="pill warn">待核实</span>（具体最后一个版本号以官方仓库为准）'],
+            ['<b>EdXposed</b>',
+             '基于 Riru 的接棒者；LSPosed 的 README 明确写着它是 LSPosed 的 <code>fork source</code>',
+             'Riru',
+             '<span class="pill warn">待核实</span>（是否已归档、最后支持到哪个版本，请以官方仓库状态为准）'],
+            ['<b>LSPosed</b>',
+             '当前事实上的主线。官方自述：<i>A Riru / Zygisk module trying to provide an ART hooking framework ' +
+             'which delivers consistent APIs with the OG Xposed, leveraging LSPlant hooking framework.</i>',
+             'Zygisk 或 Riru 两种 flavor',
+             '官方 README 写的支持范围是 <b>Android 8.1 ~ 14</b>；' +
+             '<span class="pill warn">待核实</span>（以 release 页当前说明为准）']
+          ]) +
+        T.card('两个名字必须记住：LSPlant 与 Dobby',
+          '<p>LSPosed 的 README Credits 里写得很直白：<b>LSPlant</b> 是它的核心 ART hook 框架；' +
+          '<b>Dobby</b> 用来做 inline hooking。<br>' +
+          '记住这两个名字有两个用处：<br>' +
+          '① 当你看到"LSPosed 到底怎么改的方法"时，答案在 LSPlant 里，不在 Java 层；<br>' +
+          '② 当你要在模块里做 native hook 时，Dobby 这类 inline hook 库就是同一个技术家族的成员（11.9 会用到）。</p>') +
+        '<h3 style="margin-top:26px">安装：先有 Magisk，再选一条路</h3>' +
+        '<p>LSPosed 官方安装文档（wiki <code>How to use it</code>）给出的步骤是：</p>' +
+        T.step('①', 'Magisk 24.0+',
+          '这是硬前提。LSPosed 是一个 <b>Magisk 模块</b>——它自己没有注入能力，靠 Magisk 提供。') +
+        T.step('②', '选 flavor：Zygisk 或 Riru',
+          '想走 Zygisk：在 Magisk App 里开启 Zygisk。<br>想走 Riru：先装 <b>Riru 26.1.7+</b>（官方文档给的版本号）。<br>' +
+          '<span class="pill warn">待核实</span>：Riru 与 Zygisk 两条路线在各版本上的取舍与弃用时间点，官方仓库与 Magisk 发布说明是唯一权威。') +
+        T.step('③', '装 LSPosed，重启，从通知进管理界面',
+          '重启后 LSPosed 会发一条状态通知，点它进管理界面确认激活状态。') +
+        T.step('④', '装模块，然后<b>逐个勾选作用域</b>',
+          '模块按普通 App 安装。装完之后必须回到 LSPosed 的模块页，打开开关，' +
+          '<b>再挑出这个模块要对哪些 App 生效</b>——这一步就是 scope。') +
+        T.note('key', '🔑 作用域不是"方便选项"，它是安全边界',
+          '<p>LSPosed 官方文档里有一句话值得逐字读：有些过时模块需要注入到每一个 App，' +
+          '而这件事 <i>so dangerous that LSPosed does not support Select All</i>——' +
+          '<b>LSPosed 不提供"全选"，要求用户逐个勾选</b>（文档说这与 Magisk Hide 是同样的策略）。</p>' +
+          '<p style="margin-bottom:0">把它读成设计意图：<b>作用域越宽，你的暴露面越大，出问题的爆炸半径也越大。</b>' +
+          '一个模块崩在它自己的进程里是小事，崩在每一个 App 进程里就是整台机器的事故。' +
+          '所以作用域的正确用法是"最小必要"，而不是"全都勾上省事"。</p>') +
+        '<p>下面这张动画把"从装模块到它真的跑起来"的链路走一遍。最后一步（作用域过滤）是最容易被忽略、' +
+        '也是最常见的"模块没生效"原因。</p>',
       stage: {
-        title: 'BPF Map 的内核态 ↔ 用户态数据通路',
-        speed: 2000,
+        title: '从 Magisk 到模块生效：注入链路',
+        speed: 1500,
         render:
-          '<div class="flow-row" style="align-items:flex-start;gap:14px;flex-wrap:wrap">' +
-            '<div class="flow-col" style="flex:1 1 280px">' +
-              '<div class="card"><div class="card-title">内核态 Kernel</div>' +
-                '<div class="blk" id="k1">eBPF 程序（kprobe 命中）</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="k2">helper 调用</div>' +
-                '<div class="pill" id="k3">bpf_get_current_pid_tgid()</div><br>' +
-                '<div class="pill" id="k4">bpf_get_current_comm()</div><br>' +
-                '<div class="pill" id="k5">bpf_probe_read_user_str()</div><br>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="k6">bpf_ringbuf_reserve() 取记录槽</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="k7">bpf_ringbuf_submit() 提交</div>' +
-              '</div>' +
-            '</div>' +
-            '<div class="flow-col" style="flex:0 0 200px">' +
-              '<div class="blk" id="m1">BPF Map</div>' +
-              '<div class="pill" id="m2">RINGBUF</div>' +
-              '<div class="term-box" id="mbuf" style="min-height:120px">[ 空 ]</div>' +
-            '</div>' +
-            '<div class="flow-col" style="flex:1 1 280px">' +
-              '<div class="card"><div class="card-title">用户态 Userspace</div>' +
-                '<div class="blk" id="u1">libbpf 加载程序</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="u2">bpf_map__fd() 拿到 Map fd</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="u3">ring_buffer__new() 注册回调</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="u4">ring_buffer__poll() 轮询</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="blk" id="u5">回调里拿到 struct event</div>' +
-                '<div class="arrow">▼</div>' +
-                '<div class="pill ok" id="u6">printf 输出</div>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="term-box" id="mlog" style="margin-top:12px">$ 等待开始…</div>',
+          '<div class="flow-col" style="gap:8px">' +
+            '<div class="flow-row"><span class="blk" id="m1">Magisk 24+（提供 root 与模块机制）</span></div>' +
+            '<div class="flow-row"><span class="arrow">↓ 二选一</span></div>' +
+            '<div class="flow-row"><span class="blk" id="z1">Zygisk</span>' +
+              '<span class="pill">或</span><span class="blk" id="r1">Riru 26.1.7+</span></div>' +
+            '<div class="flow-row"><span class="arrow">↓ 在 Zygote 里注入</span></div>' +
+            '<div class="flow-row"><span class="blk" id="lg">LSPosed 核心（LSPlant + Dobby）</span></div>' +
+            '<div class="flow-row"><span class="arrow">↓ App 进程 fork 出来</span></div>' +
+            '<div class="flow-row"><span class="blk" id="sc">作用域过滤：这个 App 在 scope 里吗？</span></div>' +
+            '<div class="flow-row"><span class="arrow">↓ 在 scope 里</span></div>' +
+            '<div class="flow-row"><span class="blk" id="ap">App 进程</span>' +
+              '<span class="arrow">→</span><span class="blk" id="hn">handleLoadPackage 被调用</span></div>' +
+            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
+              '<span class="pill bad" id="tip2">点"单步"开始</span></div>' +
+          '</div>',
         reset: () => {
-          ['k1','k2','k6','k7','m1','u1','u2','u3','u4','u5'].forEach(i => S(i, ''));
-          ['k3','k4','k5'].forEach(i => CLS(i, 'pill'));
-          CLS('m2', 'pill');
-          CLS('u6', 'pill ok');
-          SET('mbuf', '[ 空 ]');
-          SET('mlog', '$ 等待开始…');
+          ['m1','z1','r1','lg','sc','ap','hn'].forEach(i => S(i, ''));
+          CLS('tip2', 'pill bad');
+          SET('tip2', '点"单步"开始');
         },
         steps: [
-          { run: () => { S('k1', 'active'); SET('mlog', '$ sudo ./trace_open\\n[内核] kprobe/tracepoint 触发 → 进入 eBPF 程序'); }, },
-          { run: () => { S('k1', 'done'); S('k2', 'active'); SET('mlog', 'e->pid = bpf_get_current_pid_tgid() >> 32;'); }, },
-          { run: () => { S('k3', 'cool'); SET('mlog', 'e->pid = bpf_get_current_pid_tgid() >> 32;\\n  → 高 32 位是 PID，低 32 位是 TID（一个 64 位数拆两半）'); }, },
-          { run: () => { S('k4', 'cool'); SET('mlog', 'bpf_get_current_comm(&e->comm, sizeof(e->comm));\\n  → 进程名，最多 16 字节，含结尾的 \\\\0'); }, },
-          { run: () => { S('k5', 'cool'); SET('mlog', 'bpf_probe_read_user_str(&e->fname, sizeof(e->fname), filename);\\n  → 内核里不能直接解引用用户态指针，必须让 helper 代读'); }, },
-          { run: () => { S('k2', 'done'); S('k6', 'active'); SET('mbuf', '[ 已预留一条记录槽 ]'); SET('mlog', 'e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);\\nif (!e) return 0;   // 预留失败直接返回，不能阻塞'); }, },
-          { run: () => { S('k6', 'done'); S('k7', 'active'); SET('m1', 'active'); CLS('m2', 'pill acc'); SET('mbuf', '{\\n  pid : 4821,\\n  comm: "browser",\\n  fname:"/proc/self/maps"\\n}'); SET('mlog', 'bpf_ringbuf_submit(e, 0);\\n  → 记录被推到 ringbuf 消费者侧'); }, },
-          { run: () => { S('k1', 'done'); S('k7', 'done'); S('m1', 'done'); S('u1', 'active'); SET('mlog', '$ sudo ./trace_open\\n[用户态] libbpf 已完成程序加载与 attach'); }, },
-          { run: () => { S('u1', 'done'); S('u2', 'active'); SET('mlog', 'int map_fd = bpf_map__fd(skel->maps.events);\\n  → 这就是那块共享存储的句柄'); }, },
-          { run: () => { S('u2', 'done'); S('u3', 'active'); SET('mlog', 'rb = ring_buffer__new(map_fd, handle_event, NULL, NULL);\\n  → 注册回调：内核每提交一条，就调一次 handle_event()'); }, },
-          { run: () => { S('u3', 'done'); S('u4', 'active'); SET('m1', 'hot'); SET('mlog', 'while (1) ring_buffer__poll(rb, 100 /* ms */);\\n  → 用户态主动轮询（本质是对 Map fd 做 epoll）'); }, },
-          { run: () => { S('u4', 'done'); S('u5', 'active'); SET('mbuf', '[ 已消费，缓冲清空 ]'); SET('mlog', '[回调 handle_event]\\n  ctx->pid = 4821, ctx->comm = "browser"'); }, },
-          { run: () => { S('u5', 'done'); S('u6', 'active'); SET('m1', ''); CLS('m2', 'pill'); SET('mlog', 'printf("pid=%d comm=%s file=%s\\\\n", ...);\\npid=4821 comm=browser file=/proc/self/maps'); }, },
-          { run: () => { S('u6', 'cool'); SET('mlog', '✓ 闭环。\\n注意：全程没有任何数据「被发送」——内核写、用户态读，\\n共享的是同一个 fd。'); }, }
+          { run: () => S('m1', 'active'),
+            note: '<b>Magisk 是地基。</b>它改的是 boot 镜像的 ramdisk，在 <code>init</code> 极早期拿到控制权，' +
+                  '再用 magic mount 做 systemless 修改（第 32 章详细讲过）。<br>' +
+                  '关键结论：<b>LSPosed 自己的能力是从这里借来的</b>——它不是自己会注入，而是站在 Magisk 的肩膀上。' },
+          { run: () => { S('m1', 'done'); S('z1', 'active'); },
+            note: '<b>Zygisk：Magisk 自带的 Zygote 注入机制。</b>官方 README 要求 Magisk v24+，正是 Zygisk 出现在这个版本之后。' },
+          { run: () => { S('z1', 'done'); S('r1', 'active'); },
+            note: '<b>Riru：另一条路，第三方 zygote 注入模块。</b>LSPosed 的 README 把它列在 Credits 里：' +
+                  '<code>Riru: provides a way to inject code into zygote process</code>。<br>' +
+                  '两条路殊途同归，都是为了同一件事：<b>在 Zygote 里插一脚</b>。' },
+          { run: () => { S('r1', 'done'); S('lg', 'cool'); },
+            note: '<b>LSPosed 核心被加载进 Zygote。</b>到这里，环境已经被改造完毕——' +
+                  '但此刻还没有任何 App 进程存在。' },
+          { run: () => { S('lg', 'done'); S('sc', 'active'); },
+            note: '<b>App 进程 fork 出来，第一道闸门是作用域。</b>不在 scope 里的 App，模块对它等于不存在。<br>' +
+                  '<span class="pill warn">待核实</span>：这一步的实现细节（是"不注入"还是"注入但跳过回调"）随版本与 flavor 而异，' +
+                  '但<b>语义</b>是确定的：scope 决定这个进程里你的代码会不会被唤醒。' },
+          { run: () => { S('sc', 'done'); S('ap', 'active'); },
+            note: '<b>进了 scope 的 App 进程继续启动。</b>注意此时 App 的 Java 代码一行都还没跑——' +
+                  '你的模块比它<b>更早</b>就在场了。' },
+          { run: () => { S('ap', 'done'); S('hn', 'active'); CLS('tip2', 'pill ok'); SET('tip2', '✅ 模块生效：handleLoadPackage 在你的目标进程里被调用'); },
+            note: '<b>handleLoadPackage 被调用，模块正式接管。</b><br>' +
+                  '排错时按这条链倒着回查最快：<b>Magisk 装了吗 → flavor 装了吗 → LSPosed 激活了吗 → 模块开关开了吗 → ' +
+                  '这个 App 勾进 scope 了吗 → 进程名对得上吗</b>。' }
         ]
       },
-      after:
-        T.note('key', '🔑 Map 选型速查（记这 5 个就够入门）', '') +
-        T.tbl(['Map 类型', '结构', '什么时候用'], [
-          ['<code>BPF_MAP_TYPE_HASH</code>', '键值对，可增删', '按 pid / 路径 / 五元组聚合统计'],
-          ['<code>BPF_MAP_TYPE_ARRAY</code>', '定长数组，索引即键', '配置下发、固定槽位的计数器'],
-          ['<code>BPF_MAP_TYPE_PERCPU_ARRAY</code>', '每个 CPU 一份副本', '高频计数，避免多核写冲突'],
-          ['<code>BPF_MAP_TYPE_RINGBUF</code>', '单生产者单消费者环形缓冲', '<b>流式事件，现代首选</b>，取代 perf_event_array'],
-          ['<code>BPF_MAP_TYPE_PERF_EVENT_ARRAY</code>', '每 CPU 一份 perf 缓冲', '老代码常见，新项目不推荐']
-        ]) +
-        T.note('warn', '⚠️ 三个最容易踩的坑',
-          '<p><b>① 有界与失败处理。</b>在 eBPF 里做 Map 查找，返回值<b>必须判空</b>；写 ringbuf 前 <code>reserve</code> 失败也必须返回。验证器会盯着你——忘记判空，加载就被拒。</p>' +
-          '<p><b>② 值大小限制。</b>往 Map value 里塞东西时，结构体大小、栈上临时变量的尺寸都有上限，超出会直接编译或加载失败。大结构体要拆着写或者改用 ringbuf 直接写。</p>' +
-          '<p><b>③ perf buffer 的串扰。</b>老式 <code>perf_event_array</code> 是每 CPU 一份缓冲，多核下事件顺序会被打乱，且要开一大堆 fd。这就是 ringbuf 被推出来的原因。</p>') +
-        T.note('', '📌 对你的逆向工作意味着什么',
-          '<p>你现在应该能看出：<b>「内核态观测」是一个天然的隐蔽通道</b>。数据从 App 看不见的地方被采集、写进内核里的一块存储、再由一个<b>和 App 毫无关系的进程</b>读走。</p>' +
-          '<p>App 就算把 <code>/proc/self/maps</code> 翻烂，也不会看到任何异常——因为它本来就不在自己的地址空间里。这正是 11.5 节要展开的对比。</p>')
+      quiz: {
+        id: 'q22-1', chapter: 22, answer: 0,
+        stem: '你装好 LSPosed 和模块，重启后打开目标 App，模块里的日志一行都没有。按本章的排查顺序，<b>最应该先确认</b>的是？',
+        options: [
+          { t: '目标 App 有没有被勾进这个模块的作用域（scope），以及进程名是否匹配',
+            why: '正确。这是"模块完全没被唤醒"的第一嫌疑，而且验证成本最低。' },
+          { t: '升级 LSPosed 到最新版', why: '版本问题通常表现为行为异常或崩溃，而不是"静默地一行日志都没有"。' },
+          { t: '把 hook 改到更早的时机（比如 IXposedHookZygoteInit 里）',
+            why: '时机错会导致 findClass 失败，但你至少会看到 handleLoadPackage 的入口日志。什么都看不到，说明根本没被调用。' },
+          { t: '怀疑目标 App 检测到了 LSPosed 并主动退出了模块',
+            why: '这是可能的，但它是"更复杂的解释"。检测通常伴随闪退或异常行为，而不是安静地什么都不发生。' }
+        ],
+        explain: '<b>排查顺序的关键是"先排除最便宜、最可能的解释"。</b><br><br>' +
+          '模块完全没反应，最常见的三个原因是：<br>' +
+          '① <b>作用域没勾</b>（LSPosed 里每个模块都要逐个挑 App）——最常见；<br>' +
+          '② <b>进程名不匹配</b>：你以为在 hook 主进程，其实日志写在 <code>:push</code> 之类的子进程里，' +
+          '或者判断条件写的是 <code>packageName</code> 而目标只在特定进程加载模块；<br>' +
+          '③ 模块开关根本没打开（装完忘了启用）。<br><br>' +
+          '这三条都能在两分钟内验证。相比之下"升级版本""改时机""怀疑被检测"要么成本高，要么与现象不符。' +
+          '<span class="hit">排错的一般原则：先用最便宜的检查排除最高频的原因。</span>'
+      }
     },
 
-    /* ================= 11.4 最小程序 stepper ================= */
+    /* ============================================================ 11.3 */
     {
-      h: '11.4',
-      title: '解剖一段最小的 eBPF 程序（逐行代码推演）',
+      h: '11.3', title: '模块最小骨架：入口、声明、元数据',
       html:
-        '<p>下面这段代码短到可以背下来，但它包含了 eBPF 程序的<b>全部结构要素</b>：SEC 注解、上下文、helper、Map、有界检查。' +
-        '看懂它，再去看 libbpf-bootstrap 或 BCC 里的现成工具，就只是「多了几个钩子和几个字段」而已。</p>' +
-        '<p>任务设定：<b>追踪进程打开文件的行为，把文件名送进 ringbuf。</b>这是 eBPF 世界里 Hello World 级别的例子（BCC 里对应 <code>opensnoop</code>）。</p>',
+        '<p>一个能跑的 Xposed 模块只需要三样东西：<b>一个入口声明文件</b>、<b>一个实现入口接口的类</b>、' +
+        '<b>目标方法上的 hook 回调</b>。下面这张推演器把它从"APK 装好"到"hook 真的生效"走一遍。</p>' +
+        '<p>其中的入口文件名与内容不是编的——<code>assets/xposed_init</code> 里只写一行全限定类名，' +
+        '可以对照 11.8C 要讲的 JDex2 项目：它的 <code>assets/xposed_init</code> 内容就是 <code>com.jsnow.jdex2.JSHook</code>。</p>' +
+        '<h3 style="margin-top:26px">XC_MethodHook 与 XC_MethodReplacement：先想清楚你要不要原逻辑</h3>' +
+        '<p>挂 hook 时要在两个基类之间选一个。这个选择不是风格问题，它决定<b>原方法体内的副作用还在不在</b>。</p>' +
+        T.tbl(['', 'XC_MethodHook', 'XC_MethodReplacement'],
+          [
+            ['<b>语义</b>', '在原方法<b>前后</b>插入你的代码，原方法体<b>仍然会执行</b>',
+             '原方法体<b>不再执行</b>，完全由你的实现替代'],
+            ['<b>重写哪个方法</b>', '<code>beforeHookedMethod</code> / <code>afterHookedMethod</code>',
+             '<code>replaceHookedMethod</code>'],
+            ['<b>适合</b>', '观测、改参数、改返回值、按条件放行——绝大多数需求',
+             '彻底替换逻辑（例如强制返回固定值、让校验函数永远通过）'],
+            ['<b>风险</b>', '较低：原有副作用（写文件、发请求、初始化状态）照常发生',
+             '<b>高</b>：原方法里的副作用<b>全部消失</b>。你替换掉的可能不只是返回值，还有它顺手做的事'],
+            ['<b>一个常被忽略的点</b>',
+             '用 <code>param.setResult(x)</code> 也能"短路"，此时原方法<b>不会执行</b>（除非你调用 backup）——' +
+             '它的行为已经很接近 Replacement，但代码意图更明确',
+             '如果你只是想让某个校验返回 true，用 Replacement 更直白；但请先确认它没有"必须发生的副作用"']
+          ]) +
+        T.note('bad', '🔥 一个很容易踩的坑',
+          '<p style="margin-bottom:0">很多人为了"让校验通过"直接上 <code>XC_MethodReplacement</code>，' +
+          '结果 App 崩在别处——因为那个校验函数同时负责给某个字段赋值、或者顺手注册了回调。<br>' +
+          '<b>替换掉一个函数，等于删掉了它所有的副作用。</b>判断标准很简单：' +
+          '你只需要它的<b>结果</b>不同 → 用 <code>setResult</code> 或 Replacement；' +
+          '你需要它的<b>副作用照常发生</b>、只要结果不同 → 用 <code>setResult</code>；' +
+          '你需要它<b>什么都没发生</b> → 才用 Replacement。</p>'),
       stepper: {
-        title: 'kprobe 追踪文件打开 → 写 ringbuf → 用户态读取',
+        title: '从模块安装到 hook 生效：九步推演',
         lines: [
           {
-            code: '<span class="c">// minimal.bpf.c —— 内核态部分</span>\n<span class="k">#include</span> <span class="s">&lt;linux/bpf.h&gt;</span>\n<span class="k">#include</span> <span class="s">&lt;bpf/bpf_helpers.h&gt;</span>',
-            note: '<b>两个头文件决定了一切。</b><code>linux/bpf.h</code> 提供内核侧的 BPF 类型与 helper 声明；<code>bpf/bpf_helpers.h</code> 来自 libbpf，提供 <code>SEC()</code> 宏和 helper 的友好包装。<br>注意：这是<b>内核态代码</b>，不是普通用户态 C——这里没有 libc、没有 <code>malloc</code>、没有 <code>printf</code>（只有调试用的 <code>bpf_printk</code>）。'
+            code: '<span class="c">// assets/xposed_init（整个文件只有一行）</span>\ncom.jsnow.jdex2.JSHook',
+            note: '<b>第一步：入口声明。</b>框架读完这个文件，才知道该去加载哪个类当入口。<br>' +
+                  '它只是一个"名字清单"，不是配置——所以写错类名不会有语法错误，只会静默失效。',
+            state: { '阶段': '① 声明入口', '文件': 'assets/xposed_init', '内容': '一行全限定类名' }
           },
           {
-            code: '<span class="k">struct</span> <span class="t">event</span> {\n  <span class="t">__u32</span> pid;\n  <span class="t">char</span>  comm[<span class="n">16</span>];\n  <span class="t">char</span>  fname[<span class="n">256</span>];\n};',
-            note: '<b>这是要送到用户态的结构体</b>，两边必须逐字节一致——所以实践中通常抽到一个共享的头文件里，内核态和用户态各 include 一次。<br>字段尺寸在这里不是随便定的：comm 取 16 字节是因为内核里的进程名（TASK_COMM_LEN）就是 16；fname 给 256 是权衡后的常用值，太大会挤爆栈。'
+            code: '<span class="c">&lt;!-- AndroidManifest.xml --&gt;</span>\n&lt;meta-data android:name=<span class="s">"xposedmodule"</span> android:value=<span class="s">"true"</span> /&gt;\n' +
+                  '&lt;meta-data android:name=<span class="s">"xposeddescription"</span> android:value=<span class="s">"..."</span> /&gt;\n' +
+                  '&lt;meta-data android:name=<span class="s">"xposedminversion"</span> android:value=<span class="s">"..."</span> /&gt;',
+            note: '<b>第二步：让系统把 APK 认成"模块"而不是普通 App。</b>' +
+                  '这几个 meta-data（<code>xposedmodule</code> / <code>xposeddescription</code> / <code>xposedminversion</code>）' +
+                  '是传统 Xposed 的写法。<br>' +
+                  '<span class="pill warn">待核实</span>：新版 LSPosed 的现代 API（libxposed）改用 ' +
+                  '<code>META-INF/xposed/module.prop</code> 之类的替代方案（11.13 会逐条列出官方差异），' +
+                  '两套写法在过渡期的兼容边界请以官方 wiki 为准。',
+            state: { '阶段': '② 元数据', '作用': '被识别为模块', '现代 API': '写法不同（见 11.13）' }
           },
           {
-            code: '<span class="k">struct</span> {\n  <span class="t">__uint</span>(type, BPF_MAP_TYPE_RINGBUF);\n  <span class="t">__uint</span>(max_entries, <span class="n">256</span> * <span class="n">1024</span>);\n} events <span class="t">SEC</span>(<span class="s">".maps"</span>);',
-            note: '<b>用 BTF 风格声明一个 Map。</b><code>SEC(".maps")</code> 告诉 libbpf：这个变量不是数据，是一个 Map 定义，请把它放进 ELF 的 maps 段。<br><code>max_entries</code> 对 ringbuf 来说就是<b>缓冲区总字节数</b>，必须是 2 的幂。这段声明只存在于 <code>.o</code> 文件里，加载时由 libbpf 创建真正的内核对象。'
+            code: '<span class="k">public class</span> <span class="f">JSHook</span> <span class="k">implements</span> IXposedHookLoadPackage {',
+            note: '<b>第三步：实现入口接口。</b><code>IXposedHookLoadPackage</code> 的语义是' +
+                  '"<b>每个 App 进程加载时给我一次机会</b>"——注意是每个进程，而不仅是主进程。',
+            state: { '阶段': '③ 入口类', '接口': 'IXposedHookLoadPackage', '触发次数': '每个进程各一次' }
           },
           {
-            code: '<span class="t">SEC</span>(<span class="s">"kprobe/do_sys_open"</span>)\n<span class="k">int</span> <span class="f">handle_open</span>(<span class="k">struct</span> <span class="t">pt_regs</span> *ctx) {',
-            note: '<b>SEC 注解 = attach 点的声明书。</b>libbpf 靠扫描段名来决定把这个程序挂到哪里。<code>kprobe/do_sys_open</code> 的意思是「挂在 <code>do_sys_open</code> 这个内核函数入口」。<br><code>ctx</code> 的类型随程序类型变化：kprobe 给的是 <code>struct pt_regs *</code>（寄存器现场）。<span class="pill warn">不同内核版本里 do_sys_open 的符号与签名有差异，建议用 tracepoint 替代以提升可移植性</span>'
+            code: '<span class="k">public void</span> <span class="f">handleLoadPackage</span>(XC_LoadPackage.LoadPackageParam lpparam) {',
+            note: '<b>第四步：拿到 LoadPackageParam。</b>它是你和这个 App 进程之间唯一的握手信息，' +
+                  '里面有 <code>packageName</code>、<code>processName</code>、<code>classLoader</code>、<code>appInfo</code>。<br>' +
+                  '<span class="hit">把它当成"入场券"：所有后续动作都要从它身上找钥匙。</span>',
+            state: { '阶段': '④ 拿到参数', '进程名': ':remote 还是主进程？', 'classLoader': '可能还不是最终的那个' }
           },
           {
-            code: '  <span class="k">struct</span> <span class="t">event</span> *e;\n  e = <span class="f">bpf_ringbuf_reserve</span>(&amp;events, <span class="k">sizeof</span>(*e), <span class="n">0</span>);\n  <span class="k">if</span> (!e) <span class="k">return</span> <span class="n">0</span>;',
-            note: '<b>先在 ringbuf 里「预订」一块空间。</b>这是 ringbuf 和普通 Map 的关键差别：普通 Map 是 <code>update</code> 一次性写入，ringbuf 是<b>先 reserve 拿到可写指针、填完再 submit</b>。<br><b>那句判空绝不能省</b>：缓冲区满时 reserve 会返回 NULL（而且不会阻塞，eBPF 里不允许睡眠等待）。漏掉它，验证器直接拒收。'
+            code: '  <span class="k">if</span> (!lpparam.packageName.<span class="f">equals</span>(<span class="s">"com.target.app"</span>)) <span class="k">return</span>;',
+            note: '<b>第五步：先筛，再动手。</b>作用域已经过滤过一轮，但同一台设备上跑着几十个 App，' +
+                  '你的代码在每一个 scope 内的进程里都会被执行——所以自己也要判一次。<br>' +
+                  '实战中建议同时判 <code>processName</code>：很多 App 有 <code>:push</code>、<code>:remote</code> 等子进程，' +
+                  '在里面重复初始化会让你看到双份日志，甚至双份崩溃。',
+            state: { '阶段': '⑤ 过滤目标', '判断项': 'packageName', '建议': '同时判 processName' }
           },
           {
-            code: '  e-&gt;pid = <span class="f">bpf_get_current_pid_tgid</span>() &gt;&gt; <span class="n">32</span>;\n  <span class="f">bpf_get_current_comm</span>(&amp;e-&gt;comm, <span class="k">sizeof</span>(e-&gt;comm));',
-            note: '<b>两个最常用的 helper。</b><code>bpf_get_current_pid_tgid()</code> 返回一个 64 位数：<b>高 32 位是 PID，低 32 位是 TID</b>——所以要右移 32 位才拿到 PID。<br><code>bpf_get_current_comm()</code> 把当前进程名拷进你给的缓冲。<br>注意这里没有任何函数调用栈、没有 libc——<b>helper 就是 eBPF 世界的系统调用</b>。'
+            code: '  <span class="f">XposedHelpers.findAndHookMethod</span>(<span class="s">"com.target.Crypto"</span>, lpparam.classLoader,\n' +
+                  '      <span class="s">"encrypt"</span>, String.class, <span class="k">new</span> XC_MethodHook() { ... });',
+            note: '<b>第六步：按"类名 + 方法名 + 参数类型表"定位方法并挂上回调。</b><br>' +
+                  '注意这三个定位要素<b>缺一不可</b>：Java 有重载，只给方法名无法唯一确定目标。' +
+                  '参数类型写错（或写成了父类/包装类）会变成"方法找不到"，而不是"挂错了"——这是下一节要讲的坑。',
+            state: { '阶段': '⑥ 挂 hook', '定位三要素': '类名 / 方法名 / 参数类型', 'classLoader': '决定能不能找到类' }
           },
           {
-            code: '  <span class="t">const char</span> *filename = <span class="t">BPF_CORE_READ</span>(...);\n  <span class="f">bpf_probe_read_user_str</span>(&amp;e-&gt;fname,\n      <span class="k">sizeof</span>(e-&gt;fname), filename);',
-            note: '<b>最容易翻车的一步。</b>文件名字符串在<b>用户态内存</b>里，内核态指针不能直接解引用它——用户态随时可能把这块内存 unmap 掉，硬读就是内核 oops。<br>必须交给 <code>bpf_probe_read_user_str()</code> 这类 helper 做安全拷贝，失败了它会返回负值（很多例子里干脆不检查，因为读不到就留空，但严谨写法应该检查）。<br><span class="pill warn">从内核结构体里抠出 filename 字段的具体写法随内核版本变化很大，CO-RE 的 BPF_CORE_READ 系列是相对可移植的途径，但字段名仍需按目标内核确认</span>'
+            code: '    <span class="k">protected void</span> <span class="f">beforeHookedMethod</span>(MethodHookParam param) {\n' +
+                  '      <span class="c">// param.args[0] 就是调用方传进来的第一个参数</span>\n' +
+                  '    }',
+            note: '<b>第七步：before。</b>此刻<b>原方法还没执行</b>。<br>' +
+                  '想看"调用方到底传了什么"，只能在这里取——这是 11.6 里"参数已经变了"那个症状的根因。',
+            state: { '阶段': '⑦ 拦截（前）', 'param.args': '原始入参', '原方法': '尚未执行' }
           },
           {
-            code: '  <span class="f">bpf_ringbuf_submit</span>(e, <span class="n">0</span>);\n  <span class="k">return</span> <span class="n">0</span>;\n}\n<span class="t">char</span> <span class="t">LICENSE</span>[] <span class="t">SEC</span>(<span class="s">"license"</span>) = <span class="s">"GPL"</span>;',
-            note: '<b>提交并声明许可证。</b><code>submit</code> 之后这块记录才真的对用户态可见（若不提交要用 <code>discard</code> 归还，否则算泄漏）。<br><code>LICENSE</code> 不是形式主义：内核会检查它，声明 <code>GPL</code> 才允许调用那些 GPL-only 的 helper；写成别的字符串，某些 helper 会导致加载失败。<br>返回值 <code>0</code> 在 kprobe 上通常表示「不干预，继续执行」——eBPF 观测默认是<b>只读</b>的。'
+            code: '    <span class="k">protected void</span> <span class="f">afterHookedMethod</span>(MethodHookParam param) {\n' +
+                  '      Object result = param.<span class="f">getResult</span>();   <span class="c">// 或 param.setResult(...)</span>\n' +
+                  '    }',
+            note: '<b>第八步：after。</b>此刻原方法已经跑完，<b>对象状态、字段、缓存都已经定型</b>。<br>' +
+                  '读初始状态、读返回值、读被改写过的字段，都在这一侧。',
+            state: { '阶段': '⑧ 拦截（后）', 'param.getResult()': '返回值', '对象状态': '已定型' }
           },
           {
-            code: '<span class="c">// minimal.c —— 用户态部分（节选）</span>\n<span class="t">struct</span> minimal_bpf *skel = <span class="f">minimal_bpf__open_and_load</span>();\n<span class="f">minimal_bpf__attach</span>(skel);',
-            note: '<b>用户态只做三件事：打开、加载、挂载。</b>骨架（skeleton）是 <code>bpftool gen skeleton</code> 从 <code>.o</code> 生成的 C 头文件，它把「读 ELF、建 Map、加载程序、attach」这些琐事全包了。<br>这也是 <b>CO-RE</b> 发挥作用的位置：加载时 libbpf 读目标机器的 BTF 做重定位，所以同一份 <code>.o</code> 能在不同内核版本上跑。'
-          },
-          {
-            code: '<span class="t">struct</span> ring_buffer *rb =\n  <span class="f">ring_buffer__new</span>(<span class="f">bpf_map__fd</span>(skel-&gt;maps.events),\n                     handle_event, <span class="n">NULL</span>, <span class="n">NULL</span>);\n<span class="k">while</span> (!exiting) <span class="f">ring_buffer__poll</span>(rb, <span class="n">100</span>);',
-            note: '<b>用户态开始收割。</b>先为 ringbuf 注册一个回调 <code>handle_event</code>，然后死循环轮询。<code>poll</code> 的第二个参数是超时毫秒数，返回负数表示出错，应当退出循环（示例里为了简化省略了判断）。<br>这里的「轮询」底层是对 Map fd 做 epoll，<b>不占 CPU</b>；有数据才唤醒回调。'
-          },
-          {
-            code: '<span class="k">static int</span> <span class="f">handle_event</span>(<span class="k">void</span> *ctx, <span class="k">void</span> *data, <span class="t">size_t</span> len) {\n  <span class="k">struct</span> <span class="t">event</span> *e = data;\n  <span class="f">printf</span>(<span class="s">"pid=%d comm=%s file=%s\\n"</span>,\n         e-&gt;pid, e-&gt;comm, e-&gt;fname);\n  <span class="k">return</span> <span class="n">0</span>;\n}',
-            note: '<b>回调解包。</b>参数 <code>data</code> 指向的就是内核里那个 <code>struct event</code>——因为两边共用同一个头文件定义，可以直接强转使用（真实项目中要注意 <code>len</code> 校验以防越界读）。<br>返回非 0 会中止轮询，一般返回 0 继续。'
-          },
-          {
-            code: '$ clang -O2 -g -target bpf -c minimal.bpf.c -o minimal.bpf.o\n$ bpftool gen skeleton minimal.bpf.o &gt; minimal.skel.h\n$ clang -O2 -g minimal.c -lbpf -lelf -lz -o minimal\n$ sudo ./minimal\npid=4821 comm=browser file=/proc/self/maps\npid=4821 comm=browser file=/data/local/tmp/payload.bin',
-            note: '<b>完整构建链路四步走。</b>① clang 编成 BPF 目标文件；② bpftool 生成骨架头；③ 编用户态程序并链接 libbpf；④ 以 root 运行。<br>注意这个例子是 <b>PC Linux 上的标准流程</b>——搬到 Android 上，第 ④ 步会撞上四堵墙（见 11.6 节）。'
+            code: '<span class="f">XposedBridge.log</span>(<span class="s">"[JDex2] hooked: "</span> + param.method);',
+            note: '<b>第九步：把动作留痕。</b>没有日志的 hook 等于没有 hook——你无法区分"没生效"和"生效了但结果一样"。<br>' +
+                  '实战习惯：给自己的日志一个独立 TAG，用 <code>adb logcat -s 你的TAG</code> 单独看，' +
+                  '否则会被系统日志淹掉。',
+            state: { '阶段': '✅ 生效', '可观测': 'logcat', '下一步': '验证参数与返回值是否符合预期' }
           }
         ]
       },
-      after:
-        T.note('ok', '✅ 记住这四个结构件，你就能读绝大多数 eBPF 源码',
-          '<p><b>①</b> <code>SEC()</code> 决定<b>挂在哪</b>；<b>②</b> <code>SEC(".maps")</code> 定义<b>数据放哪</b>；<b>③</b> helper 决定<b>能拿到什么、怎么安全地拿</b>；<b>④</b> 用户态骨架负责<b>加载、挂载、读取</b>。</p>' +
-          '<p>BCC 的 Python 脚本、bpftrace 的一行命令、Cilium 的复杂数据面，剥到最里面都是这四件。</p>')
+      after: T.note('warn', '⚠️ 另一个入口：IXposedHookZygoteInit，别用错',
+        '<p>除了 <code>IXposedHookLoadPackage</code>，还有 <code>IXposedHookZygoteInit</code>（' +
+        '<code>initZygote(StartupParam)</code>）。它的调用时机是 <b>zygote 启动时、一次</b>，' +
+        '那时<b>还没有 App 进程、没有包名、也没有 App 的 classLoader</b>。</p>' +
+        '<p style="margin-bottom:0">分工很清楚：<b>改系统框架级行为 → initZygote；改某个 App 的行为 → handleLoadPackage。</b><br>' +
+        '实战里 95% 以上的工作属于后者。如果你在 <code>initZygote</code> 里试图 <code>findClass</code> 一个 App 的业务类，' +
+        '它必然失败——因为那个类此刻还不存在。</p>')
     },
 
-    /* ================= 11.4L 动手实验 ================= */
+    /* ============================================================ 11.4 */
     {
-      h: '11.4L', title: '动手实验：当一回 eBPF 验证器',
+      h: '11.4', title: 'Hook 构造函数：对象状态在构造时定型',
+      intuition: {
+        tag: '直觉模型 · 毛坯房与验房',
+        body:
+          '<p>构造函数就像装修。你在<b>装修过程中</b>推门进去看（before），看到的永远是毛坯——墙没刷、家具没进；' +
+          '只有在<b>装修结束</b>之后进去（after），才看得到这间房子最终长什么样。</p>' +
+          '<p>而 Java 对象几乎所有的"重要状态"——校验结果、密钥、token、设备指纹——都是在这段装修里定型的。' +
+          '等你 hook 到业务方法时，你看到的是<b>已经刷好墙的房子</b>；很多值一旦算完就不可逆了' +
+          '（比如 hash、签名、密文），你只能看着结果，看不到原料。</p>' +
+          '<p>所以构造函数不是"顺便 hook 一下"的地方，它是<b>唯一能同时看到"从无到有"前后两侧</b>的地方。</p>'
+      },
       html:
-        '<p>验证器（verifier）是 eBPF 最核心也最抽象的设计。理解它的最好方式不是读文档，' +
-        '而是<b>自己当一次验证器</b>——判断几段代码能不能通过。</p>',
-      lab: {
-        title: '实验：验证器会放行哪一段代码？',
-        goal: '目标：找出会被拒绝的写法',
-        intro:
-          '<p>下面有五段 eBPF 代码片段。<b>其中三段能通过验证器，两段会被拒绝。</b></p>' +
-          '<p><b>任务：找出被拒绝的那两段，并说明验证器拒绝它们的理由。</b></p>' +
-          '<pre style="margin:10px 0;font-size:12.5px"><code>' +
-          '【A】\n' +
-          '  int idx = ctx-&gt;arg0;\n' +
-          '  if (idx &gt;= 0 &amp;&amp; idx &lt; 16)          // ① 先检查\n' +
-          '      return arr[idx];               // ② 再访问\n\n' +
-          '【B】\n' +
-          '  int idx = ctx-&gt;arg0;\n' +
-          '  return arr[idx];                   // 没有边界检查\n\n' +
-          '【C】\n' +
-          '  while (1) { }                      // 无条件死循环\n\n' +
-          '【D】\n' +
-          '  #pragma clang loop unroll(full)\n' +
-          '  for (int i = 0; i &lt; 8; i++) { ... }  // 循环次数固定且可展开\n\n' +
-          '【E】\n' +
-          '  void *p = bpf_map_lookup_elem(&amp;m, &amp;key);\n' +
-          '  if (!p) return 0;                  // ① 先判空\n' +
-          '  return *(int *)p;                  // ② 再解引用' +
-          '</code></pre>',
-        inputs: [
-          { key: 'reject', label: '① 哪两段会被验证器拒绝？（填字母）',
-            hint: '格式：B、C 或 B C', ph: '例如 B、C' },
-          { key: 'reason', label: '② 验证器拒绝它们的共同理由是什么？',
-            hint: '它不做运行时测试，只在加载时做什么？', ph: '因为……', type: 'textarea', rows: 3 }
+        '<p>它也是新手最容易漏掉的 hook 点，原因很实在：<b>构造函数在字节码里叫 <code>&lt;init&gt;</code>，在源码里没有名字。</b>' +
+        '任何"按方法名搜索"的习惯都会把它漏掉。而在 Xposed 里挂它，要用专门的方式。</p>' +
+        T.tbl(['', '<code>XposedBridge.hookAllConstructors</code>', '逐个 <code>getDeclaredConstructors</code> + <code>hookMethod</code>'],
+          [
+            ['<b>语义</b>', '把一个类的<b>所有</b>构造函数都挂上同一个回调', '只挂你指定的那一个签名'],
+            ['<b>优点</b>', '快、不会漏。只要类被 <code>new</code>，你一定知道',
+             '回调干净，不碰你无关的重载；日志不会互相淹没'],
+            ['<b>缺点</b>', '类里每个重载都会走你的回调；有 10 个重载你就要判断 10 次',
+             '要自己枚举签名，写错一个就<b>静默漏掉</b>（不会报错）'],
+            ['<b>什么时候用</b>', '<b>摸底阶段</b>：先全部挂上，在回调里打印 <code>param.method</code> 把所有重载列出来',
+             '<b>收敛阶段</b>：确认是哪一个之后，只挂它，准备长期运行']
+          ]) +
+        T.note('key', '🔑 初始化的黄金位置是 after，不是 before',
+          '<p>在 <code>afterHookedMethod</code> 里，对象已经构造完成、字段已经赋值。你要做的三件事都该放在这里：</p>' +
+          '<p>① <b>把初始状态记下来</b>——之后才知道它被谁改过、改成了什么；<br>' +
+          '② <b>挂后续的 hook</b>——此时对象内部引用已经有效，不会 hook 到"半个对象"；<br>' +
+          '③ <b>打上"已处理"标记</b>——同一个构造函数可能被调用很多次（ListView 的 item、每次请求的实体），' +
+          '不标记就会重复处理。</p>' +
+          '<p style="margin-bottom:0">反过来，在 <code>before</code> 里读字段读到的 null/0，' +
+          '不是"没有值"，是"还没轮到赋值"——这是 11.5 和实验一里会反复考的一点。</p>') +
+        '<h3 style="margin-top:26px">一个真实工程里的构造函数用法：堵住它，而不是观察它</h3>' +
+        '<p>下面这段取自 JDex2 的 <code>JSHook.java</code>（11.8C 的案例主角）。它挂构造函数的目的' +
+        '<b>不是观察，而是触发</b>——请对照第 16 章 FART 的主动调用一起看。</p>' +
+        T.code(
+          '<span class="c">// 一个共享的 hook 实例：把构造函数"堵住"，让它不发生真实的构造</span>\n' +
+          '<span class="k">private static final</span> XC_MethodHook BLOCK_CONSTRUCTOR = <span class="k">new</span> XC_MethodHook() {\n' +
+          '    <span class="f">@Override</span>\n' +
+          '    <span class="k">protected void</span> <span class="f">beforeHookedMethod</span>(MethodHookParam param) {\n' +
+          '        param.<span class="f">setResult</span>(<span class="k">null</span>);   <span class="c">// 构造方法返回 void，用 null</span>\n' +
+          '    }\n' +
+          '};\n\n' +
+          '<span class="c">// 只挂第一个构造函数，然后立刻调用它，最后立刻解除 hook</span>\n' +
+          'Constructor&lt;?&gt; target = constructors[<span class="n">0</span>];\n' +
+          'target.<span class="f">setAccessible</span>(<span class="k">true</span>);\n' +
+          'XC_MethodHook.Unhook unhook = XposedBridge.<span class="f">hookMethod</span>(target, BLOCK_CONSTRUCTOR);\n' +
+          '<span class="k">try</span> {\n' +
+          '    Object[] args = <span class="f">makeDefaultArgs</span>(target.<span class="f">getParameterTypes</span>());\n' +
+          '    target.<span class="f">newInstance</span>(args);   <span class="c">// 调用构造方法，触发壳对方法体的回填</span>\n' +
+          '} <span class="k">catch</span> (Throwable ignored) {\n' +
+          '} <span class="k">finally</span> {\n' +
+          '    <span class="c">// 为了防止某些加固通过检测方法是否转为Native方法来检测Hook，无论构造是否成功都要解除Hook</span>\n' +
+          '    unhook.<span class="f">unhook</span>();\n' +
+          '}'
+        ) +
+        T.note('key', '🔑 这段代码里有三层信息量',
+          '<p>① <b>它的目的不是观察构造函数，而是让构造函数跑一遍。</b>' +
+          '真正想要的是<b>副作用</b>——壳在方法被使用时才把字节码回填进去。' +
+          '这与第 16 章 FART 用默认参数狂调一遍是同一种思想，只是从 ART 层搬到了 Java 反射层。</p>' +
+          '<p>② <b>用 <code>before</code> + <code>setResult(null)</code> 把构造体堵住</b>，' +
+          '是为了不真的创建对象（避免真实副作用和崩溃），同时仍然触发"调用发生过"这个事实。' +
+          '想清楚这一点，你就同时理解了 <code>XC_MethodHook</code> 里 <code>setResult</code> 的短路语义。</p>' +
+          '<p style="margin-bottom:0">③ <b><code>finally</code> 里立刻 <code>unhook()</code>——因为 hook 本身就是痕迹。</b>' +
+          '作者在注释里写的原因很具体：某些加固会检查"这个方法是不是被转成了 native"。' +
+          '这一句把 11.4 和 11.11 连起来了：<b>你的观测手段，本身就是对手的检测项。</b></p>') +
+        '<p>再补一条实战经验：如果你要观察的是<b>真实对象</b>（而不是触发回填），' +
+        '请在 <code>after</code> 里读字段，并且<b>只在第一次构造时做初始化</b>——' +
+        '用 <code>param.thisObject</code> 做 key 记一个标记，或者用 <code>setObjectExtra</code> / ' +
+        '<code>getObjectExtra</code> 在同一个方法调用内部传递数据。</p>',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '构造函数里的 null 字段',
+            scenario: '<b>情境：</b>你 hook 了 <code>com.target.Session</code> 的构造函数，' +
+              '在 <code>beforeHookedMethod</code> 里读 <code>param.thisObject</code> 的 <code>token</code> 字段，' +
+              '打印出来是 <code>null</code>。你又换成在构造函数<b>之后</b>调用的业务方法里读，同一个字段却有值。',
+            q: '在断定"对手把字段搬到 native 层了"之前，你<b>首先</b>该怀疑什么？',
+            choices: [
+              { t: '时机：<code>before</code> 时构造函数体还没执行，字段自然还是默认值；改到 <code>after</code> 再读即可验证',
+                next: 'n1' },
+              { t: '加固把这两个字段搬到了 native 层，Java 侧只剩空壳字段', next: 'n2' },
+              { t: '混淆把字段名改掉了，所以反射读不到（读到的是另一个字段）', next: 'n3' },
+              { t: '字段被声明成 <code>final</code> 或静态，反射读法用错了', next: 'n4' }
+            ]
+          },
+          n1: {
+            terminal: true, verdict: 'good', verdictTitle: '对：先证明时机，再怀疑对抗',
+            result: '<p><b>你选的是成本最低、也最可能正确的解释。</b><br>' +
+              '<code>beforeHookedMethod</code> 的字面语义就是"<b>在原方法体执行之前</b>"。' +
+              '构造函数里的赋值语句都在方法体里，所以此刻字段当然是默认值（引用类型为 null，int 为 0，boolean 为 false）。<br>' +
+              '验证只要一步：把读取改到 <code>afterHookedMethod</code>，看值有没有出现。<br>' +
+              '<span class="hit">顺带记住这个诊断手法：<b>同一个字段在 before / after 各打一次日志，' +
+              '就能看出它是什么时候被赋值的</b>——比反编译找赋值语句快得多。</span></p>'
+          },
+          n2: {
+            terminal: true, verdict: 'bad', verdictTitle: '你跳到了最复杂的解释',
+            result: '<p><b>认知根源：遇到异常先怀疑对手，而不是先怀疑自己的观测点。</b><br>' +
+              '"字段被搬到 native 层"确实存在（那是更强的保护），但它有明确的伴随特征：' +
+              '字段在<b>整个生命周期内</b>都不可见（因为 Java 侧根本没有真实数据），' +
+              '而不只是"在 before 时不可见"。<br>' +
+              '你的现象是"after 之后就有值了"——这恰恰证明数据<b>就在这个 Java 字段里</b>，只是赋值发生在方法体中段。<br>' +
+              '<span class="miss">先排除时机问题，再谈对抗强度。顺序反了，你会花一整天去做毫无必要的对抗分析。</span></p>'
+          },
+          n3: {
+            terminal: true, verdict: 'bad', verdictTitle: '混淆会改名，但不会变成 null',
+            result: '<p><b>认知根源：你把"读不到"和"读到另一个字段"混为一谈了。</b><br>' +
+              '如果字段被混淆改名，你用旧名字去 <code>getObjectField</code> 会<b>抛异常</b>（找不到该字段），' +
+              '而不是安静地返回 null。既然你拿到了 null，说明你<b>确实读到了那个字段</b>。<br>' +
+              '<span class="hit">这类"异常 vs 空值"的区别是一个很有用的信号：' +
+              '<b>抛异常 = 你找的东西不存在；得到 null = 你找的东西存在但此刻没有值。</b></span><br>' +
+              '当然，混淆确实会让字段名变成 <code>a</code>、<code>b</code>——那是另一个问题（11.5 讲怎么按类型和读写位置反推）。</p>'
+          },
+          n4: {
+            terminal: true, verdict: 'bad', verdictTitle: '读法错误会抛异常，不会给你 null',
+            result: '<p><b>认知根源：你没有把"反射失败"的两种形态分开。</b><br>' +
+              '用错 API 的后果是明确的：拿实例字段当静态读（或反过来）会抛异常；' +
+              '用 <code>getObjectField</code> 读 <code>int</code> 字段也会失败，因为反射不做自动装箱。<br>' +
+              '这些都不会安静地返回 null。<br>' +
+              '<span class="hit">所以当你<b>确切地</b>拿到 null 时，最可能的解释就是"值还没被赋上"——' +
+              '而这几乎是 <code>before</code> 时机的必然结果。</span></p>'
+          }
+        }
+      },
+      quiz: {
+        id: 'q22-2', chapter: 22, answer: 0,
+        stem: '为什么说构造函数是"最容易被漏掉、但价值很高"的 hook 点？',
+        options: [
+          { t: '它在字节码里叫 <code>&lt;init&gt;</code>、源码里没有名字，按方法名搜索会漏；' +
+               '而对象的关键状态基本都在这段代码里定型',
+            why: '正确。两个理由都说到：定位困难 + 状态在此定型。' },
+          { t: '因为构造函数执行得最早，所以能拿到最完整的调用栈',
+            why: '构造函数通常不是最早的调用，也未必有更完整的调用栈。这不是它的价值所在。' },
+          { t: '因为构造函数不能被打断，hook 它最稳定',
+            why: '恰恰相反：hook 构造函数很容易造成对象处于半初始化状态，风险不低。' },
+          { t: '因为只有构造函数里的参数是明文，业务方法里的参数都是加密的',
+            why: '这是想当然。是否明文取决于业务逻辑，与是不是构造函数无关。' }
         ],
-        runLabel: '🔍 对照验证器判定',
-        run: (v) => {
-          const items = [
-            { k: 'A', pass: true,  title: '先检查 idx 范围，再访问数组',
-              why: '通过。验证器跟踪 <code>idx</code> 的取值范围：经过 <code>if</code> 之后它确定落在 [0,16)，' +
-                   '而 <code>arr</code> 是已知大小的栈数组 → 访问安全。' +
-                   '<b>这是"每条可能路径上都要安全"的典型写法。</b>' },
-            { k: 'B', pass: false, title: '没有边界检查就索引数组',
-              why: '<b>拒绝。</b>验证器无法证明 <code>idx</code> 在数组范围内 —— 它是从上下文读来的<b>不可信输入</b>。' +
-                   'eBPF 不允许任何"可能越界"的访问。<br>' +
-                   '<b>注意：验证器不会"运行时试试看"</b>，它必须在<b>加载时静态证明</b>所有路径都安全。' },
-            { k: 'C', pass: false, title: '无条件死循环',
-              why: '<b>拒绝。</b>eBPF 程序运行在<b>内核态</b>，而且常常在中断/软中断上下文里执行。' +
-                   '死循环会让整个内核挂住。<br>' +
-                   '<b>所以验证器要求所有循环必须可证明会终止</b>（有界循环）。' +
-                   '注意：较新内核支持有界循环，但必须能被证明有上界。' },
-            { k: 'D', pass: true,  title: '固定次数的展开循环',
-              why: '通过。<code>#pragma clang loop unroll(full)</code> 让编译器在<b>编译期</b>把循环完全展开成 8 段直线代码，' +
-                   '指令流里<b>不再有循环结构</b>，验证器看到的是一串确定的直线代码，自然可证明会终止。<br>' +
-                   '<b>这正是 eBPF 里处理循环的经典手法：能展开就展开。</b>' },
-            { k: 'E', pass: true,  title: '判空后再解引用 Map 指针',
-              why: '通过。<code>bpf_map_lookup_elem</code> 可能返回 NULL（key 不存在），验证器<b>知道这一点</b>。' +
-                   '先 <code>if (!p) return 0;</code> 把 NULL 分支排除掉，剩下的路径上 <code>p</code> 一定非空 → 解引用安全。' }
-          ];
+        explain: '<b>两个层次的原因，缺一不可。</b><br><br>' +
+          '<b>定位层面：</b>构造函数在字节码里是 <code>&lt;init&gt;</code>，源码里没有方法名。' +
+          '任何"按名字 find"的思路都会漏掉它；在 Xposed 里要用 <code>hookAllConstructors</code> ' +
+          '或 <code>findAndHookConstructor</code>（按参数类型定位，而不是按名字）。<br><br>' +
+          '<b>价值层面：</b>对象的状态在构造时定型。校验结果、密钥、token、设备指纹这些' +
+          '"你最想要的东西"，往往在构造函数里就已经算好了。等你在业务方法里看到它们时，' +
+          '你看到的是<b>成品</b>；而在构造函数前后两侧，你能看到<b>从无到有的过程</b>——' +
+          '很多不可逆的值（hash、签名）只有在这一刻才有机会看到原料。<br><br>' +
+          '<span class="hit">记住这个组合判断：<b>按参数类型找构造函数，在 after 里读定型后的状态。</b></span>'
+      }
+    },
 
-          let html = '<table class="lab-tbl"><tr><th>片段</th><th>验证器判定</th><th>理由</th></tr>';
-          items.forEach(it => {
-            html += '<tr class="' + (it.pass ? 'same' : 'diff') + '">'
-              + '<td><b>' + it.k + '</b><br><span style="font-size:11px;color:var(--fg-3)">' + it.title + '</span></td>'
-              + '<td>' + (it.pass ? '✅ 通过' : '❌ <b>拒绝</b>') + '</td>'
-              + '<td style="font-size:12px">' + it.why + '</td></tr>';
+    /* ============================================================ 11.5 */
+    {
+      h: '11.5', title: 'Hook 常规函数与修改属性：XposedHelpers 家族',
+      html:
+        '<p>把 <code>XposedHelpers</code> 当成你的"反射工具箱"。它做的事情本质上都是 Java 反射，' +
+        '只是把样板代码收掉了。<b>记住这一点很重要</b>：因为它是反射，所以它的失败方式和反射一模一样——' +
+        '而反射的失败方式，和 Frida 那种"脚本层找不到符号"的失败方式并不相同。</p>' +
+        T.tbl(['API', '干什么', '最常见的失败'],
+          [
+            ['<code>findAndHookMethod</code>', '按"类 + 方法名 + <b>参数类型表</b>"定位并挂 hook', '类找不到、<b>参数类型表不匹配</b>'],
+            ['<code>findAndHookConstructor</code>', '按参数类型表挂构造函数', '同上（没有方法名可依赖）'],
+            ['<code>findClass</code>', '按类名 + 指定加载器加载类', '<b>加载器不对</b> → <code>ClassNotFound</code>'],
+            ['<code>getObjectField</code> / <code>setObjectField</code>', '读 / 写<b>实例</b>的引用类型字段', '字段名混淆；把实例当静态用'],
+            ['<code>getStaticObjectField</code> / <code>setStaticObjectField</code>', '读 / 写<b>静态</b>引用类型字段', '静态当实例用（会抛异常）'],
+            ['<code>getIntField</code> / <code>setIntField</code> 等', '基本类型字段的专用读写', '用 <code>getObjectField</code> 读基本类型会失败'],
+            ['<code>callMethod</code> / <code>callStaticMethod</code>', '调用实例 / 静态方法（含私有）', '重载 + null 参数歧义；参数类型不匹配'],
+            ['<code>newInstance</code>', '造一个对象', '找不到匹配的构造签名；<b>抽象类与接口直接失败</b>']
+          ]) +
+        '<h3 style="margin-top:26px">静态字段与实例字段：不只是 API 不同</h3>' +
+        T.tbl(['', '静态字段', '实例字段'],
+          [
+            ['<b>属于谁</b>', '属于 <code>Class</code> 对象，一个进程里只有一份', '属于具体的对象实例'],
+            ['<b>用什么读</b>', '<code>getStaticObjectField(clazz, "X")</code>', '<code>getObjectField(obj, "X")</code>'],
+            ['<b>在哪儿被赋值</b>', '类初始化 <code>&lt;clinit&gt;</code> 里（类第一次被使用时）', '构造函数或后续的赋值语句里'],
+            ['<b>改它的影响面</b>', '<b>全局</b>：一次修改对所有实例、所有后续逻辑生效', '只影响你手上那个对象'],
+            ['<b>实战取舍</b>', '适合"一次性关掉某个全局开关"；但风险也全局，改错了整条链路都受影响',
+             '适合精确干预单个对象的状态；缺点是对象一多就要逐个处理']
+          ]) +
+        T.note('bad', '🔥 时机太早：你读到的不是"值为空"，而是"还没轮到它"',
+          '<p>这是新手最常见的误判来源。同一个字段，在不同的 hook 点看到的值完全不同：</p>' +
+          '<p>· 静态字段在 <code>&lt;clinit&gt;</code> 里赋值 → 你在类加载早期读，它是 null/0；<br>' +
+          '· 实例字段在构造函数里赋值 → 你在构造函数的 <code>before</code> 读，它还是默认值；<br>' +
+          '· 有些字段是<b>懒加载</b>的（第一次用到才算）→ 你在任何"还没用到它"的时刻读，都是 null。</p>' +
+          '<p style="margin-bottom:0"><b>判断手法（最省事的一种）：</b>在同一个 hook 的 before 和 after 各打一行日志，' +
+          '把字段值都打出来。值在<b>哪一侧</b>出现，就说明赋值发生在中间。' +
+          '<span class="hit">这比反编译去翻赋值语句快得多，而且在混淆过的代码上同样有效。</span></p>') +
+        '<p>字段名被混淆是另一个现实问题。Xposed 这一层你面对的是 Java 反射，' +
+        '所以字段名变成 <code>a</code>、<code>b</code>、<code>c</code> 之后，' +
+        '你要靠<b>类型 + 谁在读它 + 和谁一起出现</b>来反推——而不是靠名字猜。' +
+        '（顺带说明：混淆器也可能删掉"看起来没人用"的字段，' +
+        '具体行为取决于混淆配置，<span class="pill warn">待核实</span>；遇到字段不存在时先确认它是不是被删了，' +
+        '而不是认定自己被检测了。）</p>' +
+        '<p>下面这个推演器把 <code>findAndHookMethod</code> 的内部动作拆开。' +
+        '它的价值在于：<b>失败点几乎全在"参数类型表"上</b>，而这一点很多人从没意识到。</p>',
+      stepper: {
+        title: '一次 findAndHookMethod 的解析过程（失败点在哪）',
+        lines: [
+          {
+            code: '<span class="f">XposedHelpers.findAndHookMethod</span>(\n' +
+                  '    <span class="s">"com.target.Crypto"</span>, lpparam.classLoader,\n' +
+                  '    <span class="s">"encode"</span>, String.class, callback);',
+            note: '<b>三个定位要素：类名、方法名、参数类型表。</b>Java 有重载，所以"方法名"单独一个是不够的。<br>' +
+                  '注意第二个参数是<b>加载器</b>——它决定了第一步能不能找到类。',
+            state: { '阶段': '① 调用', '目标类': 'com.target.Crypto', '方法': 'encode(String)' }
+          },
+          {
+            code: '<span class="c">// 内部：用传入的 loader 加载这个类</span>',
+            note: '<b>失败点 A：类加载失败。</b>抛 <code>ClassNotFoundException</code>。<br>' +
+                  '两种原因：类名写错（拼写、内部类要用 <code>$</code>），或者<b>加载器不对</b>——' +
+                  '这在加固 App 上更常见（见 11.8）。',
+            state: { '阶段': '② 加载类', '失败信号': 'ClassNotFoundException', '对策': '换对的加载器' }
+          },
+          {
+            code: '<span class="c">// 内部：遍历 clazz.getDeclaredMethods() 找名字匹配的候选</span>',
+            note: '<b>失败点 B：一个候选都没有。</b>方法是存在的，但名字对不上——' +
+                  '要么被混淆改成了 <code>a</code>，要么你抄错了。<br>' +
+                  '排查：把 <code>getDeclaredMethods()</code> 全部打印一遍，对着参数类型找，不要对着名字找。',
+            state: { '阶段': '③ 找名字', '候选数': '0（失败）', '对策': '打印全部方法列表' }
+          },
+          {
+            code: '<span class="c">// 内部：逐个比对参数类型表 { String.class }</span>',
+            note: '<b>失败点 C：这是最常见的坑，也是本节的核心。</b>遍历到了同名方法，但参数类型对不上：<br>' +
+                  '· 目标其实是 <code>(CharSequence)</code> 或 <code>(Object)</code>，你写了 <code>String.class</code>；<br>' +
+                  '· 目标有多个参数，你只写了一个；<br>' +
+                  '· <b>基本类型必须写 <code>int.class</code>，不能写 <code>Integer.class</code></b>（反之亦然）；<br>' +
+                  '· 变长参数在签名层面是数组：<code>Object[].class</code>。',
+            state: { '阶段': '④ 比类型', '失败信号': '找不到匹配的方法', '对策': '打印真实参数类型' }
+          },
+          {
+            code: '<span class="c">// 命中唯一候选 → 交给 XposedBridge.hookMethod 安装</span>',
+            note: '<b>命中。</b>如果同名方法有多个重载，你要自己想清楚挂哪一个——' +
+                  '用 <code>findMethodExact</code> 先把具体的 <code>Method</code> 拿到，再 <code>hookMethod</code>，可控性更好。',
+            state: { '阶段': '⑤ 安装 hook', '方式': 'XposedBridge.hookMethod', '备选': 'findMethodExact + hookMethod' }
+          },
+          {
+            code: '<span class="c">// 框架侧：把被 hook 方法的入口替换掉</span>',
+            note: '<b>框架在 ART 层做的事。</b>LSPosed 用它的核心 hook 框架（LSPlant）替换方法入口，' +
+                  '这一步在 Java 层完全不可见。<br>' +
+                  '<span class="hit">记住它的存在：11.11 里"方法入口被替换"就是一条检测项，源头就在这里。</span>',
+            state: { '阶段': '⑥ ART 层生效', '可见性': 'Java 层看不到', '检测面': '见 11.11' }
+          },
+          {
+            code: '<span class="c">// 之后：方法被调用</span>\n' +
+                  'beforeHookedMethod(param)  →  <span class="c">原方法体</span>  →  afterHookedMethod(param)',
+            note: '<b>回调链。</b>before 里 <code>param.args</code> 是原始入参；after 里 ' +
+                  '<code>param.getResult()</code> 是返回值，也可以用 <code>param.setResult(...)</code> 改掉它。<br>' +
+                  '两侧的 <code>param.thisObject</code> 是同一个对象——所以你可以用 before 记下状态、在 after 对比。',
+            state: { '阶段': '⑦ 运行期', 'before': '入参 / 对象状态', 'after': '返回值 / 定型后的字段' }
+          }
+        ]
+      },
+    },
+
+    /* ============================================================ 11.6 */
+    {
+      h: '11.6', title: '主动调用：从"被动拦截"到"主动驱动"',
+      html:
+        '<p>前面的 hook 都是被动的：等 App 自己调用，你拦下来看看。主动调用是反过来——' +
+        '<b>你发起调用，让 App 的代码替你干活</b>。</p>' +
+        T.tbl(['', '被动 hook', '主动调用（Invoke）'],
+          [
+            ['<b>谁发起</b>', 'App 自己调，你只是拦截', '<b>你发起</b>，App 的代码被动执行'],
+            ['<b>时机可控性</b>', '不可控：要等它调；没被调到的分支你永远看不到', '可控：你说什么时候调'],
+            ['<b>典型用途</b>', '观测、改参数、改返回值', '脱壳触发回填（第 16 章 FART、11.8C 的 JDex2）、' +
+             '验证算法、批量跑输入、探测方法行为'],
+            ['<b>主要成本</b>', '覆盖不全', '参数要自己造、副作用不可控、容易崩'],
+            ['<b>返回值</b>', '顺带就有了', '常常只是"顺手的副产品"——真正的收获是<b>调用发生过</b>']
+          ]) +
+        '<p>三个 API 记住就够：<code>callStaticMethod</code>（调静态）、' +
+        '<code>callMethod</code>（调实例，需要先有对象）、<code>newInstance</code>（造对象）。' +
+        '它们的参数都是 <code>Object...</code>，所以基本类型会自动装箱。</p>' +
+        T.note('warn', '⚠️ 装箱带来的一个真实歧义',
+          '<p>传 <code>null</code> 给一个重载方法时，类型信息是<b>缺失的</b>——' +
+          '框架不知道你要匹配 <code>foo(String)</code> 还是 <code>foo(List)</code>，于是可能匹配失败，' +
+          '也可能匹配到<b>不是你想要的那个</b>重载。</p>' +
+          '<p style="margin-bottom:0">对策：优先让参数带上明确的类型（哪怕是 <code>(Object) null</code> 这种显式写法），' +
+          '或者干脆先 <code>findMethodExact</code> 拿到具体 <code>Method</code> 对象再 <code>invoke</code>，' +
+          '把匹配这件事变成显式的。</p>') +
+        '<h3 style="margin-top:26px">调用失败了，按这个顺序查</h3>' +
+        '<p>主动调用失败是常态（尤其批量调用）。<b>排查顺序本身就是本节最重要的知识点</b>——' +
+        '它决定了你是十分钟定位，还是查一天。</p>' +
+        '<ol>' +
+        '<li><b>类加载器对不对。</b>信号：<code>ClassNotFoundException</code> / <code>NoClassDefFoundError</code>。<br>' +
+        '先确认你用的 loader 到底认不认识这个类（11.8）。</li>' +
+        '<li><b>方法名与签名对不对。</b>信号：<code>NoSuchMethodError</code> / <code>IllegalArgumentException</code>。<br>' +
+        '重点查：重载、参数个数、<code>int.class</code> vs <code>Integer.class</code>、变长参数的数组形式。</li>' +
+        '<li><b>调用时机对不对。</b>信号：拿到 <code>null</code>、<code>ExceptionInInitializerError</code>。<br>' +
+        '类静态初始化还没跑、对象还没构造完、或者方法是懒加载的。</li>' +
+        '<li><b>参数能不能构造出来。</b>信号：参数构造代码自己抛异常，或目标方法内部 NPE。<br>' +
+        '这就是 11.7 要专门讲的问题。</li>' +
+        '<li><b>目标方法有没有前置状态。</b>信号：业务异常，看起来像 App 的 bug。<br>' +
+        '它可能需要先登录、先有 token、必须在主线程 / 必须有 Looper（JDex2 就用 ' +
+        '<code>Handler(Looper.getMainLooper()).post(...)</code> 把某些调用丢回主线程）。</li>' +
+        '<li><b>最后才怀疑"是不是被检测到了"。</b>信号：闪退、或者安静地什么都不发生。<br>' +
+        '它排在最后不是因为不可能，而是因为它是<b>最贵</b>的解释——验证成本高，而且往往需要先排除前五条。</li>' +
+        '</ol>' +
+        T.note('key', '🔑 一条贯穿本章的判断',
+          '<p style="margin-bottom:0">主动调用时，<b>返回值通常不是你要的东西。</b>' +
+          '你要的是"这个方法被执行过"这个事实——它带来的副作用（回填字节码、初始化状态、写日志）才是收获。<br>' +
+          '这与第 16 章 FART 用默认参数狂调一遍完全同构：<b>调用会失败，但失败不影响我们要的副作用。</b>' +
+          '所以：<b>每一次主动调用都要独立 try/catch，绝不能因为第一个失败就中断整个流程</b>——' +
+          '你需要的是"失败的完整清单"，而不是"第一个错误"。</p>'),
+      quiz: {
+        id: 'q22-4', chapter: 22, answer: 0,
+        stem: '为什么说在主动调用里，"方法抛异常"往往<b>不是</b>失败信号？',
+        options: [
+          { t: '因为很多主动调用的目的是触发副作用（例如让壳回填字节码），传默认参数必然导致异常，而副作用已经发生',
+            why: '正确。这是第 16 章 FART 与本章 JDex2 的共同逻辑。' },
+          { t: '因为 Xposed 框架会吞掉所有异常，所以异常本来就不影响结果',
+            why: '框架不会替你吞异常，是你自己必须写 try/catch。' },
+          { t: '因为异常只影响返回值，不影响方法是否被执行', why: '方向对了但没说到点上：重点是"副作用"而非"执行"。' },
+          { t: '因为主动调用本来就不需要返回值，所以异常无所谓',
+            why: '"不需要返回值"和"异常不影响目标"是两件事，前者不推出后者。' }
+        ],
+        explain: '<b>关键区分：你要的是"调用发生"还是"调用成功"。</b><br><br>' +
+          '主动调用的典型场景是<b>触发副作用</b>：<br>' +
+          '· 第 16 章 FART 遍历所有方法并强制调用，传的是默认值（0、null、空串），' +
+          '目的是让抽取壳把字节码回填进 <code>code_item</code>；<br>' +
+          '· 11.8C 的 JDex2 主动调用构造函数，目的同样是触发回填——它甚至用 ' +
+          '<code>before</code> + <code>setResult(null)</code> 把构造体<b>堵住</b>，<br>' +
+          '为的就是"别真的构造对象，只要这次调用发生过"。<br><br>' +
+          '在这两个例子里，参数是假的、返回值是错的、方法很可能抛异常——<b>但副作用已经产生了</b>，任务完成。<br><br>' +
+          '<span class="hit">所以工程上的纪律是：<b>每次调用独立 try/catch；异常要记录但不能中断流程；' +
+          '用"覆盖了多少个"而不是"成功了几个"来衡量进度。</b></span>'
+      }
+    },
+
+    /* ============================================================ 11.7 */
+    {
+      h: '11.7', title: 'Java Hook 的复杂参数构造：与 Frida 的 $new 对照',
+      html:
+        '<p>如果你用过 Frida，第一反应一定会是：<b>Xposed 这边造参数怎么这么麻烦？</b>这个感受是对的，' +
+        '但它不是能力差异，是<b>封装差异</b>——Frida 把 Java 反射包装成了 JS 语法糖，' +
+        'Xposed 这边你就是直接写反射。</p>' +
+        T.tbl(['需求', 'Frida', 'Xposed（直接写反射）'],
+          [
+            ['造一个对象', '<code>Java.use("A").$new(args)</code>',
+             '<code>XposedHelpers.newInstance(A.class, args)</code>，或者 <code>clazz.newInstance()</code>（无参）'],
+            ['造数组', "<code>Java.array('byte', [...])</code>",
+             '<code>Array.newInstance(byte.class, n)</code> 再逐个 <code>Array.setByte</code>'],
+            ['造接口 / 抽象类的实现', '<code>Java.registerClass({...})</code> 动态生成一个实现类',
+             '<b>没有等价的一行 API</b>：只能找现成的实现类、用动态代理，或者自己生成 dex。' +
+             '<span class="pill warn">待核实</span>：具体可用性与你的运行环境、依赖库有关'],
+            ['造集合', '<code>Java.use("java.util.ArrayList").$new()</code>',
+             '<code>newInstance(ArrayList.class)</code>，或者更省事：<code>Collections.emptyList()</code>'],
+            ['泛型 <code>List&lt;String&gt;</code>', '运行时同样是擦除的',
+             '同样擦除：反射拿不到 <code>String</code>。需要泛型信息只能读 <code>getGenericParameterTypes</code>，' +
+             '或者靠经验判断'],
+            ['给重载方法传 null', '需要显式转型，否则歧义',
+             '同样的歧义：null 没有类型，匹配可能失败或匹配错']
+          ]) +
+        T.note('key', '🔑 一条省掉 80% 参数构造工作的判断',
+          '<p>在"触发副作用"类的任务里（脱壳、探测、验证），<b>你几乎永远不需要构造真实参数</b>。</p>' +
+          '<p>引用类型一律传 <code>null</code>，基本类型一律传 <code>0</code>/<code>false</code>——' +
+          'JDex2 的 <code>makeDefaultArgs</code> 就是这么写的：遍历参数类型，' +
+          '基本类型给零值，<b>其余一律给 null</b>，并在注释里说明了理由：' +
+          '<i>对于引用类型，传入 null 是合法的（没必要再去构造对应类型参数）</i>。</p>' +
+          '<p style="margin-bottom:0">只有当目标方法<b>真的需要</b>一个可用的参数（例如它内部会解引用这个参数）时，' +
+          '你才需要去构造。这时候优先找"最简单能用的东西"：空集合、空字符串、App 里已经存在的实现类——' +
+          '而不是自己从零造一个。</p>') +
+        '<p>下面这个终端把"参数构造失败"的几种典型报错按顺序摆出来。' +
+        '它的用处是让你看到：<b>同一个"调用失败"的现象，根因可能完全不同</b>——' +
+        '而区分它们的成本，取决于你有没有先想清楚参数从哪来。</p>',
+      term: {
+        title: '参数构造失败时的典型报错（示意输出）',
+        lines: [
+          { t: 'd', s: '# 尝试一：类都找不到，和参数无关' },
+          { t: 'e', s: 'java.lang.ClassNotFoundException: com.target.Session', note: '<b>先排除加载器问题。</b>这不是参数构造的问题——用错 loader 时，你在第一步就倒下了。先解决 11.8 的事，再谈参数。' },
+          { t: 'd', s: '# 尝试二：null 撞上重载' },
+          { t: 'e', s: 'java.lang.IllegalArgumentException: no method found matching: check(Ljava/lang/Object;)V', note: '<b>null 没有类型。</b>目标类里同时存在 <code>check(String)</code> 与 <code>check(List)</code>，你传了裸 null，框架无法决定匹配哪一个。对策：显式指定类型，或先 <code>findMethodExact</code> 拿到 Method。' },
+          { t: 'd', s: '# 尝试三：参数类型对了，但构造不出来' },
+          { t: 'e', s: 'java.lang.InstantiationException: com.target.Request is abstract', note: '<b>抽象类不能 new。</b>这是"参数构造"最典型的死路：你要的参数类型本身是抽象类或接口，必须去找一个具体实现——而在被混淆的 App 里，那个实现类往往就在同一层逻辑里。' },
+          { t: 'd', s: '# 尝试四：参数造出来了，方法自己崩了' },
+          { t: 'e', s: 'java.lang.NullPointerException  at com.target.Crypto.encrypt(Crypto.java:1)', note: '<b>参数是 null，而方法内部直接解引用了它。</b>这一类失败说明"给 null"的策略在这个方法上不成立——你必须造一个可用的参数，或者换一个不需要该参数的入口。' },
+          { t: 'w', s: '提示：以上四类报错的定位成本差别极大。先分清是"找不到"还是"造不出"还是"对方不认"。', note: '<b>把失败分类，比逐个试参数更快。</b>同一批调用里，先按异常类型分组统计，你会立刻看出问题集中在哪一类。' }
+        ]
+      },
+    },
+
+    /* ============================================================ 11.8 */
+    {
+      h: '11.8', title: 'Hook 插件 dex 与壳 dex：在类加载器层面下钩子',
+      intuition: {
+        tag: '直觉模型 · 两个人换了锁，你要撬的是门轴',
+        body:
+          '<p>把类加载器想成<b>图书馆的检索台</b>。你问检索台要一本书（某个类），它告诉你"没有"。</p>' +
+          '<p>绝大多数人此时会怀疑自己记错了书名——于是反复改类名，反复失败。' +
+          '但真正的问题是：<b>你去的是旧馆的检索台，而这本书在新馆。</b></p>' +
+          '<p>更麻烦的是，新馆是<b>运行时才建起来的</b>——你没法事先知道它的地址，' +
+          '只能守在"建馆"这个动作上，等它出现的那一刻把它记下来。</p>' +
+          '<p>这一节讲的就是这件事：<b>不再问"这本书在不在"，而是守在"馆是怎么建起来的、书是怎么被要走的"这两个层面。</b></p>'
+      },
+      html:
+        '<p>先分清两类问题。它们现象一样（都是 <code>ClassNotFound</code>），但根因完全不同——' +
+        '<b>而根因不同，解法就不可能一样</b>。</p>' +
+        T.tbl(['', '插件 dex 里的类', '壳 dex 里的类'],
+          [
+            ['<b>谁加载的</b>', '插件框架自己 <code>new</code> 出来的 <code>DexClassLoader</code>（或类似的自定义加载器）',
+             '加固壳：它替换或包裹了 App 原本的加载器'],
+            ['<b>什么时候出现</b>', '<b>运行时按需</b>：点开某个功能、走到某段逻辑才加载',
+             '<b>启动早期就完成了</b>：你 attach 上去的时候，它已经换过一轮'],
+            ['<b>你用默认加载器看到什么</b>', '完全看不到这些类', '你可能看到的是壳的 dex；真 dex 在另一个加载器里'],
+            ['<b>下钩子的目标</b>', '在"新加载器被创建 / 新 dex 被挂载"时抓住它',
+             '找到"壳替换之后的那个真实加载器"，再在它上面 <code>findClass</code>'],
+            ['<b>对应手法</b>', 'hook <code>BaseDexClassLoader</code> 构造、<code>DexPathList.make*Elements</code>、' +
+             '<code>ClassLoader.loadClass</code>',
+             '从 <code>ActivityThread.mBoundApplication.info</code>（LoadedApk）反查真实加载器']
+          ]) +
+        T.note('key', '🔑 与第 16 章是同一个道理，只是换了一条工具链',
+          '<p>第 16 章的结论是：<b>用 <code>Java.use</code> 找不到加固 App 的业务类，不是类名错了，是"你问错了人"。</b>' +
+          '（双亲委派：加载器看不到兄弟加载器加载的类。）</p>' +
+          '<p style="margin-bottom:0">这一节要做的事情完全一样，只是把 Frida 的 ' +
+          '<code>Java.enumerateClassLoaders</code> 换成了 Xposed 的反射：' +
+          '<b>找到那个真正负责目标类的加载器，然后在对的加载器上动手。</b>' +
+          '如果你跳过了第 16 章，现在回去读它的 2.2 节——本节默认你已经理解双亲委派。</p>') +
+        '<h3 style="margin-top:26px">三层下钩子的位置，看的是三种不同的问题</h3>' +
+        T.tbl(['层', '位置', '你能看到什么', '代价'],
+          [
+            ['<b>L1</b>', '<code>ClassLoader.loadClass(String)</code>',
+             '<b>所有</b>加载请求，包括那些最终由父加载器加载成功的类。' +
+             '这是"谁在要什么"的总入口',
+             '量极大。一个 App 启动会产生成千上万次请求，日志会把你自己淹掉'],
+            ['<b>L2</b>', '<code>BaseDexClassLoader.findClass(String)</code>',
+             '只有"委托链走到底、这个加载器自己动手"的那部分类',
+             '覆盖小得多，但指向性强：看到的几乎都是你关心的那批类'],
+            ['<b>L3</b>', '<code>DexPathList</code> 的 <code>makeDexElements</code> / ' +
+             '<code>makePathElements</code> / <code>makeInMemoryDexElements</code>',
+             '<b>dex 级事件</b>：一个新的 dex 被挂进某个加载器的那一刻（不是类级）',
+             '看不到具体类名；但它是发现"壳又塞了一个 dex"的唯一窗口']
+          ]) +
+        '<p>判断怎么用：<b>想在类还没被加载时就介入 → 看 L1；想定位"谁负责这个类" → 看 L2；' +
+        '想发现动态加载 → 看 L3。</b>三者不是替代关系，是三个观察角度。</p>' +
+        '<p>这不是我编的分类。11.8C 要讲的 JDex2 在它的 Hook 模式里<b>三层都挂了</b>，' +
+        '而且在代码注释里写明了理由：<i>因为一些壳根本就不新建classloader，而是向其中插入Dex，' +
+        '所以完美想要Hook创建dex成员的方法</i>——这句话对应的正是 L3。</p>',
+      lab: {
+        title: '实验：loadClass 日志分层推演 —— 哪一层能看到最多的类加载',
+        goal: '目标：用真实日志统计三层的可见范围',
+        intro:
+          '<p>下面是一段加了壳的 App 启动时产生的类加载日志（<b>教学样例</b>，格式仿 logcat）。' +
+          '三条前缀对应刚才讲的三层：<code>[L1]</code> = <code>loadClass</code>，' +
+          '<code>[L2]</code> = <code>findClass</code>，<code>[L3]</code> = <code>make*Elements</code>。</p>' +
+          '<p><b>任务：</b>① 看懂每一层的可见范围（系统会算出<b>去重后</b>的数量与覆盖率）；' +
+          '② 填出"在哪一层下钩子能看到最多的类加载"；③ 用一句话说清<b>这一层的代价</b>。</p>' +
+          '<p>日志按 <code>|</code> 分隔（自己改成换行也能解析）。改日志，统计会跟着变。</p>',
+        inputs: [
+          {
+            key: 'log', label: '类加载日志',
+            hint: '一行一条，用 | 分隔',
+            type: 'text',
+            value: '[L1] loadClass com.target.App | [L1] loadClass com.target.Crypto | ' +
+                   '[L2] findClass com.target.Crypto | [L1] loadClass java.lang.String | ' +
+                   '[L3] makeDexElements classes2.dex -> DexClassLoader | [L1] loadClass com.plugin.Entry | ' +
+                   '[L1] loadClass com.plugin.Entry | [L2] findClass com.plugin.Entry | ' +
+                   '[L1] loadClass android.app.Activity | [L3] makeInMemoryDexElements -> InMemoryDexClassLoader | ' +
+                   '[L1] loadClass com.plugin.PayImpl | [L2] findClass com.plugin.PayImpl | ' +
+                   '[L1] loadClass com.target.Util'
+          },
+          { key: 'layer', label: '哪一层能看到最多的类加载（填 L1 / L2 / L3）', hint: '看数量', type: 'text', ph: 'L?' },
+          { key: 'why', label: '这一层的代价是什么（一句话）',
+            hint: '看到得最多，付出的代价是什么？', type: 'textarea', rows: 2, ph: '一句话…' }
+        ],
+        runLabel: '🔍 统计三层的可见范围',
+        autorun: true,
+        run: v => {
+          const raw = String(v.log || '').trim() ||
+            '[L1] loadClass com.target.App | [L1] loadClass com.target.Crypto | [L2] findClass com.target.Crypto | ' +
+            '[L1] loadClass java.lang.String | [L3] makeDexElements classes2.dex -> DexClassLoader | ' +
+            '[L1] loadClass com.plugin.Entry | [L1] loadClass com.plugin.Entry | [L2] findClass com.plugin.Entry | ' +
+            '[L1] loadClass android.app.Activity | [L3] makeInMemoryDexElements -> InMemoryDexClassLoader | ' +
+            '[L1] loadClass com.plugin.PayImpl | [L2] findClass com.plugin.PayImpl | [L1] loadClass com.target.Util';
+          const re = /^\[(L[123])\]\s*(\S+)\s*(.*)$/;
+          const l1 = [], l2 = [], l3 = [];
+          let bad = 0;
+          raw.split(/[\n|]+/).forEach(seg => {
+            const ln = seg.trim();
+            if (!ln) return;
+            const m = re.exec(ln);
+            if (!m) { bad++; return; }
+            const arg = String(m[3] || '').trim();
+            if (m[1] === 'L1') l1.push(arg);
+            else if (m[1] === 'L2') l2.push(arg);
+            else l3.push(arg);
           });
-          html += '</table>';
+          const uniq = a => a.filter((x, i) => x && a.indexOf(x) === i);
+          const u1 = uniq(l1), u2 = uniq(l2);
+          const pct = (n, d) => d ? Math.round(n / d * 100) : 0;
+          // 类集合指纹：对排序后的类名串做一次真实 MD5（手工构造字节，不依赖 TextEncoder）
+          const fpSrc = u1.slice().sort().join('|');
+          const fpBytes = new Uint8Array(fpSrc.length);
+          for (let k = 0; k < fpSrc.length; k++) fpBytes[k] = fpSrc.charCodeAt(k) & 0xff;
+          const fp = window.CRYPTO.toHex(window.CRYPTO.md5(fpBytes)).slice(0, 16);
+          const miss2 = u1.filter(x => u2.indexOf(x) < 0);
+          const nois = u1.length ? (l1.length / u1.length) : 0;
 
-          // 校验用户答案
-          const picked = String(v.reject || '').toUpperCase().replace(/[^A-E]/g, '').split('');
-          const uniq = [...new Set(picked)].sort();
-          const correct = ['B', 'C'];
-          const ok = uniq.length === 2 && uniq[0] === 'B' && uniq[1] === 'C';
-          if (picked.length) {
-            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>'
-              + (ok ? '✅ 正确：B 和 C 会被拒绝' : '❌ 答案不对') + '</b>'
-              + '<div class="lab-note">' + (ok
-                  ? 'B 是<b>内存安全</b>问题（可能越界），C 是<b>终止性</b>问题（可能死循环）。'
-                  : '正确答案是 <b>B</b> 和 <b>C</b>。<br>' +
-                    'B —— 没有边界检查的数组访问，验证器无法证明不越界。<br>' +
-                    'C —— 无条件死循环，验证器无法证明会终止。<br>' +
-                    '<b>A / D / E 都能通过</b>，因为它们分别用"范围检查""循环展开""判空"给出了静态可证的保证。')
-              + '</div></div>';
-          }
+          /* 用 LABX 的委托链模型，看一个"插件类"到底由谁加载 */
+          const chain = window.LABX.classLoaderChain('com.plugin.PayImpl', {
+            boot: ['java.lang.String', 'android.app.Activity'],
+            path: ['com.target.App', 'com.target.Crypto', 'com.target.Util'],
+            custom: ['com.plugin.Entry', 'com.plugin.PayImpl']
+          });
+          const traceRows = chain.trace.map(t =>
+            [t.loader, t.role, t.hit ? '<b>命中</b>' : '不认这个类']);
 
-          const reason = String(v.reason || '').trim();
-          if (reason) {
-            const hitStatic = window.AKKC_hasConcept(reason, ['静态', '加载时', '证明', '可证明', '不运行', '编译时', '事先', '不可判定']);
-            const hitSafe = window.AKKC_hasConcept(reason, ['安全', '越界', '死循环', '终止', '崩溃', '崩溃内核', '内存']);
-            html += '<div class="lab-msg ' + (hitStatic && hitSafe ? 'pass' : 'warn') + '"><b>'
-              + (hitStatic && hitSafe ? '✅ 抓住核心了' : '🟡 还不够到位') + '</b>'
-              + '<div class="lab-note">'
-              + '验证器的核心特征是：<b>它不做运行时测试，而是在加载时静态证明"这段程序在任何输入下都不会出事"。</b><br><br>'
-              + '要证明两件事：<br>'
-              + '<b>① 内存安全</b> —— 任何一次访问都在合法范围内（B 违反）<br>'
-              + '<b>② 一定终止</b> —— 不会无限循环卡住内核（C 违反）<br><br>'
-              + '<b>这就是"凭什么允许用户代码进内核"的答案：</b>' +
-              '不是靠权限限制（那限制不住），而是靠<b>数学证明</b>。'
-              + '</div></div>';
-          }
+          let html = '<div class="lab-msg key"><b>📊 三层可见范围（去重后）</b><div class="lab-note">' +
+            '<table style="width:100%;border-collapse:collapse">' +
+            '<tr><th align="left">层</th><th align="left">匹配行数</th><th align="left">去重类数</th>' +
+            '<th align="left">覆盖率</th><th align="left">看得到什么</th></tr>' +
+            '<tr><td><b>L1</b> loadClass</td><td>' + l1.length + '</td><td><b>' + u1.length + '</b></td>' +
+            '<td>' + pct(u1.length, u1.length) + '%</td><td>全部请求（含父加载器负责的类）</td></tr>' +
+            '<tr><td>L2 findClass</td><td>' + l2.length + '</td><td>' + u2.length + '</td>' +
+            '<td>' + pct(u2.length, u1.length) + '%</td><td>只有这个加载器自己负责的类</td></tr>' +
+            '<tr><td>L3 make*Elements</td><td>' + l3.length + '</td><td>0（dex 级事件）</td>' +
+            '<td>—</td><td>新 dex 被挂进加载器的时刻</td></tr>' +
+            '</table>' +
+            '<div style="margin-top:10px">日志总行数（L1）<b>' + l1.length + '</b>，去重后 <b>' + u1.length + '</b> 个类 —— ' +
+            '重复请求倍数约 <b>' + nois.toFixed(2) + '×</b>。这就是 L1 的噪音来源：' +
+            '同一个类会被请求不止一次。<br>' +
+            '解析失败（格式不匹配）的行：<b>' + bad + '</b> 行。<br>' +
+            '本次解析出的类集合指纹（MD5 前 16 位）：<code>' + fp + '</code> —— ' +
+            '类集合一变，指纹就变，可以用来判断"两次脱壳拿到的类是不是同一批"。</div></div></div>';
+
+          html += '<div class="lab-msg fail"><b>🔎 L2 漏掉了谁</b><div class="lab-note">' +
+            'L2 看不到的类（共 ' + miss2.length + ' 个）：' +
+            (miss2.length ? '<code>' + miss2.join('</code>、<code>') + '</code>' : '（无）') + '<br>' +
+            '其中 <code>java.lang.String</code>、<code>android.app.Activity</code> 这类是<b>父加载器负责的</b>——' +
+            '请求从 L1 进来、往上委托成功，根本不会落到 L2。这正是"L1 全、L2 精"的原因。</div></div>';
+
+          html += '<div class="lab-msg model"><b>🧬 用委托链模型验证一个插件类是谁加载的</b>' +
+            '<div class="lab-note">目标：<code>com.plugin.PayImpl</code>' +
+            '<table style="width:100%;border-collapse:collapse;margin-top:8px">' +
+            '<tr><th align="left">加载器</th><th align="left">职责</th><th align="left">结果</th></tr>' +
+            traceRows.map(r => '<tr><td>' + r[0] + '</td><td>' + r[1] + '</td><td>' + r[2] + '</td></tr>').join('') +
+            '</table>' +
+            '结论：它由 <b>' + (chain.found || '（无人负责）') + '</b> 加载 → ' +
+            chain.solve + '<br>' +
+            '<span style="color:var(--fg-3)">（这段推演用的是 assets/labx.js 里的 classLoaderChain 模型，' +
+            '与第 16 章的双亲委派是同一套规则。）</span></div></div>';
           return html;
         },
-        expected: (v) => {
-          const picked = [...new Set(String(v.reject || '').toUpperCase().replace(/[^A-E]/g, '').split(''))].sort();
-          const ok = picked.length === 2 && picked[0] === 'B' && picked[1] === 'C';
+        expected: v => {
+          const lay = String(v.layer || '').trim().toUpperCase().replace(/[^L123]/g, '');
+          const why = String(v.why || '').trim();
+          const layOk = lay === 'L1' || lay === '1';
+          const whyOk = window.AKKC_hasConcept(why, [
+            '所有请求', '全部请求', '总入口', '请求都', '数量大', '量最大', '最多', '噪音', '淹没',
+            '父加载器', '委托', '过滤', '去重', '性能'
+          ]);
           return {
-            ok,
-            detail: ok
-              ? '<b>完全正确：B 和 C。</b><br>' +
-                '验证器要静态证明两件事：<b>内存安全</b>（B 违反：可能越界）和<b>一定终止</b>（C 违反：可能死循环）。<br>' +
-                'A / D / E 分别靠"范围检查""循环展开""判空"给出了可证的保证。'
-              : '<b>不是这两个。</b>正确答案是 <b>B</b> 和 <b>C</b>。<br>' +
-                '判断方法：逐段问自己"验证器能不能<b>静态证明</b>它安全？"<br>' +
-                '• A 有范围检查 → 能证明<br>• D 循环被展开成直线代码 → 能证明<br>• E 判空后解引用 → 能证明<br>' +
-                '• <b>B</b> 直接用不可信输入索引 → <b>证明不了</b><br>' +
-                '• <b>C</b> 无条件死循环 → <b>证明不了会终止</b>'
+            ok: layOk && whyOk,
+            detail:
+              (layOk ? '✅ 层选对了：<b>L1 <code>ClassLoader.loadClass</code></b> 是所有加载请求的总入口，' +
+                      '去重后能看到全部类（覆盖率 100%）。'
+                     : '❌ 层选错了。你填的是 <code>' + (lay || '（空）') + '</code>。' +
+                       '数一数上面的表：L1 看到 ' + '全部' + '，L2 只看得到"这个加载器自己动手"的那部分，' +
+                       'L3 根本不看类（只看 dex）。') + '<br>' +
+              (whyOk ? '✅ 代价也说到了：L1 的量极大（重复请求 + 系统类也走这里），不做过就会把自己淹掉。'
+                     : '❌ 代价还差一句。关键点：<b>看到得最多 = 噪音最大</b>——' +
+                       'L1 会看到同一个类的重复请求、以及大量你根本不关心的系统类（<code>java.*</code>、<code>android.*</code>），' +
+                       '所以实战里通常要在回调里做前缀过滤或去重。')
           };
         },
         showAnswer:
-          '【会被拒绝的两段】B 和 C\n\n' +
-          'B —— 内存安全问题\n' +
-          '  代码：int idx = ctx->arg0;  return arr[idx];\n' +
-          '  理由：idx 来自上下文的不可信输入，验证器无法证明它落在 arr 范围内。\n' +
-          '        只要存在一条"可能越界"的路径，就拒绝。\n\n' +
-          'C —— 终止性问题\n' +
-          '  代码：while (1) { }\n' +
-          '  理由：eBPF 跑在内核态，死循环会挂住整个内核。\n' +
-          '        验证器要求所有循环都能被证明有上界。\n\n' +
-          '【能通过的三段及原因】\n' +
-          'A：先做范围检查 if (idx >= 0 && idx < 16)\n' +
-          '   → 验证器跟踪 idx 的取值范围，检查后确定落在 [0,16) 内\n' +
-          'D：#pragma clang loop unroll(full)\n' +
-          '   → 编译期完全展开成 8 段直线代码，指令流里没有循环结构\n' +
-          'E：先判空 if (!p) return 0;\n' +
-          '   → 排除 NULL 分支后，剩余路径上 p 一定非空\n\n' +
-          '【验证器的核心特征】\n' +
-          '  它【不做运行时测试】，而是在【加载时静态证明】：\n' +
-          '    "这段程序在任何输入、任何路径下都不会出事"\n\n' +
-          '  要证明两件事：\n' +
-          '    ① 内存安全 —— 每次访问都在合法范围内\n' +
-          '    ② 一定终止 —— 不会无限循环\n\n' +
-          '  这是"凭什么允许用户代码进内核"的答案：\n' +
-          '    不是靠权限限制，而是靠数学证明。',
+          '【哪一层看到最多】L1 —— ClassLoader.loadClass(String)\n' +
+          '  它是所有加载请求的总入口。包括：\n' +
+          '    · 最终由父加载器（BootClassLoader）加载成功的系统类（java.lang.String、android.app.Activity）\n' +
+          '    · 同一个类的重复请求（日志里 com.plugin.Entry 出现了两次）\n' +
+          '  本例：L1 匹配 13 行 / 去重 7 个类 = 覆盖率 100%\n\n' +
+          '【为什么不是 L2】\n' +
+          '  L2 是 BaseDexClassLoader.findClass —— 只有"委托链一路向上都失败、这个加载器自己动手"时才会被调用。\n' +
+          '  本例：L2 只看到 3 个类（com.target.Crypto / com.plugin.Entry / com.plugin.PayImpl），覆盖率约 43%。\n' +
+          '  父加载器负责的类走不到这里 —— 这正是"L1 全、L2 精"。\n\n' +
+          '【为什么不是 L3】\n' +
+          '  L3 是 DexPathList 的 makeDexElements / makePathElements / makeInMemoryDexElements。\n' +
+          '  它看到的是 dex 级事件（新 dex 被挂进加载器），不是类。本例 2 条。\n' +
+          '  它的用途是"发现动态加载"：壳又塞进来一个 dex，只有在这一层能第一时间知道。\n\n' +
+          '【L1 的代价】\n' +
+          '  量最大、噪音最多：重复请求 + 大量系统类。\n' +
+          '  实战做法：在回调里做前缀过滤（过滤 android./java./kotlin. 等）、做去重、\n' +
+          '  或者把 L1 当作"侦察层"用一段时间，确认目标后再收敛到 L2 或具体类。\n\n' +
+          '【记住这个三层的分工】\n' +
+          '  要"提前介入还不存在的类" → L1\n' +
+          '  要"确认谁负责这个类"     → L2\n' +
+          '  要"发现新 dex 被挂上"     → L3',
         hint:
-          '不要问"这段代码平时跑得通吗"——验证器<b>不运行代码</b>。<br>' +
-          '要问：<b>「验证器能不能在加载时，静态地证明这段程序永远不会出事？」</b><br><br>' +
-          '它主要证明两件事：<br>' +
-          '① <b>内存安全</b>：每次读写都在合法范围内吗？<br>' +
-          '② <b>一定终止</b>：会不会死循环卡住内核？<br><br>' +
-          '拿这两把尺子去量五个片段，答案就出来了。',
-        after:
-          T.note('key', '🔑 这个实验训练的是"从机制推边界"',
-            '<p style="margin-bottom:0">你现在能解释一个很多人答不上来的问题：' +
-            '<b>"eBPF 凭什么敢让用户写的代码跑在内核里？"</b><br><br>' +
-            '答案是<b>验证器</b>——它用静态分析证明了程序不会危害内核。' +
-            '这也解释了 eBPF 的很多"奇怪限制"：<br>' +
-            '• 为什么不能随心所欲循环？→ 终止性无法证明<br>' +
-            '• 为什么只能用 helper 白名单？→ 白名单函数的行为是已知安全的<br>' +
-            '• 为什么不能动态分配内存？→ 分配器的行为无法静态验证<br>' +
-            '• 为什么有 4096 条指令限制？→ 保证验证能在有限时间内完成<br><br>' +
-            '<span class="hit">这一节是本课程方法论的又一次体现：' +
-            '<b>先问"机制是什么"，限制和用法就能自己推导出来，不用背。</b></span></p>')
+          '<b>先看数量。</b>把三层的"去重类数"对比一下：' +
+          'L1 会包含那些"请求了但最终由父加载器加载"的系统类（<code>java.lang.String</code>、' +
+          '<code>android.app.Activity</code>），而 L2 只处理"自己动手"的那部分。<br><br>' +
+          '<b>再说代价：</b>看到得越多，噪音越大。想想一个真实 App 启动会产生多少次类加载请求——' +
+          '你打算怎么从里面捞出你关心的那几个？',
+        after: T.note('ok', '✅ 实验的收获',
+          '<p style="margin-bottom:0">你现在能把"我要 hook 类加载"这句话拆成三个具体问题：' +
+          '<b>我要提前介入（L1）、我要确认归属（L2）、还是我要发现新 dex（L3）？</b><br>' +
+          '这个拆分能力在实战里很值钱：它决定了你的日志是"能读的"还是"不能读的"。' +
+          '11.8C 的 JDex2 三层都挂了，但它的默认模式（Reflect）<b>一层都不挂</b>——' +
+          '那是另一个维度的权衡，案例里会讲。</p>')
+      },
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '插件类的 ClassNotFound',
+            scenario: '<b>情境：</b>目标 App 用了插件化框架。你在主 dex 里成功 hook 到了几个类，' +
+              '但要找的 <code>com.plugin.PayImpl</code> 一直报 <code>ClassNotFoundException</code>。' +
+              '你已经确认过：类名没写错（在别的工具里能看到这个类），主进程也判断正确。',
+            q: '接下来最该做的是？',
+            choices: [
+              { t: 'hook <code>BaseDexClassLoader</code> 构造与 <code>DexPathList</code> 的 ' +
+                   '<code>make*Elements</code>，把"新加载器被创建 / 新 dex 被挂载"的时刻抓住，' +
+                   '再用那个新加载器去 <code>findClass</code>', next: 'n1' },
+              { t: '把包名过滤条件放宽，让模块在更多进程里生效', next: 'n2' },
+              { t: '在主 dex 里遍历所有已加载的类，用模糊匹配猜一个相近的类名', next: 'n3' },
+              { t: '改用 <code>Class.forName("com.plugin.PayImpl")</code> 直接加载，绕开加载器问题', next: 'n4' }
+            ]
+          },
+          n1: {
+            terminal: true, verdict: 'good', verdictTitle: '对：插件类是运行时才有的，你得守在"它出生"的那一刻',
+            result: '<p><b>你抓住了插件 dex 与壳 dex 的关键区别：插件类是运行时按需加载的，事前根本不存在。</b><br>' +
+              '所以任何"在固定时刻去找它"的思路都会失败——不管那个时刻有多晚。正确姿势是<b>守株待兔</b>：<br>' +
+              '① hook <code>BaseDexClassLoader</code> 的构造函数 → 新加载器出现的瞬间你就知道了；<br>' +
+              '② hook <code>DexPathList</code> 的 <code>makeDexElements</code> / <code>makePathElements</code> / ' +
+              '<code>makeInMemoryDexElements</code> → 连"往现有加载器里插 dex"这条不新建加载器的路也堵上了；<br>' +
+              '③ 拿到新加载器之后，再用它 <code>findClass</code>——这时候才谈得上"问对了人"。<br>' +
+              '<span class="hit">JDex2 的做法与此逐字对应：它 hook 了 <code>BaseDexClassLoader</code> 构造，' +
+              '也 hook 了那三个 <code>make*</code> 方法，并在注释里说明理由——' +
+              '因为有些壳根本不新建 classloader，而是往里面插 dex。</span></p>'
+          },
+          n2: {
+            terminal: true, verdict: 'bad', verdictTitle: '你把"加载器问题"当成了"作用域问题"',
+            result: '<p><b>认知根源：现象里有一个反证，你没有用上。</b><br>' +
+              '如果真是作用域问题，你<b>连主 dex 里的类都 hook 不到</b>——模块根本不会被唤醒。' +
+              '但你明确说了"主 dex 里成功 hook 到了几个类"，这证明模块已经在正确的作用域和正确的进程里工作了。<br>' +
+              '<span class="miss">放宽作用域不会让插件类出现，只会让你的模块在更多无关进程里跑起来' +
+              '（更多的日志、更多的崩溃点、更大的暴露面）。</span><br>' +
+              '诊断的基本功：<b>先用已知的成功反证掉一批假设。</b></p>'
+          },
+          n3: {
+            terminal: true, verdict: 'bad', verdictTitle: '你在猜名字，而不是找加载器',
+            result: '<p><b>认知根源：你把"类不存在"理解成了"名字不对"。</b><br>' +
+              '遍历主 dex 里已加载的类不可能找到插件类——因为它<b>根本不在主 dex 里</b>，' +
+              '它是插件加载器从另一个 dex 加载的。你遍历再多次也是零命中。<br>' +
+              '<span class="hit">这个坑第 16 章已经点过一次：<b>找不到类时，第一反应应该是"谁负责加载它"，' +
+              '而不是"它到底叫什么"。</b></span><br>' +
+              '（模糊匹配猜名字还有一个副作用：真的猜中一个相近的类，你会以为问题解决了，' +
+              '然后在后面因为类型不匹配崩得莫名其妙。）</p>'
+          },
+          n4: {
+            terminal: true, verdict: 'bad', verdictTitle: 'Class.forName 用的是同一个加载器',
+            result: '<p><b>认知根源：你以为换了一个 API，其实换不动加载器。</b><br>' +
+              '<code>Class.forName(String)</code> 的单参数版本会用<b>调用方所在的加载器</b>——' +
+              '也就是你的模块类所在的那个加载器，它同样不认识插件类。<br>' +
+              '（三参数版本 <code>Class.forName(name, initialize, loader)</code> 才允许指定加载器，' +
+              '而问题仍然回到"你手上有没有那个对的加载器"。）<br>' +
+              '<span class="hit">这正是本节的核心命题：<b>能不能找到类，取决于你手上的加载器，' +
+              '而不是取决于你用哪个 API 去问。</b></span></p>'
+          }
+        }
+      },
+      after: T.note('key', '🔑 这一节的判断，一句话版',
+        '<p style="margin-bottom:0"><b>不要"在某个时刻去找类"，要"守在类出生的地方"。</b><br>' +
+        '壳 dex 的问题用"找到真实加载器"解决；插件 dex 的问题用"捕获新加载器 / 新 dex"解决。' +
+        '两种问题的共同点是：<b>答案都在加载器这一层，而不在类名上。</b></p>')
+    },
+
+    /* ============================================================ 11.8L */
+    {
+      h: '11.8L', title: '动手实验：Hook 点选择器 / 时机推演器',
+      html:
+        '<p>这是本章的核心实验。下面给出四个真实症状——它们分别对应你在实战里最常遇到的四种"怎么都不对"。</p>' +
+        '<p>请为每一个症状选择：<b>hook 点（P1–P6）</b>与<b>时机（before / after）</b>。' +
+        '系统会按 11.1–11.8 讲的<b>真实时机语义</b>逐条判定：此刻目标类存在吗？字段有值吗？' +
+        '入参还是原始的吗？壳换过的真实加载器拿得到了吗？</p>' +
+        '<p>最后你还要用一句话写出结论——这部分会做<b>语义判分</b>（说不清就等于没学会）。</p>' +
+        T.tbl(['编号', '症状'], [
+          ['<b>1</b>', 'App 一启动就闪退，logcat 里只有一条 <code>ClassNotFoundException</code>，指向你要 hook 的那个业务类'],
+          ['<b>2</b>', '你在某个类的构造函数里读实例字段，读出来是 <code>null</code>'],
+          ['<b>3</b>', '你在加密方法的 <code>after</code> 里看 <code>param.args</code>，发现它不是调用方传的那个明文'],
+          ['<b>4</b>', '插件 dex 里的类一直 <code>ClassNotFound</code>（主 dex 里的类都能正常 hook）']
+        ]) +
+        T.tbl(['编号', 'hook 点'], [
+          ['<b>P1</b>', '在 <code>handleLoadPackage</code> 里立刻 <code>findAndHookMethod</code> 业务类'],
+          ['<b>P2</b>', 'hook <code>ClassLoader.loadClass</code>（在类被加载之前介入）'],
+          ['<b>P3</b>', '等到能拿到"壳替换后的真实加载器"之后，再 <code>findClass</code> / 挂 hook'],
+          ['<b>P4</b>', 'hook <code>BaseDexClassLoader</code> 构造与 <code>DexPathList.make*Elements</code>（捕获新 dex 与新加载器）'],
+          ['<b>P5</b>', 'hook 目标类的构造函数'],
+          ['<b>P6</b>', 'hook 业务方法本身']
+        ]) +
+        T.note('', '📌 怎么填',
+          '<p style="margin-bottom:0"><b>症状</b>填 1/2/3/4；<b>hook 点</b>填 P1–P6；' +
+          '<b>时机</b>填 <code>before</code> 或 <code>after</code>——' +
+          '如果这个 hook 点本身没有"前后两侧"的概念（P1/P3/P4 属于"在哪一刻动手"，' +
+          '不区分 before/after），填 <code>-</code> 即可，系统会说明原因。</p>'),
+      lab: {
+        title: '实验：Hook 点选择器 / 时机推演器',
+        goal: '目标：按真实时机语义判定 hook 点与侧别',
+        intro:
+          '<p>先看上面的四个症状与六个 hook 点。这个实验的判定逻辑是<b>显式的时间轴模型</b>：' +
+          '基线取自 <code>LABX.BOOT_STAGES</code>（真实的系统启动阶段），后面接上 App 进程内部的关键事件。</p>' +
+          '<p>你选的 hook 点会落到时间轴的某一步上，系统据此算出"此刻你能看到什么"，' +
+          '再与症状的要求逐条比对。<b>点错不要紧——重点看每一条判定给出的理由。</b></p>',
+        inputs: [
+          { key: 'sym', label: '症状编号（1–4）', hint: '见上方表格', type: 'text', value: '1' },
+          { key: 'point', label: 'hook 点（P1–P6）', hint: '例如 P5', type: 'text', ph: 'P?' },
+          { key: 'when', label: '时机（before / after / -）', hint: 'P1、P3、P4 填 -', type: 'text', ph: 'before' },
+          { key: 'why', label: '用一句话写出你的结论',
+            hint: '要说清"为什么是这个点、为什么是这一侧"', type: 'textarea', rows: 3,
+            ph: '例如：构造函数体在 before 时还没执行，字段要到 after 才定型，所以……' }
+        ],
+        runLabel: '🧭 推演这个 hook 点',
+        autorun: true,
+        run: v => {
+          const B = (window.LABX && window.LABX.BOOT_STAGES) || [];
+          const first = B.length ? B[0].label : '（无数据）';
+          const last = B.length ? B[B.length - 1].label : '（无数据）';
+          const TL = [
+            { ix: 0, t: '系统启动基线：' + first + ' → ' + last, n: 'zygote 在此阶段起来，LSPosed 已经在场' },
+            { ix: 1, t: 'handleLoadPackage 被调用', n: 'App 进程刚起，业务类一个都还没加载' },
+            { ix: 2, t: 'Application.attachBaseContext()', n: '加固壳在这里替换 ClassLoader' },
+            { ix: 3, t: 'Application.onCreate()', n: '壳解密真 dex 并把新加载器挂上 → 真实加载器从此可拿' },
+            { ix: 4, t: '第一次 loadClass(业务类)', n: '壳在这里回填 code_item；业务类到这一刻才第一次存在' },
+            { ix: 5, t: '第一次 new 目标对象（构造函数执行）', n: '字段在这里被赋值：before 侧还是默认值' },
+            { ix: 6, t: '业务方法被调用', n: '入参在下行；方法体执行完之后可能被改写' },
+            { ix: 7, t: '业务方法再次被调用', n: '参数与上一次不同——只 hook 一次很容易漏掉变化' }
+          ];
+          const PT = {
+            P1: { n: 'handleLoadPackage 里立刻 findAndHookMethod 业务类', ins: 1, eff: 1, w: false },
+            P2: { n: 'hook ClassLoader.loadClass（在类被加载之前介入）', ins: 3, eff: 4, w: true },
+            P3: { n: '等拿到壳替换后的真实加载器再 findClass / 挂 hook', ins: 3, eff: 5, w: false },
+            P4: { n: 'hook BaseDexClassLoader 构造与 DexPathList.make*Elements', ins: 2, eff: 3, w: false },
+            P5: { n: 'hook 目标类的构造函数', ins: 4, eff: 5, w: true },
+            P6: { n: 'hook 业务方法本身', ins: 5, eff: 6, w: true }
+          };
+          const SYM = {
+            '1': {
+              title: 'App 一启动就闪退，ClassNotFoundException 指向业务类',
+              root: '你在最早期就去 findClass 业务类，而它此刻还不存在。',
+              ok: [['P2', 'before'], ['P3', '-']],
+              kw: ['加载器', 'loader', '真实', 'loadClass', '还没加载', '更早', '提前', '时机', '等它出现', '不要一开始就找']
+            },
+            '2': {
+              title: '在构造函数里读实例字段得到 null',
+              root: 'before 侧构造函数体还没执行，字段还没被赋值。',
+              ok: [['P5', 'after']],
+              kw: ['after', '之后', '构造完', '赋值', '定型', 'before 太早', '还没轮到', '时机']
+            },
+            '3': {
+              title: 'after 里看到的参数已经不是调用方传的明文',
+              root: 'after 侧方法体已经跑完，param.args 可能已被改写；原始入参只能在 before 取。',
+              ok: [['P6', 'before']],
+              kw: ['before', '之前', '原始', '已经被改', '入参', '提前取', '先取出', '拷贝', 'copy', '保存下来']
+            },
+            '4': {
+              title: '插件 dex 里的类 ClassNotFound（主 dex 正常）',
+              root: '插件 dex 由运行时新建的加载器加载，默认加载器按双亲委派看不到它。',
+              ok: [['P2', 'before'], ['P4', '-']],
+              kw: ['加载器', 'loader', '双亲委派', '插件', '动态', '新建', '新 dex', 'makeDexElements', 'loadClass', '切换加载器']
+            }
+          };
+          const symKey = String(v.sym || '').replace(/[^0-9]/g, '') || '1';
+          const S = SYM[symKey] || SYM['1'];
+          const pk = String(v.point || '').trim().toUpperCase().replace(/[^P0-9]/g, '');
+          const P = PT[pk] || null;
+          let when = String(v.when || '').trim().toLowerCase();
+          when = when === '-' || when === '－' || when === '' ? '-' : (when.indexOf('after') >= 0 ? 'after' : (when.indexOf('before') >= 0 ? 'before' : '?'));
+
+          const eff = P ? P.eff : null;
+          const st = {
+            cls: eff == null ? null : (eff >= 4 ? (eff === 4 ? '正在被加载（就在这一刻）' : '已存在') : '还不存在'),
+            field: eff == null ? null : (eff >= 5 ? (eff === 5 && when === 'before' ? '还没赋值（默认值）' : '已定型') : '还没赋值（默认值）'),
+            raw: eff == null ? null : (eff >= 6 ? (when === 'before' ? '原始（方法体还没跑）' : '可能已被方法体改写') : '不适用（还没走到调用）'),
+            loader: eff == null ? null : (eff >= 3 ? '可以拿到' : '拿不到（壳还没换完）'),
+            dex: eff == null ? null : (eff >= 3 ? '已挂上' : '还没挂上')
+          };
+          const normW = (P && P.w) ? when : '-';
+          const hit = !!(P && S.ok.some(p => p[0] === pk && (p[1] === '-' || p[1] === normW)));
+
+          let html = '<div class="lab-msg ' + (hit ? 'pass' : 'fail') + '">' +
+            '<b>' + (hit ? '✅ 这个组合命中症状 ' + symKey : '❌ 这个组合不匹配症状 ' + symKey) + '</b>' +
+            '<div class="lab-note">' +
+            '<b>症状 ' + symKey + '：</b>' + S.title + '<br>' +
+            '<b>根因：</b>' + S.root + '<br>' +
+            '<b>你选的：</b>' + (P ? '<code>' + pk + '</code> · ' + P.n + '　时机：<code>' + normW + '</code>'
+              : '<code>' + (pk || '（未填）') + '</code> —— 这不是 P1–P6 里的任何一个') +
+            '</div></div>';
+
+          html += '<div class="lab-msg key"><b>🕒 时间轴（基线来自 LABX.BOOT_STAGES）</b><div class="lab-note">' +
+            '<table style="width:100%;border-collapse:collapse">' +
+            '<tr><th align="left">步</th><th align="left">事件</th><th align="left">说明</th></tr>' +
+            TL.map(r => {
+              const mark = (P && (r.ix === P.ins || r.ix === P.eff))
+                ? ' <span style="color:var(--acc)">◀ 你的点在这里</span>' : '';
+              return '<tr><td>' + r.ix + '</td><td>' + r.t + mark + '</td><td>' + r.n + '</td></tr>';
+            }).join('') +
+            '</table></div></div>';
+
+          if (P) {
+            html += '<div class="lab-msg ' + (hit ? 'pass' : 'fail') + '"><b>🔬 逐条判定（在这个点上，此刻你能看到什么）</b>' +
+              '<div class="lab-note"><table style="width:100%;border-collapse:collapse">' +
+              '<tr><th align="left">检查项</th><th align="left">此刻的状态</th><th align="left">对这个症状意味着</th></tr>' +
+              '<tr><td>目标业务类</td><td>' + st.cls + '</td><td>' +
+                (st.cls === '还不存在' ? '<b>你找不到它</b>——这正是症状 1 的根因' : '可以找到它了') + '</td></tr>' +
+              '<tr><td>实例字段</td><td>' + st.field + '</td><td>' +
+                (st.field === '还没赋值（默认值）' ? '<b>读到 null 是必然的</b>——症状 2 的根因' : '已经有值') + '</td></tr>' +
+              '<tr><td>方法入参</td><td>' + st.raw + '</td><td>' +
+                (st.raw === '可能已被方法体改写' ? '<b>你看到的不是调用方传的值</b>——症状 3 的根因' : '（见左侧状态）') + '</td></tr>' +
+              '<tr><td>壳替换后的真实加载器</td><td>' + st.loader + '</td><td>' +
+                (st.loader === '可以拿到' ? '可以在它上面 findClass' : '现在还拿不到，只能先蹲守更底层') + '</td></tr>' +
+              '<tr><td>新 dex 是否已挂载</td><td>' + st.dex + '</td><td>' +
+                (st.dex === '已挂上' ? 'L3 已经能看到它了' : '还没有 dex 级事件') + '</td></tr>' +
+              '</table>' +
+              '<div style="margin-top:10px"><b>判定：</b>' + (hit
+                ? '这个 hook 点 + 时机，与症状 ' + symKey + ' 的要求一致。'
+                : '不匹配。注意：<b>不是所有 hook 点都吃 before/after</b>——' +
+                  (P.w ? '你选的 <code>' + pk + '</code> 有前后两侧，时机填对了才会有意义。'
+                       : '你选的 <code>' + pk + '</code> 属于"在哪一刻动手"，本身没有 before/after 的概念（填 <code>-</code> 即可）。')) +
+              '</div></div></div>';
+          } else {
+            html += '<div class="lab-msg warn"><b>⏳ 还没选 hook 点</b><div class="lab-note">' +
+              '在"hook 点"里填 P1–P6 中的任意一个，然后点上面的按钮。' +
+              '时间轴已经列出来了，你可以先自己推：<b>症状 ' + symKey + '</b> 需要在时间轴的哪一步介入？</div></div>';
+          }
+          return html;
+        },
+        expected: v => {
+          const SYM = {
+            '1': { ok: [['P2', 'before'], ['P3', '-']],
+                   kw: ['加载器', 'loader', '真实', 'loadClass', '还没加载', '更早', '提前', '时机', '等它出现'],
+                   want: '<b>P2 + before</b>（在 <code>loadClass</code> 的 before 里蹲守类名，此时不会因为类不存在而崩），' +
+                         '或者 <b>P3</b>（等壳换完加载器再动手，时机填 <code>-</code>）' },
+            '2': { ok: [['P5', 'after']],
+                   kw: ['after', '之后', '构造完', '赋值', '定型', 'before 太早', '还没轮到', '时机'],
+                   want: '<b>P5 + after</b>（构造函数跑完，字段才定型）' },
+            '3': { ok: [['P6', 'before']],
+                   kw: ['before', '之前', '原始', '已经被改', '入参', '提前取', '先取出', '保存下来'],
+                   want: '<b>P6 + before</b>（原始入参只在方法体执行前存在）' },
+            '4': { ok: [['P2', 'before'], ['P4', '-']],
+                   kw: ['加载器', 'loader', '双亲委派', '插件', '动态', '新建', '新 dex', 'makeDexElements', '切换加载器'],
+                   want: '<b>P4</b>（捕获新加载器 / 新 dex，时机填 <code>-</code>），或者 <b>P2 + before</b>（在加载请求入口蹲守）' }
+          };
+          const symKey = String(v.sym || '').replace(/[^0-9]/g, '') || '1';
+          const S = SYM[symKey] || SYM['1'];
+          const pk = String(v.point || '').trim().toUpperCase().replace(/[^P0-9]/g, '');
+          let when = String(v.when || '').trim().toLowerCase();
+          when = when === '-' || when === '－' || when === '' ? '-' : (when.indexOf('after') >= 0 ? 'after' : (when.indexOf('before') >= 0 ? 'before' : '?'));
+          const hit = S.ok.some(p => p[0] === pk && (p[1] === '-' || p[1] === when));
+          const why = String(v.why || '').trim();
+          const whyOk = window.AKKC_hasConcept(why, S.kw);
+          return {
+            ok: hit && whyOk,
+            detail:
+              '症状 ' + symKey + '：' +
+              (hit ? '✅ hook 点与时机都对了。' : '❌ hook 点或时机不对。你填的是 <code>' + (pk || '空') + '</code> / <code>' + when + '</code>。') +
+              '<br>' +
+              (whyOk ? '✅ 结论里说到了关键概念。' :
+                '❌ 结论还差关键点。这一题要说到：<b>' + S.kw.slice(0, 4).join(' / ') + '</b> 这一层的意思。') +
+              (hit ? '' : '<br><b>再看一眼时间轴：</b>这个症状要求你在"目标信息还存在/还没被破坏"的那一步介入。')
+          };
+        },
+        showAnswer:
+          '【症状 1】App 一启动就闪退，ClassNotFoundException 指向业务类\n' +
+          '  根因：在 handleLoadPackage 最早期就去 findClass 业务类，而它还没被壳加载出来。\n' +
+          '  正解：P2 + before —— 在 ClassLoader.loadClass 的 before 侧蹲守类名（此时不会因类不存在而崩）；\n' +
+          '        或 P3 —— 等到能从 ActivityThread.mBoundApplication.info 拿到壳换过的真实加载器再动手（时机填 -）。\n' +
+          '  错误示范：P1（在最早的时机找还不存在的类）。\n\n' +
+          '【症状 2】在构造函数里读实例字段得到 null\n' +
+          '  根因：before 侧构造函数体还没执行，字段还是默认值（引用类型 null、int 0）。\n' +
+          '  正解：P5 + after —— 构造完成后字段才定型。\n' +
+          '  诊断手法：同一个字段在 before / after 各打一次日志，看它在哪一侧出现。\n\n' +
+          '【症状 3】after 里看到的参数不是调用方传的明文\n' +
+          '  根因：after 时方法体已经跑完，param.args 可能已被方法自身（或别的模块）改写。\n' +
+          '  正解：P6 + before —— 原始入参只存在于方法体执行之前；需要保留就在 before 里先复制一份。\n\n' +
+          '【症状 4】插件 dex 里的类 ClassNotFound（主 dex 正常）\n' +
+          '  根因：插件类由运行时新建的加载器加载，默认加载器按双亲委派看不到它。\n' +
+          '  正解：P4（hook BaseDexClassLoader 构造 + DexPathList.make*Elements，捕获新加载器/新 dex，时机填 -）；\n' +
+          '        或 P2 + before（在加载请求的总入口蹲守）。\n' +
+          '  注意：这不是作用域问题——主 dex 的类能 hook 到，说明模块已经在正确的进程里了。\n\n' +
+          '【一句话总纲】\n' +
+          '  hook 点的选择 = 在"你需要的信息还存在、且目标对象已经存在"的那一步介入。\n' +
+          '  两侧的语义：before = 参数与对象状态都还没被使用；after = 结果与状态都已定型。',
+        hint:
+          '<b>逐个症状问自己三个问题：</b><br>' +
+          '① 我要的东西（类 / 字段 / 原始入参 / 加载器）在<b>哪一步</b>才存在？<br>' +
+          '② 我选的 hook 点在<b>那一步之前还是之后</b>？<br>' +
+          '③ 我选的点有 before/after 两侧吗（P1/P3/P4 没有）？<br><br>' +
+          '最常错的一个：症状 2 有相当一部分人会去 hook 业务方法（P6）——那样确实能读到值，' +
+          '但你并没有回答"构造函数里为什么是 null"。',
+        after: T.note('ok', '✅ 实验的收获',
+          '<p style="margin-bottom:0">你现在应该能把本章前八节压缩成一张表：<br>' +
+          '<b>类还不存在 → 蹲守加载层（P2/P4）；对象状态没定型 → 挪到 after（P5）；' +
+          '原始数据正在被消耗 → 必须在 before 取（P6）。</b><br>' +
+          '这张表就是"时机"这件事的全部判断依据。后面无论遇到什么新症状，先问"我要的东西在哪一步存在"，答案自然出来。</p>')
       }
     },
 
-    /* ================= 11.5C 实战案例 ================= */
+    /* ============================================================ 11.8C */
     {
-      h: '11.5C', title: '实战案例：某加固 V3/V4 的 Frida 检测定位',
+      h: '11.8C', title: '实战案例：JDex2 —— 用 Xposed/LSPosed 主动调用脱抽取壳',
       case: {
-        source: 'kanxue',
-        title: '[原创]某加固最新版frida检测绕过-trace一把嗦(续)',
-        date: '2026-7-28',
-        author: '东方玻璃',
-        target: '某加固（壳 so = libDexHelper.so）最新 V3 / V4 版 Frida 检测；V3 样本 com.mobile.zgcbank，V4 样本 com.yitong.zjrc.mfs.android',
+        source: 'github',
+        title: 'JDex：基于Xposed / Lsposed的主动调用抽取壳脱壳工具',
+        date: '2026-04-06（GitHub 仓库创建时间）',
+        author: 'J5now',
+        target: 'JDex2（仓库 J5now/JDex2，Java + native，入口 com.jsnow.jdex2.JSHook）；README 自述' +
+                '「基于 Android9.0+ 开发」，依赖 LSPosed',
         background:
-          '<p>2026 年的一篇看雪原创帖。目标是某加固<b>最新 V3 / V4 版</b>的 Frida 检测：V3 样本 <code>com.mobile.zgcbank</code>，' +
-          'V4 样本 <code>com.yitong.zjrc.mfs.android</code>，壳 so 都是 <code>libDexHelper.so</code>。作者没有点名厂商。</p>' +
-          '<p>环境：Mac mini M4 / macOS 15.7.7、IDA Pro 9.4、Pixel 6A（Android 14）；' +
-          '工具链是 Codex、Frida 16.2.1、ida-export-cli、<b>glass-stalker-trace</b>、SoFixer、bindiff。</p>' +
-          '<p>这篇帖子的看点在于：<b>检测点藏在匿名内存里的 so 中，静态根本无从下手</b>，' +
-          '作者于是走上了一条“先把它变成可分析对象，再让程序自己走一遍，最后用二分法逼出唯一那个人”的路。' +
-          'V4 还多了一层变化——<b>它不再杀进程，而是故意不解密 DEX 让你自己崩</b>。</p>',
+          '<p>先把它要解决的问题摆清楚。第 8 章把加固分了几代：<b>一代壳</b>整体加密 dex，' +
+          '<b>抽取壳</b>保留 dex 结构但抽走方法体，方法首次被调用时才回填。' +
+          '第 16 章的 FART 用「主动调用」解决抽取壳——遍历所有类与所有方法强制调用一遍，逼壳回填，然后 dump。</p>' +
+          '<p>但 FART 那条路很重：要改 ART、要刷机、要跟着安卓大版本反复移植（第 26 章整章都在讲这件事）。' +
+          'JDex2 走的是另一条路：<b>做成一个 Xposed/LSPosed 模块，装上去就能跑</b>。' +
+          '它的 README 写得很直白——<i>可以应对未对Lsposed设置有效检测的大部分的企业抽取壳和免费壳的Dex加固</i>。</p>' +
+          '<p>我核对的是它的<b>仓库与源码</b>（README、<code>assets/xposed_init</code>、' +
+          '<code>app/src/main/java/com/jsnow/jdex2/JSHook.java</code>）。README 里给出的原帖链接指向看雪，' +
+          '但看雪未登录访问需要人机验证，本次工具未能取到正文，所以下面所有技术细节都来自 GitHub 仓库本身。</p>',
         points: [
-          '版本谱系：V1 / V2 会解密释放真 so 并替换 <code>soinfo</code>，hook 掉线程检测函数即可；<b>V3 / V4 内置自定义 linker，直接把真 so 加载到匿名内存</b>，磁盘上再也找不到它。',
-          'V3 dump 法：<code>Process.enumerateRanges({protection:\'r-x\',coalesce:true})</code> 扫可执行内存，校验 ELF 魔数 <code>0x7f 45 4c 46</code>，并用 <code>Process.enumerateModules()</code> 做白名单排除。',
-          'fullSize 靠解析 Phdr 算：64 位下 <code>e_phoff@32</code>、<code>e_phnum@56</code>、<code>p_size=56</code>，取所有 PT_LOAD 的 <code>p_vaddr+p_memsz</code> 最大值向上按 4096 对齐；dump 完再用 <b>SoFixer</b> 修复。',
-          'hook <code>clone</code> 定位检测线程：<code>args[3]!=0</code> 时读 <code>args[3].add(96).readPointer()</code>；当 Frida 的 <code>Process.findModuleByAddress</code> 返回 null 时，改按 <code>addr.sub(base)</code> 打印偏移。',
-          '确认某个函数是检测点后，用 <code>Arm64Writer.putRet()</code> 把函数头 patch 成 <code>ret</code>，先粗暴验证再谈精细绕过。',
-          'V3 首批 8 个偏移 <code>0x2cb28</code> / <code>0x43ed8</code> / <code>0x3e018</code> / <code>0x4bd70</code> / <code>0x4c608</code> / <code>0x574d8</code> / <code>0x48088</code> / <code>0x4aed8</code> <b>全部处理完，App 仍然崩</b>——说明真凶不在这一批里。',
-          '<b>glass-stalker-trace</b> 用法：插件放进 IDA 的 <code>plugins</code> 目录，<code>configureTrace({moduleName, root:{name:\'JNI_OnLoad\',offset:0x13A8C}})</code> 设根节点，再 <code>trace_start(base,range)</code> 跑；输出节点形如 <code>[tree] |-- sub_29D78 (0x29d78) [from=0x2832c, bl, depth=2]</code>。',
-          '<b>二分法定位</b>：取 trace 树里居中且唯一路径上的中间节点，在它的 <code>onLeave</code> 里 <code>Thread.sleep(10)</code>（5–10s 合适，太久系统会 kill app）；sleep 没跑完就崩 ⇒ 检测点在前半段，跑完才崩 ⇒ 在后半段。',
-          'V3 真检测点 <b><code>sub_2813C</code></b>：不是 JNI_OnLoad 开头的那次调用，而是<b>第 418 行 <code>if</code> 内 fork 分支里的第 2 次调用</b>；功能是扫 <code>cmdline</code> 判断调试态。',
-          '它的返回值语义是四态：<b>0 = 触发 fork、1 = 崩溃、2 = 可运行、3 = 其他点位的正常值</b> ⇒ 用 <code>retval.replace(3)</code> 绕过，而不是简单置 0。',
-          'V4 的检测摊在 8 个线程函数里：<code>0x302b0</code> / <code>0x348a4</code> / <code>0x5171c</code> / <code>0x4741c</code> / <code>0x5e588</code> / <code>0x60a88</code> / <code>0x61b3c</code> / <code>0x6dc04</code>。',
-          'V4 上 trace 默认 10s 窗口不够，要加 <code>maxDurationMs:30000</code>，并用 <code>hotPathSuppress:{functions:[0x80100,0x7C4F0]}</code> 压掉热点函数，最终锁定真检测函数 <b><code>sub_6A5A8</code></b>。',
-          'V4 的指令级定位用 <code>detailTrace:{enabled:true,startOffset:0x10380,untilProcessExit:true}</code>，log 写在 <code>/data/data/&lt;pkg&gt;/files/</code>；关键位置是最后的 <code>blr x20</code>，调用点 <code>0x10674</code>，符号为 <code>_ZN3art13DexFileLoader10OpenCommonEPKhmS2_mRKNSt3__112basic_string...</code>。',
-          '<b>V4 的关键变化</b>：它不再主动杀进程，而是检测到 Frida 后<b>故意不解密 DEX / 埋坑</b>，等正常业务逻辑去调系统 API 时因缺关键数据触发异常崩溃——把“杀你”伪装成“你自己崩的”。',
-          '<code>sub_6A5A8</code> 返回 0 → 正常解密释放 DEX；返回 1 → DEX 无法释放，最后崩溃 ⇒ 必须把它 hook 成 0，并配合 patch <code>6AB94</code>。'
+          '<b>入口声明</b>：<code>assets/xposed_init</code> 只有一行 <code>com.jsnow.jdex2.JSHook</code>；' +
+          '入口类实现 <code>IXposedHookLoadPackage</code>——就是 11.3 讲的那个最小骨架。',
+          '<b>拿壳替换后的真实 ClassLoader</b>：<code>ActivityThread.currentActivityThread()</code> → ' +
+          '<code>mBoundApplication</code> → <code>info</code>（LoadedApk）→ <code>getClassLoader()</code>；' +
+          '失败则回退到 <code>lpparam.classLoader</code>。代码注释自称这条链是 Android 自己也在用的。',
+          '<b>枚举 DexFile</b>：要求加载器是 <code>BaseDexClassLoader</code>，然后取 <code>pathList</code> → ' +
+          '<code>dexElements[]</code> → 每个元素的 <code>dexFile</code> 字段。',
+          '<b>主动调用构造</b>：取 <code>getDeclaredConstructors()</code> 的第一个，用 ' +
+          '<code>before</code> + <code>param.setResult(null)</code> 把构造体堵住，再用默认参数 ' +
+          '<code>newInstance</code> 触发回填，最后在 <code>finally</code> 里 <code>unhook()</code>。',
+          '<b>dump 交给 native</b>：读 <code>DexFile.mCookie</code>（<code>long[]</code>），' +
+          '调用自带的 native 方法 <code>dumpDexByCookie(cookie, outDir)</code>；' +
+          '模块用 <code>System.loadLibrary("jdex2")</code> 加载自己的 so（走 LSPosed 的 native 通道）。',
+          '<b>两条工作模式</b>：默认 <code>Reflect</code>（sleep 10 秒后反射 dump，<b>刻意不 hook</b> ' +
+          '<code>onCreate</code> / <code>attachBaseContext</code>）；可选 <code>Hook</code> 模式——' +
+          'hook <code>BaseDexClassLoader</code> 构造，并 hook <code>DexPathList</code> 的 ' +
+          '<code>makeDexElements</code> / <code>makePathElements</code> / <code>makeInMemoryDexElements</code>，' +
+          '通过 <code>definingContext</code> 字段拿回对应的加载器。README 把 Hook 模式标注为<b>不推荐使用</b>。',
+          '<b>稳定性设计</b>：<code>CLASS_FILTER_PREFIXES</code> 过滤 <code>android.</code>/<code>java.</code>/' +
+          '<code>kotlin.</code>/<code>com.google.</code> 等前缀；白名单 / 黑名单按前缀匹配；' +
+          '<code>isDexAlreadyDumped()</code> 用 cookie 取出该 dex 的大小、检查输出文件是否已存在 → 支持<b>分两轮脱壳</b>。',
+          '<b>产物与配置路径</b>：dump 到 <code>/sdcard/Android/data/&lt;包名&gt;/dumpDex/</code>；' +
+          '配置由 <code>MainActivity</code> 写入 <code>.../files/config.properties</code>；' +
+          'Android 12+ 用的是 <code>/Android/\\u200Bdata/</code>（路径里插了一个零宽字符）。'
         ],
         method: [
-          '先认清对手升级到了哪一代：V1 / V2 的 soinfo 替换法在 V3 / V4 上完全无效，因为真 so 已经进了匿名内存，磁盘侧无从下手。',
-          '把匿名内存里的 so 变成可分析对象：扫 <code>r-x</code> 段 → 校验 ELF 魔数 → 排除已知模块 → 按 Phdr 算出 fullSize → dump 并用 SoFixer 修复。',
-          '拿到可读 so 之后，hook <code>clone</code> 盯住检测线程的创建，先把可疑线程的调用点按 <code>addr.sub(base)</code> 的相对偏移记录下来。',
-          '对首批 8 个偏移逐个 <code>putRet()</code> 试 patch——<b>全部失败</b>，于是放弃“猜偏移”，转向行为追踪。',
-          '用 glass-stalker-trace 从 <code>JNI_OnLoad+0x13A8C</code> 为根跑出一棵调用树，拿到几千个节点的完整执行路径。',
-          '在树上做二分：挑居中节点塞 <code>Thread.sleep(10)</code>，用“崩不崩”把范围砍一半，反复收敛到唯一的那个函数。',
-          '定位到 <code>sub_2813C</code> 后，先读清它的返回值语义（四态！），再用 <code>retval.replace(3)</code> 而不是置 0 来绕过。',
-          'V4 重复同一套流程：先扩 trace 窗口到 <code>maxDurationMs:30000</code> 并压制热点函数，再从 8 个线程函数收敛到 <code>sub_6A5A8</code>。',
-          'V4 上再下沉一层，用 <code>detailTrace</code> 做指令级 trace，顺着最后的 <code>blr x20</code> 找到 <code>DexFileLoader::OpenCommon</code> 这个调用点，确认“不解密 DEX”这条链。',
-          '收口：V4 把 <code>sub_6A5A8</code> hook 成返回 0（让它老老实实解密释放 DEX），并补掉 <code>6AB94</code>，绕过完成。'
+          '先判断对手是哪一类：目标若是抽取壳，就走"主动调用触发回填"这条路；若是方法粒度抽取，这个工具自己承认无能为力（见局限）。',
+          '不信任默认加载器：先从 <code>ActivityThread.mBoundApplication.info</code> 反查壳替换后的真实 ClassLoader，拿不到再回退。',
+          '从真实加载器的 <code>dexElements</code> 里把所有 <code>DexFile</code> 掏出来，用 <code>getClassNameList(mCookie)</code> 列出类名。',
+          '按白名单 / 黑名单与系统类前缀过滤类名，避免在无关类上触发副作用（这是崩溃控制的第一步）。',
+          '逐个类主动调用构造函数触发回填，调用前用 <code>before</code> + <code>setResult(null)</code> 堵住构造体，调用后在 <code>finally</code> 里立刻 unhook。',
+          '把 <code>mCookie</code> 交给 native 层写出 dex 文件；用"cookie 里各 dex 的大小 + 文件是否已存在"做去重与增量，支持分轮补齐。',
+          '遇到崩溃就用 <code>invokeDebugger</code> 打印出的类列表 + 黑名单缩小范围（README 明确提示：某些类可能继承了当前系统版本不存在的父类）。'
         ],
         result:
-          '<p>V3 侧：定位到真检测点 <code>sub_2813C</code>，用 <code>retval.replace(3)</code> 绕过——' +
-          '注意这里的关键是<b>读懂了返回值是四态而不是布尔</b>，简单置 0 反而会踩进 <code>fork</code> 分支。</p>' +
-          '<p>V4 侧：从 8 个线程函数收敛到 <code>sub_6A5A8</code>，把它 hook 成返回 <code>0</code> 并 patch <code>6AB94</code>，' +
-          'App 恢复正常——<b>因为返回 0 才会触发正常的 DEX 解密与释放流程</b>。</p>' +
-          '<p>整条路线上真正的两个突破，一个来自<b>把匿名 so 变成可 dump 的对象</b>，另一个来自<b>用二分法把几千个函数砍成 1 个</b>。' +
-          '静态分析在这两个环节都没能直接给出答案。</p>',
-        terms: ['Frida Stalker', 'glass-stalker-trace', 'SoFixer', 'Process.enumerateRanges', 'Arm64Writer', '匿名内存加载', 'JNI_OnLoad', 'retval.replace', 'detailTrace', 'DexFileLoader'],
+          '<p>README 给出了两条使用路径与产物位置：模块页选中目标 Apk、在 LSPosed 里激活并勾选对应 App、启动目标 App，' +
+          'dump 出的 dex 落在 <code>/sdcard/Android/data/&lt;包名&gt;/dumpDex/</code> 下；' +
+          'README 还附了一张"某最新企业抽取壳脱壳效果展示"的截图。</p>' +
+          '<p>作者对适用面的表述是：<b>可以应对未对 Lsposed 设置有效检测的大部分的企业抽取壳和免费壳的 Dex 加固</b>。' +
+          '<span class="pill warn">待核实</span>：README 没有给出样本清单、加固厂商名称与成功率统计，' +
+          '所以"大部分"这个范围目前只能按作者自述理解，无法独立复核。</p>',
+        terms: ['Xposed / LSPosed', 'IXposedHookLoadPackage', 'assets/xposed_init', '主动调用', '抽取壳',
+                'ClassLoader', 'BaseDexClassLoader', 'DexPathList.make*Elements', 'DexFile.mCookie',
+                'getClassNameList', 'JNI 全局引用', 'native hook 通道', 'scope'],
         limits:
-          '<p>这篇帖子的局限作者自己交代得比较清楚，也有几处必须替他标注：</p>' +
-          '<p>① <b>trace 结果因插件版本而异</b>——作者用的是 V1.2，换版本输出可能不同。</p>' +
-          '<p>② V4 定位到 <code>sub_6A5A8</code> <b>“有一些运气成分”</b>：插件 V1.0 会折叠节点，导致当时的判断是误打误撞命中的。</p>' +
-          '<p>③ trace 命中过多热点函数时，会触发 trace 引擎自身的性能限制，需要靠 <code>hotPathSuppress</code> 之类的手段减负。</p>' +
-          '<p>④ <b>二分法的节点选取有讲究</b>：要挑居中、且在树上路径唯一的节点，随便挑一个可能压根没被走到，sleep 就白塞了。</p>' +
-          '<p>⑤ <b>加固厂商未点名</b>，样本无法据此复现验证。</p>' +
-          '<p>⑥ 作者还专门反思了“让 AI 自动调 IDA”的坑：<b>AI 谎报军情，说脚本已经跑通，实际把 APP 卡死了</b>，最后他放弃自动化、回归手工操作。</p>',
+          '<p>这个项目的价值有一半在它的"局限性"一节——作者写得非常具体，逐条照录：</p>' +
+          '<p>① <b>只能对抗类级别的方法抽取</b>；方法粒度的抽取无法进行；' +
+          '也无法应对"方法执行结束后重新抽取"的情况，以及"真正开始执行字节码才动态解密"的情况。<br>' +
+          '② 便捷性不足，一些崩溃问题可能需要参考崩溃日志分析，<b>不算很完善</b>。<br>' +
+          '③ <b>基于 Android 9.0+ 开发</b>，未适配 Android 7 系列及以下，Android 8 未知。<br>' +
+          '④ <b>JNI 全局引用数量超过 51200 个会导致崩溃</b>——类太多时要重新跑一轮脱剩下的类' +
+          '（配置不用改，会自动识别并跳过已 dump 的类）。<br>' +
+          '⑤ <b>高度依赖 Lsposed 的隐蔽性，如果 Lsposed 被检测则会直接闪退无法进行脱壳。</b><br>' +
+          '⑥ 对"继承了当前系统版本不存在的类"的类做主动调用实例化，可能导致崩溃，' +
+          '需要观察 <code>invokeDebugger</code> 的结束类并把它加进黑名单。<br>' +
+          '⑦ README 自嘲"UI 写得有点草率"（原文带删除线）。</p>' +
+          '<p>另外两点是 README 明说但容易被忽略的：<b>Hook 模式"不推荐使用"</b>（原因写在代码注释里：' +
+          'hooking <code>onCreate</code>/<code>attachBaseContext</code> 很容易被检测出来）；' +
+          '以及"Frida 式的样本覆盖度"在这里没有任何承诺——作者没有声称它通吃所有壳。</p>',
         analysis:
-          '<p><b>虽然本案例用的是 Frida Stalker 而不是 eBPF，但它是第 11 章“内核态 / 低层观测”这条思路的方法论同构。</b>' +
-          '本章的元原则是：<b>观测点决定了你能看见什么</b>——eBPF 的价值不在技术先进，而在“观测发生在目标进程的地址空间之外”。' +
-          '这个案例换了个方向用同一条原则：当静态分析看不见目标时，就<b>把观测这件事本身往下压一层</b>，从“读代码”压到“看它怎么跑”。</p>' +
-          '<p><b>第一层，把“不可能”变成“可枚举”。</b>面对匿名内存里的 so，作者没有硬啃汇编，而是用三个可判定的条件——' +
-          '扫 <code>r-x</code> 段、校验 ELF 魔数 <code>0x7f 45 4c 46</code>、用 <code>Process.enumerateModules()</code> 排除已知模块——' +
-          '把它变成了一个<b>可以被 dump 的普通对象</b>。变成文件之后，IDA 能读、bindiff 能比、SoFixer 能修，' +
-          '<span class="hit">原本无从下手的问题，被翻译成了一套标准流程。这是本章 11.7 探测清单的同一种思维：<b>把“行不行”变成一组可测量的数据。</b></span></p>' +
-          '<p><b>第二层，二分法这种“笨办法”的价值。</b>当检测点藏在几千个函数里，作者的解法是塞一个 <code>Thread.sleep(10)</code>，' +
-          '用“崩不崩”把搜索空间砍一半。<b>它比任何静态分析都快</b>，因为它完全绕过了“读懂逻辑”这件事，只依赖一个前提：程序会自己告诉你答案。' +
-          '这正是本课反复强调的元原则——<b>静观看不懂的，让程序自己走一遍</b>——第 11 章的观测优先思路，正是它在内核层的版本。' +
-          '<span class="hit">先让程序走一遍，再决定要读哪一段代码。</span></p>' +
-          '<p><b>第三层，对 AI 的批判性使用。</b>作者明确记录了“AI 谎报军情说脚本通过、实际卡死 APP”，然后回归手工。' +
-          '这个细节比技术本身更重要：<b>AI 适合做“从汇编到逻辑”的静态还原</b>——那部分它确实能省下大量时间；' +
-          '<b>但它不适合做“脚本到底跑没跑通”的判断</b>，因为那是事实问题，必须自己验证。' +
-          '<span class="hit">把 AI 用在“提出假设”上，把人工留在“验证事实”上——这与本章 11.6 那句“唯一可靠的做法是在你自己的目标设备上实测”是同一条底线。</span></p>',
-        link: 'https://bbs.kanxue.com/thread-292208.htm',
-        linkNote: '看雪论坛原创帖'
+          '<p><b>这个案例是 11.8 那节课的现实版本，而且它把"为什么"写在了代码注释里。</b></p>' +
+          '<p><b>第一，它印证了"找类失败是加载器问题，不是类名问题"。</b>' +
+          '整个工具的起点不是"我想 hook 哪个方法"，而是一段 <code>getRealClassLoader()</code>：' +
+          '从 <code>ActivityThread.mBoundApplication.info</code> 反查到 LoadedApk 再拿到加载器。' +
+          '这正是第 16 章讲的<b>双亲委派</b>在另一条工具链上的实现——' +
+          '<span class="hit">你在 Frida 里用 <code>Java.enumerateClassLoaders</code> 干的事，' +
+          '在 Xposed 这边就是沿着 ActivityThread 的引用链把那个加载器挖出来。</span></p>' +
+          '<p><b>第二，它的主动调用与第 16 章 FART 完全同构，只是换了执行层。</b>' +
+          'FART 遍历 DexFile × 类 × 方法强制 <code>Invoke</code>，目的是触发抽取壳回填；' +
+          'JDex2 走 <code>getClassNameList(mCookie)</code> → <code>findClass</code> → <code>newInstance</code>，' +
+          '目的完全一样。<b>区别只在"从 ART 内部搬到了 Java 反射层"</b>——代价是能力受限于 Java 能摸到的接口，' +
+          '好处是不用刷机。这就解释了它的第一条局限：<b>方法粒度的抽取它做不到</b>，' +
+          '因为它能触发的只是"类被使用 / 对象被构造"这个层级的事件。</p>' +
+          '<p><b>第三，它把"hook 是痕迹"这件事写进了代码。</b>' +
+          '<code>finally</code> 里那句 <code>unhook()</code> 的注释说得很清楚：' +
+          '某些加固会检测"方法是否被转为 native"。也就是说，作者<b>知道自己每次挂 hook 都在增加暴露面</b>，' +
+          '所以用完立刻撤。<span class="hit">这正是 11.11 节的命题：你的观测手段本身就是对手的检测项。</span></p>' +
+          '<p><b>第四，最值得学的是它对"两条路线"的取舍。</b>' +
+          '默认走 Reflect（不 hook、睡 10 秒后反射 dump），把 Hook 模式标成"不推荐"。' +
+          '这是一个非常清醒的权衡：<b>用时间换特征</b>——延迟 10 秒拿到加载器，' +
+          '比在 <code>onCreate</code> / <code>attachBaseContext</code> 上留 hook 痕迹安全得多。' +
+          '这跟第 27 章"用硬件断点代替软件断点"是同一种思路：<b>减少不可逆的改动</b>。</p>' +
+          '<p><b>第五，它的局限第 ⑤ 条把本章的世界观差异说透了。</b>' +
+          '"高度依赖 Lsposed 的隐蔽性，如果 Lsposed 被检测则会直接闪退无法进行脱壳"——' +
+          '这就是 11.1 讲的"<b>环境检测面</b>"：Frida 被检测时你失去的是<b>这一次会话</b>；' +
+          'LSPosed 被检测时你失去的是<b>整个运行环境</b>，而且没有降级方案。<br>' +
+          '选路线的判断就在这里：<b>如果你的目标会做环境检测，常驻型方案的收益会被整体折价。</b></p>' +
+          '<p>最后留一条方法论：README 里 <code>invokeConstructors</code>、<code>innerClassesFilter</code>、' +
+          '<code>lazyDump</code>、白名单/黑名单这一堆开关，本质上是同一个工程约束的产物——' +
+          '<b>JNI 全局引用有上限（作者给出的数字是 51200）</b>。' +
+          '类太多会把引用打爆，所以它必须能"过滤、限速、分轮、跳过已 dump"。' +
+          '<span class="hit">看清这一点，你就不会把这些开关当成"作者随意加的选项"，' +
+          '而会看到它们各自对应一个具体的失败模式。</span></p>',
+        link: 'https://github.com/J5now/JDex2',
+        linkNote: 'README 给出的原帖在看雪（thread-290669）；看雪未登录访问需要人机验证，本次未能取到正文，' +
+                  '因此所有技术细节均以 GitHub 仓库与源码为准'
       }
     },
 
-    /* ================= 11.5 eBPF vs Frida 可见性 ================= */
+    /* ============================================================ 11.9 */
     {
-      h: '11.5',
-      title: '核心价值：同一个观测行为，Frida 看得见、eBPF 看不见',
+      h: '11.9', title: 'Native Hook（上）：先拿到"模块被加载"的时机',
       html:
-        '<p>前面四节都在讲 eBPF 怎么工作。现在必须回答那个最实际的问题：<b>这跟我做逆向有什么关系？</b></p>' +
-        '<p>假定我们想做同一件事：<b>观测目标 App 的一次函数调用，拿到它的入参。</b>有两条路——' +
-        '<b>A 路</b>用 ' + T.term('Frida', '用户态动态插桩框架：把 agent 注入目标进程，在其地址空间内改写指令或解释执行 JS') + ' 注入，' +
-        '<b>B 路</b>用 ' + T.term('uprobe', '内核提供的用户态函数探针机制，在目标进程的指定函数入口插入断点式回调') + ' 从内核侧挂探针。' +
-        '下面这台动画让两条路同时接受<b>同一套 App 自查</b>，看看各自暴露了什么。</p>',
-      stage: {
-        title: '可见性对照实验：App 的六项自查，谁能躲过',
-        speed: 1900,
-        render:
-          '<div class="flow-row" style="align-items:flex-start;gap:14px;flex-wrap:wrap">' +
-            '<div class="flow-col" style="flex:1 1 320px">' +
-              '<div class="card"><div class="card-title">A 路 · Frida 用户态注入</div>' +
-                '<div class="blk" id="fa">目标进程地址空间内</div>' +
-                '<div class="pill" id="f1">1 扫 /proc/self/maps</div><br>' +
-                '<div class="pill" id="f2">2 查线程名 /proc/self/task/*/comm</div><br>' +
-                '<div class="pill" id="f3">3 扫监听端口（27042 一类）</div><br>' +
-                '<div class="pill" id="f4">4 查 TracerPid / ptrace 痕迹</div><br>' +
-                '<div class="pill" id="f5">5 校验代码段是否被改写</div><br>' +
-                '<div class="pill" id="f6">6 校验函数序言字节</div>' +
-              '</div>' +
-            '</div>' +
-            '<div class="flow-col" style="flex:1 1 320px">' +
-              '<div class="card"><div class="card-title">B 路 · eBPF 内核态观测</div>' +
-                '<div class="blk" id="ba">目标进程完全在内核视野之外</div>' +
-                '<div class="pill" id="b1">1 扫 /proc/self/maps</div><br>' +
-                '<div class="pill" id="b2">2 查线程名 /proc/self/task/*/comm</div><br>' +
-                '<div class="pill" id="b3">3 扫监听端口</div><br>' +
-                '<div class="pill" id="b4">4 查 TracerPid / ptrace 痕迹</div><br>' +
-                '<div class="pill" id="b5">5 校验代码段是否被改写</div><br>' +
-                '<div class="pill" id="b6">6 校验函数序言字节</div>' +
-              '</div>' +
-            '</div>' +
-          '</div>' +
-          '<div class="term-box" id="vlog" style="margin-top:12px">$ 等待开始…</div>',
-        reset: () => {
-          S('fa', ''); S('ba', '');
-          for (let i = 1; i <= 6; i++) { CLS('f' + i, 'pill'); CLS('b' + i, 'pill'); }
-          SET('vlog', '$ 等待开始…');
-        },
-        steps: [
-          { run: () => { SET('vlog', '实验目标：观测目标 App 调用某加密函数时的入参。\\nApp 自身内置了 6 项运行时自查，每秒执行一次。'); } },
-          { run: () => { S('fa', 'hot'); SET('vlog', '[A 路] frida -U -f com.target.app -l hook.js\\n→ agent 被注入目标进程，地址空间里多了一个 so'); } },
-          { run: () => { CLS('f1', 'pill bad'); SET('vlog', '[A 路 · 自查 1] App 打开 /proc/self/maps 逐行扫描\\n  → 命中：frida-agent-64.so  ← 可疑模块，直接暴露'); } },
-          { run: () => { CLS('f2', 'pill bad'); SET('vlog', '[A 路 · 自查 2] App 遍历 /proc/self/task/*/comm\\n  → 命中：gum-js-loop / gmain 一类的框架线程名'); } },
-          { run: () => { CLS('f3', 'pill bad'); SET('vlog', '[A 路 · 自查 3+4] App 扫本地监听端口，并读 /proc/self/status 的 TracerPid\\n  → 端口命中；TracerPid 也可能非 0（取决于接入方式）'); } },
-          { run: () => { CLS('f5', 'pill bad'); CLS('f6', 'pill bad'); SET('vlog', '[A 路 · 自查 5+6] App 把内存里的代码段和磁盘上的 .so 逐字节比对\\n  → 命中：函数序言被改写成跳转指令（inline hook 特征）\\n→ 结论：A 路被抓住，且证据链完整'); } },
-          { run: () => { S('fa', 'done'); S('ba', 'active'); SET('vlog', '--- 换 B 路：拆掉 Frida，改成在钩子点挂 eBPF 程序 ---\\n# 内核侧挂 uprobe 到目标 so 的加密函数入口\\n# 用户态读 ringbuf 拿入参'); } },
-          { run: () => { CLS('b1', 'pill ok'); SET('vlog', '[B 路 · 自查 1] 扫 /proc/self/maps\\n  → 没有新增模块。App 的地址空间和没被观测时一模一样'); } },
-          { run: () => { CLS('b2', 'pill ok'); SET('vlog', '[B 路 · 自查 2] 遍历线程名\\n  → 目标进程一个线程都没多。观测者根本不在这个进程里'); } },
-          { run: () => { CLS('b3', 'pill ok'); CLS('b4', 'pill ok'); SET('vlog', '[B 路 · 自查 3+4] 扫端口、查 TracerPid\\n  → 无新增端口；没有 ptrace，TracerPid=0。\\n  注意：uprobe 用的是内核断点机制，不是 ptrace 附着'); } },
-          { run: () => { CLS('b5', 'pill ok'); CLS('b6', 'pill ok'); SET('vlog', '[B 路 · 自查 5+6] 比对代码段、校验函数序言\\n  → 内存里没有写入任何东西：eBPF 是<b>只读观测</b>，不修改目标指令\\n→ 结论：B 路六项全绿，App 一无所知'); } },
-          { run: () => { S('ba', 'cool'); SET('vlog', '✓ 同一个观测动作，A 路留下 6 处痕迹，B 路留下 0 处（在 App 的可见范围内）。'); } },
-          { run: () => { S('ba', 'hot'); SET('vlog', '⚠️ 但别把话说满：\\n  · 观测者若在用户态，它自己会留下痕迹（进程、文件、网络）\\n  · root 环境下 App 仍可能用非常规手段检测内核（自身带 root 的场景）\\n  · 对手也可以用 eBPF 反过来监控你 —— 这是双向的'); } }
-        ]
-      },
-      after:
-        T.note('key', '🔑 隐蔽性的真正来源', '<p>不是「eBPF 这个技术很隐蔽」，而是<b>「观测发生在目标进程的地址空间之外」</b>。记住这条原理，你就能自己推导出哪些检测手段有效、哪些天生无效：<b>所有依赖「观测者必须在目标进程内部留下东西」的检测，对内核态观测一律失效</b>。</p>') +
-        T.note('warn', '⚠️ 别神化隐蔽性：三个现实约束',
-          '<p><b>① 观测者本身要在设备上落地。</b>你的 loader 是个跑在手机上的用户态进程，它会被 <code>ps</code> 看见、会在文件系统里留下文件。内核态隐蔽的只是「观测动作」，不是「观测者」。</p>' +
-          '<p><b>② 加载 eBPF 程序需要高权限。</b>没 root 基本免谈（见 11.6）。你为了让观测更隐蔽，反而先要在设备上取得最高权限——这是一个很现实的成本。</p>' +
-          '<p><b>③ 这是一场双向博弈。</b>对手同样可以用 eBPF 监控你的行为，甚至用 <code>LSM</code> 钩子加固自己的检测逻辑。第 13 章讲内核态对抗时会展开这一层。</p>') +
-        T.note('', '📌 放回课程的坐标系里',
-          '<p><b>第 6 章</b>讲 ' + T.term('Hypervisor', '虚拟机监控器，运行在比内核更高的特权级（EL2），可以监控甚至篡改内核行为') + '，那是比内核更低的层；' +
-          '<b>第 11 章（本章）</b>是内核态观测的标准手段；<b>第 13 章</b>讲内核态对抗（SVC 系统调用、硬件断点）。</p>' +
-          '<p>三章连起来是一条清晰的主线：<b>谁控制了更低的层，谁就拥有最终的观测权和控制权</b>。用户态的 Frida 打不过内核，内核打不过 Hypervisor。</p>')
+        '<p>Java 层的 hook 有一条天然边界：<b>它只看得见 Java。</b>当加密逻辑被搬进 so、当校验在 native 层做、' +
+        '当 native 方法通过动态注册和某个 C 函数绑定时，你在 Java 层能做的就很有限了。</p>' +
+        T.tbl(['层', '看得见什么', '看不见什么', '谁负责给你"时机"'],
+          [
+            ['<b>Java 层</b>（Xposed API）', '方法调用、字段读写、类加载、构造过程',
+             'so 内部逻辑、JNI 层的直接调用、指针级数据流', 'LSPosed 框架（handleLoadPackage）'],
+            ['<b>Native 层</b>（模块自己的 so + hook 库）', 'so 里的函数、<code>JNIEnv</code> 函数表、' +
+             '<code>dlopen</code> 的瞬间',
+             'Java 对象的语义（要反过来用 JNI 反射去映射）', '<b>模块自己</b>——这就是本节要讲的难点']
+          ]) +
+        '<p>关键问题不在"用什么 hook 库"，而在<b>你怎么知道该 hook 的时候到了</b>。' +
+        '一个 App 会加载很多 so，你要 hook 的那个往往是后来才 <code>dlopen</code> 进来的；' +
+        '你的 native 代码如果没有一个可靠的"被唤醒"入口，就只能靠轮询或盲猜。</p>' +
+        T.note('key', '🔑 Xposed 体系里 native hook 的共同前提：框架给你时机，引擎你自己出',
+          '<p>LSPosed 官方 Wiki 把它写得很清楚（照官方 Wiki 的原文结构）：模块在自己的 so 里导出 ' +
+          '<code>native_init</code>，框架把一组工具函数（<code>hook_func</code> / <code>unhook_func</code>）' +
+          '交给你；此后<b>每当有一个库被加载，框架就回调你的 <code>on_library_loaded(name, handle)</code></b>，' +
+          '你再用 <code>handle</code> 去 <code>dlsym</code> 并挂 hook。</p>' +
+          '<p style="margin-bottom:0">这里有个容易被忽略的细节：<b><code>hook_func</code> 是框架提供的，不是你实现的。</b>' +
+          'LSPosed 的 README 在 Credits 里写了它用 <b>Dobby</b> 做 inline hooking——' +
+          '也就是说，Xposed 生态里的 native hook <b>不是让你从零造引擎，而是把框架已经有的那套能力借给你用</b>。' +
+          '你要负责的只有两件事：<b>时机</b>（什么时候挂）和<b>目标</b>（挂谁）。</p>') +
+        '<p>官方文档里给出的接口定义（示意，照原文结构）：</p>' +
+        T.code(
+          '<span class="c">// if success, return 0</span>\n' +
+          '<span class="k">typedef int</span> (*HookFunType)(<span class="k">void</span> *func, <span class="k">void</span> *replace, <span class="k">void</span> **backup);\n' +
+          '<span class="k">typedef int</span> (*UnhookFunType)(<span class="k">void</span> *func);\n\n' +
+          '<span class="c">// 每个库被加载时，框架回调它</span>\n' +
+          '<span class="k">typedef void</span> (*NativeOnModuleLoaded)(<span class="k">const char</span> *name, <span class="k">void</span> *handle);\n\n' +
+          '<span class="k">typedef struct</span> {\n' +
+          '    uint32_t version;\n' +
+          '    HookFunType hook_func;\n' +
+          '    UnhookFunType unhook_func;\n' +
+          '} NativeAPIEntries;\n\n' +
+          '<span class="c">// 你在自己的 so 里导出的入口</span>\n' +
+          '<span class="k">extern</span> <span class="s">"C"</span> [[gnu::visibility(<span class="s">"default"</span>)]] [[gnu::used]]\n' +
+          'NativeOnModuleLoaded <span class="f">native_init</span>(<span class="k">const</span> NativeAPIEntries *entries);'
+        ) +
+        T.note('', '📌 三个必须对齐的地方',
+          '<p>① <b>导出名字必须是 <code>native_init</code></b>，而且要被导出（文档里强调了 ' +
+          '<code>visibility("default")</code> 与 <code>used</code> 两个属性）——否则框架找不到它，' +
+          '表现就是"什么都没发生"。<br>' +
+          '② <b>你还要在 <code>assets/native_init</code> 里写上你的 so 名字</b>，' +
+          '这和 Java 入口要写 <code>assets/xposed_init</code> 是同一个道理：先声明，框架才知道去找谁。<br>' +
+          '③ <b>so 得由你自己加载</b>：官方文档写明要在模块的 Java 代码里 <code>System.loadLibrary</code>。' +
+          '这意味着 native hook 的<b>时机最终由你的 Java 代码决定</b>——' +
+          '如果你在错的进程或错的作用域里尝试加载，回调永远不会来。</p>' +
+          '<p style="margin-bottom:0">第 ③ 条把本章串起来了：<b>native hook 的门票，是 Java 层那张入场券。</b></p>') +
+        '<p>本节与 11.10 的接口细节，来源是 LSPosed 官方 Wiki 的 ' +
+        '<a href="https://github.com/LSPosed/LSPosed/wiki/Native-Hook" target="_blank" rel="noopener">Native Hook</a> ' +
+        '页面（本次通过 wiki 的 raw Markdown 取到原文，HTTP 200）。凡涉及版本与实现的部分我都标了待核实——' +
+        '接口文档写的是"入口长什么样"，它<b>不承诺</b>版本兼容与检测对抗。</p>' +
+        '<p>还有一点值得单独指出：官方文档在"JNIEnv Hooks"一节里提到，' +
+        '可以 hook <code>JNIEnv</code> 的函数（比如 <code>FindClass</code>），' +
+        '并给出了一个"对某个特定类返回 <code>nullptr</code>"的示例。' +
+        '这是<b>改函数表指针</b>级别的手段——威力很大，副作用也很大（任何一方调用它加载那个类都会失败）。' +
+        '这属于 11.10 要讲的第三类落点，我们放到那里一起对比。</p>',
+      after: T.note('ok', '✅ 这一节的判断',
+        '<p style="margin-bottom:0"><b>Java 层 hook 解决"业务语义"，native hook 解决"so 里的实现细节"。</b><br>' +
+        '而 native hook 真正的门槛不是 hook 引擎（框架已经用 Dobby 给你了），' +
+        '而是<b>你能不能在正确的时机、把正确的 so 名字交到框架手上</b>。</p>')
     },
 
-    /* ================= 11.6 安卓四重限制 ================= */
+    /* ============================================================ 11.10 */
     {
-      h: '11.6',
-      title: '安卓上的四重限制：为什么大多数手机跑不起来',
+      h: '11.10', title: 'Native Hook（下）：JNI_OnLoad、RegisterNatives 与函数指针',
       html:
-        '<p>上面所有动画都在 PC Linux 的语境下。现在把场景换到手机上——这是本章最有价值、也最容易被网上教程误导的部分。</p>' +
-        '<p><b>先给结论：eBPF 在 Android 上「理论可行，实际高度受限」。</b>Android 基于 Linux 内核，内核本身有 BPF 支持；' +
-        'Android 9（kernel 4.9）起内核配置就打开了一部分 BPF 相关功能，较完整的 eBPF 能力一般需要 <b>kernel 4.14+</b>。' +
-        '但「内核里有」和「你能用」之间隔着四堵墙。</p>' +
-        T.tbl(['限制', '挡住的到底是什么', '能不能绕'], [
-          ['① 内核版本', '老设备内核太旧，很多 eBPF 特性（如 BTF、ringbuf、有界循环支持）压根不存在。内核 4.14 以下基本可以放弃', '绕不过。这是硬件与固件层面的既成事实，只能换设备'],
-          ['② 厂商内核裁剪', '手机厂商为减小体积、缩小攻击面，常把 BPF 相关配置裁掉。关键配置如 <code>CONFIG_BPF_SYSCALL</code>、<code>CONFIG_BPF_JIT</code>、<code>CONFIG_DEBUG_INFO_BTF</code> 可能未开启。<b>没有 <code>CONFIG_BPF_SYSCALL</code>，就完全无法加载 eBPF 程序</b>', '理论上可自编译内核刷入，但需解锁 bootloader、有变砖风险，且多数机型内核源码不完整'],
-          ['③ SELinux 策略', 'Android 的强制访问控制会限制 <code>bpf()</code> 系统调用。普通 App 无权调用——即使内核支持，策略也会把你拦在门外', '需要 root 后调整策略，或使用已获授权的域；这本身就是一道高门槛'],
-          ['④ 需要 root', '上面三条叠加的结果：实际使用通常需要 root 权限或定制 ROM', '没有银弹。这是本章所有手机端实验的前提条件']
-        ]) +
-        T.note('key', '🔑 一个反直觉但重要的事实：Android 自己在用 eBPF',
-          '<p>Android 系统本身就把 eBPF 用于<b>网络统计</b>（例如按 UID 统计流量、<code>trafficController</code> 相关的模块）。' +
-          '这件事有两层含义：<b>①</b> 它证明了在真机上跑 eBPF 是可行的——不是纸上谈兵；<b>②</b> 但这些程序由<b>系统进程</b>在开机时加载，普通 App 既没权限、也看不到它们。</p>' +
-          '<p>所以当你在设备上执行 <code>bpftool prog show</code> 看到一堆已有程序时，不要误以为「这台机器对我开放了」——那大概率是系统自己的。</p>') +
-        T.note('warn', '⚠️ 时效性再强调一次',
-          '<p>「哪些机型支持、哪些配置默认开启」这个问题，<b>每一年、每个厂商、每个机型、每个内核版本的答案都不一样</b>，而且厂商会随系统更新调整策略。' +
-          '本章表格里的判断是<b>2023 年前后的普遍经验</b>，不是对你的设备的结论。' +
-          '唯一可靠的做法是<b>在你自己的目标设备上实测</b>——具体探测命令见 11.7。' + T.pill('warn', '待核实') + '</p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境一 · 项目启动',
-            scenario: '<b>情境：</b>你接到一个任务——要给公司的 Android 安全测试工具加一套「内核态观测」能力，用来追踪目标 App 的文件访问和加密函数入参。团队里有人看了本章前几节，很兴奋，说 eBPF 隐蔽性最好，建议<b>把它作为所有机型上的统一方案</b>。你是这个项目的技术负责人，第一步怎么做？',
-            choices: [
-              { t: 'A. eBPF 隐蔽性碾压用户态方案，直接按统一架构立项，全线推 eBPF', next: 'n1' },
-              { t: 'B. 先拿 3-5 台真实目标机型做内核能力探测（版本、config、BTF、SELinux、root），按探测结果把 eBPF 定位成「特定机型上的可选增强」，主力仍是用户态方案', next: 'n2' },
-              { t: 'C. 既然手机上限制这么多，本章内容直接跳过，继续用 Frida', next: 'n3' },
-              { t: 'D. 先把目标机型的内核源码拉下来自编译、替换掉原厂内核，再上 eBPF', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选 A', terminal: true, verdict: 'bad',
-            verdictTitle: '方向错了：把「理论上更优」当成了「工程上可行」',
-            result: '<b>认知根源：混淆了技术上限和工程可达性。</b>eBPF 的隐蔽性确实是数量级的优势，但这个优势有一个硬前提——<b>程序能被加载进内核</b>。而加载受内核版本、厂商配置、SELinux 策略三重约束，这些约束在真实机型上大量存在。<br><br>按统一架构立项的直接后果是：交付时发现 70% 的目标机型根本加载不了，前面的架构投入全部沉没，还要回头改设计。<br><br><b>正确做法：</b>任何依赖设备底层能力的技术方案，第一步都应该是<b>能力探测</b>——把「能不能用」变成一组可测量的数据，再决定投入。'
-          },
-          n2: {
-            label: '选 B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先探测，再决定投入比例（哪怕结论是「大部分机型用不了」）',
-            result: '<b>这是本章最想让你接受的一个「反直觉」结论：</b>讲了一整章 eBPF，但正确的工程判断往往是<b>不要梭哈</b>。<br><br>探测要回答五个问题：<b>①</b> 内核版本是多少（4.14 以下基本出局）；<b>②</b> BPF 相关配置开没开（尤其是有没有 <code>CONFIG_BPF_SYSCALL</code>）；<b>③</b> <code>/sys/kernel/btf/vmlinux</code> 在不在（决定 CO-RE 能不能用）；<b>④</b> SELinux 拦不拦 <code>bpf()</code>；<b>⑤</b> 有没有 root。<br><br><b>探测的意义在于把技术选型变成数据驱动的决策</b>：如果探测下来只有少数机型可用，那 eBPF 就是一个「针对高价值目标机的精准工具」，而不是产品基线。这种分层设计在安全工程里是常态。'
-          },
-          n3: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '从一个极端跳到另一个极端',
-            result: '<b>认知根源：把「受限」读成了「不可用」。</b>限制多 ≠ 不能用。Android 系统自己在用 eBPF（流量统计就是例子），说明内核路径是通的；在部分机型上、配合 root，eBPF 完全能跑出你在 PC 上见过的效果。<br><br>更关键的是：<b>eBPF 提供的能力是用户态方案给不了的</b>。系统调用级别的全量观测、不进入目标进程地址空间的隐蔽性，这些用 Frida 做不到。因为「不是每台机器都能用」就整个放弃，等于放弃了一个能力维度。<br><br><b>正确的态度：</b>把它当作工具箱里的一件特种工具——不常出场，但出场时不可替代。'
-          },
-          n4: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '技术上可行，但在错误的阶段做了最重的事',
-            result: '<b>认知根源：跳过了「值不值得」直接进入「怎么做」。</b>自编译内核刷机在原理上确实能解开配置和策略的限制，但它的代价是：解锁 bootloader（很多机型会清空数据甚至熔断）、内核源码不完整导致编译失败、刷入后变砖风险、每换一个机型就要重来一遍。<br><br>而且这道门槛<b>并不能解决内核版本问题</b>——老设备的内核基线太旧，自编译也拿不到上游的新特性。<br><br><b>什么时候 D 才是对的？</b>当你有一台固定的、长期使用的测试样机，且项目明确需要深度内核观测能力时，为它专门定制内核是合理的投入。但这是「选定样机之后的专项工程」，不是「项目第一步」。'
-          }
-        }
-      }
-    },
-
-    /* ================= 11.7 实测与工具链 ================= */
-    {
-      h: '11.7',
-      title: '动手：一台设备到底支不支持？工具链怎么选',
-      html:
-        '<p>11.6 讲了四堵墙，但「我的这台机器到底行不行」只能靠实测。这一节给一份可执行的探测清单——' +
-        '<b>顺序很重要</b>，因为前面的检查不过，后面的做了也白做。</p>' +
-        '<p>另外要提醒一句：下面所有命令都<b>需要 root</b>（或者有等价权限）。没有 root 的话，第 ⑤ 步就已经是终点了。</p>',
+        '<p>过了"时机"这一关，接下来才是"挂在哪"。native 层有三个最常被下手的落点，' +
+        '它们的覆盖面与代价完全不同。</p>' +
+        T.tbl(['落点', '你在挂什么', '能看到什么', '代价 / 风险'],
+          [
+            ['<b>① <code>JNI_OnLoad</code></b>', 'so 被加载时系统回调的那个函数',
+             'so 的加载瞬间、以及它拿到的 <code>JavaVM</code>——进而可以拿 <code>JNIEnv</code>',
+             '很多壳<b>自己也盯这里</b>（第 9、27 章都提过）；改它等于把自己摆在最显眼的位置'],
+            ['<b>② <code>RegisterNatives</code></b>', 'JNI 动态注册的入口（第 9 章讲过它的注册语义）',
+             '<code>Java 方法 → native 函数地址</code>的绑定关系，一次全收',
+             '第 27 章列过它的五种绕过手法（延迟/分次注册、反复注销重注册、绕过它直接改 ART 内部入口……）；' +
+             '你抓到的那份地址表<b>可能很快就过期</b>'],
+            ['<b>③ 函数指针 / 函数表</b>', '直接改目标函数的入口（inline hook），' +
+             '或改导入表、改 <code>JNIEnv-&gt;functions</code> 里的函数指针',
+             '想挂什么就挂什么，粒度最自由',
+             '<b>必然修改内存</b>：首字节、校验和、自校验都能发现；而且一旦对手重新注册/换实现，' +
+             '你的 hook 会<b>静默失效</b>（不报错，只是不再触发）']
+          ]) +
+        T.note('warn', '⚠️ 与第 27 章的分工，这里必须说清楚',
+          '<p>第 27 章给出的结论是硬的：<b>高对抗场景下，"硬件断点 + 不改内存"那条路更优。</b>' +
+          '理由有三条，放在 native hook 的语境里同样成立：</p>' +
+          '<p>① <b>检测面</b>：inline hook 一定改写函数头几个字节。对手读首字节、算校验和、比对代码段，' +
+          '都能发现（第 24 章检测点⑥专门讲过这一类"通用 hook 痕迹检测"）。' +
+          '硬件断点由 CPU 调试寄存器完成地址匹配，<b>目标内存一个字节都不变</b>。</p>' +
+          '<p>② <b>时机对抗</b>：inline hook 需要你先找到地址、再成功写入；' +
+          '如果对手在你写完之后又改回来（或重新注册一遍），你会<b>静默失效</b>——没有报错，只是不触发了。' +
+          '而硬件断点监控的是"这个地址被写入"这个<b>事件本身</b>，反而能抓到对手的动作。</p>' +
+          '<p style="margin-bottom:0">③ <b>名额与代价</b>：硬件断点通常只有 4–6 个名额，不可能大规模布点；' +
+          'inline hook 可以铺满。所以正确的用法不是二选一，而是：' +
+          '<b>用 hook 铺面，用断点定关键点。</b></p>') +
+        '<p>下面这个终端模拟的是 native hook 最难受的一种失败现场：<b>它曾经是对的，后来悄悄不对了。</b></p>',
       term: {
-        title: 'root shell · 设备 eBPF 能力探测（顺序执行）',
+        title: '一个"hook 突然不再触发"的现场（示意输出）',
         lines: [
-          { t: 'p', s: 'adb shell', note: '<b>先连上设备。</b>下面所有命令都在设备的 shell 里执行。注意 <code>adb shell</code> 默认进的是 App 的 shell 域，很多命令会被 SELinux 拒绝——所以要先 <code>su</code>。' },
-          { t: 'p', s: 'su', note: '<b>第 ⑤ 道门槛：root。</b>拿不到 root，后面全部免谈。这是最现实的一条限制，也是为什么本章强调「eBPF 在手机上不是随手就能用」。' },
-          { t: 'o', s: '# id' },
-          { t: 'o', s: 'uid=0(root) gid=0(root) context=u:r:magisk:s0' },
-          { t: 'p', s: 'uname -r', note: '<b>第 ① 步：内核版本。</b>这是最硬的一条。Android 9 对应的 kernel 4.9 起内核就开了一部分 BPF 配置；较完整的 eBPF 能力一般需要 <b>4.14+</b>。看到 4.4 / 3.18 这种，基本可以直接放弃这条路线。' },
-          { t: 'o', s: '4.14.190-g0d3d5a1' },
-          { t: 'd', s: '# 上例是一台 4.14 设备：属于「可以一试」的区间。\n# 4.14 以下：BTF / ringbuf 等新特性大概率缺失。' },
-          { t: 'p', s: 'zcat /proc/config.gz | grep -E \'CONFIG_BPF|CONFIG_DEBUG_INFO_BTF\'', note: '<b>第 ② 步：厂商裁剪（最关键的一步）。</b><code>/proc/config.gz</code> 是内核配置。有些设备上这个文件不存在（说明 <code>CONFIG_IKCONFIG_PROC</code> 没开），那就只能去 <code>/boot</code> 或内核源码里找，或者干脆用第 ③ 步的能力探测法间接判断。' },
-          { t: 'o', s: 'CONFIG_BPF_SYSCALL=y\nCONFIG_BPF_JIT=y\n# CONFIG_DEBUG_INFO_BTF is not set' },
-          { t: 'w', s: '# ⚠️ CONFIG_BPF_SYSCALL 是总闸：没有它 → 完全无法加载 eBPF 程序，后面全部不用看了。\n# ⚠️ 没有 CONFIG_BPF_JIT → 只能解释执行，性能大幅下降。\n# ⚠️ 没有 CONFIG_DEBUG_INFO_BTF → 没有 BTF，CO-RE 用不了，程序必须针对具体内核编译。' },
-          { t: 'p', s: 'ls -l /sys/kernel/btf/vmlinux', note: '<b>第 ③ 步：BTF 在不在。</b>这个文件就是内核导出的 BTF 类型信息，它是 <b>CO-RE</b>（Compile Once – Run Everywhere）的前提。文件不存在 = 你没法用 CO-RE，得回到「针对每台设备的内核单独编译」的老办法。' },
-          { t: 'e', s: 'ls: /sys/kernel/btf/vmlinux: No such file or directory' },
-          { t: 'd', s: '# 本例这台机器没有 BTF：说明 CONFIG_DEBUG_INFO_BTF 未开启。\n# 结论：仍可能加载 eBPF 程序，但 portability 方案要降级。' },
-          { t: 'p', s: 'getenforce', note: '<b>第 ④ 步：SELinux。</b>Android 的强制访问控制会限制 <code>bpf()</code> 系统调用。<code>Enforcing</code> 状态下，即使内核支持，策略也会拦你。' },
-          { t: 'o', s: 'Enforcing' },
-          { t: 'p', s: './bpftool feature probe 2>&1 | head -30', note: '<b>第 ③ 步的另一种做法：直接用 bpftool 探测。</b>静态看配置文件容易漏，<code>bpftool feature probe</code> 会真正去问内核「你支持哪些 helper、哪些 Map 类型、哪些程序类型」。<b>注意</b>：你需要先把 <b>bpftool</b> 交叉编译成 <b>arm64/aarch64</b> 版本再推到设备上；用 PC 上的 x86 版本推过去是跑不起来的。' },
-          { t: 'o', s: 'eBPF kernel: available\n  ... helper / map_type / program_type 支持列表 ...' },
-          { t: 'p', s: './bpftool prog show', note: '<b>顺带看看设备上已经有什么。</b>正如 11.6 提到的，Android 系统自己就加载了一些 eBPF 程序（流量统计等）。看到它们说明内核路径是通的，但也提醒你：这些是系统进程的，不是给你的。' },
-          { t: 'o', s: '12: sched_cls  name trafficController  ...  run_time_ns 0' },
-          { t: 'w', s: '# 注意：看不到任何程序 ≠ 内核不支持；\n#      看得到程序 ≠ 你有权限加载自己的程序。两件事要分开判断。' },
-          { t: 'p', s: 'ls /data/local/tmp/', note: '<b>最后：观测者的落脚点。</b>你的 loader 是个用户态可执行文件，得先在设备上有个位置。这一步也提醒你——<b>内核态观测隐蔽，但观测者本身不隐蔽</b>。<code>/data/local/tmp</code> 是最常用的位置，也正因如此它是各种检测的重点扫描区域。' },
-          { t: 'o', s: 'trace_open\nminimal.bpf.o' }
+          { t: 'd', s: '# T+0s：模块加载，on_library_loaded 收到目标 so' },
+          { t: 'o', s: '[jdex] module loaded, native_init done', note: '<b>入口通了。</b>说明 assets/native_init 与 System.loadLibrary 这两步都对。' },
+          { t: 'o', s: '[jdex] dlopen: /data/app/.../libtarget.so  handle=0x7f3c...', note: '<b>时机抓到了。</b>框架把每个库的加载都告诉了你——这正是 11.9 说的"时机由框架给"。' },
+          { t: 'p', s: 'dlsym(handle, "native_check") -> 0x7f3c9e40', note: '<b>拿到地址。</b>接下来这一步是分水岭：你是"改内存"（inline hook），还是"不改内存"（下断点）。' },
+          { t: 'o', s: '[jdex] hook installed: native_check @ 0x7f3c9e40', note: '（示例选择 inline hook。）<b>注意这里已经写内存了</b>：函数头几个字节被改成跳转。' },
+          { t: 'd', s: '# T+5s：目标函数被调用，hook 正常' },
+          { t: 'o', s: '[jdex] native_check called: arg0=0x1', note: '<b>一切正常。</b>此时你看不出任何异常——这就是它危险的地方。' },
+          { t: 'd', s: '# T+300s：目标 App 完成初始化' },
+          { t: 'e', s: '[jdex] ...（此后没有任何输出）', note: '<b>hook 不再触发。</b>没有报错、没有异常，日志就停在上一行。' },
+          { t: 'w', s: 'Warning: 静默失效比崩溃难查一百倍', note: '<b>因为"什么都没发生"既可能是没被调用，也可能是你的 hook 已经被换掉了。</b>这两件事在日志上长得一模一样。' },
+          { t: 'd', s: '# 排查方向' },
+          { t: 'o', s: '① 读一下 0x7f3c9e40 开头的字节，还在不在？', note: '<b>先确认你的 hook 有没有被覆盖。</b>如果不在了，说明对手重写了这块内存（或换了函数实现）。' },
+          { t: 'o', s: '② 重新枚举一遍 RegisterNatives 的绑定关系，地址变了没有？', note: '<b>再看地址有没有被换。</b>反复 注销/重注册 是第 27 章列的绕过手法之一——你 hook 的那个地址可能已经成了"孤儿"。' },
+          { t: 'o', s: '③ 改成监控"入口被写入"这个事件，而不是盯着某个地址', note: '<b>这是第 27 章的思路。</b>不去追地址，而去追"谁改了入口"——不管走哪条路径绑定，最终都要往入口里写一个地址。' }
         ]
       },
-      after:
-        T.note('', '📌 探测清单（照着走一遍）',
-          '<p><b>①</b> <code>uname -r</code> → 内核版本，4.14+ 才有戏；<b>②</b> <code>CONFIG_BPF_SYSCALL</code> → 总闸，没有就结束；' +
-          '<b>③</b> <code>/sys/kernel/btf/vmlinux</code> → 决定能不能用 CO-RE；<b>④</b> <code>getenforce</code> → SELinux 会不会拦；' +
-          '<b>⑤</b> root 有没有。五条里任何一条卡住，方案就得降级。</p>') +
-        T.tbl(['工具', '仓库', '定位', '什么时候用它'], [
-          ['<b>BCC</b>', '<code>iovisor/bcc</code>', 'Python 前端 + 内嵌 C。开发快，自带大量现成工具（<code>execsnoop</code>、<code>opensnoop</code>、<code>biolatency</code>）', '快速验证想法、临时排查。缺点：<b>每次运行都要编译 C</b>，目标机要装内核头文件，启动有开销'],
-          ['<b>bpftrace</b>', '<code>bpftrace/bpftrace</code>', '类 awk 的高级脚本语言，一行就能写一个追踪器', '现场快速排查，写脚本成本最低。适合「我就想知道是谁在开这个文件」这种问题'],
-          ['<b>libbpf + CO-RE</b>', '<code>libbpf/libbpf</code>', '<b>CO-RE = Compile Once – Run Everywhere</b>：用 BTF 类型信息让同一份 <code>.o</code> 适配不同内核版本', '<b>现代推荐的工程化方案</b>。交付型项目、需要嵌入到 App 或工具链里的场景'],
-          ['<b>bpftool</b>', '<code>libbpf/libbpf</code> 附带', '内核 BPF 子系统的命令行瑞士军刀：列出程序/Map、生成 skeleton、探测能力', '开发期调试与设备探测（注意要交叉编译到 arm64）']
-        ]) +
-        T.note('key', '🔑 三者的关系（面试常问）',
-          '<p><b>BCC 和 bpftrace 内部都基于 libbpf</b>。可以把它们理解成同一套底座上的三种使用姿势：' +
-          'BCC 是「Python 包 C」，bpftrace 是「DSL 脚本」，libbpf 是「直接用 C 写工程」。</p>' +
-          '<p>新项目推荐 <b>libbpf + CO-RE</b>——它避开了 BCC 的两个老问题：<b>目标机需要装内核头文件</b>、<b>每次运行都要现场编译</b>。' +
-          '这两个问题在 PC 上只是慢一点，在手机上往往是「直接跑不起来」。</p>'),
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境二 · 实测结果很差',
-            scenario: '<b>情境：</b>你按 11.7 的清单在自己手上的测试机上跑了一遍，结果是：<code>uname -r</code> 显示 <b>4.9</b>；<code>CONFIG_BPF_SYSCALL=y</code> 但 <code>CONFIG_DEBUG_INFO_BTF</code> 没开（<code>/sys/kernel/btf/vmlinux</code> 不存在）；有 root。' +
-              '你原本写好的基于 libbpf + CO-RE 的追踪工具（用 uprobe 盯加密函数）拿过去直接跑不起来。下一步怎么办？',
+            label: 'inline hook 静默失效',
+            scenario: '<b>情境：</b>你在模块的 native 代码里 hook 了目标 so 的一个关键函数（inline hook），' +
+              'T+5 秒时日志正常，T+300 秒之后<b>再也没有输出</b>。没有异常、没有崩溃。' +
+              '你确认过：目标函数确实还在被调用（从别的地方能看到它的效果）。',
+            q: '最合理的解释与下一步是什么？',
             choices: [
-              { t: 'A. 加大投入，把这台机器的内核源码拉下来，把 CONFIG_DEBUG_INFO_BTF 打开重新编译内核刷进去', next: 'n1' },
-              { t: 'B. 放弃 CO-RE，改成为这台设备的内核单独编译一份 eBPF 目标文件（依赖具体内核的 BTF/头文件），保留 CO-RE 版本给新机型；同时评估用户态方案作为兜底', next: 'n2' },
-              { t: 'C. 既然 CO-RE 用不了，说明 eBPF 这条路在这台机器上彻底走不通，直接放弃', next: 'n3' },
-              { t: 'D. 把 PC 上用得好好的那份 CO-RE 目标文件直接拷到设备上再试一次，说不定能跑', next: 'n4' }
+              { t: '你 hook 的那个<b>地址已经过期</b>——对手重新注册/替换了实现，入口被写成了别的地址；' +
+                   '应该改为监控"入口被写入"这个事件（观察点/硬件断点），或去 hook 注册动作本身', next: 'n1' },
+              { t: '加固检测到了 hook，主动把 hook 卸载了；应该换一个更隐蔽的 hook 库', next: 'n2' },
+              { t: '你的 hook 库有 bug，在长时间运行后失效了；应该换用更成熟的库', next: 'n3' },
+              { t: '目标 so 被卸载了（dlclose），所以 hook 也不再被调用', next: 'n4' }
             ]
           },
           n1: {
-            label: '选 A', terminal: true, verdict: 'bad',
-            verdictTitle: '代价与收益严重不成比例',
-            result: '<b>认知根源：把「技术上能做到」等同于「现在就该做」。</b>自编译内核确实能打开 <code>CONFIG_DEBUG_INFO_BTF</code>，但那意味着：解锁 bootloader、找到（可能并不完整的）厂商内核源码、配置正确的交叉编译工具链、刷机、承担变砖风险，而且<b>每换一台设备就要重来一遍</b>。<br><br>更关键的是，<b>你未必需要 BTF</b>。BTF 是 CO-RE 的前提，不是 eBPF 的前提。没有 BTF，你只是失去了「一份目标文件跑遍所有内核」的能力，还可以回到「针对具体内核编译」的老路。<br><br>先问自己：<b>这台设备是要长期使用的固定样机吗？</b>如果不是，为它定制内核的投入几乎必然打水漂。'
+            terminal: true, verdict: 'good', verdictTitle: '对：地址会过期，事件不会',
+            result: '<p><b>你抓住了 native hook 最本质的脆弱点：inline hook 绑定的是"一个地址"，而这个地址是可以被换掉的。</b><br>' +
+              '典型手法（第 27 章列过）：<code>UnregisterNatives</code> 之后重新 <code>RegisterNatives</code>，' +
+              '把方法入口指向新的实现；或者干脆绕过注册接口直接改 ART 内部的方法入口。' +
+              '无论哪种，你原来写入的跳转都挂在一个<b>不再被走到</b>的地址上——它还在内存里，只是没人来了。<br>' +
+              '正确方向：<b>把观测点从"某个地址"移到"地址被写入这个事件"</b>——' +
+              '在保存方法入口的那块内存上下观察点，或在 ART 内部"入口被写入"的位置下硬件断点。' +
+              '<b>不管走哪条绑定路径，最终都要往入口里写一个地址</b>，所以这个事件是绕不过去的。<br>' +
+              '<span class="hit">而这也顺带解决了检测问题：硬件断点/观察点不改内存，对手的自校验抓不到。</span></p>'
           },
           n2: {
-            label: '选 B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：把「缺失的能力」降级处理，而不是全盘放弃',
-            result: '<b>这是本章第二个反直觉结论：没有 BTF / CO-RE，不等于没有 eBPF。</b><br><br>CO-RE 解决的是<b>可移植性</b>问题——让同一份编译产物适配不同内核。没有它，你退回到传统做法：<b>针对目标设备的内核版本，单独编译一份 eBPF 目标文件</b>（需要该内核的头文件/类型信息，字段偏移在编译期就固定下来）。这条路更麻烦、更难维护，但在这个内核（4.9，<code>CONFIG_BPF_SYSCALL=y</code>、有 root）上，它<b>大概率是能跑通的</b>。<br><br>工程上的正确姿势是<b>分层</b>：新机型走 CO-RE 的通用路径，老机型走「一机一编」的特化路径，再老的（内核 &lt; 4.14 或没有 <code>CONFIG_BPF_SYSCALL</code>）走用户态方案兜底。<b>明确每一层的适用边界，比追求一套方案通吃要可靠得多。</b>'
+            terminal: true, verdict: 'bad', verdictTitle: '症状对不上"被检测"',
+            result: '<p><b>认知根源：你把"静默"当成了"对抗"，但被检测的典型表现不是这样的。</b><br>' +
+              '如果对手真的检测到了你的 inline hook，它更可能<b>闪退、弹窗、走假逻辑、或者直接拒绝启动</b>——' +
+              '因为它已经确认了环境不可信，没必要还陪你把函数跑完。<br>' +
+              '而你描述的是：<b>T+5 秒正常，T+300 秒后停</b>——这是一个"先好后坏"的时间序列，' +
+              '说明变化发生在运行过程中，而不是启动时的检测。<br>' +
+              '<span class="miss">换 hook 库解决不了这个问题：不管哪个库，它改的都是同一块内存、绑的都是同一个地址。</span></p>'
           },
           n3: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '把一个子能力的缺失，误判为整条路线不通',
-            result: '<b>认知根源：把 CO-RE 和 eBPF 划了等号。</b>CO-RE 只是 eBPF 工程化的一种方式（而且是较新的一种），它依赖 BTF。BTF 缺失只说明「你不能用最省事的那种方式」，不代表内核不支持 eBPF。<br><br>回到探测结果本身：<code>CONFIG_BPF_SYSCALL=y</code> —— 说明<b>加载 eBPF 程序的总闸是开的</b>；有 root —— 说明权限这关也过了。这两条已经跨过了最难的两堵墙（11.6 的第 ② 和第 ④ 条）。<br><br><b>读探测结果要分清「缺什么」和「缺的那个是不是必需的」。</b>BTF 是「好用的加速器」，<code>CONFIG_BPF_SYSCALL</code> 才是「生死线」。'
+            terminal: true, verdict: 'bad', verdictTitle: '先看现象，再怀疑工具',
+            result: '<p><b>认知根源：你把"工具不成熟"当成了默认解释。</b><br>' +
+              'hook 库确实可能有 bug，但它的典型表现是崩溃、错误跳转、参数错乱——' +
+              '而不是"前 5 分钟完美、之后完全静默"。<br>' +
+              '更关键的是：<b>即使换了库，只要路线还是 inline hook，你面对的是同一个物理事实</b>——' +
+              '你写下的跳转依附于一个可以被替换的地址。<br>' +
+              '<span class="hit">诊断顺序应该是：先确认"我的 hook 还在不在内存里"（读一下函数头几个字节），' +
+              '再确认"这个地址还在不在被调用"。这两步用五分钟能做完，比换库快得多。</span></p>'
           },
           n4: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '误判了 CO-RE 到底在哪一步生效',
-            result: '<b>认知根源：以为 CO-RE 是「编译时烧进目标文件里的自适配魔法」。</b>事实正相反——CO-RE 的重定位发生在<b>加载时</b>：libbpf 读取<b>目标机器</b>的 <code>/sys/kernel/btf/vmlinux</code>，据此把 <code>.o</code> 里记录的字段偏移改成这台机器的真实偏移。<br><br>所以当目标机器上根本没有 <code>/sys/kernel/btf/vmlinux</code> 时，重定位这一步<b>没有输入</b>，加载必然失败——再拷一百次也一样。这不是运气问题，是机制问题。<br><br><b>排查口诀：CO-RE 加载失败，先确认目标机的 <code>/sys/kernel/btf/vmlinux</code> 存在且可读。</b>把「机制问题」误当成「玄学问题」，是浪费时间的经典方式。'
+            terminal: true, verdict: 'bad', verdictTitle: '卸载会一起带走你的代码，不是悄悄停',
+            result: '<p><b>认知根源：你没有区分"hook 不触发"和"代码不在内存里了"这两种状态。</b><br>' +
+              '如果目标 so 真的被 <code>dlclose</code>，通常会连带引发引用计数问题、后续调用崩溃、' +
+              '或者你的 hook 库里备份的原函数指针变成野指针——<b>更常见的表现是崩</b>，而不是安静。<br>' +
+              '而且 App 的关键 so 一般不会在运行中被卸载（它们被全局持有）。<br>' +
+              '<span class="miss">"什么都没发生"这种情况，优先怀疑"我的观测点不再被执行到"，' +
+              '而不是"目标消失了"。</span>——毕竟你已经确认目标函数还在被调用。</p>'
           }
         }
       },
       quiz: {
-        id: 'q11-1', chapter: 11,
-        answer: 1,
-        stem: '你在设备上执行 <code>ls /sys/kernel/btf/vmlinux</code>，返回 <code>No such file or directory</code>。基于本章内容，<b>最准确</b>的结论是什么？',
+        id: 'q22-6', chapter: 22, answer: 0,
+        stem: '在 Xposed 体系里做 native hook，与第 27 章讲的"硬件断点 + 不改内存"相比，' +
+              '最本质的差别是什么？',
         options: [
-          { t: '这台设备不支持 eBPF，应该直接放弃', why: '过度推断。BTF 和 eBPF 是两个层次的东西：BTF 是类型信息来源，eBPF 是内核的虚拟机子系统。没有 BTF，内核照样可能支持加载和运行 eBPF 程序。' },
-          { t: '内核很可能没有开启 <code>CONFIG_DEBUG_INFO_BTF</code>，因此 <b>CO-RE 无法使用</b>；但 eBPF 本身是否可用，还要看 <code>CONFIG_BPF_SYSCALL</code> 等配置和实际加载测试', why: '正确。BTF 缺失直接影响的是 CO-RE 的重定位能力（加载时 libbpf 需要读目标机的 BTF），而不是 eBPF 加载能力本身。判断后者要看 BPF 相关的配置与实测。' },
-          { t: '说明 SELinux 正在拦截 <code>bpf()</code> 系统调用', why: '混淆了不同的限制维度。SELinux 拦截会表现为权限类错误（EACCES/EPERM），而不是文件不存在；BTF 文件不存在是配置层面的问题。' },
-          { t: '只要 root 权限足够，就能自动生成这个文件', why: '错误。BTF 是内核在编译期通过配置项生成的调试信息，不是运行时可以凭空创建的文件；有 root 也不能无中生有。' }
+          { t: 'inline hook 必须改写目标内存（函数头/函数表），因此会被校验类检测发现，' +
+               '而且当对手更换实现时会静默失效；硬件断点由 CPU 调试寄存器匹配地址，一个字节都不改',
+            why: '正确。这是"改内存"与"不改内存"两条路线的根本分界。' },
+          { t: 'inline hook 只能 hook 导出函数，硬件断点能 hook 所有函数',
+            why: '断点确实能作用在任意地址上，但这不是二者的本质差别（inline hook 只要能拿到地址也能挂）。' },
+          { t: 'inline hook 需要 root，硬件断点不需要', why: '两者都需要底层权限，这不是区分点。' },
+          { t: 'inline hook 只能用于 Java 层，硬件断点只能用于 native 层',
+            why: '两者都是 native 层手段，方向搞反了。' }
         ],
-        explain: '<b>这道题考的是一条纪律：把「现象」翻译成「机制」，再翻译成「结论」，不要一步跳到底。</b><br><br>现象：<code>/sys/kernel/btf/vmlinux</code> 不存在。<br>机制：这个文件是内核 BTF（BPF Type Format，内核的调试类型信息）的导出点，由 <code>CONFIG_DEBUG_INFO_BTF</code> 决定是否生成。<br>直接结论：<b>CO-RE 用不了</b>——因为 CO-RE 的重定位在加载时依赖目标机的 BTF。<br>不能推出的结论：<b>eBPF 不能用</b>——那取决于 <code>CONFIG_BPF_SYSCALL</code>（总闸）、<code>CONFIG_BPF_JIT</code>（性能）、SELinux 策略和权限。<br><br>在实际排查里，把「缺 BTF」误当成「不能用 eBPF」，会让你白白放弃一个本来可行的方案；反过来把「有 BTF」当成「一定能跑」，也会让你在加载失败时找不到原因。'
+        explain: '<b>本质差别是"要不要动目标内存"。</b><br><br>' +
+          '<b>inline hook：</b>把目标函数开头几个字节改成跳转。优点是可以大量布点、粒度自由；' +
+          '代价是两个——<br>' +
+          '① <b>必然留下痕迹</b>：首字节变了、代码段校验和对不上。' +
+          '第 24 章检测点⑥讲的就是这类检测，而且它<b>对任何 inline hook 一视同仁</b>（不区分是你还是 Frida）。<br>' +
+          '② <b>绑定的是地址，而地址会被换掉</b>：对手重新注册/替换实现后，你的跳转还写在旧的地址上，<br>' +
+          '从此<b>静默失效</b>——不报错、不崩溃，只是不再触发。这种失败最难查，因为你分不清' +
+          '"没被调用"和"hook 已经不在链路上"。<br><br>' +
+          '<b>硬件断点：</b>地址匹配在 CPU 内部完成，<b>目标内存一个字节都不变</b>，因此对自校验完全隐形；' +
+          '而且它监控的是"执行/写入到这个地址"这个事件，<b>对手换实现的动作本身就会被你看到</b>。<br>' +
+          '代价是名额少（通常 4–6 个），不可能铺满。<br><br>' +
+          '<span class="hit">所以结论不是"谁更好"，而是分工：<b>用 hook 铺面，用断点定关键点。</b></span>'
       }
     },
 
-    /* ================= 11.8 源码赏析与工程决策 ================= */
+    /* ============================================================ 11.11 */
     {
-      h: '11.8',
-      title: '源码赏析：三类实用项目的技术原理',
+      h: '11.11', title: '检测与对抗：Xposed 的暴露面在哪',
+      intuition: {
+        tag: '直觉模型 · 门禁系统自己的破绽',
+        body:
+          '<p>回到 11.1 那个类比：你给整栋楼换了一套门禁系统。住户用起来一切正常——' +
+          '门还是那扇门，刷卡还是那张卡。<b>但楼里多了几个不该有的东西</b>：' +
+          '门口多了一台读卡器、配电间多了一条线、门框的螺丝换过。</p>' +
+          '<p>风控要找的从来不是"你现在是不是被接上了"，而是<b>"这栋楼有没有被动过"</b>。</p>' +
+          '<p>所以 Xposed 的检测项，几乎全都是<b>环境取证</b>：进程表里多了什么、内存映射里多了什么、' +
+          '某个函数的入口是不是被换过、类加载器的链条是不是多了一环。<br>' +
+          '这也解释了为什么这一节的结论会有点扫兴：<b>你能减少暴露面，但不能把痕迹归零。</b></p>'
+      },
       html:
-        '<p>最后一节把「热门 eBPF 项目」按用途分成三类，说清它们各自用了什么钩子、解决什么问题。你会发现：<b>看懂了 11.2 的九步和 11.4 的四个结构件，这些项目就没有神秘感了</b>。</p>' +
-        T.tbl(['类别', '核心钩子', '技术原理', '对逆向的用处'], [
-          ['<b>系统调用追踪</b><br><span class="small">如 BCC 的 execsnoop / opensnoop</span>',
-           '<code>tracepoint</code>（如 <code>sys_enter</code>/<code>sys_exit</code>）、<code>kprobe</code>',
-           '在每个系统调用的入口/出口挂程序，从上下文里取出参数（路径、flags、fd）和返回值，写进 Map 或 ringbuf，用户态聚合成「谁在什么时候做了什么」',
-           '<b>极高</b>。App 的任何文件访问、网络连接、进程创建最终都要走系统调用，这里能看到<b>完整且不可绕过</b>的行为序列'],
-          ['<b>网络过滤</b><br><span class="small">如 Cilium、XDP 程序、tc 分类器</span>',
-           '<code>XDP</code>（驱动层最早处理点）、<code>tc</code>（流量控制层）、<code>socket filter</code>',
-           '在网络包进入协议栈前后直接读取/修改/丢弃。XDP 在驱动收包后最先执行，性能极高，常用于 DDoS 防护和负载均衡；tc 层能做更复杂的流分类',
-           '<b>中高</b>。可观测目标的全部网络流量（域名、IP、载荷元数据），且<code>XDP</code> 层可以做到丢包级干预'],
-          ['<b>性能分析</b><br><span class="small">如 BCC 的 biolatency、火焰图工具</span>',
-           '<code>perf_event</code>、<code>kprobe</code>、<code>tracepoint</code>',
-           '用采样或埋点记录延迟、调用次数、栈回溯，聚合到 PERCPU_ARRAY 之类的 Map 里再导出。关键是<b>开销极低</b>，可以长时间挂在生产环境',
-           '<b>中</b>。定位目标 App 的性能瓶颈和热点函数，间接推断其内部结构']
-        ]) +
-        T.note('key', '🔑 从源码里最该学的三个模式',
-          '<p><b>① SEC 段名就是配置。</b>读一个 eBPF 项目，先从 <code>SEC("...")</code> 看它挂了哪些钩子——钩子决定了它能看见什么，这比读逻辑更快。</p>' +
-          '<p><b>② 数据结构的定义就是信息边界。</b>内核态和用户态共享的那个 <code>struct event</code>，列出了这个工具能给你的<b>全部</b>信息。看它，就知道这个工具能不能解决你的问题。</p>' +
-          '<p><b>③ helper 的用法暴露了它的能力上限。</b>用了 <code>bpf_probe_read_user_str()</code> 说明它在读用户态字符串（uprobe 类）；用了 <code>bpf_skb_*</code> 系列说明它在处理网络包；只用 <code>bpf_get_current_pid_tgid()</code> 和 Map，那多半是个统计类工具。</p>') +
-        T.note('', '📌 对逆向实战的具体用法（把本章落到地上）',
-          '<p>假设你要分析一个 App 的加密协议，但在用户态怎么 hook 都被反调试挡住。用 eBPF 的思路是：</p>' +
-          '<p><b>①</b> 先按 11.7 探测目标设备是否具备条件；<b>②</b> 确认加密函数所在的 so，用 <code>uprobe</code> 挂到函数入口和返回；' +
-          '<b>③</b> 入口处用 helper 读参数（<code>bpf_probe_read_user</code> 系列），返回处读返回值或输出缓冲；<b>④</b> 写进 ringbuf，用户态进程收集。</p>' +
-          '<p>整个过程中，目标 App <b>没有新增模块、没有新增线程、代码段没有被改写</b>——它的常规反调试检测全部落空。这就是本章开头说的「在电线杆上装摄像头」。</p>'),
+        '<p>下面六类检测面，按"对手取证的成本"从低到高排。每一条我都写清<b>它为什么成立</b>——' +
+        '因为只有知道它为什么成立，你才知道哪些对抗是有效的、哪些只是心理安慰。</p>' +
+        T.tbl(['检测面', '对手在查什么', '为什么成立'],
+          [
+            ['<b>① 内存映射 / 模块列表</b>',
+             '读 <code>/proc/self/maps</code> 等，找模块的 so 路径、找 Zygisk / Riru 的注入痕迹',
+             '你的模块代码必须以某种形式存在于进程内存里。Xposed 时代查的是 <code>XposedBridge.jar</code> 一类的特征；' +
+             'LSPosed 时代特征变成了注入的 so 与模块自身的 so 路径。' +
+             '<span class="pill warn">待核实</span>：具体特征项随实现与版本变化，以对应版本的源码为准'],
+            ['<b>② 方法入口特征</b>',
+             '检查关键方法的入口有没有被替换、有没有被 deoptimize，或"这个方法是不是被转成了 native"',
+             'hook 的实现方式决定了它必须在 ART 层改方法的入口（LSPosed 用 LSPlant）。' +
+             '11.8C 那个案例的代码注释里就直接点出了这一条：某些加固会检测"方法是否被转为 native"'],
+            ['<b>③ StackTrace / 调用栈异常</b>',
+             '主动抛异常读栈，找陌生帧；或检查"谁调用了这个方法"是不是符合预期',
+             'Xposed 早期实现会在栈里留下非常明显的框架帧；换成 ART hook 之后栈帧特征弱了很多，' +
+             '<b>但"某个方法被不该存在的调用者调用"这个矛盾依然存在</b>'],
+            ['<b>④ ClassLoader 链异常</b>',
+             '遍历加载器链、看 <code>DexPathList</code> 里有没有多出来的元素',
+             '注入、脱壳、插件化都会在加载器链上留下痕迹。' +
+             '<span class="hit">第 16 章讲的"双亲委派"在这里从工具变成了检测面。</span>'],
+            ['<b>⑤ 系统完整性</b>',
+             '属性、<code>/proc</code> 内容、SELinux 上下文、设备指纹的一致性',
+             '改过 Zygote 注入链路的系统，在这些地方往往会有不自洽。' +
+             '第 30 章的 <code>tcontext=u:r:magisk:s0</code>、第 32 章讲的环境自洽，都是同一类取证思路'],
+            ['<b>⑥ 行为侧信道</b>',
+             '某方法的执行时间、调用次数、返回值的分布是否异常',
+             '<b>最难对抗的一类。</b>它不找特征，只看行为：' +
+             '一个"应该耗时 30ms 的校验"突然变成 3ms，或者原本每次都不同的返回值变得恒定——' +
+             '这本身就是强烈的信号']
+          ]) +
+        T.note('key', '🔑 检测的本质是环境取证，不是"抓现行"',
+          '<p style="margin-bottom:0">这六条里只有第②条是"抓你的 hook 现行"，其余五条都在问同一个问题：' +
+          '<b>这台机器的系统还是不是原装的？</b><br>' +
+          '所以"我把 hook 写得很隐蔽"能防的是第②条；<b>它防不了①③④⑤⑥</b>——' +
+          '因为那些痕迹不是你这次 hook 留下的，而是"装过 LSPosed"这件事留下的。<br>' +
+          '这就是 11.1 那句判断的完整含义：<b>Frida 被检测，你丢的是一次会话；LSPosed 被检测，你丢的是整个环境。</b></p>') +
+        '<p>那么对抗的边界在哪？我给三条实际可用的原则，而不是安慰性的口号：</p>' +
+        '<p><b>① 减少暴露面，而不是"隐藏"暴露面。</b>' +
+        '作用域只勾必须的 App（11.2 讲过 LSPosed 连"全选"都不提供，就是这个道理）；' +
+        'hook 点压到最少；能用一次性的方式（等到真实加载器再动手）就不要用常驻的 hook。' +
+        '11.8C 那个案例的默认模式就是这个思路：<b>延迟 10 秒、不挂任何 hook、直接反射 dump</b>。</p>' +
+        '<p><b>② 该换路线的时候换路线。</b>如果目标会做环境检测，' +
+        '常驻型方案的收益是会被整体折价的。这时候值得考虑的不是"怎么藏得更好"，而是' +
+        '<b>"有没有不需要常驻环境的做法"</b>——例如不修改系统的方案（LSPosed 生态里就有非 root 的分支，' +
+        'LSPatch 一类，<span class="pill warn">待核实</span>：其适用范围与当前维护状态请以官方仓库为准）、' +
+        '或者改用一次性注入的 Frida 路线（代价见第 10 章），或者干脆放弃 hook、走模拟执行（第 21 章）。</p>' +
+        '<p><b>③ 承认有的东西藏不住。</b>' +
+        '"装过 LSPosed 的机器"与"原装机"之间的差异不可能被完全抹平。' +
+        '这不是技术不够，而是<b>目标本身就不一样</b>：你的进程里确实多了一段别人的代码。' +
+        '<span class="hit">承认这条边界的实际价值是：你不会再把时间花在"找到一个完美的隐藏方案"上，' +
+        '而是会去评估"这个目标值得我用哪种暴露面去换"。</span></p>',
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境三 · 老板要「反 eBPF 检测」',
-            scenario: '<b>情境：</b>你在甲方做 App 加固。防护团队开会时，安全负责人说：「既然 eBPF 能在内核态偷偷看我们，那你们加固组想办法<b>检测出设备上有没有人在用 eBPF 监控我们</b>，加进我们的反调试体系。」' +
-              '你清楚前面几节讲的原理。<b>你会怎么回应这个需求？</b>',
+            label: '目标有环境检测',
+            scenario: '<b>情境：</b>目标 App 有 root 检测，并且额外检查 Zygisk / Riru 的注入痕迹——' +
+              '它不针对你的模块，它针对的是"系统被改过"这件事。你手里只有一台装了 Magisk + LSPosed 的设备。',
+            q: '要长期监控这个 App 的加密调用，你的判断是什么？',
             choices: [
-              { t: 'A. 直接答应，回去就写代码遍历内核里的 BPF 程序列表，发现有挂在目标进程上的就报警', next: 'n1' },
-              { t: 'B. 先说明能力边界：不越权的情况下 App 根本拿不到内核态信息，这条路走不通；但有<b>真正可行</b>的替代方向——检测「观测者」在用户态留下的痕迹（高权限环境、异常进程与文件、设备的 root/解锁状态），并指出这是双向博弈', next: 'n2' },
-              { t: 'C. 告诉负责人 eBPF 是内核态技术，我们做不了任何事，这个需求没法接', next: 'n3' },
-              { t: 'D. 建议在 App 里直接读取 /proc/kallsyms 和内核内存，扫描 BPF 相关数据结构', next: 'n4' }
+              { t: '还能做，但要重新设计暴露面：作用域只勾这一个 App、hook 点压到最少、' +
+                   '优先用"不改方法的观测方式"；同时并行评估不常驻的路线（非 root 方案 / 一次性注入 / 模拟执行），' +
+                   '把常驻方案只当作备选', next: 'n1' },
+              { t: '把 root 隐藏好就行：Magisk 的 DenyList 加进去，模块照样用', next: 'n2' },
+              { t: '换 Frida：它是按需注入的，目标检测不到', next: 'n3' },
+              { t: '加更多 hook 去伪装：把检测用到的属性、包列表、maps 内容都改掉，做一套完整的环境自洽', next: 'n4' }
             ]
           },
           n1: {
-            label: '选 A', terminal: true, verdict: 'bad',
-            verdictTitle: '承诺了一个在权限模型下做不到的事',
-            result: '<b>认知根源：把「内核里有这个能力」当成了「App 有这个权限」。</b>遍历内核里的 BPF 程序，需要通过 <code>bpf()</code> 系统调用做 <code>BPF_PROG_GET_NEXT_ID</code> 一类的枚举操作，或者读内核内存。这需要 <code>CAP_BPF</code>/<code>CAP_SYS_ADMIN</code> 级别的高权限——<b>普通 App 根本没有</b>，而且这正是 11.6 第 ③ 条讲的 SELinux 限制所针对的行为。<br><br>答应了做不到的事，比一开始就说清楚代价大得多。安全工程里，<b>先说边界，再谈方案</b>是基本职业素养。'
+            terminal: true, verdict: 'good', verdictTitle: '对：把选择变成一道"暴露面预算"的题',
+            result: '<p><b>你没有在"能不能用"上纠缠，而是把它改写成了"用多少暴露面换多少收益"。</b><br>' +
+              '这就是本章的落点。具体到操作：<br>' +
+              '· <b>收窄</b>：作用域只勾目标 App（LSPosed 不支持全选，本身就是让你这么用）；' +
+              '进程名判准，别在子进程里也跑一遍；<br>' +
+              '· <b>降数量</b>：每个 hook 点都是一次 ART 层的入口改写（11.11 检测面②），' +
+              '能用一个点解决就不要挂三个；<br>' +
+              '· <b>选方式</b>：优先"不改目标方法"的观测方式，把最关键的几个点交给"不修改内存"的手段；<br>' +
+              '· <b>留后手</b>：同时评估非常驻路线，因为常驻方案一旦被环境检测否掉，' +
+              '它是<b>整体失效</b>而不是局部失效（11.8C 的局限第⑤条就是活例子）。<br>' +
+              '<span class="hit">记住这个判断框架：<b>先算暴露面预算，再决定用哪条路线</b>——' +
+              '而不是先选好路线，再去想办法解释暴露面。</span></p>'
           },
           n2: {
-            label: '选 B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：厘清边界，把不可行的需求转成可行的需求',
-            result: '<b>这是本章最重要的一次认知迁移。</b>答案的关键不是「能不能检测 eBPF」（在 App 权限下不能），而是<b>「把你的威胁模型从内核态挪回用户态」</b>。<br><br>要加载 eBPF 程序，观测者必须：<b>①</b> 取得 root 或等价高权限——那么设备的 root 状态本身就是最强的信号；<b>②</b> 在设备上放一个用户态 loader——它会出现在进程列表和文件系统里；<b>③</b> 很可能解锁了 bootloader、刷了非官方镜像。<br><br>这些<b>全部是可以从 App 侧合理检测的</b>（当然也要受 SELinux 和 Android 版本的限制，需要实测确认哪些 API 可用）。<br><br>同时要明确告诉负责人：<b>这是双向博弈，不存在一劳永逸。</b>你的检测手段会被绕过，对方也会升级；加固的价值在于抬高成本，不是造一道绝对防线。'
+            terminal: true, verdict: 'bad', verdictTitle: '你把"隐藏 root"当成了"隐藏注入"',
+            result: '<p><b>认知根源：你把两个不同的检测对象混成了一个。</b><br>' +
+              'DenyList 解决的是"<b>这台设备有 root</b>"这件事：隐藏 root 管理器的包、隐藏 <code>su</code> 路径、' +
+              '隐藏相关属性。<br>' +
+              '但你的场景里，对手额外检查的是"<b>Zygisk / Riru 的注入痕迹</b>"——' +
+              '也就是"<b>进程里/系统里有没有被塞进别人的代码</b>"。这是另一个问题：<br>' +
+              '· 隐藏 root 之后，你的进程里<b>依然运行着模块的代码</b>；<br>' +
+              '· 目标的方法入口<b>依然被改写过</b>（检测面②）。<br>' +
+              '<span class="miss">这两件事不可能靠"把 root 藏起来"解决。</span>' +
+              '先分清对手问的是哪个问题，再谈对策。</p>'
           },
           n3: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '把「不能直接做」答成了「什么都做不了」',
-            result: '<b>认知根源：只回答了字面问题，没有回到需求背后的真实目标。</b>负责人真正想要的是「降低被内核态观测的风险」，而「检测 eBPF」只是他想到的一种实现方式。<br><br>App 侧确实拿不到内核态信息，但风险降低路径依然存在：提高观测者的门槛（root 检测、完整性校验、设备可信状态评估）、增加观测者的成本、把敏感逻辑下沉到更难被静态定位的位置。<br><br><b>面对一个技术上不可实现的需求，优秀的回应是「重新定义问题」，而不是「拒绝问题」。</b>前者是工程师，后者只是执行者。'
+            terminal: true, verdict: 'bad', verdictTitle: 'Frida 不是"检测不到"，是"暴露面不同"',
+            result: '<p><b>认知根源：你把"按需注入"理解成了"没有痕迹"。</b><br>' +
+              'Frida 的暴露面集中在进程侧：注入线程名、agent 的内存映射、默认端口、以及（如果用了 inline hook）' +
+              '被改写的函数头。第 24 章整节都在讲这些检测点，第 10 章则专门讲怎么去掉这些特征。<br>' +
+              '对一个"已经在做环境/注入检测"的目标来说，Frida 往往<b>更容易被查</b>，而不是更安全——' +
+              '因为它要在目标进程里留下一整套运行时。<br>' +
+              '<span class="hit">正确的说法是：<b>两者暴露在不同维度上</b>。' +
+              'Frida 暴露在"进程被接上了"，LSPosed 暴露在"环境被改过"。选哪个，取决于对手查的是哪一类。</span></p>'
           },
           n4: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '技术上正是那道权限墙拦住的路径',
-            result: '<b>认知根源：以为「读文件」比「调系统调用」更容易。</b>在 Android 上，<code>/proc/kallsyms</code> 和内核内存恰恰是限制最严的东西：<code>kptr_restrict</code> 一类内核参数会让符号地址对非特权进程隐藏；<code>/dev/kmem</code> 在现代内核上基本不存在；SELinux 也会拦住这类访问。<br><br>更根本的是：<b>App 的进程运行在 EL0，内核数据在 EL1</b>。从用户态「扫描内核内存」本身就是个伪命题——你没有那个视角，除非先拿到内核读写能力，而那就等于已经 root 了。<br><br>这条选项的诱惑在于它听起来很「底层、很硬核」，但方向错了，越硬核越浪费时间。'
+            terminal: true, verdict: 'bad', verdictTitle: '每一次伪装都在增加不自洽的风险',
+            result: '<p><b>认知根源：你把"覆盖检测项"当成了可以无限叠加的加法。</b><br>' +
+              '"环境自洽"这个思路本身没错（第 32 章就是这么讲云手机的）——错在把它当成万能解：<br>' +
+              '· 每一个伪装点都是<b>一个新的代码路径</b>，也是一个新的暴露面；<br>' +
+              '· 伪装越多，<b>互相之间越容易矛盾</b>：你改了 maps 里的某个条目，' +
+              '却忘了 <code>/proc</code> 里另一处会露出同一份数据；' +
+              '· 而且你是在<b>被动跟随</b>对手的检测清单——他加一条你补一条，永远慢一步。<br>' +
+              '<span class="miss">这就是第 32 章那句话的另一面：<b>伪装不是改一个返回值，而是让所有证据面互相对得上账。</b>' +
+              '账本越厚，越容易记错。</span><br>' +
+              '更实际的问法不是"我还能补哪些检测项"，而是"<b>这个目标值不值得我维持这么大一套伪装</b>"。'
           }
         }
+      },
+      quiz: {
+        id: 'q22-7', chapter: 22, answer: 0,
+        stem: '为什么说 Xposed / LSPosed 的检测对抗，比 Frida 的"去特征"更难？',
+        options: [
+          { t: '因为 LSPosed 的痕迹是"系统被改过"这类环境痕迹——它不依赖你当前是否接上，' +
+               '所以无法通过"这次不注入"来规避',
+            why: '正确。这正是 11.1 讲的"检测面在环境 vs 在进程"的延伸。' },
+          { t: '因为 LSPosed 的代码不能修改，所以特征去不掉', why: 'LSPosed 是开源的，可以自编译，这不是根本原因。' },
+          { t: '因为 Frida 的端口和线程名本来就是标准行为，不算特征',
+            why: '恰恰相反，端口与线程名是 Frida 最典型的特征之一（第 24 章）。' },
+          { t: '因为 LSPosed 只支持高版本 Android，高版本检测更严',
+            why: '版本因素存在，但不是"更难"的根本原因。' }
+        ],
+        explain: '<b>根本区别在"痕迹的归属"。</b><br><br>' +
+          '<b>Frida 的痕迹属于"这次会话"</b>：agent 映射、注入线程、端口、被改写的函数头。' +
+          '只要你不 attach，这些痕迹就不存在。所以去特征是有明确靶子的——' +
+          '改端口、改线程名、编译 hluda、改用硬件断点（第 10、27 章）。<br><br>' +
+          '<b>LSPosed 的痕迹属于"这台设备"</b>：Zygote 注入链路、模块 so 的映射、' +
+          '被替换的方法入口、加载器链上的变化。<b>哪怕你今天不运行任何 hook，这些差异依然存在</b>——' +
+          '因为模块已经在每个作用域进程里了。<br><br>' +
+          '所以对抗的形态也不同：Frida 是"隐藏这一次的痕迹"，LSPosed 是"否认这台机器被改过"。' +
+          '前者的靶子小、可穷尽；后者的靶子大、且永远做不到 100%。<br><br>' +
+          '<span class="hit">最实际的做法因此不是"藏得更好"，而是<b>把暴露面当成预算来花</b>：' +
+          '作用域只勾必要的 App、hook 点压到最少、并准备好一条不需要常驻环境的备选路线。</span>'
       }
     },
-    /* 三个自测题各占一个 section —— 同一 section 里放多个 quiz 键会被 JS 静默覆盖 */
+
+    /* ============================================================ 11.12 */
     {
-      h: '11.9', title: '自测（一）：BTF 缺失意味着什么',
-      quiz: {
-        id: 'q11-2', chapter: 11,
-        answer: 2,
-        stem: '一位同事说：「eBPF 就是把 Frida 那套 hook 搬到内核里跑，原理一样，只是位置不同。」这个说法<b>最主要的错误</b>在哪里？',
-        options: [
-          { t: '没有错误，本质就是这样', why: '这个说法抹掉了 eBPF 最核心的设计——验证器，也抹掉了两者在能力边界上的巨大差异。' },
-          { t: 'eBPF 不能 hook 用户态函数，所以和 Frida 没有可比性', why: '不准确。uprobe/uretprobe 正是挂到用户态函数入口/返回的钩子，eBPF 完全可以观测用户态函数——只是方式与 Frida 的指令改写完全不同。' },
-          { t: 'Frida 是改写目标进程的指令/内存来拦截执行，而 eBPF 程序是<b>独立运行在内核里的程序</b>，靠内核提供的钩子点被动触发；而且它必须先通过<b>验证器</b>的静态安全证明才能加载，能力被 helper 白名单严格限制', why: '正确。差别不是「换个位置执行同样的逻辑」，而是两套完全不同的执行与安全模型。' },
-          { t: 'eBPF 只能用在 Linux 服务器上，手机上根本不存在这种东西', why: '错误。Android 基于 Linux 内核，系统自身就在用 eBPF（例如网络统计）。限制在于厂商配置、内核版本和 SELinux，而不是「不存在」。' }
-        ],
-        explain: '<b>「搬到内核里跑」这五个字丢掉了三件最关键的事。</b><br><br><b>① 执行模型不同。</b>Frida 的 Stalker/Interceptor 是<b>改写目标进程</b>——把跳转指令写进函数序言，或接管执行流。eBPF 是<b>一段独立存在于内核中的程序</b>，由内核在事件发生时调用；它不修改目标进程的任何字节。这也是 11.5 里「校验函数序言」那项自查对 eBPF 无效的原因。<br><br><b>② 安全模型不同。</b>Frida 注入的 JS 拥有目标进程的全部权限——它想崩就能崩。eBPF 必须过<b>验证器</b>：静态证明无越界、无死循环、指针类型正确，才能被加载。这是「凭什么允许用户代码进内核」这个问题的答案。<br><br><b>③ 能力边界不同。</b>Frida 能调用目标进程里的任意函数、读写任意内存。eBPF 只能用<b>helper 白名单</b>里的函数，不能动态分配内存、不能阻塞。它的能力是<b>被刻意收窄</b>的。<br><br>所以正确的表述是：<b>两者解决的是「观测/干预」这个大问题下的不同子问题，而不是同一个方案的两种部署位置。</b>'
-      }
+      h: '11.12', title: '用 Xposed 给自己脱壳：第 16 章的思路换到另一条工具链',
+      html:
+        '<p>第 16 章给了脱壳的元原则：<b>在壳把真 dex 解密到内存、结构完整、但还没藏回去的那一刻把它取出来</b>；' +
+        '对抽取壳则要<b>主动调用逼它回填方法体</b>。这一节讲的是：同一件事，用 Xposed / LSPosed 怎么做。</p>' +
+        '<p>五个动作，全部落在前面讲过的地方：</p>' +
+        T.step('①', '拿到壳替换后的真实加载器',
+          '这是所有事情的前提。Xposed 这边的常规路径是从 <code>ActivityThread</code> 的 ' +
+          '<code>mBoundApplication</code> → <code>info</code>（LoadedApk）→ <code>getClassLoader()</code> 反查' +
+          '（11.8C 的 JDex2 用的就是这条链）。<br>' +
+          '<span class="hit">和第 16 章 Frida 那边枚举加载器是同一个目的：<b>找到真正负责目标类的那个加载器。</b></span>') +
+        T.step('②', '从加载器里把 DexFile 掏出来',
+          '要求它是 <code>BaseDexClassLoader</code>：取 <code>pathList</code> → <code>dexElements[]</code> → ' +
+          '每个元素的 <code>dexFile</code> 字段。有多少个 dex 都要拿到——第 16 章强调过"多 dex"，' +
+          '加固会把关键代码放在后面的 dex 里。') +
+        T.step('③', '从 DexFile 拿到能落盘的句柄',
+          'Xposed 侧读到 <code>DexFile.mCookie</code>（<code>long[]</code>），把它交给 native 层写文件。' +
+          'JDex2 的做法就是两个 native 方法：<code>dumpDexByCookie(cookie, outDir)</code> 与 ' +
+          '<code>getDexSizesByCookie(cookie)</code>。<br>' +
+          '为什么用 native 写？因为 <code>mCookie</code> 背后是 ART 的 dex 内存结构，' +
+          '用 Java 的输入输出流是拿不到的。<b>这一步把 11.9 的 native 通道用上了。</b>') +
+        T.step('④', '主动调用触发回填（针对抽取壳）',
+          '<code>DexFile.getClassNameList(mCookie)</code> 列出类名 → <code>findClass</code> → ' +
+          '对每个类主动调用它的构造函数（或其他能触发使用的方法）。<br>' +
+          '与第 16 章 FART 的"遍历所有方法强制调用"是同一件事，只是粒度更粗：' +
+          'FART 能精确到方法，Java 反射这边主要能做到"类被使用 / 对象被构造"。' +
+          '<b>这就是为什么这类工具通常只能对付类级别的抽取。</b>') +
+        T.step('⑤', '增量与去重（这一条最容易被忽略，但决定能不能成功）',
+          'JDex2 用 cookie 取每个 dex 的大小、检查输出文件是否已存在，从而支持"<b>分两轮脱壳</b>"：' +
+          '第一轮把能脱的脱掉，崩溃或引用耗尽后改配置再跑第二轮，自动跳过已 dump 的类。<br>' +
+          '为什么必须这样？因为 <b>JNI 全局引用有上限</b>（README 给出的数字是 51200），' +
+          '类多到一定程度必然撞墙。<span class="hit">这是"工程约束倒逼设计"的典型：' +
+          '不是作者想加这个开关，而是不加就跑不完。</span>') +
+        T.tbl(['', '第 16 章：FART / 改 ART 路线', '本章：Xposed / LSPosed 模块路线'],
+          [
+            ['<b>改动面</b>', '改 ART 源码、编译、刷机', '装一个模块，勾一下作用域'],
+            ['<b>能力</b>', '能精确到方法粒度（方法抽取也能回填）', '通常只能到类级别；方法粒度抽取无能为力'],
+            ['<b>随版本演进的成本</b>', '<b>高</b>：每个安卓大版本都要重新定位（第 26 章整章）',
+             '<b>低</b>：把系统适配的活交给 LSPosed，你只跟 Java API 打交道'],
+            ['<b>稳定性 / 可持久性</b>', '取决于你的 ROM，通常很稳',
+             '取决于 LSPosed 自身不被检测——被检测即整体失效'],
+            ['<b>最适合</b>', '长期、批量、对抗强度高的脱壳工程', '快速验证、单样本分析、迭代成本敏感的场景']
+          ]) +
+        T.note('key', '🔑 这条路线的真正优势不是"技术更强"',
+          '<p style="margin-bottom:0">是<b>迭代成本低</b>：不用刷机、不用编译 ROM、不用等构建，' +
+          '改几行 Java、重装模块、重启 App 就能重试。<br>' +
+          '第 26 章那种"每个大版本重定位一次"的痛苦，在这里被 LSPosed 承担了——代价是' +
+          '<b>你的能力上限也被 LSPosed 的接口限住了</b>（比如方法粒度的抽取就做不到）。<br>' +
+          '这就是选型的本质：<b>你不是在选"更强的工具"，而是在选"把复杂度放在哪一层"。</b></p>') +
+        T.note('warn', '⚠️ 关于本章案例来源的说明',
+          '<p>本章想收录一条看雪（bbs.kanxue.com）上的 Xposed/LSPosed 原帖作为案例，' +
+          '但我尝试取的几个帖子（例如 JDex2 的 README 里给出的 <code>thread-290669</code>、' +
+          '以及搜索到的 LSPosed 原理帖、FDex2 脱壳工具帖）<b>都落在人机验证页上</b>：' +
+          '<code>web_fetch</code> 返回 HTTP 200，但正文是"安全验证 / 请确认您不是机器人"。' +
+          '这属于"能访问到页面、但取不到内容"，按契约不算可验证来源。</p>' +
+          '<p style="margin-bottom:0">所以本章的两个案例都取自 <b>GitHub</b>，并且都用 ' +
+          '<code>web_fetch</code> 取到了正文（一个是仓库 README 与源码文件，一个是官方 wiki 原文）。' +
+          '看雪的原帖链接我保留在案例的 <code>linkNote</code> 里，方便你自己登录后核对。</p>') +
+        T.note('', '📌 合规口径',
+          '<p style="margin-bottom:0">本节与 11.8C 讨论的脱壳技术，面向<b>合法授权的安全研究、' +
+          '自身产品的加固效果验证与教学</b>。请勿用于未授权地破解他人产品。' +
+          '这与全站一贯的口径一致（第 16、24、8 章同）。</p>')
     },
+
+    /* ============================================================ 11.13 */
     {
-      h: '11.10', title: '自测（二）：把可用性拆成四个维度',
-      quiz: {
-        id: 'q11-3', chapter: 11,
-        answer: [0, 2, 3],
-        stem: '<b>多选。</b>以下关于 eBPF 在 Android 上可用性的判断，哪些是<b>正确</b>的？',
-        options: [
-          { t: '厂商常在定制内核时裁掉 BPF 相关配置，若 <code>CONFIG_BPF_SYSCALL</code> 未开启，则完全无法加载 eBPF 程序', why: '正确。这是 11.6 第 ② 条的核心：BPF 系统调用是总闸，没有它一切免谈。' },
-          { t: '只要设备的 Android 版本足够新，就一定能加载自定义 eBPF 程序', why: '错误。Android 版本只是间接线索，真正的决定因素是内核版本、内核配置、SELinux 策略和权限。系统版本新但内核被裁剪的设备完全可能存在。' },
-          { t: 'Android 系统自身使用 eBPF（例如按 UID 的网络流量统计），这说明内核路径是通的，但这些程序由系统进程加载，普通 App 无权', why: '正确。这既是可行性的证据，也划清了权限边界——「系统能用」不等于「你能用」。' },
-          { t: '即使内核支持，Android 的 SELinux 强制访问控制仍可能限制 <code>bpf()</code> 系统调用，通常需要 root 才能绕过', why: '正确。这是 11.6 第 ③④ 条的叠加效果。' }
-        ],
-        explain: '<b>这道题的关键在于：把「支持」拆成四个独立的维度来判断。</b><br><br><b>① 内核版本</b>——决定有没有这个特性（较完整能力一般需 4.14+，Android 9 / kernel 4.9 起开启部分 BPF 功能）。<br>' +
-          '<b>② 内核配置</b>——决定这个特性<b>在你这台机器上</b>有没有被编译进来，典型开关是 <code>CONFIG_BPF_SYSCALL</code>、<code>CONFIG_BPF_JIT</code>、<code>CONFIG_DEBUG_INFO_BTF</code>。<br>' +
-          '<b>③ SELinux 策略</b>——决定你有没有权限去调用它。<br>' +
-          '<b>④ 运行身份</b>——root 与否，往往决定前三条能不能落地。<br><br>' +
-          '选项 B 的错误是典型的<b>「用代理指标替代真实指标」</b>：Android 版本和内核版本、内核配置之间没有强绑定，厂商可以在很新的系统上裁剪内核，也可以在老系统上开启部分功能。做这类判断，永远要落到<b>实测</b>。<br><br>' +
-          '<span class="pill warn">再次提醒时效性</span>：上述经验以 2023 年前后的生态为背景，不同厂商、机型、内核版本差异极大，请以你自己的目标设备实测结果为准。'
-      }
+      h: '11.13', title: 'LSPosed 逆向开发实战要点',
+      html:
+        '<p>先给一个让人安心的结论：<b>传统 Xposed API 仍然能用。</b>' +
+        'LSPosed 的 README 明确写了双向兼容——基于 LSPosed 的模块与原版 Xposed 框架兼容，反之亦然。' +
+        '所以你前面学的 <code>IXposedHookLoadPackage</code>、<code>XposedHelpers</code>、' +
+        '<code>XC_MethodHook</code> 这一套没有作废。</p>' +
+        '<p>但官方同时推进了一套<b>现代 API</b>（<code>io.github.libxposed.api</code>，工程名 libxposed）。' +
+        '下面这几条差异全部来自官方 wiki 的 Modern Xposed API 页面原文。' +
+        '<b>如果你要写新模块，必须知道它们</b>——否则你会照着旧教程写出一个能跑但"少了半边能力"的模块。</p>' +
+        T.tbl(['', '传统 API', '现代 API（libxposed）'],
+          [
+            ['<b>Java 入口声明</b>', '<code>assets/xposed_init</code>',
+             '<code>META-INF/xposed/java_init.list</code>（放在 <code>src/main/resources/META-INF</code>，Gradle 会自动打包）'],
+            ['<b>Native 入口声明</b>', '<code>assets/native_init</code>',
+             '<code>META-INF/xposed/native_init.list</code>'],
+            ['<b>模块元数据</b>', '<code>AndroidManifest</code> 里的 ' +
+             '<code>xposedmodule</code> / <code>xposeddescription</code> / <code>xposedminversion</code>',
+             '<b>不再用 metadata</b>：名称用 <code>android:label</code>、描述用 <code>android:description</code>、' +
+             '作用域用 <code>META-INF/xposed/scope.list</code>（一行一个包名）、' +
+             '配置用 <code>META-INF/xposed/module.prop</code>（Java properties 格式，含 ' +
+             '<code>minApiVersion</code> / <code>targetApiVersion</code> / <code>staticScope</code>）'],
+            ['<b>入口接口</b>', '<code>IXposedHookLoadPackage</code> / <code>IXposedHookZygoteInit</code>',
+             '实现 <code>io.github.libxposed.api.XposedModule</code>；框架自动调用 ' +
+             '<code>attachFramework(XposedInterface)</code>；官方明确要求模块<b>不要</b>在 ' +
+             '<code>onModuleLoaded()</code> 之前做初始化'],
+            ['<b>Hook 写法</b>', '<code>XC_MethodHook</code> 的 before / after；<code>XC_MethodReplacement</code>',
+             '<b>OkHttp 风格的拦截器链</b>：实现 <code>Hooker&lt;T&gt;</code> 的 ' +
+             '<code>intercept(Chain&lt;T&gt; chain)</code>；hook 返回 <code>HookBuilder</code> 以配置优先级与异常策略'],
+            ['<b>辅助工具类</b>', '<code>XposedHelpers</code> 家族（本章 11.5 讲的全套）',
+             '<b>框架不再提供 XposedHelpers</b>——官方另出 <code>libxposed/helper</code> 这类库补上'],
+            ['<b>内联与调用</b>', 'hook 有时会被方法内联"绕过"',
+             '可以对具体方法（接受 <code>Executable</code> 参数）做 deoptimize 以绕开内联；' +
+             '并引入 Invoker 体系：<code>getInvoker(Method)</code> / <code>getInvoker(Constructor)</code>，' +
+             '提供 <code>invokeSpecial</code> / <code>newInstanceSpecial</code>'],
+            ['<b>资源 Hook</b>', '历史上支持',
+             '<b>被移除</b>。官方给的理由是它难以维护、此前造成过很多问题'],
+            ['<b>与框架通信</b>', '基本没有正式通道',
+             '可以注册 service listener 与框架通信：动态申请作用域、跨模块与目标 App 共享 ' +
+             'SharedPreferences / blob 文件、查询框架名与版本；<b>因此模块 App 自身不再被 hook</b>']
+          ]) +
+        T.note('key', '🔑 现代 API 里最值得注意的两条',
+          '<p>① <b>"模块 App 自身不再被 hook"</b>——传统实现里模块 APK 自己也会被注入（因为它在作用域里就是个普通 App），' +
+          '这带来过不少混乱。现代 API 用一个明确的通信通道替掉了这种"自己 hook 自己"的用法。</p>' +
+          '<p style="margin-bottom:0">② <b><code>staticScope</code> / 动态申请作用域</b>——' +
+          '作用域从"安装时勾一次"变成"可以在运行中与框架协商"。' +
+          '这对 11.11 讲的"暴露面预算"是好事：你可以只在自己需要的那一刻申请最小作用域，' +
+          '而不是一开始就勾上一大片。</p>') +
+        '<h3 style="margin-top:26px">新版 Android 上的作用域与兼容性问题</h3>' +
+        '<p>三条现实约束，按踩坑频率排：</p>' +
+        '<p><b>① 作用域勾多了，崩溃的爆炸半径跟着变大。</b>' +
+        '这一点在 11.8C 那个案例里体现得最直接：它的局限里同时出现了"JNI 全局引用超上限"和' +
+        '"某些类继承了本系统不存在的父类导致崩溃"。' +
+        '<b>模块崩在自己的进程里是小事，崩在每一个被勾选的 App 里就是设备级事故。</b>' +
+        '所以白名单/黑名单、进程名判断、增量跳过这些东西不是可选项，而是必备。</p>' +
+        '<p><b>② 存储路径与分区存储。</b>Android 11 之后 <code>/sdcard/Android/data/&lt;包名&gt;/</code> 的写入被逐步收紧。' +
+        '11.8C 的案例里，作者在 Android 12+ 上用的是 <code>/Android/\\u200Bdata/</code>——' +
+        '路径中间插了一个零宽字符来绕过限制。<span class="pill warn">待核实</span>：' +
+        '这类技巧在哪些版本、哪些机型上仍然有效，无法从仓库信息里确认；' +
+        '而且它的性质是"和系统规则对抗"，随时可能失效。<b>把它当作临时手段，不要当作设计基础。</b></p>' +
+        '<p><b>③ 系统版本不等于 ART 版本。</b>' +
+        '这是第 26 章的结论，在这里同样成立：从 Android 12 起 ART 变成可以独立升级的 APEX 模块，' +
+        '所以"我这是 Android 13"不足以判断 hook 框架能不能用——' +
+        '真正决定兼容性的是 ART 内部结构，而 hook 框架恰恰是最依赖这东西的。' +
+        'LSPosed 的 README 写的是 Android 8.1 ~ 14，<span class="pill warn">待核实</span>：' +
+        '请以官方 release 页的当前说明为准。</p>' +
+        '<h3 style="margin-top:26px">Zygisk 模块与 LSPosed 模块是什么关系</h3>' +
+        '<p>这是最容易混淆的一对概念。用一句话分开：</p>' +
+        T.note('', '🏗️ 地基、房子、家具',
+          '<p><b>Zygisk 是地基，LSPosed 是盖在地基上的房子，你的模块是房子里的家具。</b></p>' +
+          '<p>· <b>Zygisk 模块</b>：Magisk 提供的 Zygote 注入机制。它给你的接口是 <b>native 的</b>，' +
+          '你能做的事情更底层——替换 libc、改系统属性、在最早的时刻注入自己的 so。<br>' +
+          '· <b>LSPosed 模块</b>：提供 <b>Java / ART 层</b>的 hook API。' +
+          'LSPosed 自己就是一个"跑在 Zygisk 或 Riru 之上的模块"（README 自述：' +
+          '<i>A Riru / Zygisk module trying to provide an ART hooking framework</i>）。</p>' +
+          '<p style="margin-bottom:0"><b>怎么选：</b>要的是 Java 语义（方法、字段、类加载）→ 写 LSPosed 模块；' +
+          '要的是比 Java 更底层的能力（native、属性、极早期）→ 写 Zygisk 模块。<br>' +
+          '两者也可以配合，而且<b>官方就给了配合的通道</b>：LSPosed 模块里 ' +
+          '<code>System.loadLibrary</code> 自己的 so，就是 11.9 讲的那条 native 入口。</p>') +
+        '<h3 style="margin-top:26px">五条实战要点（都是踩出来的）</h3>' +
+        '<ol>' +
+        '<li><b>先确认作用域与进程名，再怀疑代码。</b>模块"完全没反应"的第一嫌疑永远是这两件事（11.2）。</li>' +
+        '<li><b>日志给独立 TAG，用 <code>adb logcat -s 你的TAG</code> 单独看。</b>' +
+        '在几十个 App 的作用域下跑模块，不隔离日志等于没有日志。</li>' +
+        '<li><b>定位方法一律写全签名，不靠名字猜。</b>混淆之后名字没有信息量，参数类型表才是稳定标识（11.5）。</li>' +
+        '<li><b>一次只改一件事，改完立刻看日志。</b>同时改五个 hook 点然后崩溃，你失去的是全部线索。</li>' +
+        '<li><b>主动调用/批量操作必须独立 try/catch，并留可审计的黑名单。</b>' +
+        '跳过而不记录，等于给自己的脱壳结果挖洞（11.6）。</li>' +
+        '</ol>',
+      after: T.note('warn', '⚠️ 关于版本与维护状态的统一提醒',
+        '<p style="margin-bottom:0">本章涉及的所有<b>版本号、支持范围、维护状态</b>都可能已经变化：' +
+        '原始 Xposed 的最后一个版本、EdXposed 是否归档、LSPosed 当前支持的 Android 区间、' +
+        'Riru 与 Zygisk 两条 flavor 的取舍、libxposed 的 API 版本。' +
+        '凡标注 <span class="pill warn">待核实</span> 的地方，请以<b>官方仓库与 release 页</b>为准。' +
+        '我刻意不写死这些数字——写死一个过期版本号，比留一个空格糟糕得多。</p>')
     },
+
+    /* ============================================================ 11.14 */
     {
-      h: '11.11', title: '自测（三）：按数据通路排查',
+      h: '11.14', title: '收束：把这一章压成一张判断表',
+      html:
+        '<p>本章的技术点很多，但真正需要带走的是<b>判断顺序</b>。下面这张表是它的压缩版。</p>' +
+        T.tbl(['你遇到的现象', '先问什么', '去哪一节'],
+          [
+            ['模块完全没反应', '作用域勾了吗？进程名对吗？', '11.2'],
+            ['类找不到（ClassNotFound）', '谁负责加载它？我手上的加载器对吗？', '11.8 / 11.8C'],
+            ['字段读出来是 null', '我是在 before 还是 after？它什么时候被赋值？', '11.4 / 11.5'],
+            ['参数不是调用方传的值', '我看的是不是 after？原始值还在不在？', '11.6'],
+            ['主动调用崩了', '类加载器 / 签名 / 时机 / 参数 / 前置状态——按顺序查', '11.6 / 11.7'],
+            ['hook 曾经生效，后来静默了', '地址还在不在？入口有没有被换？', '11.10'],
+            ['目标有 root / 注入检测', '我是在花哪一份暴露面预算？有没有非常驻路线？', '11.11'],
+            ['该用 Frida 还是 LSPosed', '管一个进程，还是管一套环境？', '11.1 / 11.11'],
+            ['要长期监控全部加密调用', '目标会做环境检测吗？暴露面允许常驻吗？', '11.1 / 11.11'],
+            ['要脱一个抽取壳', '类级别还是方法级别？迭代成本重要还是能力上限重要？', '11.12 / 11.8C']
+          ]) +
+        T.note('key', '🔑 三句最该记住的话',
+          '<p>① <b>Frida 管一个进程，LSPosed 管一套环境。</b>' +
+          '进程模型决定了注入时机、作用域、可持久性，也决定了检测面在哪一侧。</p>' +
+          '<p>② <b>不要"在某个时刻去找类"，要"守在类出生的地方"。</b>' +
+          '类加载器这一层同时解决加固壳（找真实加载器）与插件 dex（捕获新加载器/新 dex）两类问题。</p>' +
+          '<p style="margin-bottom:0">③ <b>你的观测手段就是对手的检测项。</b>' +
+          '每一个 hook 点都在增加暴露面，所以"最少必要"不是洁癖，是设计原则。</p>') +
+        '<p>最后说一句不好听但必要的话：<b>本章给出的所有对抗手段都有边界。</b>' +
+        '装过 LSPosed 的机器与原装机之间的差异不可能完全抹平；' +
+        'native hook 必然改内存，inline hook 必然留下入口痕迹；' +
+        '主动调用的粒度决定了它处理不了方法级别的抽取。<br>' +
+        '知道这些边界在哪，比多背几个 API 有用得多——' +
+        '因为选型失败通常不是"不会用工具"，而是<b>"用错了形态"</b>。</p>',
       quiz: {
-        id: 'q11-4', chapter: 11,
-        answer: 3,
-        stem: '你的 eBPF 程序在内核里采集到了数据，但用户态程序一直读不到任何内容。回看 11.2 的九步流程，<b>最应该优先排查</b>的是哪一环？',
+        id: 'q22-9', chapter: 22, answer: 0,
+        stem: '<b>综合题。</b>你要长期监控一个 App 的全部加密调用（每一次输入输出都要记录）。' +
+              '目标会做 root 与注入检测。下面哪个判断最站得住？',
         options: [
-          { t: '第一步「写程序」——重新检查 C 代码的逻辑是否正确', why: '逻辑错误确实可能导致没有数据，但「内核侧毫无输出」这种症状更典型地指向数据通路而非业务逻辑。而且如果程序有逻辑问题，往往加载阶段就会因为验证器检查失败而暴露。' },
-          { t: '第六步「attach」——确认程序是否挂到了正确的钩子上，以及事件有没有真的发生', why: '这是第二顺位，值得排查（挂错钩子确实会一条数据都没有）。但如果 attach 完全失败，libbpf 通常会在加载或挂载时直接报错，而不是静默无输出。' },
-          { t: '第五步「JIT 编译」——怀疑内核没有开启 JIT，导致程序没有真正执行', why: '方向错误。JIT 只影响<b>性能</b>；没有 JIT 时程序会解释执行，依然会产出数据，只是更慢。这不会造成「完全没有输出」。' },
-          { t: '第八步「写 Map」——检查内核侧是否真的提交了数据：Map 定义、reserve/submit 是否配对、以及漏掉了失败分支的判空', why: '正确。这是最高频的原因，且症状完全吻合：程序在跑、事件在发生，但数据没有进入共享存储。' }
+          { t: '先算暴露面预算：如果目标的环境检测会否掉常驻方案，就选按需注入的路线（并接受它的特征管理成本）；' +
+               '如果常驻方案可用，就用最小作用域 + 最少 hook 点，并准备一条备选路线',
+            why: '正确。这是本章的落点：先算暴露面，再选路线，并保留退路。' },
+          { t: '直接上 LSPosed，因为它比 Frida 更隐蔽', why: '这是把 11.1 的结论搞反了：LSPosed 的痕迹是环境级的，不依赖你是否接上。' },
+          { t: '直接上 Frida，因为它按需注入、不装模块，所以不会被检测到',
+            why: '按需注入不等于无痕；进程侧特征（线程、映射、端口、函数头）依然存在。' },
+          { t: '两个一起上，覆盖面最全', why: '同时叠加两套暴露面，等于把两边的检测项都送给对手；这不是"覆盖更全"而是"风险相乘"。' }
         ],
-        explain: '<b>这道题训练的是「按数据通路排查」而不是「凭感觉猜」。</b><br><br>把 11.2 的九步按数据流切成三段：<b>入口段</b>（①②③④⑤⑥⑦：写、编、加载、验证、JIT、挂载、触发）、<b>存储段</b>（⑧：写 Map）、<b>出口段</b>（⑨：用户态读）。<br><br>「内核侧采集到了但用户态读不到」这个症状，指向的是<b>存储段和出口段</b>。而出口段相对好验证——先确认 Map fd 拿到了、注册回调成功、<code>poll</code> 返回值不是负数。如果出口段没问题，那问题几乎必然在第八步。<br><br>第八步最常见的三个坑：<b>①</b> Map 定义写错（类型、大小、<code>max_entries</code> 不合法——比如 ringbuf 要求 2 的幂）；<b>②</b> <code>reserve</code> 之后忘了 <code>submit</code>（或该 <code>discard</code> 时没归还），记录永远不出现在消费侧；<b>③</b> 没有处理 <code>reserve</code> 返回 NULL 的情况——缓冲满时静默丢数据，看起来就像「什么都没发生」。<br><br><b>排查口诀：先分入口/存储/出口三段定位，再在段内按可能性排序。</b>比逐个环节乱试快得多。'
-      }
+        explain: '<b>这道题考的不是"哪个工具好"，而是"你先算什么"。</b><br><br>' +
+          '题目给了两个硬约束：<b>长期</b>（暗示要持久、要稳定）与<b>目标会做环境检测</b>（暗示常驻方案有整体失效风险）。' +
+          '这两条一摆出来，答案就不是"选 Frida"或"选 LSPosed"，而是：<br><br>' +
+          '<b>第一步，判断环境检测会不会否掉常驻方案。</b>' +
+          '如果目标是"装过 LSPosed 就拒绝运行"，那所有常驻方案都是零分——无论你写得多好。' +
+          '（11.8C 的案例就是活证据：作者自述"高度依赖 Lsposed 的隐蔽性，如果 Lsposed 被检测则会直接闪退"。）<br><br>' +
+          '<b>第二步，如果常驻方案可用，就按最小暴露面设计。</b>' +
+          '作用域只勾目标 App、hook 点压到最少、能用一次性时机就不用常驻 hook。' +
+          '注意"监控全部加密调用"这个需求本身就在逼你多挂点——' +
+          '所以要评估：能不能只挂一个"总入口"（例如某个统一的加密调度方法），而不是每个算法各挂一个。<br><br>' +
+          '<b>第三步，永远留一条备选路线。</b>' +
+          '常驻方案失效的方式是<b>整体失效</b>，没有降级空间。' +
+          '所以并行评估非常驻路线（一次性注入、非 root 方案、模拟执行，见第 10、21 章）不是浪费，是保险。<br><br>' +
+          '<span class="hit">把这三步合起来就是本章的元判断：' +
+          '<b>先算暴露面预算，再选路线，并保留退路。</b></span>'
+      },
+      after: T.note('ok', '✅ 本章完成',
+        '<p style="margin-bottom:0">你现在应该能回答这几个问题，而且能说出理由：<br>' +
+        '· 为什么在加固 App 上 <code>findAndHookMethod</code> 会 <code>ClassNotFound</code>，以及两条解法分别是什么；<br>' +
+        '· 构造函数为什么值得单独 hook，before / after 各自能拿到什么；<br>' +
+        '· 插件 dex 与壳 dex 的 ClassNotFound 为什么解法不同；<br>' +
+        '· Xposed 生态里 native hook 的时机从哪来、引擎从哪来，以及它和第 27 章那条路怎么分工；<br>' +
+        '· 为什么"装过 LSPosed"这件事本身无法被完全隐藏。<br><br>' +
+        '如果有一条说不顺，回到对应小节；如果都顺了，去严师那里过一遍——那才是真正的验收。</p>')
     }
+
   ],
 
+  /* ============================================================== 名词表 */
   glossary: [
-    { t: 'BPF', d: 'Berkeley Packet Filter，1992 年提出的网络包过滤机制，是 tcpdump 背后的底层技术。它只处理网络包，用途很窄。' },
-    { t: 'eBPF', d: 'extended BPF，2014 年（Linux 3.18）引入。把 BPF 从「包过滤器」扩展成<b>一个运行在内核中的通用虚拟机</b>，可挂到几十种事件源上，用于可观测性、网络和安全监控。' },
-    { t: '验证器 Verifier', d: '内核在加载 eBPF 程序时的静态分析器。它<b>不运行</b>程序，而是模拟所有可能的执行路径，证明代码不会崩溃内核、循环有界、内存访问不越界、指针类型正确。<b>它是 eBPF 安全性的基石</b>。' },
-    { t: 'BPF Map', d: '内核态 eBPF 程序与用户态程序共享的键值存储，是两者通信的<b>主要</b>通道。常见类型有 HASH、ARRAY、PERCPU_ARRAY、RINGBUF、PERF_EVENT_ARRAY。' },
-    { t: 'ringbuf', d: '<code>BPF_MAP_TYPE_RINGBUF</code>，现代推荐的流式数据传输方式。单生产者单消费者、无锁、高效，用来取代老式的 perf_event_array（后者是每 CPU 一份缓冲，会打乱事件顺序且 fd 开销大）。' },
-    { t: 'Helper 函数', d: '内核提供给 eBPF 程序调用的受控函数白名单。eBPF 程序<b>不能</b>直接调用任意内核函数，只能通过这些 helper（如 bpf_probe_read_user、bpf_get_current_pid_tgid）。这是安全边界的一部分。' },
-    { t: 'kprobe / kretprobe', d: '内核函数入口 / 返回处的动态探针，用于追踪内核函数调用。属于较底层的手段，依赖具体的内核函数名与签名。' },
-    { t: 'uprobe / uretprobe', d: '用户态函数入口 / 返回处的探针。对逆向最有用——可以直接盯住某个 so 里的加解密、校验函数，且不需要修改目标进程的任何指令。' },
-    { t: 'tracepoint', d: '内核预先定义的静态追踪点（如系统调用的 sys_enter/sys_exit）。相比 kprobe 更稳定，不依赖内核内部函数名，是<b>推荐优先使用</b>的钩子类型。' },
-    { t: 'BTF', d: 'BPF Type Format，内核的调试类型信息，暴露在 <code>/sys/kernel/btf/vmlinux</code>。它是 CO-RE 的基础——没有它，libbpf 无法在加载时做类型重定位。' },
-    { t: 'CO-RE', d: 'Compile Once – Run Everywhere。借助 BTF 类型信息，让同一份 eBPF 目标文件适配不同内核版本。重定位发生在<b>加载时</b>（libbpf 读目标机的 BTF），因此目标机没有 BTF 时无法使用。' },
-    { t: 'XDP', d: 'eXpress Data Path，网络驱动层最早的数据包处理点。在协议栈之前执行，性能极高，常用于高性能包处理、负载均衡和 DDoS 防护。' }
+    { t: 'Xposed', d: '最早的 Android Hook 框架（rovo89）。替换 <code>app_process</code> 并把 <code>XposedBridge.jar</code> 带进 Zygote，' +
+        '定义了 <code>IXposedHookLoadPackage</code> 这一整套 API。后续所有实现都以它为 API 基准。' +
+        '官方版本支持范围停在 Android 8.1 时代，<span class="pill warn">待核实</span>。' },
+    { t: 'EdXposed', d: '基于 Riru 的接棒实现，LSPosed 的 fork 源。维护状态 <span class="pill warn">待核实</span>。' },
+    { t: 'LSPosed', d: '当前事实上的主线实现。官方自述是一个 Riru / Zygisk 模块，提供与原始 Xposed 一致的 API，' +
+        '核心 ART hook 框架是 LSPlant。README 标注支持 Android 8.1 ~ 14（<span class="pill warn">待核实</span>）。' },
+    { t: 'LSPlant', d: 'LSPosed 的核心 ART hook 框架（LSPosed 组织维护）。"方法入口被替换"这件事就发生在这一层，也是 11.11 的检测面②。' },
+    { t: 'Dobby', d: 'Inline hook 库。LSPosed README 的 Credits 里写明用它做 inline hooking；' +
+        '也是 Xposed 生态里模块做 native hook 时可复用的引擎。' },
+    { t: 'Magisk', d: 'Android 的 root 方案与模块化框架。它在 boot 镜像的 ramdisk 里注入自己的 init，' +
+        '再用 magic mount 做 systemless 修改。LSPosed 是它的一个模块，自己并不具备注入能力。' },
+    { t: 'Zygisk', d: 'Magisk 提供的在 Zygote 进程注入代码的机制（Magisk v24+ 起）。' +
+        '因为 Zygote 是所有 App 进程的母体，在这里注入等于每个 App 进程出生即带代码。' },
+    { t: 'Riru', d: '第三方的 Zygote 注入模块（LSPosed 官方文档要求 26.1.7+）。' +
+        '与 Zygisk 是同一目的的两种实现，LSPosed 提供两种 flavor。' },
+    { t: '作用域（scope）', d: '决定一个模块对哪些 App 生效的清单。LSPosed 要求逐个勾选、不提供全选' +
+        '（官方理由是"注入每个 App 太危险"）。它是安全边界，不是方便选项。' },
+    { t: 'IXposedHookLoadPackage', d: '模块入口接口之一。<code>handleLoadPackage(XC_LoadPackage.LoadPackageParam)</code> ' +
+        '在每个作用域内的 App 进程加载时被调用一次（注意：每个进程一次，不是每个 App 一次）。' },
+    { t: 'IXposedHookZygoteInit', d: '入口接口之一。<code>initZygote(StartupParam)</code> 在 Zygote 启动时执行一次，' +
+        '此时没有 App 进程、没有包名、也没有 App 的 ClassLoader——适合改系统框架级行为。' },
+    { t: 'XC_MethodHook', d: '最常用的 hook 基类。<code>beforeHookedMethod</code> 在原方法体执行前调用，' +
+        '<code>afterHookedMethod</code> 在之后调用。原方法体仍然会执行——除非你在 before 里 <code>setResult</code>。' },
+    { t: 'XC_MethodReplacement', d: '用 <code>replaceHookedMethod</code> 完全替代原方法体。' +
+        '注意：原方法的所有副作用也随之消失，这是最容易踩的坑。' },
+    { t: 'XposedHelpers', d: '反射工具箱：<code>findAndHookMethod</code> / <code>getObjectField</code> / ' +
+        '<code>setObjectField</code> / <code>callMethod</code> / <code>callStaticMethod</code> / <code>newInstance</code> / ' +
+        '<code>findClass</code>。本质是 Java 反射，所以失败方式与反射一致（例如 <code>int.class</code> ≠ <code>Integer.class</code>）。' },
+    { t: 'loadClass / findClass', d: '<code>ClassLoader.loadClass</code> 是所有加载请求的总入口（含最终由父加载器加载的类）；' +
+        '<code>BaseDexClassLoader.findClass</code> 只在"这个加载器自己动手"时才被调用。前者全而吵，后者精而少。' },
+    { t: 'DexPathList.make*Elements', d: '<code>makeDexElements</code> / <code>makePathElements</code> / ' +
+        '<code>makeInMemoryDexElements</code>。新 dex 被挂进某个加载器的时刻——发现"动态加载"的唯一窗口（11.8 的 L3）。' },
+    { t: '主动调用（Invoke）', d: '由你发起对 App 方法的调用（<code>callMethod</code> / <code>callStaticMethod</code> / ' +
+        '<code>newInstance</code>）。典型用途是触发抽取壳回填方法体；返回值通常只是副产品。' },
+    { t: 'mCookie', d: 'Android <code>DexFile</code> 内部指向 ART dex 结构的句柄（常见形态是 <code>long[]</code>）。' +
+        '脱壳时把它交给 native 层即可把 dex 落盘（JDex2 的 <code>dumpDexByCookie</code> 就是这么做的）。' },
+    { t: 'JNI 全局引用上限', d: 'JNI 全局引用数量有上限，超过会导致崩溃（JDex2 的 README 给出的数字是 51200）。' +
+        '这是"批量主动调用必须支持分轮与跳过"的根因。' },
+    { t: 'libxposed（现代 API）', d: 'LSPosed 推进的新一代 API（<code>io.github.libxposed.api</code>）。' +
+        '入口改 <code>META-INF/xposed/java_init.list</code>、元数据改 <code>module.prop</code>、' +
+        'Hook 改为 <code>Hooker&lt;T&gt;</code> 拦截器链，并且框架不再提供 <code>XposedHelpers</code>。' }
   ],
 
+  /* ============================================================== 严师 */
   teacher: {
-    id: 'ch11', chapter: 11,
-    name: '追问老师 · 第 11 章',
-    sub: 'eBPF 的安全模型、它和 Frida 的关系、以及它在 Android 上到底能不能用。',
-    intro: '<p style="margin:0">这一章名词多、门槛高，所以我会问得比前几章更狠。<b>我不接受「eBPF 很强大所以要用它」这种回答</b>——我要听的是：内核凭什么信任它、数据怎么回来、以及在你的目标设备上它究竟跑不跑得起来。答不上来我会一层层追问，直到你自己把逻辑补完整。</p>',
+    id: 't22', chapter: 22,
+    name: '严师 · 时机审计员',
+    sub: '说不清"为什么这里能拿到、那里拿不到"，你就只能一遍遍试',
+    intro: '<p style="margin:0">我不考你 API 怎么调（那个查文档就行）。我考的是：' +
+           '<b>你为什么在这个时机、这一层、这一侧动手；拿不到的东西到底是被谁挡住的。</b><br>' +
+           '下面每道题都要用自己的话说全关键点。含糊我会追问；追问三次我直接给答案——但那不算你过关。</p>',
     questions: [
       {
-        id: 'c11q1', depth: 1, threshold: 0.7,
-        q: '<b>BPF</b> 和 <b>eBPF</b> 是什么关系？请说清 BPF 最初是干什么的、eBPF 在什么时候把它变成了什么。',
+        id: 'c22q1', depth: 1, threshold: 0.7,
+        q: 'Frida 和 Xposed / LSPosed 在<b>注入时机</b>上有什么本质差别？' +
+           '这个差别带来了哪些具体后果（至少说三条）？',
         concepts: [
-          { label: 'BPF 是 1992 年提出的网络包过滤机制，是 tcpdump 的底层',
-            hint: '先想 tcpdump 抓包的时候，那些过滤表达式最终是谁在执行？',
-            any: ['1992', '包过滤', '抓包', 'tcpdump', 'libpcap', 'packet filter', 'berkeley packet filter', '网络包', '报文过滤', '过滤网络包'] },
-          { label: 'eBPF 是 extended BPF，2014 年随 Linux 3.18 引入',
-            hint: '它是在哪个内核版本进入主线的？',
-            any: ['2014', '3.18', 'extended bpf', 'linux 3.18', '扩展 bpf', '扩展版 bpf'] },
-          { label: 'eBPF 把它从专用过滤器升级成运行在内核中的通用虚拟机',
-            hint: '升级之后，它还能不能只处理网络包？',
-            any: ['通用虚拟机', '虚拟机', 'vm', 'virtual machine', '通用', '不再局限于网络', '不只是网络', '内核中运行', '内核态运行', '可编程', '通用执行引擎', '跑在内核里'] }
+          { label: 'Frida 是<b>按需</b>注入你指定的单个进程（attach 事后补挂，或 spawn 抢跑）',
+            hint: 'Frida 改的是"一个进程"还是"一台设备"？',
+            any: ['attach', 'spawn', '按需', '单个进程', '指定进程', '一个进程', '只注入', '注入单个'] },
+          { label: 'LSPosed 注入 Zygote，此后每个 fork 出来的 App 进程都带着模块',
+            hint: '模块是从哪个进程开始生效的？', any: ['zygote', 'Zygote', '母体', 'fork', '每个进程', '所有进程', '出生'] },
+          { label: '时机差别：LSPosed 更早（早到 App 第一行 Java 代码之前），但时机不由你选；Frida 可控（可抢跑可事后）',
+            hint: '谁决定注入发生在哪一刻？', any: ['更早', '第一行', '启动之前', '事先', '系统决定', '可控', '抢'] },
+          { label: '可持久性差别：LSPosed 常驻（重启后仍生效），Frida 是会话级（detach 或重启就没了）',
+            hint: '今天 hook 过，明天还需要再连一次吗？', any: ['持久', '常驻', '重启', '会话', 'detach', '一直生效', '仍在'] },
+          { label: '暴露面差别：Frida 的特征在进程，LSPosed 的特征在环境/整台设备',
+            hint: '被检测时，你失去的是"这一次会话"还是"整个环境"？',
+            any: ['暴露面', '检测面', '环境', '进程级', '整台', '全局', '更大', '整体失效'] }
         ],
         hints: [
-          '回忆一下：tcpdump 写 `tcp port 80` 这种过滤条件时，真正的过滤动作发生在用户态还是内核态？',
-          '版本号是个硬知识：BPF 的年代，和 eBPF 进入 Linux 主线内核的版本。'
+          '不要停在"一个早一个晚"。先问：Frida 的作用单位是什么？LSPosed 的作用单位是什么？',
+          '再想一个后果层面的问题：如果 LSPosed 被目标检测到了，你还有"这次不接上"这个退路吗？'
         ],
         probes: [
-          '你说 eBPF 是「通用虚拟机」——那它「通用」体现在哪里？和原来只处理网络包相比，多了什么能力？',
-          '为什么这个改动值得单独立一个名字？直接叫 BPF 2.0 不行吗？'
+          '你说 LSPosed 更早——那你为什么不能在 <code>IXposedHookZygoteInit</code> 里直接 hook 某个 App 的业务类？',
+          '换个角度：如果目标只在"当前有没有被 attach"这一件事上做检测，两种方案谁更吃亏？为什么？'
         ],
-        model: '<b>BPF（Berkeley Packet Filter）诞生于 1992 年</b>，解决的问题非常具体：网络抓包时，如果每个包都要先拷到用户态再判断「要不要」，开销太大。BPF 的思路是把过滤规则编译成一小段字节码，<b>在内核里先筛一遍</b>，只把命中的包交给用户态。它是 <code>tcpdump</code> 背后的底层机制（经由 libpcap），几十年里一直很稳定，但用途也一直很窄——只处理网络包。' +
-          '<br><br><b>eBPF（extended BPF）在 2014 年随 Linux 3.18 进入主线内核</b>，做的是把 BPF 从「一个专用过滤器」彻底重做成「<b>一个运行在内核中的通用虚拟机</b>」。这个「通用」体现在三处：<b>①</b> 输入不再限于网络包——内核提供了几十种<b>钩子点</b>（kprobe、tracepoint、uprobe、XDP、LSM……），挂在哪里决定它看见什么；<b>②</b> 指令集扩充为 64 位、寄存器从 2 个扩到 10 个以上（具体数量不必死记），能表达更复杂的逻辑；<b>③</b> 有了 <b>BPF Map</b> 这个内核态与用户态共享的存储，程序可以把状态留下来、把结果交出去。' +
-          '<br><br>于是今天它被用在可观测性（性能分析、系统调用追踪）、网络（负载均衡、DDoS 防护）和安全监控上。<b>对逆向工程师来说，最重要的那句总结是：eBPF 让我们第一次有了一个「写起来像普通程序、跑起来在内核态、还不改目标进程一个字节」的观测手段。</b>',
-        after: '<p>这道题是地基。如果 BPF/eBPF 的关系说不清，后面验证器、Map、Android 限制全都挂不上。</p>'
-      },
+        model: '<b>本质差别：Frida 注入个体，LSPosed 注入母体。</b><br><br>① <b>进程模型：</b>Frida 的单位是进程——attach 谁改谁，别的不受影响；LSPosed 的单位是 Zygote——模块在母体里，此后每个 fork 出来的 App 进程都带着它，你甚至没有 attach 任何进程。<br>② <b>注入时机：</b>Frida 由你决定（spawn 抢跑或 attach 事后）；LSPosed 由系统决定，进程一出生就在场，早到 App 第一行 Java 代码之前，你只能靠作用域选"给谁装"。<br><br><b>三个后果：</b><br>· <b>覆盖范围</b>：Frida 只改你连过的那个进程；LSPosed 装一次处处生效——暴露面从 1 个进程变成一整台机器。<br>· <b>持久性</b>：Frida 是会话级（detach 或重启即复原，"昨天 hook 过"没有意义）；LSPosed 常驻，重启后仍生效。<br>· <b>检测面</b>：Frida 在进程侧（注入线程、agent 映射、端口、被改写的函数头）；LSPosed 在环境侧（Zygote 注入链路、模块 so、被替换的方法入口、加载器链异常）。<br><br><span class="hit">关键一句：<b>Frida 的检测问"你现在有没有被接上"，LSPosed 的检测问"这台机器的系统还是不是原装的"。</b>前者可以靠"这次不接"规避，后者不能。</span>'},
       {
-        id: 'c11q2', depth: 2, threshold: 0.75,
-        q: '内核凭什么敢让用户写的代码在内核态执行？<b>验证器</b>具体检查哪些东西？请至少说出三项，并解释为什么它被称为 eBPF 安全性的基石。',
+        id: 'c22q2', depth: 2, threshold: 0.7,
+        q: '为什么 hook 构造函数常常是<b>唯一</b>能拿到对象初始状态的地方？' +
+           '另外说清 <code>hookAllConstructors</code> 与逐个 hook 各自该在什么时候用。',
         concepts: [
-          { label: '验证器做的是静态分析，不实际运行程序',
-            hint: '它是「跑一遍看看会不会崩」，还是「证明它不可能崩」？',
-            any: ['静态分析', '静态检查', '不运行', '不会真的执行', '不实际执行', '模拟执行', '符号执行', '证明', 'statically', 'static analysis', '遍历所有路径', '所有可能路径'] },
-          { label: '检查循环：老内核完全禁止，新内核要求能证明循环有界',
-            hint: '如果程序里有个永不结束的循环，内核会怎么样？',
-            any: ['循环', '死循环', '有界', '边界', '上界', '无限循环', 'loop', 'bounded', '有界循环', '循环次数', '不能无限'] },
-          { label: '检查内存访问：读写必须落在合法范围内，不能越界',
-            hint: '如果程序读了一个越界的地址会怎样？',
-            any: ['内存访问', '越界', '边界', '偏移', '范围', 'out of bound', 'bounds', '内存安全', '读写范围', '非法地址', '不能越界'] },
-          { label: '检查指针类型：ctx / Map value / 包指针不能混用，算术运算后类型会退化',
-            hint: '一个指向 Map value 的寄存器，能不能当上下文指针用？',
-            any: ['指针类型', '类型系统', '类型检查', '寄存器类型', 'ptr_to', '不能混用', '类型退化', 'pointer type', '类型不匹配', '类型安全'] },
-          { label: '检查 helper 调用是否在白名单内、参数类型是否匹配',
-            hint: 'eBPF 程序能不能随便调用内核函数？',
-            any: ['helper', '白名单', '受控', '调用限制', '参数类型', '允许调用的函数', '不能调用任意', 'helper 白名单'] },
-          { label: '它是安全性的基石：证明不通过就拒绝加载，把「信任作者」变成「证明程序安全」',
-            hint: '如果去掉验证器，eBPF 还能存在吗？',
-            any: ['基石', '基础', '根本', '拒绝加载', '加载失败', '不允许加载', '不信任作者', '证明安全', '安全保证', '没有它就不安全', '先决条件', '前提'] }
+          { label: '对象的状态在构造时定型：校验结果、密钥、token 这类关键值在构造函数里算好并写入字段',
+            hint: '你最想要的那些值，是什么时候被算出来的？',
+            any: ['构造时', '构造函数里', '定型', '初始化', '赋值', '算好', '写进字段'] },
+          { label: '构造函数在字节码里叫 <code>&lt;init&gt;</code>、源码里没有名字，' +
+              '按方法名搜索的工具会漏掉它（要用 hookAllConstructors 或按参数类型找）',
+            hint: '你平时怎么定位一个方法？这个办法在构造函数上为什么不适用？',
+            any: ['init', '<init>', '没有名字', '字节码', '按名字', '漏掉', 'hookAllConstructors', 'findAndHookConstructor'] },
+          { label: '<code>before</code> 时字段还是默认值，<code>after</code> 才是定型后的状态；' +
+              '用两侧各打一次日志就能看出赋值发生在哪一步',
+            hint: '同一个字段，在这两侧看到的值会一样吗？',
+            any: ['before', 'after', '默认值', '还没赋值', '定型', 'null', '两侧', '各打一次'] },
+          { label: 'hookAllConstructors 适合<b>摸底</b>（不漏，但每个重载都会走回调、噪音大）；' +
+              '逐个 hook 适合<b>收敛</b>（精确，但签名写错会静默漏掉）',
+            hint: '哪个阶段该"全挂上"，哪个阶段该"只挂一个"？',
+            any: ['摸底', '不漏', '噪音', '淹', '收敛', '精确', '签名', '重载', '静默漏'] },
+          { label: '不可逆的值（hash、签名、密文）只有在构造阶段才有机会看到"原料"，之后再无可能',
+            hint: '如果值已经被算成摘要，你还能倒推吗？',
+            any: ['不可逆', 'hash', '摘要', '签名', '密文', '原料', '明文', '倒推', '还原不了'] }
         ],
         hints: [
-          '换个角度问自己：如果内核直接执行用户提交的任意字节码，攻击者会怎么做？把你能想到的坏事列出来，每一条对应验证器的一项检查。',
-          '「循环、内存、指针」是三项核心检查；除此之外还有一类和「能调用什么函数」有关的检查。'
+          '先回答一个更基础的问题：一个对象"变成它自己"是在哪一刻完成的？',
+          '再想定位问题：你靠什么识别一个方法？构造函数在这种情况下缺了什么？'
         ],
         probes: [
-          '你说验证器检查内存访问——那内核态程序想读用户态内存里的字符串，直接解引用行不行？为什么？',
-          '为什么旧内核干脆禁止循环，而不是想办法限制循环次数？后来为什么又放开了？'
+          '你说在 after 里能读到定型后的字段——那如果他想要的是"这个字段<b>被谁</b>改过"，after 够用吗？该怎么办？',
+          '如果某个关键值是在构造之后<b>懒加载</b>的，你的方案要怎么调整？'
         ],
-        model: '<b>验证器（verifier）要回答的是「凭什么信任」这个问题，而它的答案不是信任作者，而是证明程序安全。</b>注意它的工作方式是<b>静态分析</b>：<b>它不会真的把程序跑一遍看会不会崩</b>，而是模拟执行字节码的<b>所有可能路径</b>，逐条指令地证明这段代码不可能损坏内核。' +
-          '<br><br>核心检查有三项：<br>' +
-          '<b>① 循环。</b>最早的 eBPF <b>完全禁止循环</b>——因为内核态死循环等于整机卡死，而这个后果无法接受。后来内核放宽了限制：允许循环，但验证器<b>必须能证明它有界</b>（例如循环次数是常量，或被限定在某个可证明的范围内）。证明不了的，直接拒收。这就是为什么在 eBPF 里写 <code>while</code> 要格外小心。<br>' +
-          '<b>② 内存访问。</b>内核指针（ctx、Map value、数据包）的每次读写，偏移量都必须被证明落在合法范围内。越界一次，轻则信息泄露，重则内核 oops。特别地，<b>用户态指针在内核里绝对不能直接解引用</b>——用户态随时可能把那块内存 unmap 掉，必须改用 <code>bpf_probe_read_user()</code> 这类 helper 做安全拷贝。<br>' +
-          '<b>③ 指针类型。</b>验证器维护一套寄存器类型系统：这是 ctx 指针、那是指向 Map value 的指针、那只是个标量。类型是一道硬墙，不能混用；而且<b>指针一旦做算术运算，类型就会退化</b>，之后想再用它读写必须重新做边界检查。<br><br>' +
-          '此外还会检查 <b>helper 调用</b>：eBPF 程序不能调用任意内核函数，只能用内核提供的受控 helper，且不同程序类型开放的白名单不同。<br><br>' +
-          '<b>为什么说它是基石？</b>因为它是「允许用户代码进内核」这个决定的唯一担保。没有验证器，eBPF 就是一个任意内核代码执行漏洞——整个技术根本不可能被接受进主线内核。所以验证失败不是异常而是常态，排查顺序建议是：<b>先看循环有没有上界，再看有没有直接解引用用户态指针，最后看指针类型有没有用混。</b>',
-        after: '<p>能把这三项检查和「如果不管会出什么事」一一对应上，就说明你真的理解了 eBPF 的安全模型，而不是背了三条名词。</p>'
-      },
+        model: '<b>为什么唯一：</b>对象状态在构造时定型——校验结果、密钥、token 这类值都在构造函数里算好并写入字段；你 hook 业务方法时看到的是成品，而 hash / 签名 / 密文一旦算完就不可逆。<b>只有构造函数的前后两侧能看到"从无到有"这个过程</b>：before 是毛坯（默认值），after 是装修好的样子。<br><br><b>为什么容易漏：</b>构造函数在字节码里叫 <code>&lt;init&gt;</code>，源码里没有名字，按方法名 find 必然漏掉；Xposed 里要用 <code>hookAllConstructors</code> 或按参数类型 <code>findAndHookConstructor</code>。<br><br><b>两种挂法：</b><br>· <code>hookAllConstructors</code>：全挂上、不会漏，但每个重载都走回调、日志被淹——<b>用于摸底</b>（在回调里打印 <code>param.method</code> 列出所有重载签名）。<br>· 逐个 <code>getDeclaredConstructors</code> + <code>hookMethod</code>：回调干净、日志可读，但签名写错会<b>静默漏掉</b>——<b>用于收敛</b>。<br><br><b>时机纪律：</b>读定型后的状态放 <code>afterHookedMethod</code>，并在 after 里打"已处理"标记（每个新对象都会走一次构造函数）。<br><span class="hit">诊断技巧：同一字段在 before / after 各打一行日志，值在哪一侧出现，赋值就发生在中间——比反编译翻赋值语句快得多，在混淆代码上同样有效。</span>'},
       {
-        id: 'c11q3', depth: 2, threshold: 0.75,
-        q: 'eBPF 程序跑在内核态，它采到的数据是<b>怎么回到用户态</b>的？为什么一定要走这条路？另外，<code>ringbuf</code> 相比老的 <code>perf_event_array</code> 好在哪？',
+        id: 'c22q3', depth: 2, threshold: 0.7,
+        q: '同样是 <code>ClassNotFoundException</code>，为什么"<b>壳 dex 里的类</b>"和' +
+           '"<b>插件 dex 里的类</b>"解法不一样？请说到类加载器这一层。',
         concepts: [
-          { label: '通过 BPF Map：内核态与用户态共享的键值存储，是两者通信的主要通道',
-            hint: '它不是「发消息」，那它是什么？',
-            any: ['map', 'bpf map', 'bpf maps', '共享', '键值', '键值对', '共享存储', '共享内存', '通信通道', '主要通道', 'kv', 'key value'] },
-          { label: '内核态用 helper 写：bpf_map_lookup_elem / bpf_map_update_elem / bpf_map_delete_elem 等',
-            hint: '内核侧是用什么 API 往 Map 里放东西的？',
-            any: ['helper', 'bpf_map_update_elem', 'bpf_map_lookup_elem', 'bpf_map_delete_elem', 'bpf_map_update', 'bpf_map_lookup', 'map_update_elem', '用 helper 写'] },
-          { label: '用户态按 fd 读：通过 bpf() 系统调用或 libbpf 提供的封装',
-            hint: '用户态拿到的是什么句柄？',
-            any: ['fd', '文件描述符', 'libbpf', 'bpf()', 'bpf 系统调用', '系统调用', 'bpf_map__fd', '用户态读', '轮询', 'poll', 'map fd'] },
-          { label: '内核态不能直接 printf，也不能直接把数据推给某个进程',
-            hint: 'eBPF 里有 printf 吗？',
-            any: ['不能 printf', '不能直接输出', '没有 printf', '不能打印', 'bpf_printk', '不能直接通信', '无法直接', '不能任意调用', '只能写 map', '没有 libc'] },
-          { label: 'ringbuf 是单生产者单消费者、无锁、高效，推荐用于流式数据',
-            hint: 'ringbuf 的核心卖点是它的并发模型。',
-            any: ['ringbuf', 'ring buffer', '环形缓冲', '单生产者', '单消费者', '无锁', 'lock free', 'lockless', '高效', 'spmc', '推荐'] },
-          { label: 'perf_event_array 是每 CPU 一份缓冲，会打乱事件顺序、fd 开销大，所以被 ringbuf 取代',
-            hint: '老方案在多核机器上有什么麻烦？',
-            any: ['perf_event_array', 'perf buffer', 'perf 缓冲', '每 cpu', 'per cpu', '每个 cpu', '顺序', '乱序', '打乱', '开销大', '文件描述符多', 'fd 多', '被取代', '老方案', '旧方案'] }
+          { label: '壳 dex：壳替换/包裹了加载器，要先拿到"壳替换后的真实加载器"' +
+              '（常见路径是 ActivityThread.mBoundApplication → info（LoadedApk）→ getClassLoader）',
+            hint: '壳改过加载器之后，你手上那个 lpparam.classLoader 还是最终的吗？',
+            any: ['真实加载器', 'LoadedApk', 'mBoundApplication', 'ActivityThread', 'info', '壳换', '替换', '回退'] },
+          { label: '插件 dex：由运行时<b>按需新建</b>的加载器加载，事前根本不存在，' +
+              '所以要守在"新加载器被创建 / 新 dex 被挂载"的那一刻',
+            hint: '插件类是你启动时就有，还是走到某一步才有的？',
+            any: ['运行时', '按需', '新建', '动态', '之前不存在', '挂载', '捕获', '蹲守'] },
+          { label: '具体钩子：<code>BaseDexClassLoader</code> 构造、<code>DexPathList</code> 的 ' +
+              '<code>makeDexElements</code> / <code>makePathElements</code> / <code>makeInMemoryDexElements</code>',
+            hint: '一个 dex 要被"挂进"加载器，会经过哪个方法？',
+            any: ['BaseDexClassLoader', 'DexPathList', 'makeDexElements', 'makePathElements',
+                  'makeInMemoryDexElements', '构造'] },
+          { label: '共同根因是双亲委派：加载器看不到兄弟加载器加载的类，' +
+              '所以这不是"类名写错"，而是"问错了人 / 问的时机不对"',
+            hint: '第 16 章讲过的那条规则，在这里起什么作用？',
+            any: ['双亲委派', '看不到', '兄弟', '不是类名', '加载器不对', '问错了人', '委托'] },
+          { label: '<code>ClassLoader.loadClass</code> 是最早能看到"加载请求"的层面：' +
+              '它在类还不存在的时候就存在，所以不会"找不到"',
+            hint: '有没有一个地方，是"类还没出生"时就已经存在的？',
+            any: ['loadClass', '请求', '最早', '类名', '总入口', '还不存在', 'L1'] }
         ],
         hints: [
-          '关键认识：Map 不是「内核发给用户态的消息」，而是双方都能按 fd 访问的<b>同一块存储</b>。先接受这一点，所有 API 就顺了。',
-          '想想多核：如果每个 CPU 都往自己那份缓冲里写，用户态读的时候，事件的全局顺序还保得住吗？'
+          '把两种情况的"类是什么时候出现的"分别写出来——一个在启动早期，一个在运行中。',
+          '既然一个类可能"后来才出现"，那你有没有办法不"找它"，而是"等它出现"？'
         ],
         probes: [
-          '你说用 Map 传数据——那如果我要传的是「源源不断的事件流」而不是「一张统计表」，Map 类型该怎么选？为什么？',
-          '内核态程序往 Map 里写的时候，有没有可能写失败？失败了你该怎么办？（提示：验证器会盯着你）'
+          '你说要 hook <code>DexPathList.make*Elements</code>——为什么 JDex2 的作者在注释里专门强调"有些壳根本不新建 classloader，而是向其中插入 Dex"？这句话对应的正是哪个钩子？',
+          '如果我用 <code>Class.forName</code> 去加载插件类，为什么还是失败？'
         ],
-        model: '<b>内核态和用户态之间只有一条主要通道：BPF Map。</b>先纠正一个常见误解——Map <b>不是「内核发给用户态的消息队列」</b>，而是<b>一块双方都能按 fd 访问的共享键值存储</b>。内核侧和用户态侧谁也不「发送」什么，只是各自往同一个 fd 上读写而已。理解这一点，后面所有 API 都不再别扭。' +
-          '<br><br><b>为什么必须走这条路？</b>因为 eBPF 程序的能力被刻意收窄了：它没有 libc，<b>不能调用 printf，也不能直接把数据交给某个用户态进程</b>。它唯一被允许的对外动作，就是通过 helper 操作内核对象。<br><br>' +
-          '<b>内核侧</b>用 helper 写：<code>bpf_map_lookup_elem()</code>、<code>bpf_map_update_elem()</code>、<code>bpf_map_delete_elem()</code>；流式场景则用 ringbuf 的 <code>reserve</code>/<code>submit</code> 配对。<br>' +
-          '<b>用户态侧</b>通过 <code>bpf()</code> 系统调用，或直接用 libbpf 的封装（如 <code>bpf_map__fd()</code>、<code>ring_buffer__poll()</code>）读同一块存储。' +
-          '<br><br><b>ringbuf 相比 perf_event_array 的改进</b>：老的 <code>perf_event_array</code> 是<b>每个 CPU 一份缓冲</b>，带来两个麻烦——多核下事件的<b>全局顺序会被打乱</b>，而且要开一大堆 fd、管理成本高。' +
-          '<code>ringbuf</code>（<code>BPF_MAP_TYPE_RINGBUF</code>）是<b>单生产者单消费者、无锁</b>的环形缓冲，所有 CPU 共享一个，既保序又高效，是<b>现代推荐的流式传输方式</b>。' +
-          '<br><br><b>实战提醒：</b>在 Map 上做操作必须<b>判空</b>、写 ringbuf 前 <code>reserve</code> 失败必须返回——验证器会检查这些分支。漏掉判空，加载就被拒。另外结构体大小和栈上临时变量都有尺寸上限，超出会直接失败。',
-        after: '<p>把「Map 是共享存储而不是消息通道」这句话记住，你就超过了大多数只会照抄 BCC 脚本的人。</p>'
-      },
+        model: '<b>差别在"类什么时候出现"。</b><br><br><b>壳 dex：</b>壳在启动早期解密真 dex，并替换或包裹了加载器，所以你手上那个 <code>lpparam.classLoader</code> 不一定认识业务类。解法是<b>找出壳换过之后的真实加载器</b>：<code>ActivityThread.currentActivityThread()</code> → <code>mBoundApplication</code> → <code>info</code>（LoadedApk）→ <code>getClassLoader()</code>。这就是第 16 章 <code>Java.enumerateClassLoaders</code> 的等价物。<br><br><b>插件 dex：</b>插件类是运行时按需加载的（走到某段逻辑才新建 <code>DexClassLoader</code> 把 dex 挂上），所以在任何固定时刻"去找它"都必然失败。解法是<b>守在它出生的地方</b>：hook <code>BaseDexClassLoader</code> 的构造 → 新加载器一出现你就知道；hook <code>DexPathList</code> 的 <code>makeDexElements</code> / <code>makePathElements</code> / <code>makeInMemoryDexElements</code> → 覆盖"不新建加载器、只往里插 dex"的情况（JDex2 的注释原话：<i>因为一些壳根本就不新建classloader，而是向其中插入Dex</i>）。<br><br><b>共同根因：</b>按双亲委派，加载器看不到兄弟加载器加载的类——所以不是类名写错，而是"问错了人"或者"问早了"。<br><span class="hit">通用判断：<b>不要"在某个时刻去找类"，要"守在类出生的地方"。</b>Java 层是 <code>loadClass</code>（请求）与 <code>make*Elements</code>（挂载），native 层是 <code>dlopen</code>。</span>'},
       {
-        id: 'c11q4', depth: 3, threshold: 0.75,
-        q: '<b>综合题。</b>你手上有一台 Android 手机，想用 eBPF 观测某个 App 的行为。请说出至少<b>四重</b>限制，每重说明「挡住了什么、能不能绕过」；并说明你会按什么顺序去探测一台设备到底支不支持。',
+        id: 'c22q4', depth: 3, threshold: 0.7,
+        q: '<b>综合题：</b>Frida 和 LSPosed 各适合什么场景？请从<b>进程模型、注入时机、检测面</b>三个角度说清，' +
+           '并给出一个<b>只能用其中一个</b>的具体场景。',
         concepts: [
-          { label: '内核版本：老设备内核太旧，较完整的 eBPF 能力一般需要 4.14+',
-            hint: 'Android 9 对应哪个内核版本？更完整的 eBPF 能力需要多新？',
-            any: ['内核版本', 'kernel 版本', '版本太旧', '4.14', '4.9', 'kernel 4', '版本低', '内核太老', 'android 9', '内核基线'] },
-          { label: '厂商内核裁剪：BPF 相关配置可能未开启，CONFIG_BPF_SYSCALL 未开则完全无法加载',
-            hint: '厂商为了让内核变小、攻击面变小，会做什么？哪个配置是总闸？',
-            any: ['裁剪', '厂商', '定制内核', 'config', '内核配置', 'CONFIG_BPF_SYSCALL', 'BPF_SYSCALL', 'CONFIG_BPF_JIT', 'BPF_JIT', 'DEBUG_INFO_BTF', '未开启', '没开', '总闸', '编译选项', '阉割'] },
-          { label: 'SELinux 强制访问控制会限制 bpf() 系统调用，普通 App 无权调用',
-            hint: 'Android 上有一层强制访问控制，它会拦系统调用。',
-            any: ['selinux', '强制访问控制', 'mac', '策略', 'policy', '被拦', '拦截', '权限控制', 'enforcing', '无权调用', '普通 app 无权'] },
-          { label: '需要 root（或定制 ROM）：前面几条叠加的结果',
-            hint: '前面三条叠加起来，最后的现实门槛是什么？',
-            any: ['root', '超级用户', '提权', 'su', 'magisk', '定制 rom', '刷机', '高权限', 'cap_bpf', 'cap_sys_admin', '需要权限'] },
-          { label: 'Android 系统自身在用 eBPF（如按 UID 的网络流量统计），证明可行但这些程序由系统进程加载',
-            hint: 'Android 自己有没有在用 eBPF？这说明了什么、又没说明什么？',
-            any: ['android 自己', '系统自己在用', '流量统计', 'trafficController', 'traffic controller', '系统进程', '系统加载', '证明可行', '网络统计', 'uid 统计', '按 uid'] },
-          { label: '探测顺序与实测意识：不臆测，要在目标设备上按版本→配置→BTF→SELinux→root 逐项确认（且结果有时效性）',
-            hint: '不同厂商机型差异极大，你凭什么下结论？',
-            any: ['实测', '探测', '验证', '确认', 'uname', 'config.gz', 'btf', 'vmlinux', 'getenforce', '逐项', '顺序', '不确定', '差异大', '以实测为准', '时效', '不能假设', '不能臆测'] }
+          { label: '进程模型：Frida 注入你指定的单个进程；LSPosed 注入 Zygote，' +
+              '此后每个 fork 出来的 App 进程都带模块',
+            hint: '两者的作用单位分别是什么？', any: ['zygote', 'Zygote', '母体', '单个进程', '每个进程', 'fork', '一个进程'] },
+          { label: '注入时机：Frida 可控（spawn 抢跑 / attach 事后）；LSPosed 由系统决定，' +
+              '进程一出生就生效（早到 App 第一行 Java 代码之前）',
+            hint: '谁能决定"在哪一刻注入"？', any: ['spawn', 'attach', '可控', '抢', '更早', '第一行', '出生', '系统决定'] },
+          { label: '检测面：Frida 在进程侧（注入线程、agent 映射、端口、改写函数头）；' +
+              'LSPosed 在环境侧（Zygote 注入链路、模块 so、方法入口、Zygisk 痕迹）',
+            hint: '被检测时，你失去的是"这次会话"还是"整个环境"？',
+            any: ['环境检测', '进程特征', '线程', '端口', 'maps', 'Zygisk', '注入痕迹', '整台', '会话'] },
+          { label: '可持久性：LSPosed 常驻（重启后仍生效、无需人工介入）；Frida 是会话级（要重新连）',
+            hint: '需要"每次 App 启动都自动生效"时，你会选谁？',
+            any: ['持久', '常驻', '重启', '会话', '一次性', '自动生效', '每次启动'] },
+          { label: '只能用其中一个的场景要具体：例如"必须每次启动自动生效、无人值守的长期监控"只能靠 LSPosed；' +
+              '"设备不能 root / 不能装模块"或"需要 Stalker 级别的执行流跟踪、完整调用栈"只能靠 Frida',
+            hint: '想一个场景，其中另一个方案在物理上就做不到（而不是"效果差一点"）。',
+            any: ['不 root', '不能 root', '无法 root', 'gadget', '免 root', '长期', '每次启动', '自动生效',
+                  'Stalker', '执行流', '调用栈', '藏不住', '不方便装'] },
+          { label: '选型原则：先算暴露面预算再选路线，并保留一条备选路线（因为常驻方案是整体失效）',
+            hint: '如果选错了，代价是局部损失还是全盘损失？',
+            any: ['暴露面', '预算', '退路', '备选', '权衡', '代价', '整体失效'] }
         ],
         hints: [
-          '把「支持 eBPF」拆成四个独立维度来想：内核<b>有没有</b>这个特性、这个特性在这台机器上<b>有没有被编译进来</b>、你有<b>没有权限</b>调用它、你<b>是不是 root</b>。',
-          '还有一个反直觉的事实：Android 系统自己就在用 eBPF。想清楚这件事「证明了什么」和「没证明什么」。'
+          '先把三个维度各自写成一句对比，再去找"交集为空"的场景——也就是另一个方案在物理上做不到的那种。',
+          '注意"效果差一点"和"根本做不到"是两回事：前者不是选型依据，后者才是。'
         ],
         probes: [
-          '你说要看内核配置——如果 <code>/proc/config.gz</code> 这个文件在设备上根本不存在，你还能怎么判断内核支不支持 BPF？',
-          '假设探测结果是没有 BTF，但 CONFIG_BPF_SYSCALL=y、也有 root。你会放弃吗？如果不放弃，方案要怎么改？'
+          '你说"设备不能 root 时只能用 Frida"——那 LSPosed 生态里的非 root 分支（例如 LSPatch 一类）算不算反例？' +
+          '如果要推翻你的结论，你需要补什么条件？',
+          '换一个方向：有没有一个场景是"Frida 能做到、LSPosed 根本做不到"的？请说清是哪个能力。'
         ],
-        model: '<b>结论先说：eBPF 在 Android 上「理论可行，实际高度受限」。</b>Android 基于 Linux 内核，内核本身有 BPF 支持；Android 9（kernel 4.9）起内核配置就开了一部分 BPF 功能，较完整的 eBPF 能力一般需要 <b>4.14+</b>。但「内核里有」和「你能用」之间隔着四堵墙。' +
-          '<br><br><b>① 内核版本。</b>挡住的是「这个特性存不存在」。老设备内核太旧，BTF、ringbuf、有界循环支持等新能力压根没有。<b>绕不过</b>——这是硬件与固件层面的既成事实，只能换设备。' +
-          '<br><b>② 厂商内核裁剪。</b>挡住的是「这个特性有没有被编译进来」。厂商为减小体积、缩小攻击面，常把 BPF 相关配置裁掉：<code>CONFIG_BPF_SYSCALL</code>（总闸，没有它<b>完全无法加载</b> eBPF 程序）、<code>CONFIG_BPF_JIT</code>（没有它只能解释执行，性能大降）、<code>CONFIG_DEBUG_INFO_BTF</code>（没有它就没有 BTF，CO-RE 用不了）。<b>理论可自编译内核，但需解锁 bootloader、有变砖风险、多数机型源码不完整</b>，成本极高。' +
-          '<br><b>③ SELinux 策略。</b>挡住的是「你有没有权限调用」。Android 的强制访问控制会限制 <code>bpf()</code> 系统调用，普通 App 无权。<b>需 root 后调整策略</b>。' +
-          '<br><b>④ 需要 root。</b>这是前三条叠加的现实结果。没有银弹。' +
-          '<br><br><b>一个反直觉但重要的事实：Android 自己在用 eBPF</b>（例如按 UID 的网络流量统计、<code>trafficController</code> 相关模块）。这<b>证明</b>了真机上跑 eBPF 可行；但<b>不证明</b>你有权限——这些程序由系统进程在开机时加载。' +
-          '<br><br><b>探测顺序（顺序很重要，前一项不过后面做了也白做）：</b><b>①</b> <code>uname -r</code> 看内核版本；<b>②</b> <code>zcat /proc/config.gz | grep CONFIG_BPF</code>（文件不存在就改用 <code>bpftool feature probe</code> 直接问内核）；<b>③</b> <code>ls /sys/kernel/btf/vmlinux</code> 判断 CO-RE 可用性；<b>④</b> <code>getenforce</code> 看 SELinux；<b>⑤</b> 有没有 root。' +
-          '<br><br><b>最后必须强调时效性：</b>「哪些机型支持」这个问题，每一年、每个厂商、每个机型、每个内核版本的答案都不一样，厂商还会随系统更新调整策略。<b>以你自己的目标设备实测为准，不要相信任何固定结论</b>——包括我这段话。',
-        after: '<p>如果这道题你能把四重限制和探测顺序都讲出来，说明你已经具备「在真机上评估一项底层技术可行性」的能力——这比记住 eBPF 的 API 值钱得多。</p>'
-      },
+        model: '<b>三个维度先摆平：</b><br>① <b>进程模型</b>：Frida 的单位是进程（attach 谁改谁）；LSPosed 的单位是 Zygote（每个 fork 出来的 App 进程都带模块）。<br>② <b>注入时机</b>：Frida 由你决定（spawn 抢跑 / attach 事后）；LSPosed 由系统决定，进程一出生就在场，比 App 第一行 Java 还早，你只能用作用域选"给谁装"。<br>③ <b>检测面</b>：Frida 在进程侧（注入线程、agent 映射、端口、被改写的函数头）；LSPosed 在环境侧（Zygote 注入链路、模块 so、被替换的方法入口、Zygisk / Riru 痕迹）。<br>再加一条 <b>可持久性</b>：LSPosed 常驻（重启仍在），Frida 是会话级（每次都要重新建立现场）。<br><br><b>由此分出场景：</b><br>· <b>LSPosed：</b>装好就一直生效的长期值守；覆盖每个 App 进程的批量观测；迭代要快（不刷机、不编 ROM，改几行重装即可）；目标不做环境检测。<br>· <b>Frida：</b>一次性深度分析；需要运行时能力（完整调用栈、执行流跟踪——这些是 ART hook 接口给不了的）；设备不能 root 或不允许装模块（可用 gadget 形态）；目标只做进程侧检测且你能处理（第 10 章的去特征）。<br><br><b>只能用其中一个的场景（各举一个）：</b><br>· <b>只能用 LSPosed：</b>无人值守、每次 App 启动都要自动生效的长期监控——Frida 需要每次重新连接，这是<b>形态上不成立</b>，不是效果差一点。<br>· <b>只能用 Frida：</b>设备不允许 root / 刷模块，只能用 gadget 嵌入；或者你需要 Stalker 级别的指令级执行流跟踪——那是 LSPosed 的接口<b>根本提供不了</b>的能力维度。<br><br><span class="hit"><b>选型原则：先算暴露面预算，再选路线。</b>常驻方案一旦被环境检测否掉就是整体失效，所以"长期 + 对抗"的任务必须同时评估一条非常驻的退路。选型的本质不是"谁更强"，而是"复杂度放在哪一层、愿意付多少暴露面"。</span>'},
       {
-        id: 'c11q5', depth: 3, threshold: 0.75,
-        q: '<b>综合题（本章灵魂）。</b>同样是观测目标 App 的一次函数调用，用 eBPF 和用 Frida 相比，<b>隐蔽性上的差别到底来自哪里</b>？请从「App 能做哪些自查」的角度具体说明，并谈谈这种隐蔽性有什么代价和边界。',
+        id: 'c22q5', depth: 3, threshold: 0.7,
+        q: '<b>综合题：</b>任务是在一台<b>已经装了 LSPosed 的手机</b>上长期监控某个 App 的全部加密调用，' +
+           '而目标<b>会做注入检测</b>。请设计一条从"最小暴露"出发的技术路线：' +
+           '每一步在减少什么特征、代价是什么；如果最终被否掉，你的退路是什么。',
         concepts: [
-          { label: 'Frida 需要注入目标进程，会在其地址空间里留下模块（/proc/self/maps 可见）',
-            hint: 'agent 被注入之后，目标进程里多了什么？',
-            any: ['注入', 'maps', '/proc/self/maps', '模块', 'so', 'frida-agent', '地址空间', '多了一个 so', '内存里', '进程内部', '要注入'] },
-          { label: 'Frida 会改写指令/内存来拦截执行，代码段与磁盘文件不一致，函数序言被改，可被完整性校验发现',
-            hint: 'inline hook 在内存里留下了什么痕迹？',
-            any: ['改写', '修改指令', 'inline hook', '序言', '代码段', '内存校验', '字节比对', '完整性', '改了内存', '篡改', 'prologue'] },
-          { label: 'Frida 可能留下线程名、监听端口、ptrace 痕迹（TracerPid）',
-            hint: '除了内存，进程表、端口表上还有没有线索？',
-            any: ['线程名', 'thread', 'comm', '端口', 'port', '27042', 'tracerpid', 'ptrace', 'task', '进程表', '句柄'] },
-          { label: 'eBPF 运行在<b>内核态</b>，在目标进程的地址空间之外，App 的这些自查全部失效',
-            hint: '核心差别不在于技术先进，而在于观测点在哪。',
-            any: ['内核态', 'kernel', '地址空间之外', '不在进程里', '进程外', '内核侧', '内核里', '观测点更底', '外层', '内核视角', 'all 失效', '看不到'] },
-          { label: 'eBPF 是只读观测，不修改目标进程的任何字节（不注入、不改指令、不加线程）',
-            hint: 'eBPF 会改目标进程的内存吗？',
-            any: ['只读', '不修改', '不改指令', '不注入', '不改变目标', '不加线程', '不改内存', 'read only', '无侵入', '非侵入', '零修改'] },
-          { label: '代价与边界：观测者自身（loader 进程、文件、root 状态）仍会在用户态留痕；加载需要高权限；对手也能用 eBPF 反制，是双向博弈',
-            hint: '内核态隐蔽的是「观测动作」，那「观测者」呢？',
-            any: ['代价', '边界', '局限', 'loader', '观测者', '进程可见', '文件', 'root 状态', '高权限', '双向', '对手也能', '反制', '博弈', '不是万能', '同样能', '需要 root', '留痕'] },
-          { label: '与课程的层级主线呼应：内核态观测（第 11 章）/ 内核态对抗（第 13 章）/ Hypervisor（第 6 章），逐层向下要控制权',
-            hint: '本章在课程里处在哪一层？再往下还有什么？',
-            any: ['第 13 章', '第13章', '13 章', '第 6 章', '第6章', 'hypervisor', '层级', '更低', '逐层', 'svc', '硬件断点', '更底层', '控制权'] }
+          { label: '作用域最小化：只勾目标 App、不做全选；进程名精确判断（别在 :push / :remote 里重复初始化）',
+            hint: 'LSPosed 为什么连"全选"都不提供？', any: ['作用域', 'scope', '只勾', '最小', '进程名', '收窄', '不勾其它'] },
+          { label: 'hook 点数量最小化：尽量合并到一个"总入口"（例如统一的加密调度方法），' +
+              '而不是每个算法各挂一个——每个 hook 点都是一次方法入口改写',
+            hint: '挂 10 个点比挂 1 个点多付出了什么？', any: ['最少', '减少', '合并', '总入口', '一个点', '少挂', '数量'] },
+          { label: '把最关键的观测点交给"不修改内存"的手段（硬件断点 / 观察点），因为 inline hook 必然改函数头、会被自校验发现',
+            hint: '第 27 章的结论在这里怎么用？', any: ['硬件断点', '观察点', '不改内存', '不修改', '断点', 'watchpoint', '首字节'] },
+          { label: '优先"一次性时机"而非常驻 hook：例如延迟取真实加载器后一次性采集；' +
+              '或用现代 API 的动态作用域（staticScope / 按需申请）把生效范围压到最小',
+            hint: '11.8C 那个案例的默认模式为什么是"延迟 10 秒、不挂 hook"？',
+            any: ['一次性', '延迟', '等到', '动态作用域', 'staticScope', '按需', '不常驻', '少挂 hook'] },
+          { label: '承认无法消除的残留特征：Zygote 注入链路、模块 so 的映射、方法入口替换——' +
+              '所以常驻方案随时可能被整体否掉，不能只做"藏得更好"这一手准备',
+            hint: '哪一部分痕迹不是你这次 hook 留下的？',
+            any: ['无法完全', '残留', '抹平', '整体失效', '环境痕迹', 'zygote', '承认', '不是这次留下'] },
+          { label: '准备备选路线：非常驻方案（一次性注入 / gadget / 非 root 方案 / 模拟执行），' +
+              '因为常驻方案失效是整体失效、没有降级空间',
+            hint: '如果明天这个 App 更新了检测，你还有什么牌？',
+            any: ['备选', '退路', 'Frida', '模拟执行', '非 root', '不 root', 'gadget', '降级', 'unidbg'] }
         ],
         hints: [
-          '不要泛泛说「eBPF 更高级」。请具体列出 App 有哪几项自查手段，然后逐项判断：这条手段对 Frida 有效吗？对 eBPF 有效吗？为什么？',
-          '隐蔽性的来源可以用一句话概括——但它不是「eBPF 这个技术本身很隐蔽」，而是关于<b>观测发生在哪里</b>的一句话。'
+          '把"暴露面"当成一份预算：先列出你能减少的项（作用域、hook 点数、改内存的次数、生效时间），再逐项定价。',
+          '别忘了最坏情况：如果目标明天更新了检测，你的方案是"部分失效"还是"直接归零"？'
         ],
         probes: [
-          '你说 App 检测不到 eBPF——那 App 有没有可能检测到「有人在这台设备上加载 eBPF」这件事本身？注意区分「观测动作」和「观测者」。',
-          '如果对手也用 eBPF 来监控你的行为，你该怎么办？这个问题的答案和本章哪个章节有关联？'
+          '你说要"合并到一个总入口"——如果这个 App 的加密调用分散在 Java 层与 native 层两处，你的"一个入口"还成立吗？不成立时你怎么办？',
+          '你把关键点交给硬件断点——但硬件断点通常只有 4–6 个名额。请说清：你会把名额分给哪几个点，依据是什么？'
         ],
-        model: '<b>隐蔽性的差别不来自「eBPF 技术更先进」，而来自一句很朴素的话：观测发生在目标进程的地址空间之外。</b>把这句话想通，你就能自己推导出哪些检测有效、哪些天生无效。' +
-          '<br><br><b>先看 App 的常规自查有哪些，以及两条路各会露出什么：</b><br>' +
-          '<b>① 扫 <code>/proc/self/maps</code>。</b>Frida 注入后会多出一个 agent 模块，<b>命中</b>；eBPF 不往目标进程里放任何东西，<b>无效</b>。<br>' +
-          '<b>② 遍历 <code>/proc/self/task/*/comm</code> 查线程名。</b>Frida 会留下框架线程，<b>命中</b>；eBPF 一个线程都不加，<b>无效</b>。<br>' +
-          '<b>③ 扫监听端口（例如 27042 一类）。</b>Frida 可能开端口，<b>可能命中</b>；eBPF 根本不进这个进程，<b>无效</b>。<br>' +
-          '<b>④ 读 <code>/proc/self/status</code> 看 TracerPid / 查 ptrace 痕迹。</b>Frida 的某些接入方式会命中；eBPF 走的是内核探针机制，不是 ptrace 附着，<b>无效</b>。<br>' +
-          '<b>⑤ 把内存里的代码段与磁盘上的 <code>.so</code> 逐字节比对。</b>Frida 的 inline hook 会改写函数序言，<b>命中</b>；eBPF <b>不修改目标进程的任何字节</b>——它是只读观测，<b>无效</b>。<br>' +
-          '<b>⑥ 校验函数序言字节。</b>同上，Frida <b>命中</b>，eBPF <b>无效</b>。<br><br>' +
-          '<b>所以规律是：所有依赖「观测者必须在目标进程内部留下东西」的检测手段，对内核态观测一律失效。</b>' +
-          '<br><br><b>但这种隐蔽性有明确的代价与边界，不能神化：</b>' +
-          '<b>① 观测者本身不隐蔽。</b>你的 loader 是个跑在手机上的用户态进程，会被 <code>ps</code> 看见、会在文件系统里留下文件（<code>/data/local/tmp</code> 是重灾区）。内核态隐蔽的是「观测动作」，不是「观测者」。<br>' +
-          '<b>② 加载门槛极高。</b>要加载 eBPF 程序需要高权限，实际通常要 root（见 11.6）。你为了让观测更隐蔽，反而先要在设备上取得最高权限——这是很现实的成本，而且 root 状态本身就是 App 最容易检测的信号之一。<br>' +
-          '<b>③ 这是双向博弈。</b>对手同样可以用 eBPF 监控你的行为，甚至用 LSM 钩子加固自己的检测逻辑。<b>不存在一劳永逸的隐蔽</b>，加固与对抗的价值都在于抬高对方的成本。<br>' +
-          '<b>④ 观测粒度有取舍。</b>eBPF 看不到目标进程内部的任意内存和任意函数调用细节（Frida 可以），它擅长的是系统调用、文件、网络、以及通过 uprobe 挂到的特定函数入口/出口。' +
-          '<br><br><b>放回课程坐标系：</b>第 6 章的 Hypervisor 层比内核更低，第 11 章（本章）是内核态观测的标准手段，第 13 章讲内核态对抗（SVC 系统调用、硬件断点）。三章连起来是一条主线——<b>谁控制了更低的层，谁就拥有最终的观测权和控制权。</b>',
-        after: '<p>这道题是本章存在的理由。如果你只能记住本章的一件事，请记住：<b>内核态观测的隐蔽性来自「在目标进程的地址空间之外」，而不是来自 eBPF 本身有什么隐身魔法。</b></p>'
+        model: '<b>基调：这道题没有完美方案，只有"暴露面预算怎么花"。</b><br><br><b>① 收窄（作用域）</b>：只勾目标 App、不做全选；用 <code>processName</code> 精确判进程，避免在子进程里重复初始化。减少的是注入覆盖范围，代价几乎为零。<br><b>② 减量（hook 点数）</b>：每个 hook 点都是一次方法入口改写，优先找"总入口"（例如统一的加密调度方法），用 1 个点覆盖 10 个算法。代价：粒度更粗，要额外解析参数才能区分算法。<br><b>③ 换手段（不改内存）</b>：把最敏感的点交给硬件断点 / 观察点——inline hook 必然改内存，自校验能发现它；硬件断点由 CPU 调试寄存器匹配，一个字节都不改。代价：名额只有 4–6 个，必须取舍。<br><b>④ 换时机（能一次性就不常驻）</b>：延迟到壳换完加载器后一次性采集；现代 API 还给了动态作用域，可把生效范围压到最小。代价：放弃实时拦截，只拿到采集时刻的快照——如果需求是"每次调用的输入输出都要记录"，这一步就不成立，只能回到常驻并接受它的暴露面。<br><b>⑤ 承认残留</b>：Zygote 注入链路、模块 so 的映射、被替换的方法入口，这些不是这次 hook 留下的，而是"装过 LSPosed"留下的，写得再好也消不掉——所以随时可能被<b>整体否掉</b>（11.8C 的作者自述就是活证据）。<br><b>⑥ 留退路</b>：并行准备非常驻路线（一次性注入 / gadget / 非 root 方案 / 模拟执行）。<br><br><span class="hit"><b>骨架：收窄范围 → 减少改写 → 换用不改内存的手段 → 缩短存活时间 → 承认残留 → 留退路。</b>每一层都在做同一个交换：<b>用能力换暴露面。</b>这道题考的就是能不能把它说成一个"预算问题"，而不是"哪个工具更隐蔽"的问题。</span>'
       }
     ]
   }

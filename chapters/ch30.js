@@ -1,2746 +1,1116 @@
-/* 第 30 章数据 —— 逆向工作环境与关键代码定位 */
-/* ---------------------------------------------------------------------------
-   本章自带两个「真的会算」的引擎，都挂在 window.CH30X 上：
-     ① 七条线索的成本-收益选型器（线索库 + 事实识别 + 打分排序）
-     ② 调用栈判读器（帧解析 + 分层 + 业务边界/入口/代理帧定位 + 栈质量诊断）
-   为什么挂在 window 而不是写顶层 const：同一台校验器沙箱里会连续装载几十章，
-   顶层词法声明会跨章冲突（Identifier already declared）。挂全局对象最安全。
-   --------------------------------------------------------------------------- */
-window.CH30X = {
-
-  /* ======================================================================
-     一、七条线索的成本-收益模型
-     成本 = 启动这条线索要付的代价（base + 情境修正，下限 1）
-     收益 = 它能把搜索空间缩小到什么程度（gain，1–4，用证据强度近似）
-     效益 = 收益 / 成本。排序先看效益，再看收益，再看成本，最后按固定序号。
-     被情境「结构性排除」的线索（例如界面不是原生 View 树时的 UI 反推）直接置底。
-     ====================================================================== */
-  CLUES: [
-    {
-      id: 'str', no: 1, name: '字符串搜索', base: 1, gain: 1,
-      note: '在 dex / so / 资源里搜明文：URL、错误提示、日志 TAG、算法常量、密钥前缀。',
-      fail: '搜不到，通常意味着三件事之一：这段文字在运行时才被拼出来、它由服务端下发、或者代码里的原话和界面上看到的不是同一个词。',
-      whyAny: ['明文', '常量', '字符串', '搜索', '关键字', '文案', '资源', 'strings.xml'],
-      rules: [
-        { f: 'literal', cost: -1, gain: 1, why: '手里有可以直接当搜索词的明文' },
-        { f: 'uiText', cost: -1, why: '界面文字本身就是明文常量，通常落在 strings.xml 或布局里' },
-        { f: 'serverText', cost: 3, gain: -1, why: '文案由服务端下发，本地根本没有这个常量' },
-        { f: 'cipher', cost: 3, why: '你手上只有密文，密文在代码里不存在' },
-        { f: 'packed', cost: 3, why: '加固/字符串加密之后，静态搜索命中率骤降' },
-        { f: 'flutter', gain: 1, why: '界面不是原生 View 树，但 Dart 的字符串常量通常仍落在 AOT 快照里，字符串这条线并没有一起失效' }
-      ]
-    },
-    {
-      id: 'static', no: 2, name: '静态结构', base: 2, gain: 1,
-      note: '从 manifest 的组件与权限、import 与类型引用、方法调用图、注解与泛型残留里找结构。',
-      fail: '结构读不出来时，你要区分两件事：是「结构被壳拿走了」，还是「你看的结构层级不对」（Java 层调用链 vs so 的导入表）。',
-      whyAny: ['静态', 'manifest', '组件', '权限', '调用图', '导入表', '交叉引用', '结构', '符号'],
-      rules: [
-        { f: 'manifest', cost: -1, gain: 1, why: 'manifest 是最便宜的一层结构信息，入口与权限都写在那里' },
-        { f: 'jniReg', cost: -1, gain: 1, why: 'JNI 动态注册会留下一张名字与地址的对应表' },
-        { f: 'native', cost: -1, gain: 1, why: 'native 侧有导入表和常量池，这是一张免费的地图，证据强度比 Java 层的名字更高' },
-        { f: 'packed', cost: 1, why: '加固会打散 Java 层结构，静态阅读收益下降' },
-        { f: 'stripped', cost: 1, why: '符号被剥离后，函数名这条线没了，要靠结构与交叉引用反推' }
-      ]
-    },
-    {
-      id: 'stack', no: 4, name: '调用栈', base: 2, gain: 1,
-      note: '顺着调用链走：谁调用了谁、业务边界在哪一帧、栈上还能看到什么。',
-      fail: '拿不到栈或栈被内联/混淆之后，你剩下的只有「第一个业务帧的类名」，而那个名字大概率是 a.a.a。',
-      whyAny: ['调用栈', '栈', '帧', '调用链', '业务边界', 'backtrace', '谁调用了'],
-      rules: [
-        { f: 'crash', cost: -1, gain: 2, why: '崩溃日志直接给出了事发帧，这是最便宜的栈' },
-        { f: 'cipher', gain: 1, why: '有已知的输入输出当锚点，顺序回溯能一路收敛' },
-        { f: 'native', cost: 1, why: 'native 栈要自己 unwind，没有 Java 栈那么规整' },
-        { f: 'stripped', cost: 1, why: '符号被剥离后，栈上的地址需要额外映射回模块' },
-        { f: 'hookReady', cost: -1, gain: 1, why: '有注入能力就能在关键点直接打栈' }
-      ]
-    },
-    {
-      id: 'ui', no: 5, name: 'UI 组件反推', base: 2, gain: 1,
-      note: '从界面元素反查 Activity / 布局 / 资源 id，再从资源 id 反查绑定函数。',
-      fail: '反推失效时你会发现：界面不是原生 View 树（Flutter/自绘/游戏引擎），控件根本没有 resource-id 这个东西。',
-      whyAny: ['界面', '控件', '资源 id', '布局', 'activity', 'uiautomator', '反推', 'onClick'],
-      rules: [
-        { f: 'uiText', cost: -1, gain: 1, why: '原生界面上每一个控件都能被 dump 出资源 id' },
-        { f: 'packed', cost: 1, why: '加固一般不动布局，但会让人怀疑资源 id 还能不能对上代码' },
-        { f: 'flutter', blocked: true, why: '界面不是原生 View 树，控件没有 resource-id，这一条从根上不成立' }
-      ]
-    },
-    {
-      id: 'log', no: 7, name: '日志线索', base: 2, gain: 1,
-      note: 'logcat / 崩溃栈 / 框架日志 / 自己的插入日志，把「发生过什么」变成可读记录。',
-      fail: '日志被加固清掉、或关键字全被改成无意义 TAG 时，你至少还能拿到「进程在什么时刻做了什么」这一层信息。',
-      whyAny: ['日志', 'logcat', 'tag', '打印', '崩溃日志', '输出'],
-      rules: [
-        { f: 'logLine', cost: -1, gain: 1, why: '已经有日志线索，等于已经有一个入口' },
-        { f: 'crash', cost: -1, gain: 1, why: '崩溃栈本身就是一份日志' },
-        { f: 'packed', cost: 2, why: '加固/反调试常顺手清理或伪造日志' }
-      ]
-    },
-    {
-      id: 'trace', no: 6, name: 'Profiling / Trace', base: 4, gain: 1,
-      note: '采样或插桩执行流：按钮点下去之后，到底有哪些方法被调用过。',
-      fail: '采样会丢方法（太短、太深、被内联），拿到的是「可能相关的候选集」，不是证据链；它需要和别的线索交叉验证。',
-      whyAny: ['profiling', 'trace', '采样', '执行流', '插桩', 'stalker', 'method tracing'],
-      rules: [
-        { f: 'uiText', gain: 1, why: '有一个明确的用户操作当起点，采样的范围可以被压得很小' },
-        { f: 'packed', cost: 1, why: '加固与反调试常把这类采集变成噪音' },
-        { f: 'noroot', cost: 2, why: '多数采样手段要注入或重编译，没有 root 就很贵' },
-        { f: 'hookReady', cost: -1, gain: 1, why: '有注入能力就能按需开 trace' }
-      ]
-    },
-    {
-      id: 'debug', no: 3, name: '动态调试', base: 4, gain: 1,
-      note: 'Smali 断点 / IDA attach so：让程序停在你想看的那一行，看寄存器、内存、参数。',
-      fail: '挂不上调试器时先分清两类原因：环境没配对（debuggable/JDWP/权限），还是对方主动检测并退出。两者处理方式完全不同。',
-      whyAny: ['动态调试', '断点', '调试器', 'ida', 'jdb', '单步', '寄存器', 'attach'],
-      rules: [
-        { f: 'literal', cost: -1, why: '有明确的观察对象时，一个断点就能顶掉大量猜测' },
-        { f: 'cipher', cost: -1, gain: 1, why: '密文是天然的内存锚点，断在那里比什么都直接' },
-        { f: 'stripped', cost: -1, why: '没有符号时，动态观察比静态阅读省力' },
-        { f: 'native', gain: 1, why: '算法沉到 native 之后，寄存器与内存是唯一的第一手现场' },
-        { f: 'noroot', cost: 3, why: '没有 root、又不能重打包时，注入与调试基本没有落脚点' },
-        { f: 'hookReady', cost: -1, gain: 1, why: '环境已经就绪，只剩选点问题' }
-      ]
-    }
-  ],
-
-  /* 事实识别：把一段自然语言情境翻译成事实集合。
-     这是「真实规则判定」的入口——同一段文字，谁的规则都能算出同一个结果。 */
-  FACTS: [
-    { id: 'literal', re: /文字|文案|提示|报错|错误信息|字符串|日志行/, label: '有明文文本可以直接当搜索词' },
-    { id: 'uiText', re: /按钮|界面|页面|控件|图标|弹窗|列表|布局|点击/, label: '有原生界面元素（控件/资源）' },
-    { id: 'serverText', re: /服务端|服务器|后端|下发|接口返回|远程/, label: '文本来自服务端' },
-    { id: 'cipher', re: /密文|加密参数|\bhex\b|\bsign\b|签名串|报文|响应的\s*body|抓到的包/i, label: '手上只有一个密文/加密参数' },
-    { id: 'crash', re: /崩溃|闪退|\bcrash\b|堆栈|调用栈|tombstone|\banr\b/i, label: '有崩溃栈可用' },
-    { id: 'logLine', re: /logcat|日志|打印/i, label: '有日志线索' },
-    { id: 'native', re: /native|\bso\b|\bjni\b|\bndk\b/i, label: '目标在 native/so 里' },
-    { id: 'stripped', re: /strip|剥离|去符号|无符号|符号被删|符号没了|混淆/i, label: '符号被剥离或混淆' },
-    { id: 'packed', re: /加固|加壳|\b壳\b|\bvmp\b|ollvm/i, label: '目标被加固' },
-    { id: 'flutter', re: /flutter|dart|自绘|非原生|游戏引擎/i, label: '界面不是原生 View 树' },
-    { id: 'noroot', re: /没\s*root|无\s*root|不能\s*root|未\s*root|没有\s*root/i, label: '设备没有 root' },
-    { id: 'hookReady', re: /hook\s*环境已就绪|已经能\s*hook|hook\s*环境就绪|能挂\s*hook|有注入能力|注入能力/, label: 'Hook 环境已就绪' },
-    { id: 'jniReg', re: /动态注册|registernatives/i, label: '存在 JNI 动态注册' },
-    { id: 'manifest', re: /manifest|组件|权限|入口\s*activity/i, label: '有 manifest/组件线索' }
-  ],
-
-  detect: function (text) {
-    const t = String(text || '');
-    const hits = [];
-    (this.FACTS || []).forEach(function (f) {
-      if (f.re.test(t)) hits.push(f.id);
-    });
-    return hits;
-  },
-
-  factLabels: function (ids) {
-    const self = this;
-    return (ids || []).map(function (id) {
-      const hit = self.FACTS.filter(function (x) { return x.id === id; })[0];
-      return hit ? hit.label : id;
-    });
-  },
-
-  score: function (facts) {
-    const set = {};
-    (facts || []).forEach(function (f) { set[f] = true; });
-    const out = this.CLUES.map(function (c) {
-      let cost = c.base, gain = c.gain, blocked = false;
-      const why = [];
-      (c.rules || []).forEach(function (r) {
-        if (!set[r.f]) return;
-        if (r.cost) cost += r.cost;
-        if (r.gain) gain += r.gain;
-        if (r.blocked) blocked = true;
-        if (r.why) why.push(r.why);
-      });
-      cost = Math.max(1, cost);
-      gain = Math.max(1, Math.min(4, gain));
-      return {
-        id: c.id, no: c.no, name: c.name,
-        cost: cost, gain: gain,
-        eff: blocked ? 0 : Math.round(gain / cost * 100) / 100,
-        blocked: blocked, why: why,
-        note: c.note, fail: c.fail, whyAny: c.whyAny
-      };
-    });
-    out.sort(function (a, b) {
-      if (a.blocked !== b.blocked) return a.blocked ? 1 : -1;
-      if (b.eff !== a.eff) return b.eff - a.eff;
-      if (b.gain !== a.gain) return b.gain - a.gain;
-      if (a.cost !== b.cost) return a.cost - b.cost;
-      return a.no - b.no;
-    });
-    return out;
-  },
-
-  matchClue: function (s) {
-    const t = String(s || '').trim();
-    if (!t) return null;
-    const self = this;
-    const num = /^[1-7]$/.exec(t);
-    if (num) {
-      const hit = self.CLUES.filter(function (x) { return x.no === parseInt(num[0], 10); })[0];
-      if (hit) return hit.id;
-    }
-    let found = null;
-    self.CLUES.forEach(function (c) {
-      if (found) return;
-      if (t === c.id || t.indexOf(c.name) >= 0) found = c.id;
-      else if (window.AKKC_hasConcept && window.AKKC_hasConcept(t, c.whyAny)) found = c.id;
-    });
-    return found;
-  },
-
-  /* 把排序结果渲染成一张可读的表 */
-  rankHtml: function (ranked, factIds) {
-    const labels = this.factLabels(factIds);
-    let h = '';
-    if (!labels.length) {
-      h += '<div class="lab-msg warn"><b>没有识别到任何已知特征</b><br>' +
-           '<span class="lab-note">情境描述里至少要包含一个可判定的事实，比如「有崩溃日志」「只有密文」「界面是 Flutter」。' +
-           '你可以把界面上看到的、手上拿到的东西直接写进去。</span></div>';
-    } else {
-      h += '<div class="lab-msg key"><b>识别到的事实（' + labels.length + ' 项）</b><div class="lab-note">' +
-           labels.map(function (x) { return '<span class="pill acc">' + x + '</span>'; }).join(' ') +
-           '</div></div>';
-    }
-    h += '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-         '<th>优先</th><th>线索</th><th>启动成本</th><th>收益</th><th>效益</th><th>算出来的依据</th></tr></thead><tbody>';
-    ranked.forEach(function (c, i) {
-      const blocked = c.blocked ? '<span class="pill bad">结构性排除</span> ' : '';
-      h += '<tr><td>' + (c.blocked ? '—' : (i + 1)) + '</td>' +
-           '<td>' + blocked + '<b>' + c.no + '. ' + c.name + '</b></td>' +
-           '<td class="center">' + c.cost + '</td>' +
-           '<td class="center">' + c.gain + '</td>' +
-           '<td class="center">' + (c.blocked ? '0' : c.eff) + '</td>' +
-           '<td>' + (c.why.length ? c.why.join('；') : '<span class="muted">本情境没有额外修正，取基准值</span>') + '</td></tr>';
-    });
-    h += '</tbody></table></div>';
-    const top = ranked.filter(function (c) { return !c.blocked; })[0];
-    if (top) {
-      const second = ranked.filter(function (c) { return !c.blocked; })[1];
-      h += '<div class="lab-msg pass"><b>首选：' + top.no + '. ' + top.name + '</b>' +
-           '<div class="lab-note">' + top.note + '</div>' +
-           (second ? '<div class="lab-note">排第二的是 <b>' + second.no + '. ' + second.name +
-             '</b>（效益 ' + second.eff + '）。首选失败时，第二条就是你的下一个动作，而不是从头乱试。</div>' : '') +
-           '<div class="lab-note"><b>首选失败时你能得到什么：</b>' + top.fail + '</div></div>';
-    }
-    return h;
-  },
-
-  /* ======================================================================
-     二、调用栈判读器
-     帧解析 → 分层（系统/框架 · 业务 · 代理/合成） → 三个坐标：
-       业务边界：从栈顶往下第一帧业务代码（离事发点最近的那一帧）
-       进入入口：从栈底往上第一帧业务代码（系统框架第一次把控制权交给 App）
-       代理帧：真正的无业务语义帧（反射 / 合成 lambda / 动态代理）
-     再算一份「栈质量诊断」：无行号比例、单字母名、重复帧 → 判断栈是否退化。
-     ====================================================================== */
-  SYS_RE: /^(java\.|javax\.|android\.|androidx\.|com\.android\.|dalvik\.|libcore\.|sun\.|kotlin\.|kotlinx\.)/,
-  WRAP_RE: /(\$\$ExternalSyntheticLambda|ExternalSyntheticLambda|\$\$Lambda\$|\$Proxy|GeneratedMethodAccessor|MethodAccessor|(^|\.)reflect\.|Lambda\$)/,
-  SYS_SO_RE: /^(libc|libm|libdl|libart|libandroid|libbinder|libutils|liblog|libnativehelper|libc\+\+_shared|libcutils|libhwui|libgui)\.so$/,
-
-  parseStack: function (text) {
-    const lines = String(text || '').split(/\r?\n/);
-    const frames = [];
-    lines.forEach(function (line) {
-      const s = String(line).replace(/\t/g, ' ').trim();
-      if (!s) return;
-      let m = /^at\s+([\w$.]+)\.([\w$<>]+)\(([^)]*)\)/.exec(s);
-      if (m) {
-        frames.push({ kind: 'java', raw: s, cls: m[1], method: m[2], loc: m[3], mod: '' });
-        return;
-      }
-      m = /^#?(\d+)?\s*pc\s+([0-9a-fA-F]+)\s+(\S+)/.exec(s);
-      if (m) {
-        const path = m[3];
-        frames.push({ kind: 'native', raw: s, cls: '', method: '', loc: m[2], mod: path.split('/').pop() || path });
-        return;
-      }
-      m = /^(0x[0-9a-fA-F]+)\s+(\S+?\.so)(?:!|\+)(0x[0-9a-fA-F]+)?/.exec(s);
-      if (m) {
-        frames.push({ kind: 'native', raw: s, cls: '', method: '', loc: m[3] || '0x?', mod: m[2].split('/').pop() });
-        return;
-      }
-      frames.push({ kind: 'header', raw: s, cls: '', method: '', loc: '', mod: '' });
-    });
-    return frames;
-  },
-
-  classify: function (fr) {
-    if (fr.kind === 'native') {
-      const mod = fr.mod || '';
-      if (this.SYS_SO_RE.test(mod)) return 'system';
-      if (/libapp\.so|libflutter\.so/.test(mod)) return 'app';
-      return 'app';
-    }
-    if (this.SYS_RE.test(fr.cls) && !this.WRAP_RE.test(fr.cls)) return 'system';
-    if (this.WRAP_RE.test(fr.cls) || this.WRAP_RE.test(fr.method || '')) return 'wrapper';
-    return 'app';
-  },
-
-  judgeStack: function (frames) {
-    const self = this;
-    const numbered = [];
-    (frames || []).forEach(function (f) {
-      if (f.kind !== 'java' && f.kind !== 'native') return;
-      const copy = {
-        kind: f.kind, raw: f.raw, cls: f.cls, method: f.method, loc: f.loc, mod: f.mod,
-        idx: numbered.length + 1
-      };
-      copy.layer = self.classify(copy);
-      copy.name = copy.kind === 'native' ? (copy.mod || 'native') : (copy.cls + '.' + copy.method);
-      numbered.push(copy);
-    });
-
-    const counts = { app: 0, system: 0, wrapper: 0 };
-    numbered.forEach(function (f) { counts[f.layer]++; });
-
-    let boundary = null, proxy = null, nearBoundary = null, entry = null;
-    for (let i = 0; i < numbered.length; i++) {
-      if (numbered[i].layer === 'app') { boundary = numbered[i]; break; }
-    }
-    for (let i = numbered.length - 1; i >= 0; i--) {
-      if (numbered[i].layer === 'app') { entry = numbered[i]; break; }
-    }
-    for (let i = 0; i < numbered.length; i++) {
-      if (numbered[i].layer === 'wrapper') { proxy = numbered[i]; break; }
-    }
-    if (boundary) {
-      for (let i = boundary.idx - 2; i >= 0; i--) {
-        if (numbered[i].layer !== 'app') { nearBoundary = numbered[i]; break; }
-      }
-    }
-
-    let noLine = 0, shortName = 0;
-    const seen = {};
-    let dup = 0;
-    numbered.forEach(function (f) {
-      const loc = String(f.loc || '');
-      if (/Native Method|Unknown Source|^SourceFile/.test(loc)) noLine++;
-      if (f.kind === 'java') {
-        const seg = f.cls.split('.').pop() || '';
-        if (seg.length <= 2 || String(f.method || '').length <= 1) shortName++;
-      }
-      const key = f.name;
-      if (seen[key]) dup++;
-      seen[key] = true;
-    });
-    const total = numbered.length || 1;
-    const reasons = [];
-    if (noLine / total >= 0.5) reasons.push('超过一半的帧没有行号（Native Method / Unknown Source / SourceFile）');
-    if (shortName >= 2) reasons.push('出现多个单字母类名或方法名，说明名字已被混淆');
-    if (dup > 0) reasons.push('有 ' + dup + ' 处同名帧重复出现，调用链被折叠或递归展开');
-    if (counts.app === 0) reasons.push('整条栈里没有任何业务帧，几乎全部是系统与框架');
-    const degraded = reasons.length > 0;
-
-    return {
-      numbered: numbered, counts: counts,
-      boundary: boundary, entry: entry, proxy: proxy, nearBoundary: nearBoundary,
-      dup: dup, noLineRatio: Math.round(noLine / total * 100) / 100,
-      reasons: reasons, degraded: degraded
-    };
-  },
-
-  framesHtml: function (j) {
-    if (!j.numbered.length) {
-      return '<div class="lab-msg warn"><b>没有解析出任何栈帧</b><div class="lab-note">' +
-             '把崩溃日志或 backtrace 原样粘进来即可：Java 帧要形如 <span class="mono">at com.a.B.c(B.java:12)</span>，' +
-             'native 帧要形如 <span class="mono">#00 pc 00000000001a4c10 /data/app/.../libtarget.so</span>。' +
-             '异常名那一行会被忽略，它不算帧。</div></div>';
-    }
-    let h = '<div class="lab-msg key"><b>解析结果：共 ' + j.numbered.length + ' 帧</b>' +
-            '<div class="lab-note">帧号按解析顺序排列（异常名那一行不计入）。' +
-            '左列只给出<b>语法层</b>能看到的东西——它属于哪一层，要你自己判断。</div></div>' +
-            '<div class="tbl-wrap"><table class="tbl"><thead><tr>' +
-            '<th>#</th><th>帧</th><th>模块 / 类</th><th>位置</th><th>语法特征</th></tr></thead><tbody>';
-    j.numbered.forEach(function (f) {
-      const flags = [];
-      if (/Native Method/.test(String(f.loc))) flags.push('<span class="pill warn">native 方法</span>');
-      if (/Unknown Source|^SourceFile/.test(String(f.loc))) flags.push('<span class="pill warn">无行号</span>');
-      if (j.dup && j.numbered.filter(function (x) { return x.name === f.name; }).length > 1) {
-        flags.push('<span class="pill warn">同名帧</span>');
-      }
-      h += '<tr><td class="center">' + f.idx + '</td>' +
-           '<td class="mono small">' + f.name + '</td>' +
-           '<td class="mono small">' + (f.kind === 'native' ? (f.mod || '—') : f.cls.split('.').slice(0, 3).join('.')) + '</td>' +
-           '<td class="mono small">' + f.loc + '</td>' +
-           '<td>' + (flags.length ? flags.join(' ') : '<span class="muted">—</span>') + '</td></tr>';
-    });
-    h += '</tbody></table></div>';
-    h += '<div class="lab-msg ' + (j.degraded ? 'fail' : 'pass') + '"><b>栈质量诊断：' +
-         (j.degraded ? '这条栈已经退化了' : '这条栈信息量正常') + '</b>' +
-         '<div class="lab-note">业务帧 ' + j.counts.app + ' 帧 / 系统与框架 ' + j.counts.system +
-         ' 帧 / 代理与合成 ' + j.counts.wrapper + ' 帧；无行号帧占比 ' + Math.round(j.noLineRatio * 100) + '%。</div>' +
-         (j.reasons.length ? '<div class="lab-note">' + j.reasons.map(function (r) { return '· ' + r; }).join('<br>') + '</div>'
-                           : '<div class="lab-note">行号齐全、名字完整、没有重复帧——可以放心按三个坐标去读。</div>') +
-         '</div>';
-    return h;
-  },
-
-  judgeHtml: function (j) {
-    if (!j.numbered.length) return '';
-    const f = function (x) { return x ? ('#' + x.idx + ' <span class="mono small">' + x.name + '</span>') : '<span class="muted">（这条栈里没有）</span>'; };
-    let h = '<div class="lab-msg model"><b>三个坐标</b><ul style="margin:8px 0 0 18px">' +
-            '<li><b>业务边界</b>（从栈顶往下第一帧业务代码）：' + f(j.boundary) + '</li>' +
-            '<li><b>进入入口</b>（从栈底往上第一帧业务代码）：' + f(j.entry) + '</li>' +
-            '<li><b>无业务语义的代理/合成帧</b>：' + f(j.proxy) + '</li>' +
-            '<li><b>紧贴业务边界之上的框架帧</b>：' + f(j.nearBoundary) + '</li>' +
-            '</ul></div>';
-    if (j.boundary && /Native Method/.test(String(j.boundary.loc))) {
-      h += '<div class="lab-note"><b>注意这一帧的形态：</b>' + j.boundary.name +
-           ' 标着 <span class="mono">(Native Method)</span>。它同时是「业务边界」和「Java→native 的交接点」——' +
-           '再往里一步就不在 Java 栈上了，你需要的是 so 里的地址（转到 IDA / backtrace）。</div>';
-    }
-    return h;
-  },
-
-  /* 两段真实形状的栈：A 是信息完整的，B 是退化之后的对照组 */
-  DEMO_A: [
-    'java.lang.IllegalStateException: sign verify failed (code=4031)',
-    '    at com.target.pay.CryptoBridge.nativeSign(Native Method)',
-    '    at com.target.pay.SignProxy.invoke(SignProxy.java:37)',
-    '    at java.lang.reflect.Method.invoke(Native Method)',
-    '    at com.target.pay.PayActivity.doPay(PayActivity.java:203)',
-    '    at com.target.pay.PayActivity$2.onClick(PayActivity.java:88)',
-    '    at android.view.View.performClick(View.java:7792)',
-    '    at android.os.Handler.handleCallback(Handler.java:942)',
-    '    at android.os.Looper.loop(Looper.java:274)',
-    '    at android.app.ActivityThread.main(ActivityThread.java:8456)'
-  ].join('\n'),
-
-  DEMO_B: [
-    'java.lang.RuntimeException: decrypt failed',
-    '    at com.target.a.a.a(Native Method)',
-    '    at com.target.a.a.b(SourceFile:2)',
-    '    at com.target.a.a.a(SourceFile:1)',
-    '    at android.os.Handler.handleCallback(Handler.java:942)'
-  ].join('\n')
-};
-
+/* 第 30 章 · 安卓模拟器环境与原理揭密
+   作者：章节作者（ch16）
+   结构：14 个 section / stage×3 / stepper×1 / term×2 / decision×3 / quiz×4
+   注：AOSP target 名、分区细节等不确定处一律标 <span class="pill warn">待核实</span> */
 window.CHAPTER = {
   no: 30,
-  title: '逆向工作环境与关键代码定位',
-  lede: '前面二十多章把方法散在各处：环境怎么配、代码怎么找、栈怎么读，都是顺带讲的。' +
-        '这一章把它们收成一套可以照着走的流程——<strong>先把环境搭起来，再用七条线索去定位关键代码</strong>。' +
-        '本章的立场很明确：<strong>环境是成本，定位是收益</strong>；每一次投入都应该换来一个更小的搜索空间。',
+  title: '安卓模拟器环境与原理揭密',
+  lede: '模拟器不是「另一台手机」，它是<strong>一套运行环境方案</strong>。这一章拆开三件事：ARM 指令在 x86 上怎么被翻译、Android 的 GKI 内核怎么被替换、以及 Google 官方的云端虚拟设备 Cuttlefish 到底长什么样。',
   meta: [
-    '核心问题：<b>在 hook 之前，你怎么知道该 hook 哪里？</b>',
-    '关键机制：<b>环境依赖链 / 七条线索的成本-收益 / 调用栈三坐标</b>',
-    '对手：<b>加固、反调试、混淆，以及你自己的时间</b>'
+    '核心问题：<b>为什么 x86 镜像 + 翻译层比全系统 ARM 模拟快得多？GKI 把内核拆成了什么？云手机的底座是什么？</b>',
+    '关键工具：<b>QEMU / TCG</b>、<b>libhoudini / libndk_translation</b>、<b>AOSP 编译</b>、<b>GKI + KMI</b>、<b>Cuttlefish + KVM</b>',
+    '对手：<b>App 的模拟器风控</b>（ro.kernel.qemu / goldfish / ranchu / SwiftShader / /dev/qemu_pipe）与硬件虚拟化限制'
   ],
 
   sections: [
-    /* ============================================================ 30.1 */
+    /* ================= 30.1 ================= */
     {
-      h: '30.1', title: '先要一张地图：五块拼图，以及它们之间的依赖',
+      h: '30.1',
+      title: '为什么逆向工程师必须懂模拟器原理',
       intuition: {
-        tag: '直觉模型 · 装修一间工作室',
-        body:
-          '<p>把逆向环境想成装修一间工作室。设备是房子，root 是电闸，抓包证书是门禁卡，' +
-          'Hook 框架是墙上那排插座，调试器是那台能随时暂停画面的监视器。</p>' +
-          '<p>关键不在清单，在<b>依赖</b>：没有电闸，插座和门禁都装不上；' +
-          '但没有监视器，你照样能进屋干活，只是慢。</p>' +
-          '<p>所以「环境没配好」从来不是一个是非题，而是一句<b>程度描述</b>：' +
-          '你缺的是哪一块，它让你的哪一类观测手段直接失效。这就是本章第一节要给的地图。</p>'
+        tag: '直觉模型 · 一场国际会议的同声传译',
+        body: '<p>会场里有两种极端的做法。<b>做法一</b>：所有参会者都只会说外语，于是<b>每一个人说的每一句话</b>都要经过同声传译——包括主持人念流程、念注意事项。传译员再快，会议也会被拖慢好几倍。这就是<b>全系统模拟</b>。<br><b>做法二</b>：会议主体改用中文进行，只有台上那位外宾发言时需要翻译。会场 95% 的交流是原生速度，只有外宾那几句要过一遍传译。这就是<b>应用级翻译</b>。<br>两者的差别不在「翻译质量」，而在<b>需要被翻译的代码占多大比例</b>。这一章所有的性能直觉，都从这个比例出发。</p>'
       },
       html:
-        T.note('key', '🔑 先把判断立在这里',
-          '<p style="margin-bottom:0">配环境的目的不是「把网上教程的清单打勾」，而是<b>买到观测能力</b>。' +
-          '买不到 root，你就买不到系统证书库；买不到注入，你就买不到运行时参数。' +
-          '所以每一步都要问一句：<b>这一步失败，我会失去哪种观测？</b>——失去的那种观测，就是我接下来必须绕着走的地方。</p>') +
-        '<p>下面是本章的骨架地图。先看它，再看后面的细节：</p>' +
-        T.tbl(
-          ['拼图', '它解决什么问题', '不装它，你会失去什么', '它依赖谁'],
-          [
-            ['<b>① 设备</b>（真机 / 模拟器）',
-             '让目标 App 真实跑起来，并决定它「看到的环境」长什么样',
-             '什么都做不了；或者被环境的差异误导（模拟器特征、隐藏 API 差异）',
-             '——（这是底座）'],
-            ['<b>② root 能力</b>',
-             '读写系统分区、向别的进程注入、把证书放进系统信任库',
-             '只能走「改 APK 重打包」这条更重、更容易被完整性校验抓到的路',
-             '设备的 bootloader 可解锁（真机），或模拟器自带（模拟器）'],
-            ['<b>③ 抓包证书</b>',
-             '让你的中间人证书被目标接受，从「只有 CONNECT」变成「能看内容」',
-             'HTTPS 的正文全部看不见，只剩域名与连接时序',
-             '<b>依赖 ②</b>（走系统库路线时）；不依赖 root 的替代方案是重打包'],
-            ['<b>④ Hook 框架</b>',
-             '在运行时改行为、看参数、打调用栈',
-             '只能静态读代码；参数、密钥、随机数都只能靠推理',
-             '<b>依赖 ②</b>（frida-server 形态）；gadget 形态依赖重打包'],
-            ['<b>⑤ 调试器</b>',
-             '断点、单步、看寄存器与内存（唯一的第一手现场）',
-             '只能靠打印与猜测；native 算法基本没法读',
-             '目标可调试（JDWP 可达 / debuggable）；<b>不依赖 root</b>'],
-            ['<b>⑥ 观测层</b>（logcat / Profiling / trace）',
-             '把「发生过什么」变成可读记录，把偶发变成可复现',
-             '每次都要重新触发，且无法做时间维度的对比',
-             '几乎不依赖别的东西——这也是它总该被先试的原因']
-          ]) +
-        T.note('warn', '⚠️ 这张表的读法：不是「先做①再做②」的流水线',
-          '<p style="margin-bottom:0">它是<b>依赖图</b>，不是<b>工序表</b>。' +
-          '上表最后一列才是顺序信息；中间那列才是价值信息。<br>' +
-          '很多人的时间浪费在「按教程从第 1 步做到第 7 步」，而正确做法是：' +
-          '<b>先确定这次任务需要哪种观测，再只配那一块。</b>抓一个 HTTP 接口不需要 Hook 框架；' +
-          '读一个 native 算法不需要抓包证书。</p>') +
-        T.note('key', '📐 与其它章的分工（本章不重复讲原理）',
-          '<p style="margin-bottom:0">' +
-          '<b>Frida 的注入原理与脚本写法</b> → 第 1 章；' +
-          '<b>Frida 的特征与对抗、改名换端口、maps 过滤</b> → 第 10 章；' +
-          '<b>objection / r0capture / r0tracer / ModuleMap</b> → 第 21 章；' +
-          '<b>LSPosed 的注入链路与模块开发</b> → 第 22 章；' +
-          '<b>HTTPS、Android 7 的信任变化、抓包安装与诊断</b> → 第 23 章；' +
-          '<b>Magisk systemless 与启动链路</b> → 第 18 章。<br>' +
-          '本章只做两件事：<b>把「怎么搭起来」和「每步失败长什么样」说明白</b>，' +
-          '以及<b>把散在各章的定位方法收成七条线索</b>。</p>'),
-      stage: {
-        title: '环境总览 · 五块拼图与依赖链',
-        speed: 1900,
-        render:
-          '<div class="flow-col" style="gap:9px">' +
-            '<div class="flow-row"><span class="pill mono">底座</span>' +
-              '<span class="blk" id="blk-dev">① 设备：真机 / 模拟器</span>' +
-              '<span class="muted small">决定「App 看到的世界」</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 真机需解锁 bootloader</span></div>' +
-            '<div class="flow-row"><span class="pill mono">能力</span>' +
-              '<span class="blk" id="blk-root">② root（Magisk systemless）</span>' +
-              '<span class="muted small">系统分区 / 注入 / 信任库</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 有 root 才能做这两件事</span></div>' +
-            '<div class="flow-row"><span class="pill mono">观测</span>' +
-              '<span class="blk" id="blk-cert">③ 抓包证书进系统库</span>' +
-              '<span class="blk" id="blk-hook">④ Hook 框架（按需 / 常驻）</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 与上面两条并列，不依赖 root</span></div>' +
-            '<div class="flow-row"><span class="pill mono">现场</span>' +
-              '<span class="blk" id="blk-dbg">⑤ 调试器（JDWP / IDA attach）</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 所有动作最终都落到这一层</span></div>' +
-            '<div class="flow-row"><span class="pill mono">记录</span>' +
-              '<span class="blk" id="blk-ob">⑥ 观测层：logcat / Profiling / trace</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="mark">🎯 缺哪一块，就等于少了一种观测</span></div>' +
-            '<div class="note" id="diag"><div class="note-h">缺口诊断</div>' +
-              '<p style="margin-bottom:0">点「播放」，逐块点亮，并看清每一块缺了之后你会失去什么。</p></div>' +
-          '</div>',
-        reset: () => {
-          ['blk-dev', 'blk-root', 'blk-cert', 'blk-hook', 'blk-dbg', 'blk-ob'].forEach(i => S(i, ''));
-          CLS('mark', 'pill bad');
-          SET('mark', '🎯 缺哪一块，就等于少了一种观测');
-          SET('diag', '<div class="note-h">缺口诊断</div><p style="margin-bottom:0">点「播放」，逐块点亮，并看清每一块缺了之后你会失去什么。</p>');
-        },
-        steps: [
-          { run: () => S('blk-dev', 'active'),
-            note: '<b>① 设备：一切的底座。</b>真机与模拟器的差别不在性能，在<b>「它让 App 看到什么」</b>：' +
-                  '属性、传感器、指令特征、缺失的内核启动痕迹，全都是可检测的差异（第 15、16 章）。' +
-                  '<span class="hit">选设备的真正判据是：这台机器像不像一台真实的手机。</span>' },
-          { run: () => { S('blk-dev', 'done'); S('blk-root', 'active'); },
-            note: '<b>② root：买到「系统级权限」这一大类观测。</b>它的三种用途分别是：' +
-                  '读写系统分区（装证书、换配置）、向别的进程注入（Hook）、' +
-                  '以及观测别的进程（读别人的 maps / 内存）。<br>' +
-                  '<span class="miss">代价在三十章之前就该知道：解锁 bootloader 会清数据、可能熔断、影响保修。</span>' },
-          { run: () => { S('blk-root', 'done'); S('blk-cert', 'active');
-                         SET('diag', '<div class="note-h">缺口诊断 · 没有 root</div><p>装系统证书这条路直接断掉。你剩下两个选择：<b>重打包 APK</b>（把信任用户证书的声明写进 manifest），或者<b>让抓包工具走别的观测面</b>（socket / SSL 层 hook，第 21、23 章）。<br><b>先想清楚你能否接受重打包的代价</b>：签名变了，完整性校验、第三方 SDK 校验、升级都会受影响。</p>'); },
-            note: '<b>③ 抓包证书：依赖 root 的那一半。</b>Android 7 之后用户证书默认不被 App 信任，' +
-                  '所以「把证书塞进系统库」成了标准动作（第 23 章有完整原理与安装步骤）。<br>' +
-                  '<b>这里只记一句：</b>没 root 不等于抓不到包，只是路线从「装证书」变成「改 APK 声明」。' },
-          { run: () => { S('blk-cert', 'done'); S('blk-hook', 'active');
-                         SET('diag', '<div class="note-h">缺口诊断 · 有 root，但不想常驻</div><p>这正是 <b>frida-server（按需注入）</b>与 <b>LSPosed（常驻）</b>的分界线：前者每次开工都要重建现场，后者装好就一直生效。<b>取舍一句话：按需注入适合一次性深挖，常驻适合长期值守与批量观测。</b>细节在第 21、22 章。</p>'); },
-            note: '<b>④ Hook 框架：两种形态。</b>frida-server 是独立进程 + 你主动连接（按需注入）；' +
-                  'LSPosed 挂在 Zygote 上，每个 App 进程一出生就带着模块（常驻）。<br>' +
-                  '<span class="hit">它们的部署差异会直接改变你的工作节奏，而不只是改变检测面。</span>' },
-          { run: () => { S('blk-hook', 'done'); S('blk-dbg', 'active');
-                         SET('diag', '<div class="note-h">缺口诊断 · 调试器挂不上</div><p>先分清两类原因：<b>环境没配对</b>（没开 USB 调试、目标不是 debuggable、JDWP 没转发到），还是<b>对方检测到调试器并主动退出</b>。<br>前者是配置问题，五分钟能修；后者是设计好的对抗，要靠抢时序或换观测面。<b>把它当成同一类问题处理，就是浪费一下午的开始。</b></p>'); },
-            note: '<b>⑤ 调试器：唯一能看到「现场」的东西。</b>寄存器、内存、栈上的局部变量，' +
-                  '这些东西在 hook 里都只能猜。而它<b>不依赖 root</b>——依赖的是目标可调试。<br>' +
-                  '所以「没 root」从来不是放弃动态调试的理由；「目标不是 debuggable」才是。' },
-          { run: () => { S('blk-dbg', 'done'); S('blk-ob', 'active');
-                         SET('mark', 'pill warn'); SET('mark', '⚠️ 五块都亮了——现在的问题变成「先付哪一笔成本」'); },
-            note: '<b>⑥ 观测层：所有动作的最终产物。</b>logcat、Method Profiling、指令级 trace——' +
-                  '它们把「我看到了」变成「我能拿着它对比」。<br>' +
-                  '<span class="hit">这一层是唯一「几乎零依赖」的层：不 root、不注入、不改包，也可能拿到关键线索。</span>' +
-                  '所以它在下一节的七条线索里排得很靠前。' },
-          { run: () => { CLS('mark', 'pill ok'); SET('mark', '✅ 地图建好了：现在开始逐块谈代价');
-                         SET('diag', '<div class="note-h">地图的用法</div><p style="margin-bottom:0">拿到一个任务，先问：<b>这次我需要哪种观测？</b>需要看明文 → ③；需要看参数 → ④；需要看寄存器 → ⑤；需要看「谁调用了谁」 → ⑥。<br>然后只配那一块。<b>配环境应该由任务驱动，而不是由教程驱动。</b></p>'); },
-            note: '<b>收尾：把地图变成配额。</b>真实项目里时间有限，你不可能每次都把五块配齐。' +
-                  '所以每次开工前花两分钟做一次「观测需求 → 拼图」的映射，比盲目折腾环境划算得多。<br>' +
-                  '<b>下一节开始逐块讲代价：root、证书、Hook 环境、DEBUG 环境。</b>' }
-        ]
-      },
-      quiz: {
-        id: 'q30-1', chapter: 30, answer: 2,
-        stem: '你接到的任务是：<b>把一个 App 里「本地计算出来的签名参数」还原来</b>，' +
-              '而这个计算发生在 so 里。设备是一台已经 root 的测试机，但抓包证书还没装。' +
-              '按本章的「观测需求 → 拼图」思路，<b>最该先配的是哪一块？</b>',
-        options: [
-          { t: '先把抓包证书装进系统库——没有抓包就没有输入输出，什么都做不了',
-            why: '抓包能把请求和响应拿到，但它回答不了「这个签名是怎么算出来的」。目标是本地计算，观测点应该在计算发生的地方，而不是网络边界。证书这件事对你的任务不是瓶颈。' },
-          { t: '先把调试环境配好（am start -D / JDWP），因为调试器不依赖 root，看起来最省事',
-            why: '调试器确实是这五块里唯一不依赖 root 的，但它解决的是「停在哪一行」。你连函数在哪都还没定位，此时配调试器没有观察对象——它会在七条线索的后半段才真正值钱。' },
-          { t: '先确认 Hook 环境可用（能注入、能拿到 so 的基址与符号信息），因为参数与寄存器信息只能从运行时拿',
-            why: '正确。目标在 so 里做本地计算，这类任务的核心观测是「运行时参数、内存、寄存器」。有了注入能力，你才有资格去谈字符串搜索、调用栈、Profiling 这些线索；证书与调试器都可以等。' },
-          { t: '五块一起配齐最稳妥，缺一块都会在某个环节卡住',
-            why: '「全配齐」听起来稳妥，实际是把成本乘以五。本章反复强调的判据是：环境的每一块都要对应一个具体的观测需求，没有需求的那一块就是纯支出。' }
-        ],
-        explain: '<b>这道题考的是「由观测需求反推环境」，而不是背清单。</b><br>' +
-                 '任务的关键信息有两条：<b>① 计算发生在 so 里</b>（本地计算，不走网络）；' +
-                 '<b>② 你要还原的是参数</b>（要的是输入输出与中间状态）。<br>' +
-                 '能同时满足这两条的只有运行时注入这一类能力，对应拼图 ④（以及它依赖的 ②）。' +
-                 '抓包证书服务于网络观测，调试器服务于「停下来看」——它们都是好工具，但都不是这个任务的第一笔支出。<br>' +
-                 '<span class="hit">环境配置没有标准答案，只有「针对这次任务的最优支出」。</span>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">你拿到了一张依赖图，并且知道了它的正确读法：' +
-        '<b>「缺哪一块」等于「少哪种观测」</b>，而不是「没按顺序做」。<br>' +
-        '接下来三节把 root、证书、Hook 与 DEBUG 环境逐个讲清——只讲代价与失败现象，principle 全部指回对应的章节。</p>')
+        T.note('key', '🔑 本章主线',
+          '<p>模拟器 = <b>指令翻译方案</b> + <b>内核/系统镜像方案</b> + <b>虚拟化底座</b>。三块拼起来，才是一台「虚拟安卓设备」。</p>'
+          + '<p>本章按这个顺序讲：先把 <b>ARM→x86 翻译</b>讲透（30.2–30.3），再讲 <b>GKI 内核</b>怎么组织、怎么换（30.4–30.5），再看 Google 官方的 <b>Cuttlefish</b>（30.6），最后把模拟器、Cuttlefish、云手机、Waydroid 放进一张谱系图（30.7）。</p>')
+        + T.grid(2, [
+          '<div class="card"><div class="card-title">看得见的一层：模拟器是个「软件」</div><p>你双击 emulator，出现一个安卓窗口。这一层谁都会用。</p></div>',
+          '<div class="card"><div class="card-title">看不见的一层：它是一台「机器」</div><p>它有内核、有 <span class="mono">/proc</span>、有属性系统、有分区表、有设备节点。App 通过 <span class="mono">Build.*</span>、<span class="mono">System.getProperty</span>、读取 <span class="mono">/proc</span>、<span class="mono">/sys</span> 就能「感知」到这是一台什么机器。</p></div>'
+        ])
+        + T.note('', '这对逆向有什么用（本章必须回答的问题）',
+          '<p><b>① 识别环境</b>——风控 SDK 判断「你是不是模拟器」，靠的是一串<b>环境特征</b>：<span class="mono">ro.kernel.qemu</span>、硬件名 <span class="mono">goldfish</span>/<span class="mono">ranchu</span>、渲染器 <span class="mono">SwiftShader</span>、设备节点 <span class="mono">/dev/qemu_pipe</span>、<span class="mono">/dev/socket/genyd</span> 等。这些字符串不是随机出现的，它们<b>是这套虚拟化架构的必然产物</b>：Goldfish 是模拟器的虚拟硬件平台，ranchu 是它的新一代实现，qemu_pipe 是 guest 与宿主 emulator 进程通信的通道。你只有理解了「谁生成了这个文件/属性」，才知道它能不能删、删了会怎样。</p>'
+          + '<p><b>② 定制隐蔽环境</b>——想做一个「看起来像真机」的模拟器，你必须改三处：<b>属性系统</b>（ro.* 只读属性从哪来、怎么在编译期或 <span class="mono">default.prop</span> 层改）、<b>内核</b>（内核启动参数、<span class="mono">/proc</span> 里的痕迹、驱动名字）、<b>系统镜像里的文件</b>（设备节点、传感器列表、相机 HAL）。不知道系统镜像怎么组织，就只能改改 <span class="mono">build.prop</span> 骗骗最弱的检测。</p>'
+          + '<p><b>③ 云手机的基础</b>——云手机本质就是<b>跑在服务器上的安卓虚拟设备</b>。理解了 Cuttlefish 的组成（宿主 Linux + KVM + 虚拟设备 + 编排），云手机就不再神秘：它把 Cuttlefish 这类方案做成了多租户、带串流和运维的服务。</p>'
+          + '<p><b>④ KVM 是共同底座</b>——QEMU、Cuttlefish、crosvm 都依赖 KVM 做硬件虚拟化。所以「为什么模拟器只能在特定 CPU/系统上跑得快」，答案在 KVM 的可用性上。</p>')
+        + T.note('warn', '⚠️ 两个容易混淆的词',
+          '<p><b>「模拟」（emulation）</b>：用软件解释另一套指令集，guest 架构可以 ≠ host 架构。<br><b>「虚拟化」（virtualization）</b>：CPU 硬件直接执行 guest 指令，要求 guest 架构 = host 架构（x86 上跑 x86）。<br>本章大部分性能结论，都来自「你到底在用哪一个」。</p>')
     },
 
-    /* ============================================================ 30.2 */
+    /* ================= 30.2 ================= */
     {
-      h: '30.2', title: '真机 root：先算代价，再动手，而且 root 本身就是信号',
+      h: '30.2',
+      title: 'ARM 指令在 x86 上的两条翻译路径',
       html:
-        '<p>先说结论：<b>root 是本章所有能力里唯一一笔「不可逆」的支出</b>。' +
-        '别的东西配错了可以重来，解锁 bootloader 带来的后果往往跟着这台机器一辈子。' +
-        '所以这一节把代价放在最前面。</p>' +
-        T.tbl(
-          ['代价', '具体表现', '为什么不可逆 / 难逆转'],
-          [
-            ['<b>清空用户数据</b>', '解锁那一步会触发一次全盘擦除（相当于恢复出厂）',
-             '这是安全设计，不是可以绕过的步骤：解锁的前提就是「证明这台机器的主人愿意放弃数据」'],
-            ['<b>熔断（部分机型）</b>', '某些安全特性一旦解锁就永久失效，之后即使刷回官方系统也不会恢复',
-             '实现方式通常写死在硬件/安全启动链的存储位上，属于「一次性」标记'],
-            ['<b>保修与售后</b>', '不少厂商把解锁状态当作拒保依据；有些机型会改开机提示',
-             '厂商策略，随机型与地区变化 —— 这一条<b>必须按你自己的机型了解当期政策</b>'],
-            ['<b>部分 App 直接拒绝运行</b>', '风控、支付、金融、部分游戏会在 root 环境里拒绝启动或降级功能',
-             '这正是本节后半段要讲的：<b>root 自己就是一个可被观测的特征</b>'],
-            ['<b>系统更新变麻烦</b>', 'OTA 通常需要先恢复原状；跨版本升级常常要重新走一遍流程',
-             'root 方案与系统版本强耦合（第 12 章讲过 ART 结构逐版本变化，同一件事在不同版本代价不同）']
-          ]) +
-        T.note('key', '🔑 systemless：Magisk 的关键词，但原理不在这里讲',
-          '<p>Magisk 的核心思路是 <b>systemless（不碰系统分区）</b>：把定制内容放在一个被挂载/覆盖上去的层里，' +
-          '系统分区本身保持「和官方一模一样」。这样做的收益有三条：</p>' +
-          '<ul>' +
-          '<li><b>OTA 与完整性校验更容易过</b>——系统分区的镜像没被改过。</li>' +
-          '<li><b>卸载干净</b>——移除覆盖层，系统回到出厂状态，不像改分区那样留下永久修改。</li>' +
-          '<li><b>模块化</b>——证书、Hook 模块都以「模块」的形式叠加上去，彼此独立、可分别开关。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0">它具体怎么改 ramdisk、怎么实现挂载覆盖、Zygisk 又插在哪一层，' +
-          '<b>第 18 章讲得很细，本节不复述</b>。这里只需要记住一个推论：' +
-          '<span class="hit">因为它是「挂载层」的定制，所以它的痕迹也是「挂载层」的痕迹</span>——' +
-          '这正是部分风控会去读 mount 信息的原因。</p>') +
-        '<h4>root 之后：能做什么，不能做什么</h4>' +
-        T.grid(2, [
-          T.card('✅ root 能给你的',
-            '<ul>' +
-            '<li>把证书放进<b>系统信任库</b>（或用模块把证书库替换掉）</li>' +
-            '<li>向目标进程<b>注入</b>（frida-server / gadget / 内核模块）</li>' +
-            '<li>读别的进程的 <span class="mono">/proc/&lt;pid&gt;/maps</span>、内存、fd</li>' +
-            '<li>改系统属性、换 hosts、装系统级 App</li>' +
-            '<li>用<b>内核态</b>的手段观测（第 11、13 章的 eBPF / 内核模块路线）</li>' +
-            '</ul>'),
-          T.card('❌ root 不能给你的',
-            '<ul>' +
-            '<li>它<b>不能让你看懂代码</b>——root 只是权限，不是理解</li>' +
-            '<li>它<b>不能让反调试失效</b>：TracerPid、调试标志、时序检测与 root 无关</li>' +
-            '<li>它<b>不能绕过服务端风控</b>：设备指纹、行为模型都在服务端</li>' +
-            '<li>它<b>不能隐藏自己</b>：root 的存在本身就是一组可读特征（见下）</li>' +
-            '<li>它<b>不能替代静态分析</b>：很多结论仍然要从代码结构里读出来</li>' +
-            '</ul>')
-        ]) +
-        T.note('warn', '⚠️ 风控视角：root 是一次「自我举报」',
-          '<p>站在检测方的角度，一个 root 设备会同时给出下面这些信号（它们互相独立，但都指向同一件事）：</p>' +
-          '<ul>' +
-          '<li><b>su 可执行文件与它的调用痕迹</b>——最经典的一条。</li>' +
-          '<li><b>挂载信息异常</b>：systemless 的覆盖层会在 mount 表里留下与官方不同的条目。</li>' +
-          '<li><b>系统分区校验失败</b>：部分完整性校验会去比对分区内容或 dm-verity 状态。</li>' +
-          '<li><b>属性与文件系统痕迹</b>：Magisk 相关目录、属性、App 包名。</li>' +
-          '<li><b>可注入性本身</b>：能注入意味着任何人都能改这个进程的行为——这才是风控真正在意的东西。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><span class="hit">所以「root 之后如何不被发现」是个独立课题</span>，' +
-          '它的主战场不在本章（第 10、13、18、21 章分别从 Frida 特征、内核绕过、容器环境、去特征四个角度讲）。' +
-          '本章的立场是：<b>先把 root 当成一笔明码标价的支出，再决定这次任务值不值得付。</b></p>') +
-        T.note('warn', '📌 版本与命令的时效性',
-          '<p style="margin-bottom:0">解锁 bootloader、修补镜像、刷入、验证 root 这一整套动作，' +
-          '<b>命令名、分区名、参数名在厂商之间、在 Android 大版本之间都不统一</b>' +
-          '（例如 Android 13 之后出现了 init_boot 分区，修补对象随之变化）。<br>' +
-          '本节下面终端里出现的命令是<b>形状示意</b>，都标了 <span class="pill warn">待核实</span>——' +
-          '<b>一律以你的机型的官方说明与工具当期文档为准</b>，不要照抄。</p>'),
+        '<p>x86 电脑要跑安卓，第一条拦路虎是<b>指令集不同</b>：安卓生态的原生库（<span class="mono">.so</span>）绝大多数是 <b>ARM/ARM64</b> 的，而你的 PC 是 <b>x86_64</b>。让它们合作，历史上有两条完全不同的路。</p>'
+        + T.note('', '路径 A · 全系统模拟（QEMU + TCG）',
+          '<p>Android 官方模拟器早期走的是这条路：用 <b>QEMU 全系统模拟</b>跑一个完整的 ARM 安卓系统。<span class="term" data-def="Tiny Code Generator，QEMU 内置的动态二进制翻译引擎">TCG</span> 把 guest 的 ARM 指令<b>逐条</b>翻译成等价的 x86 指令（并按基本块缓存成 TB，Translation Block）。</p>'
+          + '<p>缺点很直观：<b>整个系统</b>——内核、Android 运行时、每一行 Java、每一个系统服务——都在被翻译。哪怕只是滑动桌面，背后也是几十万条 ARM 指令被逐条转译。这就是当年「模拟器慢到没法用」的根因。</p>')
+        + T.note('', '路径 B · 应用级翻译（x86 镜像 + 翻译层）',
+          '<p>现代方案换了个思路：<b>让安卓系统本身就是 x86 的</b>（系统镜像 <span class="mono">x86_64</span>，原生速度运行），只有 <b>App 里那些 ARM 的 <span class="mono">.so</span></b> 在运行时被翻译。</p>'
+          + '<p>承担翻译的是两个<b>应用级</b>翻译层：<b><span class="term" data-def="Intel 提供的 ARM→x86 二进制翻译层，让 x86 安卓系统能运行 ARM 的原生库（.so）。Intel 已停止维护">libhoudini</span></b>（Intel 的 ARM→x86 二进制翻译层，已停止维护）和 <b><span class="term" data-def="Google 在 NDK 体系下延续的 ARM→x86 翻译层方案，作用与 libhoudini 类似">libndk_translation</span></b>（Google 在 NDK 体系里延续的方案）。它们挂在运行时的库加载路径上：当 <span class="mono">System.loadLibrary</span> 加载到一个 ARM 架构的 <span class="mono">.so</span> 时，由翻译层接管，把 ARM 代码翻译成 x86 执行。</p>'
+          + '<p>关键区别：<b>需要被翻译的代码比例从 100% 掉到了个位数</b>。这就是为什么现代模拟器、云手机几乎都偏好「x86 系统镜像 + 翻译层」。</p>')
+        + T.note('warn', '⚠️ 硬件加速解决的是「另一个问题」',
+          '<p><b><span class="term" data-def="Hardware Accelerated Execution Manager，Intel 的硬件加速方案，让 QEMU 借助 VT-x 直接执行 guest 指令">HAXM</span></b>（Hardware Accelerated Execution Manager）和 <b>AMD Hyper-V</b> 是<b>硬件加速</b>：让 QEMU 借助 CPU 的虚拟化扩展（VT-x / AMD-V）直接执行 guest 指令，不再逐条软件翻译。</p>'
+          + '<p>但它们有一个硬条件：<b>guest 与 host 必须同架构</b>。也就是说，HAXM/Hyper-V 能让 x86 镜像跑得飞快，<b>却不能</b>让 ARM 镜像跑得快——ARM 镜像仍然只能退回 TCG 软翻译。这条限制是整个模拟器选型的物理边界。</p>')
+        + T.tbl(['方案', '跑的安卓系统是什么架构', '翻译发生在哪', '性能直觉'], [
+          ['QEMU + TCG', 'ARM / ARM64（全系统）', '每一条 ARM 指令', '<span class="miss">慢</span>'],
+          ['QEMU + HAXM / Hyper-V', 'x86 / x86_64', '<span class="hit">不翻译</span>，硬件直跑', '<span class="hit">接近原生</span>'],
+          ['x86 镜像 + libhoudini / libndk_translation', 'x86_64 系统 + ARM App', '只有 App 的 ARM <span class="mono">.so</span>', '<span class="hit">快得多</span>']
+        ]),
+      stage: {
+        title: 'ARM 指令在 x86 上的两条执行路径（对比动画）',
+        speed: 1900,
+        render:
+          '<div class="flow-row">'
+          + '<div class="flow-col">'
+          + '<div class="blk" id="p1">① ARM 安卓系统镜像<br><span class="small">内核 + 运行时 + 全部 App，全是 ARM 指令</span></div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="blk" id="p2">② QEMU TCG 全系统翻译<br><span class="small">逐条 ARM → 等价 x86，缓存为 TB</span></div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="blk" id="p3">③ x86 CPU 执行翻译结果</div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="pill" id="p4">待评估</div>'
+          + '</div>'
+          + '<div class="flow-col">'
+          + '<div class="blk" id="q1">① x86_64 安卓系统镜像<br><span class="small">系统本身是原生指令，不翻译</span></div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="blk" id="q2">② Java / Kotlin 代码 → ART 直接执行<br><span class="small">x86 后端，原生速度</span></div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="blk" id="q3">③ App 里的 ARM .so<br><span class="small">libhoudini / libndk_translation 翻译</span></div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="blk" id="q4">④ x86 CPU 执行</div>'
+          + '<div class="arrow">↓</div>'
+          + '<div class="pill" id="q5">待评估</div>'
+          + '</div>'
+          + '</div>',
+        reset: () => {
+          ['p1', 'p2', 'p3', 'q1', 'q2', 'q3', 'q4'].forEach((id) => S(id, ''));
+          CLS('p4', 'pill'); SET('p4', '待评估');
+          CLS('q5', 'pill'); SET('q5', '待评估');
+        },
+        steps: [
+          { run: () => S('p1', 'active'),
+            note: '<b>左路起点：整个系统都是 ARM。</b>内核、ART 运行时、SystemServer、每一个 App 的每一行代码——没有任何一部分是 x86 原生的。这意味着<b>没有任何东西可以幸免于翻译</b>。' },
+          { run: () => { S('p1', 'done'); S('p2', 'active'); },
+            note: '<b>QEMU TCG 上场。</b>它把 ARM 指令逐条翻译成等价的 x86 指令序列，并把一段连续代码（基本块）的翻译结果缓存成 TB（Translation Block），下次执行同一块就直接复用。缓存能缓解、但消除不了开销：<b>第一次经过的每一条指令都要翻译</b>。' },
+          { run: () => { S('p2', 'done'); S('p3', 'active'); },
+            note: '<b>x86 CPU 执行的是「翻译产物」。</b>注意：CPU 完全不知道自己在跑安卓——它只是在跑 TCG 生成的 x86 代码。多了一层间接，寄存器映射、标志位模拟、内存访问检查都要额外开销。' },
+          { run: () => { S('p3', 'done'); SET('p4', '慢'); CLS('p4', 'pill bad'); },
+            note: '<b>结论：慢，而且慢在根上。</b>不是「QEMU 写得不好」，而是<b>100% 的代码都要过翻译器</b>。再怎么优化 TCG，这个比例也降不下来——除非换架构。' },
+          { run: () => S('q1', 'active'),
+            note: '<b>右路起点：系统本身就是 x86_64。</b>系统镜像、内核、ART 都是 x86 原生指令。<span class="hit">这一层完全不需要翻译</span>——前提是 CPU 支持硬件虚拟化（HAXM / Hyper-V / KVM），让 guest 代码直接跑在真实 CPU 上。' },
+          { run: () => { S('q1', 'done'); S('q2', 'active'); },
+            note: '<b>App 的 Java/Kotlin 层也是原生的。</b>ART 有 x86 后端，DEX 字节码编译出的就是 x86 机器码。绝大多数 App 的绝大部分代码在这一层——<b>它们以原生速度运行</b>。' },
+          { run: () => { S('q2', 'done'); S('q3', 'active'); },
+            note: '<b>问题只剩一个角落：App 里的 ARM <span class="mono">.so</span>。</b>加固壳、算法库、音视频引擎、游戏引擎——这些原生库通常只带 ARM 版本。当加载器发现它是 ARM 架构时，交给翻译层（libhoudini / libndk_translation）处理。' },
+          { run: () => { S('q3', 'done'); S('q4', 'active'); },
+            note: '<b>翻译只发生在 .so 的边界内。</b>翻译层把 ARM 指令转成 x86 执行，并对 Java 层保持透明。翻译的代码量从「整个系统」缩小到「App 的原生库」，通常只占总执行量的很小一部分。' },
+          { run: () => { S('q4', 'done'); SET('q5', '快得多'); CLS('q5', 'pill ok'); },
+            note: '<b>结论：快得多。</b>不是因为翻译质量更高，而是因为<b>需要翻译的比例极低</b>。这就是现代模拟器、云手机普遍选择 x86 系统镜像 + 翻译层的原因——把翻译成本从「全民负担」变成「局部负担」。' },
+          { run: () => {
+              CLS('p4', 'pill bad'); SET('p4', '慢 · 100% 代码过翻译器');
+              CLS('q5', 'pill ok'); SET('q5', '快 · 只有 ARM .so 过翻译器');
+              S('p1', 'hot'); S('q1', 'cool');
+            },
+            note: '<b>一句话记住这条分界线。</b><span class="bad">全系统模拟</span>翻译的是「整个操作系统」；<span class="hit">应用级翻译</span>翻译的是「App 里的 ARM 原生库」。前者是架构决定的必然代价，后者是可优化的局部成本。<b>选型时先问一句：我到底需要翻译多少代码？</b>' }
+        ]
+      },
+      after: T.note('', '对逆向的直接含义',
+        '<p>① 在 x86 模拟器上抓一个 App 的 ARM <span class="mono">.so</span>，你看到的执行并不完全等价于真机——翻译层可能有自己的行为差异（比如对某些指令、对内存模型的模拟）。做<b>反调试验证</b>时要把这层差异算进去。</p>'
+        + '<p>② 反过来，<b>翻译层的存在本身就是环境特征</b>：某些加固/风控会检测进程里是否加载了 <span class="mono">libhoudini</span>、<span class="mono">libndk_translation</span> 相关的库。你在做环境伪装时，这属于要清理的清单之一。</p>')
+    },
+    /* ================= 30.3 ================= */
+    {
+      h: '30.3',
+      title: '自己编译一个安卓模拟器与系统镜像',
+      html:
+        '<p>官方 emulator 是二进制分发的，但你可以<b>从 AOSP 源码</b>把模拟器（<span class="mono">emulator</span>）和系统镜像一起编出来。这条路走通一次，你就拥有了「完全可控的安卓环境」——包括内核、属性、驱动、预置文件。<span class="pill warn">待核实</span> 具体 target 名称随 AOSP 版本变化，请以你所用分支的 <span class="mono">lunch</span> 列表为准。</p>'
+        + T.note('', '编出来的到底是什么',
+          '<p>一条命令产出的其实<b>不止模拟器程序</b>，而是三样东西：</p>'
+          + '<p>① <b>系统镜像</b>：<span class="mono">system.img</span>（Android 框架与系统应用）、<span class="mono">vendor.img</span>（厂商 HAL）、<span class="mono">boot.img</span>（内核 + ramdisk）等；<br>'
+          + '② <b>模拟器程序</b> <span class="mono">emulator</span>：本质是 QEMU 的一个定制分支 + 配套工具；<br>'
+          + '③ <b>镜像包目录</b>：让 emulator 知道去加载哪套镜像、用什么虚拟硬件（Goldfish / ranchu 平台）。</p>'
+          + '<p>所以「编译模拟器」和「编译系统镜像」是一起完成的——这也是为什么自编译环境最容易做深度定制。</p>')
+        + T.note('warn', '<span class="pill warn">待核实</span> 的边界',
+          '<p>下面终端里的 <b>target 名称</b>（<span class="mono">aosp_x86_64-eng</span>、<span class="mono">sdk_phone_x86_64</span>）在不同 AOSP 分支上存在差异，<span class="mono">eng</span>/<span class="mono">userdebug</span>/<span class="mono">user</span> 三种变体的可用性也不完全一致。<b>不要背 target 名，要会看 lunch 列表。</b></p>'),
       term: {
-        title: 'root 判定链：从解锁到「确认真的拿到了 root」',
+        title: 'AOSP：从源码到可启动的模拟器',
         lines: [
-          { t: 'd', s: '# 判定链共四段：设备可见 → 进入可刷写模式 → 完成解锁 → 验证权限真的到手' },
-          { t: 'p', s: 'adb devices',
-            note: '先确认设备对主机可见。<b>这一步失败就是驱动 / 授权 / 线材问题</b>，与 root 无关——' +
-                  '但它是后面所有步骤的前提，所以永远从它开始。' },
-          { t: 'o', s: 'List of devices attached\n0A1B2C3D4E    device',
-            note: '看到 <span class="mono">device</span> 才算通。若是 <span class="mono">unauthorized</span>，' +
-                  '去设备上确认「允许 USB 调试」弹窗；若是 <span class="mono">offline</span>，先重启 adb 服务。' },
-          { t: 'p', s: 'adb reboot bootloader',
-            note: '进入 bootloader / fastboot 模式。' +
-                  '<span class="pill warn">待核实</span>：不同厂商进入方式不同（按键组合、专用工具、甚至需要在系统设置里先打开某个开关），' +
-                  '以机型说明为准。' },
-          { t: 'p', s: 'fastboot devices',
-            note: '确认此时主机能看到处于可刷写模式的设备。<b>看不到就停在这里</b>，' +
-                  '不要往下试解锁命令——那只会让你以为是「解锁被拒绝」。' },
-          { t: 'p', s: 'fastboot flashing unlock   （或 fastboot oem unlock）',
-            note: '<span class="pill warn">待核实</span>：<b>这条命令的名字是最不该照抄的东西。</b>' +
-                  '不同厂商、不同年代用的是不同的子命令；有的机型还要先在系统里做一次「允许解锁」。<br>' +
-                  '<b>真正需要你带走的判断是：执行它之前，先确认「这台机器的数据可以被清空」。</b>' },
-          { t: 'o', s: '(bootloader) Start unlock flow\nOKAY [  0.032s]',
-            note: '看到解锁流程启动。<b>接下来设备通常会自动清空数据并重启</b>——' +
-                  '这一步没有回头路（想恢复锁定状态一般还要再走一次同样的擦除）。' },
-          { t: 'e', s: 'FAILED (remote: Flashing Unlock is not allowed)',
-            note: '<b>这是最常见的一种「此路不通」。</b>含义是：这台设备在服务端/固件层就没有开放解锁。' +
-                  '通常是运营商定制机、部分企业机型或特定地区版本。<br>' +
-                  '<span class="hit">它给出的信息很有价值：你不需要再折腾工具链了，换设备是唯一解。</span>' },
-          { t: 'p', s: '(重启进系统 → 用 Magisk 修补官方 boot / init_boot 镜像 → 刷回该分区)',
-            note: '这一段是「形状」，不是步骤清单。<b>细节全部省略的理由是它随版本变化太快</b>：' +
-                  '修补对象（boot 还是 init_boot）、刷入方式（fastboot 还是 recovery 还是专用工具）' +
-                  '都取决于机型与系统版本。<span class="pill warn">待核实</span>——以官方安装说明为准。<br>' +
-                  '第 18 章讲过 systemless 的原理，这里只要知道：<b>你改的是「被挂载的镜像」，不是系统分区本身。</b>' },
-          { t: 'p', s: 'adb shell "su -c id"',
-            note: '<b>唯一有效的验证方式：让 su 真的执行一条命令，看它返回什么身份。</b>' +
-                  '不要用「Magisk App 里显示已安装」当证据——那只证明模块装上了，不证明你的 shell 能拿到 root。' },
-          { t: 'o', s: 'uid=0(root) gid=0(root)',
-            note: '看到 <span class="mono">uid=0</span> 才算真的通了。' +
-                  '如果这里报 <span class="mono">permission denied</span> 或 <span class="mono">not found</span>，' +
-                  '说明 root 授权没准备好（授权弹窗没点、或权限没给到这个 App）。' },
-          { t: 'w', s: '⚠️ 到这一步，任务刚刚开始：你同时也变成了一台「可被判定为 root 的设备」',
-            note: '<b>把这句话记住。</b>验证成功的同一秒钟，你在风控眼里也从一个普通设备变成了高风险管理对象。' +
-                  '接下来决定要不要做隐藏、隐藏到什么程度，取决于你的目标 App；' +
-                  '而那部分内容属于第 10、13、21 章。<b>本节只负责让你知道：这笔账在配环境时就已经记上了。</b>' }
+          { t: 'p', s: 'repo init -u https://android.googlesource.com/platform/manifest -b <分支名>',
+            note: '<b>拉取清单。</b>AOSP 由上千个 git 仓库组成，<span class="mono">repo</span> 是 Google 包的一层管理工具。<span class="mono">-b</span> 指定分支（如某个 <span class="mono">android-XX.Y.Z_rN</span> 标签）。<span class="pill warn">待核实</span> 具体分支名请查官方发布页。' },
+          { t: 'p', s: 'repo sync -c -j8',
+            note: '<b>同步源码。</b>几十到上百 GB，是这一步最耗时的部分。<span class="mono">-c</span> 只拉当前分支，<span class="mono">-j8</span> 是并发数。' },
+          { t: 'p', s: 'source build/envsetup.sh',
+            note: '<b>引入构建环境。</b>这个脚本把 <span class="mono">lunch</span>、<span class="mono">m</span>、<span class="mono">mm</span>、<span class="mono">croot</span> 等命令注入当前 shell。<b>每个新终端都要重新 source 一次</b>——这是新手最常踩的坑：新开窗口直接敲 lunch，提示 command not found。' },
+          { t: 'p', s: 'lunch',
+            note: '<b>选 target（无参数时会列出全部可选项）。</b>格式是 <span class="mono">&lt;product&gt;-&lt;buildvariant&gt;</span>。模拟器相关的典型选项是 <span class="mono">aosp_x86_64-eng</span> 或 <span class="mono">sdk_phone_x86_64</span>。<span class="pill warn">待核实</span> 名称随版本变化，<b>务必以本机 lunch 列表为准</b>。' },
+          { t: 'o', s: 'Lunch menu... pick a combo:\n    1. aosp_arm-eng\n    2. aosp_x86_64-eng\n    ...  （列表随分支变化）', },
+          { t: 'p', s: 'lunch aosp_x86_64-eng',
+            note: '<b>锁定 target。</b>选完之后，环境变量 <span class="mono">TARGET_PRODUCT</span>、<span class="mono">TARGET_BUILD_VARIANT</span> 被设置好，后续 make 才知道要编什么。选了 x86_64 就意味着走「应用级翻译」那条路（需要另外准备 ARM 翻译层）。' },
+          { t: 'p', s: 'make -j$(nproc)',
+            note: '<b>开始构建。</b>首次全量编译在普通开发机上以小时计。产物落在 <span class="mono">out/target/product/&lt;target&gt;/</span> 下，包括各分区镜像。' },
+          { t: 'w', s: '注意：镜像架构 = target 架构。选了 x86_64，系统就是 x86_64 的', },
+          { t: 'p', s: 'emulator -avd <你的AVD名> -no-snapshot',
+            note: '<b>用编出来的产物启动。</b>前提是镜像路径被正确指向（通常靠 <span class="mono">ANDROID_PRODUCT_OUT</span> 或把镜像放进 SDK 的 system-images 目录）。<span class="mono">-no-snapshot</span> 跳过快照，确保你启动的是刚编出来的东西。' },
+          { t: 'p', s: 'adb shell getprop ro.build.fingerprint',
+            note: '<b>验证。</b>确认跑起来的确实是你的构建产物。这一步不做，你可能会花一小时调试一个其实没被加载的镜像。' }
         ]
       },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">root 的代价清单、systemless 的收益与痕迹、' +
-        '以及「root 本身就是信号」这个立场。<br>' +
-        '更重要的是终端里那条判定链：<b>每一步的失败都能被翻译成一句明确的话</b>——' +
-        '看不清设备、进不了刷写模式、解锁被服务端拒绝、su 拿不到身份。它们对应完全不同的处理，不会互相混淆。</p>')
+      after: T.note('', '对逆向的含义',
+        '<p>会自编译 = 你能改<b>别人改不了的东西</b>：</p>'
+        + '<p>① <b>属性系统</b>——在系统镜像源码层面把 <span class="mono">ro.kernel.qemu</span>、<span class="mono">ro.hardware</span>、<span class="mono">ro.product.*</span> 改成真机样式，而不是运行时去 hook；<br>'
+        + '② <b>纯净环境</b>——编一个 <span class="mono">userdebug</span> 变体，默认 <span class="mono">adb root</span> 可用，省掉刷 Magisk 的步骤；<br>'
+        + '③ <b>预置工具</b>——把 frida-server、抓包证书、调试工具直接放进系统镜像，开机即在。</p>'
+        + '<p>代价是环境维护成本：每次 AOSP 升级，你的补丁都要重新适配一次。</p>')
     },
 
-    /* ============================================================ 30.3 */
+    /* ================= 30.3L 动手实验 ================= */
     {
-      h: '30.3', title: '抓包证书：Android 7 那道线，三种过线方式与各自的代价',
+      h: '30.3L', title: '动手实验：给需求选对翻译模式',
       html:
-        '<p>抓包这件事的原理在第 23 章：HTTPS 握手、信任链、证书固定、五道门的对抗分层。' +
-        '本节只回答一个问题：<b>要让一个 App 接受你的中间人证书，有哪几条路，各要付什么代价。</b></p>' +
-        T.note('key', '🔑 那道线的准确表述',
-          '<p style="margin-bottom:0">从 Android 7.0 开始，<b>App 默认不再信任用户安装的 CA</b>，' +
-          '只信任系统信任库里的证书（除非 App 自己显式声明信任用户 CA）。<br>' +
-          '所以「浏览器能抓、App 抓不到」这个现象有一个非常朴素、也非常确定的解释：' +
-          '<b>你的证书只在用户库里，而 App 按默认策略不去看用户库。</b><br>' +
-          '这条线的完整来龙去脉与判定顺序在第 23.7 与 23.8，<b>本节不重复</b>。</p>') +
-        '<h4>三种过线方式：不是「哪个更好」，而是「你更怕哪种代价」</h4>' +
-        T.tbl(
-          ['做法', '它做了什么', '代价与适用边界', '什么时候它是对的'],
-          [
-            ['<b>A. 改系统分区，把证书放进系统信任库</b>',
-             '把证书按系统库要求的命名放进系统证书目录，让 App 的默认策略直接命中',
-             '<b>系统分区通常只读</b>：要重新挂载，而现代设备上挂载常被分区只读、验证启动、动态分区挡住；' +
-             '改过的分区会让完整性校验更容易出问题；系统升级后可能被覆盖。<br>' +
-             '<span class="pill warn">待核实</span>：证书目录位置与命名规则随版本变化（新版证书库在 Conscrypt 模块内），以目标机实际目录为准',
-             '老设备、可写系统的模拟器、或者你只是临时试一下'],
-            ['<b>B. 用 Magisk 模块把证书（或证书库）叠加上去</b>',
-             '不改系统分区，用 systemless 的覆盖层让系统「看到」多了一张证书',
-             '<b>依赖 root</b>，而且依赖这个模块与你的系统版本兼容；' +
-             '挂载层本身会留下痕迹（上一节刚讲过）；证书库被替换后要留意它与系统更新的关系。<br>' +
-             '这是当前<b>最通用的路线</b>，代价是「你必须先有一台能 root 的机器」',
-             '真机 + 已 root + 需要长期、稳定地抓多个 App'],
-            ['<b>C. 重打包 APK，声明信任用户证书</b>',
-             '在 manifest 里加上信任用户 CA 的网络配置，然后把包重签回来',
-             '<b>不需要 root</b>，但代价在别处：签名变了 → 完整性校验、第三方 SDK 校验、' +
-             '与官方包共存的升级链路都可能出问题；加固包的修改本身也困难。' +
-             '换句话说：<b>你用一个「改客户端」的代价，换掉了「拿 root」的代价</b>',
-             '没有 root、又只针对这一个 App 做一次性分析'],
-            ['<b>D. 根本不走代理这条路</b>（对照项）',
-             '在 socket / SSL 层 hook，直接取明文',
-             '不是「装证书」，而是绕开整个证书信任问题；代价是要自己处理明文边界与字节流（第 21、23 章）',
-             'App 自带网络栈、或证书路线被 pinning 彻底堵死时']
-          ]) +
-        T.note('warn', '⚠️ 一条纪律：先确认「证书这一层通了没有」，再去怀疑别的',
-          '<p>「装了证书还是抓不到」这句话里藏着三个完全不同的状态，必须先把它们分开：</p>' +
-          '<ol>' +
-          '<li><b>证书根本没进系统库</b>——文件在，但位置/命名/格式不对。' +
-          '典型现象：一个 App 都抓不到、浏览器能抓。</li>' +
-          '<li><b>证书进了，但目标不认</b>——固定校验（pinning）或双向认证。' +
-          '典型现象：其它 App 能抓到明文，这个 App 只有 CONNECT。' +
-          '<b>注意：这恰好证明了你的证书这一层是通的。</b></li>' +
-          '<li><b>证书通了，但内容仍然不可读</b>——握手成功、headers 正常、body 是密文。' +
-          '这不是证书问题，是应用层自己又加密了一层。</li>' +
-          '</ol>' +
-          '<p style="margin-bottom:0"><span class="hit">「别的 App 能抓到明文」这一条信息，' +
-          '价值高于任何配置检查</span>——它一次性证明代理、证书、网络三层都没问题，' +
-          '把范围直接压到「目标 App 自己这一侧」。这就是第 23.8 那张诊断表的用法。</p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境一 · 证书装上了，只有部分接口抓不到',
-            scenario: '<b>情境：</b>你已经把抓包工具的根证书装进了系统信任库（并且验证过：<b>其它 App、包括系统浏览器，都能抓到完整明文</b>）。' +
-                      '现在打开目标 App，操作了一遍：<b>首页的列表接口、登录接口都抓到了完整 JSON</b>，' +
-                      '但那个「支付前算签名」的接口，抓包工具里只有一条 <span class="mono">CONNECT</span>，之后什么都没有。' +
-                      '<span class="small muted">（补充：这个 App 没有被加固的迹象，反编译出来能看到正常的业务类。）</span>',
-            q: '这一现象属于哪一类问题，你下一步最该做什么？',
-            choices: [
-              { t: 'A. 说明证书没装好——重新装一遍，或者换一个抓包工具再试', next: 'na' },
-              { t: 'B. 先对「抓到的」和「抓不到的」做分层取证：看失败请求是「没有 CONNECT」「有 CONNECT 无内容」还是「有内容但 body 是密文」，再按对应的层级处理', next: 'nb' },
-              { t: 'C. 直接判定它做了 SSL Pinning，写一个绕过脚本挂上去', next: 'nc' },
-              { t: 'D. 判定这个 App 有反抓包能力（检测代理就断网），开始做反检测对抗', next: 'nd' }
-            ]
-          },
-          na: {
-            label: '选 A', terminal: true, verdict: 'bad',
-            verdictTitle: '「部分成功」恰恰证明证书这一层是通的',
-            result: '<b>认知根源：把「有东西抓不到」自动归因到最熟悉的那一步上。</b><br>' +
-                    '证书信任是<b>按进程、按默认策略</b>生效的，它不会「对首页接口有效、对支付接口无效」。' +
-                    '既然同一个 App 的其它接口抓到了完整明文，那这个 App 的 TLS 栈、你的证书、代理链路，' +
-                    '<b>三者全部成立</b>。<br>' +
-                    '把「部分失败」当成「证书没装好」，代价是你会花时间在一个已经被证明没问题的环节上反复折腾，' +
-                    '而真正的差异（某条请求走了另一条代码路径）始终没被看见。<br>' +
-                    '<span class="hit">判据要记牢：能抓到一部分，就说明基础链路没问题；问题一定在「那条请求本身」。</span>' },
-          nb: {
-            label: '选 B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先分清失败发生在哪一层',
-            result: '<b>这是唯一能把范围收敛的做法。</b>对那条抓不到的请求，按顺序看三件事：<br>' +
-                    '<b>① 抓包工具里有没有 CONNECT？</b><br>' +
-                    '· 没有 → 这条请求<b>没走系统代理</b>。可能它自己实现了网络栈、设了 ' +
-                    '<span class="mono">Proxy.NO_PROXY</span>、走的是原生 socket，或者根本不是 HTTP 类请求（例如 WebSocket、UDP/QUIC）。<br>' +
-                    '<b>② 有 CONNECT，但没有后续数据？</b><br>' +
-                    '· 失败点在 <b>TLS 校验</b>：这一条连接被客户端拒绝了。注意它<b>可能只对某个域名/某个连接生效</b>，' +
-                    '所以完全可以是「首页没事、支付被拒」——这正是 pinning 的典型形态。<br>' +
-                    '<b>③ 有内容，但 body 是密文？</b><br>' +
-                    '· 传输层没问题，<b>应用层自己又加密了一层</b>。此时你要找的是加密函数，而不是证书。<br>' +
-                    '<b>为什么这个顺序最有效：</b>它把「一个模糊的失败」拆成三个互斥的层级，' +
-                    '每一层对应一套有限的手段。第 23.8 与 23.12 分别是这套诊断与后续溯源的完整展开。' },
-          nc: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '方向可能是对的，但你现在还缺一个证据',
-            result: '<b>认知根源：把「最可能的解释」直接当成「已确认的结论」。</b><br>' +
-                    'Pinning 确实是「部分接口抓不到」的常见原因之一，而且它天然可以是「按域名/按连接」生效的——' +
-                    '所以你的猜测并不离谱。<br>' +
-                    '问题在于：<b>同样的现象还有另外两种成因</b>（走了非代理路径、或 body 另有加密），' +
-                    '而它们要用的手段完全不同。<br>' +
-                    '直接写 bypass 脚本的风险是：你会得到一个「脚本挂了但没生效」或「脚本生效了但仍然看不懂」的状态，' +
-                    '而这两种状态都<b>不会告诉你方向对不对</b>。<br>' +
-                    '<span class="hit">先花三十秒看 CONNECT，再决定要不要写脚本。</span>' +
-                    '判据一旦拿到（有 CONNECT 无内容），C 就从猜测变成了一个明确动作。' },
-          nd: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '用一个高级解释覆盖了还没做的取证',
-            result: '<b>认知根源：把「对抗」当成了第一解释。</b><br>' +
-                    '真正的反抓包（检测代理、检测 VPN、拒绝走系统代理）有一个很硬的判据：' +
-                    '<b>它表现为「一条都没有」，而且往往在很早的阶段就断掉</b>——' +
-                    '因为检测到就干脆不发请求，或者立刻切到直连。<br>' +
-                    '而现在你手上是「大部分接口正常、个别接口异常」，这个形态与「检测到代理」不符：' +
-                    '检测是有状态的，它不会只对某一个接口生效。<br>' +
-                    '<b>另一层代价：</b>反检测对抗是会改变环境的（改属性、hook 检测点、换 ROM），' +
-                    '一旦你在没有结论的情况下改动环境，后面所有观测的<b>可信度都会下降</b>——' +
-                    '你不再确定某个现象是 App 的行为，还是你改动造成的。<br>' +
-                    '<span class="small muted">补充：这个 App 没有被加固的迹象，' +
-                    '这进一步降低了「它有一套复杂的自研反抓包」的可能性——加固与风控通常是一起上的。</span>' }
-        }
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">三种过线方式的代价对照（改分区 / systemless 模块 / 重打包），' +
-        '以及最重要的那一条纪律：<b>先把「证书没通」「证书通了但目标不认」「证书通了但内容加密」</b>三件事分开。<br>' +
-        '这三件事对应三个完全不同的下一步，混在一起处理就是时间黑洞。</p>')
-    },
-    /* ============================================================ 30.4 */
-    {
-      h: '30.4', title: 'Hook 环境：两种形态的取舍，以及「怎么算真的就绪」',
-      html:
-        '<p>Hook 框架在 Android 上有两种主流形态，它们不是「新旧关系」，而是<b>两种工作节奏</b>：</p>' +
-        T.tbl(
-          ['', '<b>frida-server（按需注入）</b>', '<b>LSPosed（常驻）</b>'],
-          [
-            ['<b>进程模型</b>', '一个独立进程，你主动连上去、主动注入目标', '挂在 Zygote 上，每个 App 进程一出生就带着模块'],
-            ['<b>生效时机</b>', '由你决定：spawn 抢跑，或 attach 事后进场', '由系统决定：比 App 的第一行 Java 还早，你只能选作用域'],
-            ['<b>持久性</b>', '会话级。重启、断连就要重建现场', '装好就一直生效，重启仍在'],
-            ['<b>能力上限</b>', '运行时能力更强：Stalker 指令级 trace、完整调用栈、动态构造参数', '受 ART hook 接口限制，拿不到指令级执行流'],
-            ['<b>迭代成本</b>', '改脚本即可，代价是每次都要重新连接', '改模块要重装，但改完对所有目标 App 生效'],
-            ['<b>暴露面</b>', '进程侧：注入线程、agent 映射、端口、被改写的函数头（第 10、21 章）', '环境侧：Zygote 注入链路、模块 so、Zygisk 痕迹（第 22 章）']
-          ]) +
-        T.note('key', '🔑 取舍一句话（细节全部在第 21、22 章）',
-          '<p style="margin-bottom:0"><b>按需注入（Frida）适合一次性深挖：需要运行时能力、需要抢时序、需要临时改主意；' +
-          '常驻（LSPosed）适合长期值守：装一次、每次启动自动生效、批量覆盖所有进程。</b><br>' +
-          '选错形态的典型症状是「效果差一点」变成「形态上不成立」：' +
-          '想让它无人值守自动生效，Frida 就得每次重建现场；想要 Stalker 级 trace，LSPosed 的接口根本提供不了。<br>' +
-          '<b>至于怎么把 frida-server 推上去、改名、换端口、怎么装 LSPosed 模块 —— 分别是第 10.9、21.11 与第 22.2 的内容，本节不复述。</b></p>') +
-        T.note('warn', '⚠️ 一个反直觉的经验：环境「就绪」不能靠「脚本没报错」来判断',
-          '<p style="margin-bottom:0">Frida 脚本最常见的两种「假成功」：<br>' +
-          '<b>① 注入成功但没进目标进程</b>——脚本在，目标其实是另一个进程（多进程 App、插件化、被拉起的新进程）。<br>' +
-          '<b>② hook 挂上了但代码路径没走到</b>——hook 点选得太深（在某个未被执行的条件分支里），或者目标方法被内联。' +
-          '此时你的控制台一片安静，而你会误以为「这个函数没被调用」。<br>' +
-          '所以下面这个步进器的重点不是命令，而是<b>每一步的判据</b>：<span class="hit">你要能说出「凭什么认为这一步成立了」。</span></p>'),
-      stepper: {
-        title: '环境就绪判定链：从「能连上」到「hook 真的生效」',
-        lines: [
-          { code: '<span class="c"># 0. 先选形态：按需，还是常驻？</span>\n' +
-                  '一次性深挖 → frida-server ；长期值守 → LSPosed',
-            note: '<b>这一步之后所有命令都不同，所以它必须排在第一位。</b>' +
-                  '判据：你能不能接受「每次开工都要重建现场」。不能接受就选常驻；' +
-                  '但如果任务需要 Stalker 级执行流，那没得选——只能按需注入。',
-            state: { '任务形态': '一次性深挖', '选择': 'frida-server', '理由': '需要运行时改主意 + 指令级 trace' } },
-          { code: '<span class="c"># 1. 设备可达</span>\n' +
-                  'adb devices → device',
-            note: '<b>判据：设备状态是 <span class="mono">device</span>。</b>' +
-                  '这一步失败与 Hook 无关，但它会让后面每一步都表现为「莫名其妙地失败」。' +
-                  '把它单独列出来，是为了让失败有唯一的解释。',
-            state: { 'adb': 'device', '结论': '底座可用' } },
-          { code: '<span class="c"># 2. 注入能力存在（不要自证，要反证）</span>\n' +
-                  'hook 一个「必然会被调用」的函数，看它是否命中\n' +
-                  '<span class="c">// 例如目标进程自己会打的某条日志、或 Activity 的 onCreate</span>',
-            note: '<b>这是本节最重要的一步：用一个必然命中的点做探针。</b><br>' +
-                  '为什么要反证：如果一上来就 hook 你的目标函数，<b>「没命中」有两种含义</b>' +
-                  '（注入没成功 / 函数没被调用），你分不出来。<br>' +
-                  '探针命中 → 注入链路成立；探针不命中 → 问题在环境，与你的目标无关。' +
-                  '<span class="hit">这一步把「注入问题」和「选点问题」彻底分开了。</span>',
-            state: { '探针': '命中', '结论': '注入链路成立', '排除': '环境问题' } },
-          { code: '<span class="c"># 3. 确认脚本真的在「那个」进程里</span>\n' +
-                  '打印当前进程名 / pid，与目标进程核对',
-            note: '<b>判据：脚本报告的进程名与 pid，就是你想要的那个。</b><br>' +
-                  '多进程 App（例如独立推送进程、独立 WebView 进程）里，attach 错了进程是很常见的事，' +
-                  '表现和「hook 不生效」一模一样。',
-            state: { '进程': 'com.target.app', 'pid': '12345', '结论': '目标进程正确' } },
-          { code: '<span class="c"># 4. 确认 hook 点真的被执行（而不是挂上了）</span>\n' +
-                  'hook 里加计数器 + 打印参数；重复触发三次操作',
-            note: '<b>判据：计数器随操作增长。</b>这是「挂上了」与「被执行了」的分界线。<br>' +
-                  '如果挂上却没有计数，按顺序怀疑三件事：' +
-                  '<b>① 代码路径没走到</b>（换一个更靠外的调用点试试）；' +
-                  '<b>② 方法被内联</b>（编译器把函数体展开，调用点根本不存在）；' +
-                  '<b>③ 你 hook 的是同名的另一个重载/另一个类加载器里的类</b>。',
-            state: { '计数器': '0 → 3', '结论': 'hook 点有效' } },
-          { code: '<span class="c"># 5. 先记录基线，再开始改行为</span>\n' +
-                  '原样跑一遍，把「输入 → 输出」存下来',
-            note: '<b>判据：你手上有一份未修改状态下的输入输出对照。</b><br>' +
-                  '这一步经常被跳过，代价在后面：当你改了行为、绕过某个校验之后，' +
-                  '你再也无法回答「这个结果是我改出来的，还是它本来就这样」。' +
-                  '<span class="hit">基线是后面所有结论的参照系。</span>',
-            state: { '基线': '已保存', '结论': '可以开始干预' } },
-          { code: '<span class="c"># 6. 环境自检通过，但别忘了它的代价</span>\n' +
-                  '<span class="c">// 你现在同时拥有：观测能力 与 被观测的特征</span>',
-            note: '<b>最后一步不是技术动作，是记账。</b>' +
-                  '注入能力给你观测，同时也给检测方证据（第 10 章的八个检测点、第 21 章的六层暴露面）。' +
-                  '所以「环境就绪」这句话的完整版是：<b>我已经能看了，并且我知道我现在有多显眼。</b>',
-            state: { '观测能力': '✅', '暴露面': '已知（第 10 / 21 章）' } }
-        ]
-      },
-      quiz: {
-        id: 'q30-2', chapter: 30, answer: 1,
-        stem: '你的任务是「连续两周，每天盯着一个 App 在启动时读了哪些文件」，' +
-              '并要求<strong>它每次自动启动都被记录下来，不需要你手动连上去</strong>。' +
-              '设备已 root，两种 Hook 形态都装得上。选哪一个，理由是什么？',
-        options: [
-          { t: 'frida-server：它更灵活，随时可以改脚本重新观察',
-            why: '灵活是真的，但「每天自动记录、不用手动连」这个需求指向的是「常驻」这个形态本身。用按需注入去做无人值守，是实现层面的硬伤，不是效果差一点。' },
-          { t: 'LSPosed：需求的关键词是「长期 + 自动生效」，这正是常驻形态的定义',
-            why: '正确。常驻模块在进程一出生就在场，不需要你维持一个会话，天然满足「每次自动启动都被记录」。代价是改逻辑要重装模块，但在这个需求里它完全不是瓶颈。' },
-          { t: '两个都装：Frida 负责写逻辑，LSPosed 负责常驻，互相配合',
-            why: '同时上两套注入链路会让暴露面叠加一倍，而收益（把脚本塞进常驻形态）用 LSPosed 单独就能拿到。多一套链路只会让「出了问题是谁造成的」变得难以判断。' },
-          { t: '取决于目标是否检测：它检测就用 LSPosed，不检测就用 Frida',
-            why: '这条判据本身没错（常驻方案的暴露面在环境侧，按需在进程侧），但「检测」是你两周之后才会知道的事。在需求是「长期自动」的前提下，先用需求定形态，再处理检测，顺序不能反。' }
-        ],
-        explain: '<b>先按需求定形态，再按检测调策略。</b><br>' +
-                 '需求里有三个关键词：<b>长期</b>（两周）、<b>自动</b>（不手动连）、<b>批量</b>（每次启动）。' +
-                 '这三条全都指向常驻形态。frida-server 的能力上限更高（Stalker、完整调用栈），' +
-                 '但这个任务并不需要那些能力——它需要的是「一直在场」。<br>' +
-                 '<span class="hit">环境选型的第一判据永远是任务形态，而不是工具强弱。</span>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">两种 Hook 形态的取舍判据，以及六步「就绪判定链」——' +
-        '其中最值钱的是第 2 步：<b>用一个必然命中的探针，把「注入问题」与「选点问题」分开</b>。<br>' +
-        '这条纪律会在后面每一步复用：任何一次「hook 没反应」，先问它是哪一类失败。</p>')
-    },
-
-    /* ============================================================ 30.5 */
-    {
-      h: '30.5', title: 'DEBUG 环境：debuggable 的两个层次，以及为什么它会被检测',
-      html:
-        '<p>调试环境这一块，概念上只有四个东西，但它们是四种完全不同的「权限来源」：</p>' +
-        T.tbl(
-          ['概念', '它是什么', '谁决定它', '它意味着什么'],
-          [
-            ['<b>开发者选项 + USB 调试</b>',
-             '设备侧的开关，允许 adb 与调试协议接入',
-             '你在设备上手动打开',
-             '只是「允许调试协议进来」，<b>并不等于 App 可以被断点</b>'],
-            ['<b><span class="mono">android:debuggable</span></b>',
-             '<b>每个 App 自己</b>在 manifest 里的标志位',
-             '构建方（debug 构建为 true，release 一般为 false）',
-             '这一条是「这个 App 能不能被 JDWP 附加」的关键。<b>它是 per-app 的。</b>'],
-            ['<b><span class="mono">ro.debuggable</span></b>',
-             '<b>系统级</b>属性，表示这台设备的系统镜像本身是 debuggable 构建',
-             'ROM / 系统镜像的构建方（工程机、部分模拟器为 1）',
-             '<b>它是 per-device 的</b>。系统 debuggable 时，很多进程的可调试性会被整体放宽'],
-            ['<b>JDWP</b>',
-             'Java 调试线协议：调试器与被调试 JVM/ART 之间的通信通道',
-             '由运行时提供，通过一个调试控制接口暴露',
-             '它是「断点」这条路的实际承载者；<b>能不能连上它，是调试环境是否就绪的唯一判据</b>']
-          ]) +
-        T.note('key', '🔑 两个 debuggable 的分工，一定要分清',
-          '<p style="margin-bottom:0"><b><span class="mono">android:debuggable</span> 是应用级开关，' +
-          '<span class="mono">ro.debuggable</span> 是系统级属性。</b><br>' +
-          '「我打开了 USB 调试，为什么断点打不上」——大概率是你把设备开关当成了应用开关。' +
-          'USB 调试打开的是<b>通道</b>，而<b>门</b>在 App 自己的 debuggable 标志上。<br>' +
-          '反过来，系统 <span class="mono">ro.debuggable=1</span> 的设备（工程机、部分模拟器）会放宽整体策略，' +
-          '所以「同一份 APK 在我这里能调、在你那里不能调」是很常见的事——<b>差异来自设备，不来自 APK。</b></p>') +
-        '<h4>把调试器「请进门」的两个动作</h4>' +
-        T.grid(2, [
-          T.card('① <span class="mono">am start -D</span>：让 Activity 停在起跑线上',
-            '<p>这个参数的作用是<b>让目标组件启动后先暂停、等待调试器挂上</b>，而不是直接跑完。</p>' +
-            '<p>它的价值在于<b>时序</b>：很多初始化逻辑（注册、解密、自检）发生得极早，' +
-            '你事后 attach 只能看到结果。先让它等，你才有机会在第一条指令前就把断点摆好。</p>' +
-            '<p class="muted small">具体参数形态与等待行为随版本变化，' +
-            '<span class="pill warn">待核实</span>：以 adb 当期文档为准。</p>'),
-          T.card('② <span class="mono">adb forward</span> 与 JDWP：把通道接到主机上',
-            '<p>可调试进程会暴露一个调试控制接口，主机的调试器要访问它，' +
-            '就要用端口转发把它接到本地。</p>' +
-            '<p>常见形态是「查询目标进程的调试接口编号 → 把某个本地端口转发到它」。</p>' +
-            '<p class="muted small">接口编号通常由系统分配、不是固定值；<b>端口号与查询方式都随版本变化</b>，' +
-            '<span class="pill warn">待核实</span>：照抄网上的固定端口是常见的第一个坑。</p>')
-        ]) +
-        T.note('warn', '⚠️ 为什么很多 App 会主动检测这些',
-          '<p style="margin-bottom:0">站在检测方的角度，「被调试」与「被 hook」是同一类风险：' +
-          '<b>有人在运行时看我的内部状态</b>。而调试留下的痕迹比 Hook 更集中、更容易判定：</p>' +
-          '<ul>' +
-          '<li><b>被追踪标记</b>：进程的追踪者字段非空（被 ptrace 附加的通用痕迹）。</li>' +
-          '<li><b>调试接口存在</b>：可调试进程会暴露 JDWP 通道，扫一遍就能发现。</li>' +
-          '<li><b>调试相关线程 / 握手行为</b>：附加之后进程里会多出调试相关的线程与通信。</li>' +
-          '<li><b>耗时特征</b>：断点会让某段代码的执行时间出现人类不可能产生的量级。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><span class="hit">这些判据的共同点是：它们不关心你用什么工具，只关心「有没有人在旁边看」。</span>' +
-          '所以第 10 章讲的<b>抢时序</b>思路在这里同样成立——' +
-          '检测代码本身也要被执行，谁先动手谁说了算。具体对抗手段见第 10、13 章，本节不重复。</p>'),
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境二 · 一挂调试器就退出',
-            scenario: '<b>情境：</b>你按流程用 <span class="mono">am start -D</span> 让目标停住，' +
-                      '主机的调试器也连上了那个 JDWP 通道。' +
-                      '<b>结果：只要一附加，App 就在一两秒内退出</b>，logcat 里只留下一句与本任务无关的空指针异常，' +
-                      '看起来像是「启动失败」。不附加调试器时，App 一切正常。<br>' +
-                      '<span class="small muted">（你手上还有：静态反编译出来的代码、一份能跑通的抓包环境、' +
-                      '以及一台已 root 的测试机。）</span>',
-            q: '下一步最合理的是：',
-            choices: [
-              { t: 'A. 先取证：确认它是「检测到调试就退出」，还是「被调试之后自己跑崩了」。用不改调试标志的方式观察它读了什么、退在哪一步', next: 'na' },
-              { t: 'B. 放弃动态调试，回去做静态分析——反正静态也能看逻辑', next: 'nb' },
-              { t: 'C. 直接上反调试绕过脚本：把常见的检测函数（ptrace、调试标志检查、JDWP 探测）通通 hook 掉', next: 'nc' },
-              { t: 'D. 换一台设备或换一个模拟器重试，可能是这个环境不兼容', next: 'nd' }
-            ]
-          },
-          na: {
-            label: '选 A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先分清「它检测到了」还是「它被调试搞崩了」',
-            result: '<b>这个区分决定了后面所有工作的方向。</b>两种成因的表现完全不同：<br>' +
-                    '<b>① 主动检测后退出：</b>退出是<b>有意图的</b>——通常伴随一条被清理过的假异常、' +
-                    '或在退出前有一段可疑的耗时（它在做判断）。此时正确的动作是<b>抢时序</b>：' +
-                    '把观测点提前到它的检测代码之前（spawn 类手段、启动早期注入），' +
-                    '而不是在退出之后研究现场。<br>' +
-                    '<b>② 被调试拖崩：</b>退出是<b>副作用</b>——目标逻辑对时序/线程状态敏感，' +
-                    '断点一停，超时、锁等待、看门狗就把进程带走了。此时要换的是调试方式：' +
-                    '改用日志或 hook 打点（不暂停线程），或只在内核/驱动之外做被动观测。<br>' +
-                    '<b>为什么「取证」排在「绕过」之前：</b>绕过脚本是有副作用的（它改变目标行为），' +
-                    '一旦挂上去，你就再也分不清「它退出了」是因为检测、还是因为你的脚本。' +
-                    '<span class="hit">在拿到「它到底检测了什么」之前动手，等于亲手污染了现场。</span>' },
-          nb: {
-            label: '选 B', terminal: true, verdict: 'bad',
-            verdictTitle: '放弃得太早了——而且你是放弃了一整类观测',
-            result: '<b>认知根源：把「这一次调试失败」当成了「调试这条路不通」。</b><br>' +
-                    '调试器是本章五块拼图里<b>唯一能给你第一手现场</b>的东西（寄存器、内存、局部变量）。' +
-                    '在还没确认失败原因的情况下放弃它，等于主动放弃了后面所有「停下来看」的机会。' +
-                    '静态分析当然有用，但它回答不了「运行时的这个值是多少」。<br>' +
-                    '更重要的是：<b>很多静态疑惑本来就要靠调试来确认</b>' +
-                    '（例如某分支到底走不走、某个字段是不是 null）。丢掉的不是一条备用路线，是主要手段之一。<br>' +
-                    '<b>什么情况下「换手段」确实是对的：</b>当你已经确认检测发生在启动极早期、' +
-                    '且你没有能力在那一层注入时——这属于「拿到证据后的决定」，' +
-                    '与「一遇到挫折就换路」是两回事。' },
-          nc: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '在不知道检测点的情况下，这是赌博，而且大概率赌不赢',
-            result: '<b>认知根源：把「常见检测点清单」当成了「这个 App 的检测点清单」。</b><br>' +
-                    '反调试检测点的形态差异极大：有的读进程状态、有的比对函数开头的字节、' +
-                    '有的比较耗时、有的在 native 层直接发系统调用（第 13 章）。' +
-                    '把所有常见点都挂一遍，实际效果经常是：<b>脚本挂上了，App 还是退出</b>——' +
-                    '因为你压根没挂到它真正用的那一个。<br>' +
-                    '还有一个更隐蔽的代价：<b>hook 本身留下痕迹。</b>' +
-                    '如果它的检测恰好包含「检查函数序言有没有被改」，你的绕过脚本会直接触发它，' +
-                    '于是你得到一个「越绕越死」的闭环，并且完全不知道是自己造成的。<br>' +
-                    '<span class="hit">正确顺序永远是：先确定它在哪一层做判断，再选择在不改内存的前提下观测，最后才谈绕过。</span>' },
-          nd: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '换环境会改变现象，但不会告诉你原因',
-            result: '<b>认知根源：用「换一个变量」代替「理解一个变量」。</b><br>' +
-                    '换设备/换模拟器确实可能让 App 不再退出——但你无法解释为什么，' +
-                    '于是这个「成功」是不可复现的：下一次遇到同类问题，你还是没有方法。<br>' +
-                    '而且环境差异本身会引入新的混淆项：模拟器有它自己的可检测特征（属性、传感器、指令翻译痕迹，第 15、16 章），' +
-                    '换过去之后你的观测结果里混进了「模拟器」这个变量，可信度反而下降。<br>' +
-                    '这个选项唯一合理的版本是：<b>把它当作对照实验来用</b>——' +
-                    '在真机上退出、在模拟器上不退出，这个差异本身就是一条证据（说明检测依赖某个设备特征）。' +
-                    '但前提是你先有一个假设，而不是碰运气。' }
-        }
-      },
-      quiz: {
-        id: 'q30-3', chapter: 30, answer: 0,
-        stem: '下面哪一句对 <span class="mono">android:debuggable</span> 与 <span class="mono">ro.debuggable</span> 的描述是<b>正确</b>的？',
-        options: [
-          { t: '前者是应用级标志，决定「这个 App 能不能被 JDWP 附加」；后者是系统级属性，决定「这台设备的系统镜像是不是 debuggable 构建」',
-            why: '正确。一个是 per-app（写在这个 App 的 manifest 里），一个是 per-device（写在系统镜像的属性里）。分清它们，才能解释「同一份 APK 在不同设备上可调试性不同」这种现象。' },
-          { t: '两者都是全局开关，打开任意一个就足以让所有 App 都能被调试',
-            why: '把 per-app 的标志说成了全局开关。android:debuggable 只作用于声明它的那一个 App，它不会让别的 App 变得可调试。' },
-          { t: '前者由系统在安装时根据签名自动设置，后者由开发者在 manifest 里声明',
-            why: '两者说反了，而且设置主体也不对：应用级标志来自构建配置，系统级属性来自系统镜像的构建方。' },
-          { t: '两者都已经在 Android 新版本中被移除，现代调试依赖别的机制',
-            why: '这两个概念至今仍是 Android 调试与检测的基础；说它们被移除，会导致你把「调试环境为什么配不上」归因到错误的地方。' }
-        ],
-        explain: '<b>记住这两句话就够了：</b><br>' +
-                 '<b>① <span class="mono">android:debuggable</span> 是「门」，属于 App 自己</b>——' +
-                 '它决定了这个进程愿不愿意对外暴露调试接口。<br>' +
-                 '<b>② <span class="mono">ro.debuggable</span> 是「整栋楼的物业政策」，属于设备</b>——' +
-                 '系统镜像是 debuggable 构建时，很多进程的可调试性会被整体放宽。<br>' +
-                 '而开发者选项里的「USB 调试」只是「允许调试协议进来」的通道开关，' +
-                 '<span class="hit">通道打开不等于门打开</span>——这是新手最常见的混淆。'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">四个概念（USB 调试 / android:debuggable / ro.debuggable / JDWP）的分工，' +
-        '两个动作（让程序等着、把通道接过来），以及「为什么这些会被检测」的四条判据。<br>' +
-        '<b>最关键的一条是决策演练里的区分：</b>「检测到调试后退出」与「被调试拖崩」是两种病，' +
-        '开错药会浪费一整天，还会污染现场。</p>')
-    },
-
-    /* ============================================================ 30.6 */
-    {
-      h: '30.6', title: '定位方法论总纲：七条线索，以及它们的成本排序',
-      intuition: {
-        tag: '直觉模型 · 七种找钥匙的办法',
-        body:
-          '<p>钥匙丢在一个很大的房间里。你有七种办法：</p>' +
-          '<ul>' +
-          '<li><b>看标签</b>（字符串搜索）——最快，前提是钥匙上写着字。</li>' +
-          '<li><b>看房间结构</b>（静态结构）——从家具怎么摆推断它可能掉在哪一类角落。</li>' +
-          '<li><b>装监控回放</b>（Profiling / Trace）——看它掉的全过程，代价是装设备、而且画面会丢帧。</li>' +
-          '<li><b>问在场的人</b>（日志）——前提是有人看见了，并且愿意说。</li>' +
-          '<li><b>看脚印</b>（调用栈）——从它经过的路径倒推。</li>' +
-          '<li><b>看监控画面</b>（UI 反推）——从「它最后出现在哪个位置」反推。</li>' +
-          '<li><b>把房间冻结住逐寸搜</b>（动态调试）——最彻底，也最贵。</li>' +
-          '</ul>' +
-          '<p>本章要建立的判断力是：<b>面对一个具体现象，先付哪一笔成本。</b>' +
-          '排错顺序的原则只有一条——<span class="hit">先做那个「即使失败也几乎不花钱」的动作。</span></p>'
-      },
-      html:
-        T.note('key', '🔑 全章骨架：七条线索与它们的成本',
-          '<p style="margin-bottom:0">下面这张表是本章的地图。' +
-          '<b>成本不是难度，是「启动这条线索要付的代价」</b>：要不要环境、要不要复现、要不要中断程序、需不需要知道具体位置。</p>') +
-        T.tbl(
-          ['线索编号', '线索', '启动成本', '它回答什么问题', '它最容易死在什么地方'],
-          [
-            ['<b>1</b>', '<b>字符串搜索</b>', '<span class="pill ok">最低</span>',
-             '「这个功能相关的代码在哪」——URL、提示语、日志 TAG、算法常量、密钥前缀',
-             '字符串被加密、被拼接、或来自服务端；搜到的词不唯一（几十处命中）'],
-            ['<b>2</b>', '<b>静态结构</b>', '<span class="pill acc">中</span>',
-             '「系统是怎么把它拉起来的」——入口组件、权限、调用图、导入表、交叉引用',
-             '被壳打散；符号被剥离；VMP 化之后调用图不再反映真实执行'],
-            ['<b>3</b>', '<b>动态调试</b>', '<span class="pill bad">最高</span>',
-             '「这一行执行时，寄存器/内存/参数到底是什么」——第一手现场',
-             '环境没配对（debuggable/JDWP）；或对方检测到调试就退出'],
-            ['<b>4</b>', '<b>调用栈</b>', '<span class="pill acc">中</span>',
-             '「谁调用了它」以及「业务边界在哪一帧」',
-             '栈被内联/混淆折叠；native 侧拿不到 unwind 信息'],
-            ['<b>5</b>', '<b>UI 组件反推</b>', '<span class="pill acc">中</span>',
-             '「这个界面元素背后的代码在哪」——Activity、布局、资源 id、绑定函数',
-             '界面不是原生 View 树（Flutter / 自绘 / 游戏引擎）时结构性失效'],
-            ['<b>6</b>', '<b>Profiling / Trace</b>', '<span class="pill warn">高</span>',
-             '「这一串操作里到底跑了哪些方法」——候选集，而不是证据',
-             '采样丢方法；内联导致调用关系缺失；反调试把 trace 变成噪音'],
-            ['<b>7</b>', '<b>日志线索</b>', '<span class="pill ok">低</span>',
-             '「刚才发生了什么」——崩溃栈、框架日志、业务打印、时序',
-             '日志被加固清理；TAG 被改成无意义字符串；release 包关掉了日志']
-          ]) +
-        T.note('key', '📖 这张表的读法：编号是「身份」，不是「顺序」',
-          '<p style="margin-bottom:0">上表的行序就是线索编号，它与后面七节（30.7 – 30.13）一一对应，' +
-          '是你和别人对齐说法时用的名字（「线索 5 出局了」）。<br>' +
-          '<b>但编号不代表优先级</b>——优先级只看「启动成本」那一列，以及下面三条排序判据。' +
-          '所以你完全可能先用线索 7（日志，成本低）再用线索 2（静态结构，成本中），' +
-          '把最贵的线索 3（动态调试）留到范围最小的时候。<br>' +
-          '<span class="hit">30.14 那张决策图里用的是「尝试顺序」，与这里的编号是两回事——' +
-          '那里按成本排，这里按身份排。</span></p>') +
-        T.note('warn', '⚠️ 排序原则：不是「从 1 到 7 依次做」，而是「按失败代价排序」',
-          '<p>三条判据，按优先级排：</p>' +
-          '<ol>' +
-          '<li><b>失败时是否几乎不花钱？</b>搜一个字符串，搜不到只需三十秒；' +
-          '挂一次 IDA 调试，配环境加断点可能是一小时。<b>便宜的先行，是为了让贵的用在确定的地方。</b></li>' +
-          '<li><b>它是否需要「具体位置」才能开始？</b>动态调试需要你先知道断在哪一行——' +
-          '所以它天然排在定位类线索之后。反过来，字符串搜索不需要任何前提。</li>' +
-          '<li><b>它是否会被目标「结构性排除」？</b>界面是 Flutter 时 UI 反推直接出局；' +
-          '加固+字符串加密时静态搜索出局。<b>被排除的线索不是「效果差」，而是「逻辑上不成立」——' +
-          '要直接划掉，不要浪费一轮去验证。</b></li>' +
-          '</ol>' +
-          '<p style="margin-bottom:0"><span class="hit">这七条线索不是七个独立的工具，是一条「成本递增、精度递增」的梯子。</span>' +
-          '你要做的是每次只往上爬一级，并且清楚「爬到这一级失败时，我手里多了什么信息」。</p>') +
-        T.card('每条线索失败时，你能拿到什么（这一栏比成功更有用）',
-          T.tbl(
-            ['线索失败', '你得到的信息', '它把可能性砍掉了什么'],
-            [
-              ['字符串搜索无命中', '这段文字不是「代码里的静态常量」',
-               '排除了「明文硬编码」；指向运行时拼接 / 服务端下发 / 加密字符串（第 8、19 章）'],
-              ['日志无有效信息', '这条路径上没有人留下可读记录',
-               '说明要么被清理过，要么它压根没走这条路径——两者都缩小了范围'],
-              ['静态结构读不出调用关系', '结构被处理过（壳 / 混淆 / VMP）',
-               '这是<b>加固的证据</b>，直接把你推向脱壳或运行时观测（第 19 章）'],
-              ['拿不到调用栈 / 栈退化', '调用关系被内联或折叠',
-               '说明目标经过了编译期优化或混淆；同时否定了「靠名字读栈」这条路'],
-              ['UI 反推失效', '界面不是原生 View 树',
-               '排除了「从控件反查 Activity」；指向 Flutter / 自绘 / 引擎（字符串搜索仍可能有效）'],
-              ['Trace 只有候选集', '你有一份「可能相关」的方法列表',
-               '这是很好的<b>假设来源</b>，但需要别的手段把它变成证据'],
-              ['动态调试挂不上', '要么环境问题，要么对方在检测',
-               '<b>最有价值的一次失败</b>：确认了「有人不希望被调试」，于是转向抢时序或换观测层']
-            ]))
-        ,
-      stage: {
-        title: '七条线索 · 成本阶梯（从最便宜爬到最贵）',
-        speed: 1700,
-        render:
-          '<div class="flow-col" style="gap:9px">' +
-            '<div class="flow-row"><span class="pill ok mono">成本 1</span>' +
-              '<span class="blk" id="c1">① 字符串搜索</span>' +
-              '<span class="blk" id="c5">⑤ 日志线索</span>' +
-              '<span class="muted small">零环境依赖，随时可做，先做这个</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 无命中 / 信息不足时往下走</span></div>' +
-            '<div class="flow-row"><span class="pill acc mono">成本 2</span>' +
-              '<span class="blk" id="c2">② 静态结构</span>' +
-              '<span class="blk" id="c3">③ 调用栈</span>' +
-              '<span class="blk" id="c4">④ UI 组件反推</span>' +
-              '<span class="muted small">需要工具或运行环境，但不用中断程序</span></div>' +
-            '<div class="flow-row" style="margin-left:22px"><span class="arrow">↓ 结构读不出来 / 需要「谁被调用了」时往下走</span></div>' +
-            '<div class="flow-row"><span class="pill warn mono">成本 4</span>' +
-              '<span class="blk" id="c6">⑥ Profiling / Trace</span>' +
-              '<span class="blk" id="c7">⑦ 动态调试</span>' +
-              '<span class="muted small">要注入、要采样、要中断程序——用在确定的地方</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="mark">🎯 每次只往上爬一级，并且记住失败时得到了什么</span></div>' +
-            '<div class="note" id="mk"><div class="note-h">现在这一步</div>' +
-              '<p style="margin-bottom:0">点「播放」：每一步点亮一条线索，并说明「什么时候必须换下一条」。</p></div>' +
-          '</div>',
-        reset: () => {
-          ['c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7'].forEach(i => S(i, ''));
-          CLS('mark', 'pill bad');
-          SET('mark', '🎯 每次只往上爬一级，并且记住失败时得到了什么');
-          SET('mk', '<div class="note-h">现在这一步</div><p style="margin-bottom:0">点「播放」：每一步点亮一条线索，并说明「什么时候必须换下一条」。</p>');
-        },
-        steps: [
-          { run: () => S('c1', 'active'),
-            note: '<b>成本 1 · 字符串搜索。</b>你要搜的东西包括：URL 与域名、错误提示、日志 TAG、' +
-                  '加解密算法的常量（S 盒、IV、K 表）、密钥前缀、配置项名。<br>' +
-                  '<b>什么时候换下一条：</b>搜不到，或者命中太多（几十处）。' +
-                  '搜不到说明它不是静态明文；命中太多说明这个词太通用，换一个更独特的词再试一次——' +
-                  '<span class="hit">换词仍然是成本 1，不要急着升级手段。</span>' },
-          { run: () => { S('c1', 'done'); S('c5', 'active'); },
-            note: '<b>成本 1 · 日志线索。</b>它同样零环境依赖：崩溃栈、框架日志、' +
-                  '以及 App 自己打的业务日志。<br>' +
-                  '<b>什么时候换下一条：</b>logcat 里只有噪音、或 TAG 全被改成无意义字符串。' +
-                  '注意：<b>崩溃栈本身就是一份「高质量的调用栈」</b>——如果你的目标恰好会崩，' +
-                  '那么「调用栈」这条线索的成本会瞬间从「中」掉到「低」（下面会看到）。' },
-          { run: () => { S('c5', 'done'); S('c2', 'active'); },
-            note: '<b>成本 2 · 静态结构。</b>从 manifest 的组件与权限、import 与类型引用、' +
-                  '方法调用图、注解与泛型残留里找。<br>' +
-                  '它比字符串搜索贵在「要读」：你要把一堆符号关系在脑子里连成一张图。' +
-                  '<b>什么时候换下一条：</b>结构被壳打散、或符号被剥离到读不出语义（第 19 章）。' },
-          { run: () => { S('c2', 'done'); S('c3', 'active'); },
-            note: '<b>成本 2 · 调用栈。</b>它的成本取决于<b>你已经有什么</b>：' +
-                  '有一份崩溃日志 → 几乎免费；<br>' +
-                  '要靠注入打栈 → 成本抬到与 Hook 环境同价；<br>' +
-                  '要在 native 侧 unwind → 再贵一档。<br>' +
-                  '<b>什么时候换下一条：</b>栈被内联/混淆折叠成了 a.a.a，读不出业务边界。' },
-          { run: () => { S('c3', 'done'); S('c4', 'active'); },
-            note: '<b>成本 2 · UI 组件反推。</b>当你的起点是「界面上某个元素」时，这条线索极其有效：' +
-                  'dump 出资源 id → 反查布局 → 反查绑定函数。' +
-                  '<b>什么时候换下一条：</b>界面不是原生 View 树。' +
-                  '<span class="miss">这是本章唯一的「结构性排除」——遇到 Flutter / 自绘 / 游戏引擎，' +
-                  '直接划掉它，不要试着验证。</span>' },
-          { run: () => { S('c4', 'done'); S('c6', 'active');
-                         SET('mk', '<div class="note-h">到这里，你已经花了多少？</div><p>前五条线索的共同点是：<b>都不需要中断程序、都不需要精确知道位置。</b>它们给你的是「范围」和「候选」。<br>下面两条要付更高的成本，所以它们应该被用在<b>范围已经很小</b>的时候。</p>'); },
-            note: '<b>成本 4 · Profiling / Trace。</b>它回答的是「这一串操作里跑了哪些方法」——' +
-                  '给的是<b>候选集</b>，不是证据链。<br>' +
-                  '<b>什么时候换下一条：</b>采样把目标方法丢了（太短、太深），或内联导致调用关系缺失。' +
-                  '<span class="hit">它最大的价值是「在没有字符串可搜、结构也读不出来时，给你第一批假设」。</span>' },
-          { run: () => { S('c6', 'done'); S('c7', 'active');
-                         SET('mark', 'pill warn'); SET('mark', '⚠️ 最贵的一级：它要求你先知道「断在哪」'); },
-            note: '<b>成本 4 · 动态调试。</b>它是唯一能给出第一手现场的手段（寄存器、内存、局部变量），' +
-                  '所以它必须被用在<b>最确定的地方</b>。<br>' +
-                  '<b>它的成本有一半不在技术上，在环境上</b>：debuggable、JDWP 通道、' +
-                  '以及「目标是否检测调试」。<b>这也是为什么它排在最后：先用它前面的六条把范围压小，再动手。</b>' },
-          { run: () => { CLS('mark', 'pill ok'); SET('mark', '✅ 顺序不是死的：任何一步拿到强证据都可以直接跳到第 7 级');
-                         SET('mk', '<div class="note-h">阶梯的正确用法</div><p style="margin-bottom:0">这不是「必须从 1 走到 7」。<b>任何一步拿到强证据，都可以直接跳到最贵的那一级</b>——' +
-                           '比如崩溃日志直接给出了类名与行号（③命中），你就可以立刻在那里下断点（⑦）。<br>' +
-                           '阶梯真正的用途是回答一个问题：<b>「我现在这一步失败了，下一步该往哪走？」</b></p>'); },
-            note: '<b>收尾：阶梯的价值在于「决定下一步」，而不是「规定顺序」。</b><br>' +
-                  '强证据可以让你跳级；弱证据（比如 Trace 给的候选集）则必须回到便宜的那几级去交叉验证。<br>' +
-                  '<span class="hit">判断力体现在：知道自己现在手里的东西是「强证据」还是「候选集」。</span>' }
-        ]
-      },
-      quiz: {
-        id: 'q30-4', chapter: 30, answer: 3,
-        stem: '下面关于七条线索的排序，哪一条判断是<b>正确</b>的？',
-        options: [
-          { t: '七条线索应该从 1 到 7 依次尝试，这样才能保证不遗漏任何一种可能',
-            why: '依次尝试忽略了「成本差异」。一次动态调试的启动成本可能等于几十次字符串搜索；更糟的是，把最贵的手段用在一个还没缩小范围的目标上，得到的往往是无效结论。' },
-          { t: '动态调试最精确，所以应该优先使用，避免在便宜的线索上浪费时间',
-            why: '把「精确」当成了「优先」。动态调试需要你先知道断在哪里——没有前六条给出的范围，你连下断点的位置都选不出来。' },
-          { t: '只要字符串搜索命中，就应该停止使用其它线索，避免节外生枝',
-            why: '字符串搜索命中给你的是「候选位置」，不是结论。混淆命名、工具类复用、多份相似代码都会让命中指向错误的函数，仍然需要调用栈或调试来确认。' },
-          { t: '被「结构性排除」的线索要直接划掉：界面是 Flutter 时，UI 反推不是效果差，而是逻辑上不成立',
-            why: '正确。这正是本章对七条线索排序的关键补充：成本排序管的是「先试哪个」，结构性排除管的是「哪个根本不用试」。两者一起用，才能既不遗漏也不浪费。' }
-        ],
-        explain: '<b>把这两件事分开看，排序才不会变成教条：</b><br>' +
-                 '<b>① 成本排序</b>决定「先付哪一笔钱」——便宜的先做，因为失败几乎不花钱，' +
-                 '而且它给出的信息（不是明文常量 / 结构被处理过 / 栈退化了）本身就能砍掉一大片可能性。<br>' +
-                 '<b>② 结构性排除</b>决定「哪个逻辑上不成立」——Flutter 界面没有原生 View 树，' +
-                 '所以 UI 反推不是「弱」，而是「错」；加固+字符串加密时静态搜索不是「慢」，而是「空」。<br>' +
-                 '<span class="hit">判断力 = 知道哪条线索便宜（先做） + 知道哪条线索不成立（别做）。</span>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">七条线索、一张成本表、三条排序判据，以及最重要的那张「失败时得到什么」的表。<br>' +
-        '下面七节逐条展开。<b>读每一条时请始终带着同一个问题：它失败时，我会得到什么信息？</b></p>')
-    },
-
-    /* ============================================================ 30.7 */
-    {
-      h: '30.7', title: '线索一 · 字符串搜索：搜什么，以及搜不到时说明了什么',
-      html:
-        '<p>字符串搜索是整章最便宜的动作，也是<b>最容易做错的动作</b>——' +
-        '大多数人的问题是「不知道搜什么词」，而不是「不会搜」。</p>' +
-        T.card('值得优先试的六类搜索词（按命中率排序）',
-          '<ol>' +
-          '<li><b>URL 与域名</b>：接口路径、CDN 域名、埋点地址。字符串搜索里命中率最高的一类，' +
-          '因为域名几乎不会被混淆掉（它必须是真的域名才能通信）。</li>' +
-          '<li><b>错误提示与业务文案</b>：界面上看到的每一句话都可能是一个明文常量。' +
-          '注意「可能」——下一段会讲它的三种例外。</li>' +
-          '<li><b>日志 TAG</b>：业务代码的 TAG 往往直接写着模块名或功能名，是天然的索引。</li>' +
-          '<li><b>加解密算法的常量</b>：标准表的初始向量、轮常量、编码表。<b>魔改算法恰恰会留下这些改过的常量</b>，' +
-          '所以这是识别「这是什么算法」最直接的入口（第 8、9 章的主战场）。</li>' +
-          '<li><b>密钥 / 盐的前缀与格式特征</b>：例如形如固定前缀加随机串的 key、固定长度的 hex 串。' +
-          '搜前缀往往能定位到密钥派生的代码。</li>' +
-          '<li><b>配置项名与协议字段名</b>：参数名、header 名、固定字段。<b>字段名是被双方约定死的</b>，' +
-          '所以它通常老老实实躺在协议解析代码里。</li>' +
-          '</ol>') +
-        T.note('key', '🔑 什么时候该怀疑「这条线索不成立」',
-          '<p>界面上的文案有三种情况，搜不到时按顺序排查：</p>' +
-          '<ol>' +
-          '<li><b>运行时拼出来的</b>：文案由多个片段拼接，你搜整句当然搜不到。' +
-          '对策：<b>换成搜其中的独特片段</b>，或者去搜「格式化」的痕迹（拼接点附近）。</li>' +
-          '<li><b>服务端下发的</b>：本地只有一个错误码。<b>这是最常见的「搜不到」</b>。' +
-          '判据：抓包能看到这句原文，而本地搜不到任何片段。</li>' +
-          '<li><b>被加密的</b>：字符串在 dex / so 里以密文或编码后的形式存在，运行时才解密（第 19 章）。' +
-          '判据：搜不到；而且你能看到成片的、看起来像随机数据的高熵区域。</li>' +
-          '</ol>' +
-          '<p style="margin-bottom:0"><span class="hit">无论哪一种，你都拿到了一个明确的信息：' +
-          '「这个功能不是靠明文常量驱动的」</span>——这本身就是一条把范围缩小了的结论。' +
-          '而它的下一站是明确的：拼接 → 顺调用栈；服务端 → 抓包与协议分析；加密 → 脱壳与字符串解密（第 8、19 章）。</p>') +
-        T.acc('为什么「搜不到」反而常常是有价值的信号',
-          '<p>很多人把「搜不到」当成一次失败，然后换下一个词、再换下一个词，' +
-          '最后得出结论「这个 App 没法分析」。</p>' +
-          '<p>正确的读法是：<b>搜索的命中与否，是在给这段代码做分类。</b></p>' +
-          '<ul>' +
-          '<li>命中了 → 这段逻辑是<b>静态可读</b>的，继续用静态手段。</li>' +
-          '<li>该搜的词都搜遍了都不中 → 这段逻辑是<b>运行时构造</b>的，' +
-          '继续静态搜索是浪费，应该转向调用栈、Trace 或动态调试。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0">换句话说：<span class="hit">字符串搜索真正的产出不是「那个字符串」，' +
-          '而是「这份代码是静态型还是运行时型」这个判断</span>。它决定了你接下来该走静态还是动态——' +
-          '这是本章最早、最便宜的一次分岔。</p>'),
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">六类高价值搜索词，以及「搜不到」的三种成因（拼接 / 服务端 / 加密）与各自的下一站。<br>' +
-        '记住这条线索的真正产出：<b>它给代码做了一次「静态型 / 运行时型」的分类。</b></p>')
-    },
-
-    /* ============================================================ 30.8 */
-    {
-      h: '30.8', title: '线索二 · 静态结构：Java 看调用链，Native 看导入表与交叉引用',
-      html:
-        '<p>静态结构这条线索听起来很虚，其实它有四个非常具体的抓手。按「从外到内」的顺序：</p>' +
-        T.tbl(
-          ['抓手', '具体看什么', '它能直接回答的问题'],
-          [
-            ['<b>① manifest（最外层）</b>',
-             '入口 Activity 与 intent-filter、Service / Receiver / Provider 声明、权限、' +
-             '<span class="mono">android:debuggable</span>、网络配置、<span class="mono">extractNativeLibs</span> 之类的开关',
-             '「程序从哪里开始跑」「它有没有对外暴露的组件」「它声明了哪些能力」'],
-            ['<b>② import 与类型引用</b>',
-             '某个类引用了哪些框架类型：加密相关、网络相关、反射相关、动态加载相关',
-             '<b>「它在用什么能力」</b>——比读方法体便宜得多，且不受混淆影响（框架类名不会被混淆）'],
-            ['<b>③ 方法调用图</b>',
-             '谁调用谁：从入口向外展开，或从可疑点向内回溯',
-             '「这条业务链路经过哪些类」；也是判断「哪些方法是死代码」的依据'],
-            ['<b>④ 注解与泛型残留</b>',
-             '注解（含运行时注解）、泛型签名、异常表、内部类名字',
-             '<b>混淆最难抹掉的一层</b>：注解与泛型签名是结构化元数据，' +
-             '经常能还原出「这个类原本叫什么、处理什么数据」']
-          ]) +
-        T.note('key', '🔑 Java 与 Native 的静态阅读，盯的不是同一样东西',
-          '<p style="margin-bottom:0">这是本节最该带走的一句话：</p>' +
-          '<ul>' +
-          '<li><b>静态看 Java：盯「调用链」。</b>Java 层有完整的类型信息、方法引用、' +
-          '甚至行号与注解——所以你的工作是<b>沿着引用关系把链路连起来</b>，' +
-          '从「界面触发的入口」走到「真正干活的那个方法」。混淆会改名字，但改不了调用关系的<b>形状</b>。' +
-          '<span class="hit">名字被混淆时，形状就是你的地图。</span></li>' +
-          '<li><b>静态看 Native：盯「导入表 + 常量 + 交叉引用」。</b>' +
-          'so 里没有类型系统可依赖，符号还可能被剥离，所以你只能靠三样东西：' +
-          '<b>它调用了哪些外部函数</b>（导入表——即使符号被剥离，导入表依然存在，' +
-          '因为动态链接必须靠它）、<b>它用了哪些常量</b>（算法常量、错误字符串、配置键）、' +
-          '以及<b>谁引用了这段代码</b>（交叉引用：从 JNI 注册点、从导出函数、从字符串引用反查）。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0">这一节的推论很实用：<b>符号被剥离不等于 native 不可读。</b>' +
-          '导入表告诉你它「会做什么」，常量告诉你它「用的是什么算法」，' +
-          '交叉引用告诉你「从哪进来」——三条合起来已经足够画出一张草图。</p>') +
-        T.grid(2, [
-          T.card('静态结构的五个「高价值锚点」',
-            '<ul>' +
-            '<li><b>JNI 动态注册表</b>：名字与函数指针的对应关系，等于一份免费的符号表。' +
-            '哪怕 so 被剥离，注册表里也写着名字（第 20 章）。</li>' +
-            '<li><b>导出函数表</b>：被外部调用的入口；如果它是 JNI 静态注册，函数名本身就是签名信息。</li>' +
-            '<li><b>字符串引用点</b>：从「搜到的那个常量」反查「谁引用了它」，' +
-            '这是把「字符串」变成「代码位置」的标准动作。</li>' +
-            '<li><b>导入表</b>：网络、加密、文件、反射——四类导入几乎能勾勒出模块的功能轮廓。</li>' +
-            '<li><b>异常与断言字符串</b>：调试期留下的信息，往往直接说明「这里在检查什么」。</li>' +
-            '</ul>'),
-          T.card('静态结构最容易误判的三种情况',
-            '<ul>' +
-            '<li><b>把「引用」当成「执行」</b>：一段代码被引用，不代表它会被跑到。' +
-            '很多诱导性代码就是这样设计的。<b>静态给的是可能性，不是事实。</b></li>' +
-            '<li><b>把「死代码」当成主线</b>：混淆会插入大量不可达分支。' +
-            '判据：在调用图上找不到从入口过来的路径。</li>' +
-            '<li><b>把「壳的结构」当成业务结构</b>：如果反编译出来只有一个巨大的 Application ' +
-            '和一堆看不懂的类，先考虑「这是壳」，而不是「这个 App 逻辑很奇怪」（第 19 章）。</li>' +
-            '</ul>')
-        ]) +
-        T.note('warn', '📌 一个纪律：静态结论必须用动态或数据流交叉验证',
-          '<p style="margin-bottom:0">静态分析给出的是<b>读代码得到的推理</b>，' +
-          '而推理会被三件事欺骗：不可达代码、被替换的方法（壳在运行时换实现）、以及编译器优化。<br>' +
-          '所以任何一条静态结论，只要它足够关键（例如「密钥是这里派生的」），' +
-          '就应该用一个便宜的动作去验证：加一条日志、打一个栈、或者对一次输入输出。' +
-          '<b>验证的成本通常远低于推理错误的代价。</b></p>'),
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">四个抓手（manifest / 类型引用 / 调用图 / 注解与泛型残留），' +
-        '以及 Java 与 Native 静态阅读的分工：<b>Java 盯调用链的形状，Native 盯导入表、常量与交叉引用。</b></p>')
-    },
-
-    /* ============================================================ 30.9 */
-    {
-      h: '30.9', title: '线索三 · 动态调试：Smali 断点与 IDA attach，重点在「观察什么」',
-      html:
-        '<p>动态调试的操作细节（用哪个 IDE、怎么配端口、点哪个按钮）随工具版本变化，' +
-        '而且网上一搜一大把。<b>本节刻意不写按键序列</b>，只写两件事：' +
-        '两条调试路线各自适合什么场景，以及停下来的那一刻你应该看什么。</p>' +
-        T.grid(2, [
-          T.card('路线 A：Smali 层断点（<span class="mono">am start -D</span> + 主机调试器）',
-            '<p><b>适合：</b>目标逻辑在 Java 层；你要确认「某个分支走不走」「某个字段是不是 null」' +
-            '「某个方法收到的参数到底是什么」。</p>' +
-            '<p><b>它的独特价值是「变量可见」</b>：在 Java 层，你能直接看到对象内容、字符串、集合，' +
-            '不需要自己做内存解析。</p>' +
-            '<p><b>它的短板：</b>Java 层看到的东西可能是「已经被 native 处理过的结果」。' +
-            '如果算法在 so 里，Java 断点只能看到输入和输出，看不到中间过程。</p>' +
-            '<p class="muted small">前置条件与失败形态见 30.5；具体操作以当前工具文档为准。</p>'),
-          T.card('路线 B：IDA attach so（原生层）',
-            '<p><b>适合：</b>算法 / 校验 / 加解密在 so 里；你要看寄存器、内存布局、' +
-            '以及「这个函数被谁调用」。</p>' +
-            '<p><b>它的独特价值是「唯一的第一手现场」</b>：寄存器里的中间值、栈上的临时缓冲、' +
-            '堆上那块被 XOR 过的数据，只有在这一层才看得到。</p>' +
-            '<p><b>它的短板：</b>需要so 已加载（attach 时机）、需要地址（基址 + 偏移）、' +
-            '符号被剥离时定位困难。所以它天然排在静态结构与调用栈之后。</p>' +
-            '<p class="muted small">attach 模式与断点方式随 IDA 版本与目标架构变化，以当期文档为准。</p>')
-        ]) +
-        T.tbl(
-          ['停下来的那一刻，先看这四样', '为什么先看它', '常见误判'],
-          [
-            ['<b>① 参数（寄存器和栈上的入参）</b>',
-             '参数决定了这次调用「在算什么」。先确认自己停在了正确的那一次调用上，再做别的',
-             '只看了第一次命中就下结论——很多函数会被调用几十次，第一次可能只是初始化'],
-            ['<b>② 返回地址（谁调用了它）</b>',
-             '返回地址直接告诉你上一层是谁，这是把「孤立函数」接回调用链的最快方式',
-             '把返回地址当成了「函数内某个常量地址」；或者忘了减掉指令长度（架构相关）'],
-            ['<b>③ 关键内存（输入缓冲、输出缓冲、密钥区）</b>',
-             '算法的真相在内存里：读一次输入缓冲、读一次输出缓冲，就能确认数据流方向',
-             '只看寄存器不看内存——数据结构的指针在寄存器里，内容在内存里'],
-            ['<b>④ 这一段的执行轨迹（谁改了它）</b>',
-             '当你要回答「这个值是谁写进来」时，断点比读代码有效得多',
-             '在没有缩小范围时就开指令级 trace：数据量大到你读不完']
-          ]) +
-        T.note('warn', '⚠️ 一条经验：调试器的成本有一半花在「选点」上',
-          '<p style="margin-bottom:0">新手常以为动态调试的难点是「怎么挂上去」。' +
-          '实际上挂上去只是入场券，<b>贵的是「断在哪里」</b>：' +
-          '断点太多 → 你要处理的命中数爆炸；断点太浅 → 看到的是无关的框架代码；' +
-          '断点太深 → 可能永远不命中（那个分支根本没走到）。<br>' +
-          '<span class="hit">所以六条更便宜的线索的真正用途，就是帮你把「断在哪」这件事从猜测变成选择。</span></p>'),
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">两条调试路线的适用边界（Java 层看变量、native 层看现场），' +
-        '以及停下来要看的四样东西：参数、返回地址、关键内存、执行轨迹。<br>' +
-        '<b>本节刻意不给按键序列</b>——那些随版本变化；而「观察什么」不会过期。</p>')
-    },
-    /* ============================================================ 30.10 */
-    {
-      h: '30.10', title: '线索四 · 调用栈：栈的三段、业务边界，以及栈退化之后长什么样',
-      intuition: {
-        tag: '直觉模型 · 一张收据',
-        body:
-          '<p>调用栈像一张打印出来的收据：从下往上，记录着「是谁把钱交给了谁」。</p>' +
-          '<p>最底下几行是银行和收单机构（系统与框架），中间可能有几行是转接行（库与代理），' +
-          '最上面那几行才是真正花钱的人（业务代码）。</p>' +
-          '<p>你关心两件事：<b>最上面的业务痕迹从哪一行开始</b>（事发点），' +
-          '以及<b>最下面那笔交易是怎么被发起的</b>（入口）。</p>' +
-          '<p>如果这张收据上所有的名字都被涂成了「a、b、c」，那你手里的纸还在，信息已经没了——' +
-          '这就是栈退化。</p>'
-      },
-      html:
-        '<p>调用栈之所以被单独列为一条线索，是因为它有一种别的线索没有的性质：' +
-        '<b>它同时给出了「位置」和「关系」</b>。字符串搜索给你一个位置，调用栈给你一条路径。</p>' +
-        T.note('key', '🔑 栈的三段：先学会分层，再谈读法',
-          '<p>拿到一条栈，第一步不是找目标，而是<b>把它切成三段</b>：</p>' +
-          '<ul>' +
-          '<li><b>① 系统与框架段</b>（栈底）：<span class="mono">android.*</span>、' +
-          '<span class="mono">java.*</span>、<span class="mono">androidx.*</span>、' +
-          '<span class="mono">com.android.*</span>，以及运行时的 so（libc / libart / libandroid）。' +
-          '<b>这一段告诉你「这次调用是被什么机制触发的」</b>——是 UI 事件、是消息循环、是 Binder 回调、还是线程池。</li>' +
-          '<li><b>② 业务框架段</b>（中间）：第三方 SDK、网络库、加解密封装库、插件框架、你自己的基础库。' +
-          '它们的特征是「名字看起来像公司，但不像这个 App 的业务」。' +
-          '<b>这一段是噪音的主要来源</b>，也是「无意义包装」最常出现的地方。</li>' +
-          '<li><b>③ 业务逻辑段</b>（栈顶）：目标 App 自己的包名。' +
-          '<b>这才是你要读的部分。</b></li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><span class="hit">分层靠的是包名与模块名，不是靠「哪个名字看起来重要」。</span>' +
-          '这也是为什么它是一条可靠的、可以交给别人复核的判断。</p>') +
-        T.note('key', '🎯 业务边界：第一次出现「你的目标」的那一帧',
-          '<p>业务边界有两种等价的说法：</p>' +
-          '<ul>' +
-          '<li><b>从栈顶往下数：</b>第一帧属于<b>应用自己包名</b>、并且<b>不是代理/合成/反射帧</b>的代码。</li>' +
-          '<li><b>从你的目标倒着数：</b>你要找的那个字符串、那个密文、那个错误码，' +
-          '<b>第一次出现在哪一帧</b>——那一帧就是业务边界。</li>' +
-          '</ul>' +
-          '<p>两种说法为什么等价：因为它们都在回答同一个问题——<b>「控制权是从哪一帧开始进入业务的」</b>。<br>' +
-          '找到它之后，你的动作是明确的：<b>把断点/日志/计数器放到那一帧</b>，' +
-          '而不是放在它上面那一堆框架代码里。</p>' +
-          '<p style="margin-bottom:0"><b>反方向的用法同样重要：</b>从栈底往上数，第一帧业务代码是' +
-          '<b>业务入口</b>——它回答的是「用户的一次操作是从哪里进入这个 App 的代码的」。' +
-          '一个栈，两个方向，分别对应「事发点」与「入口点」。</p>') +
-        T.tbl(
-          ['栈上的形态', '它意味着什么', '你的下一步'],
-          [
-            ['<b>代理 / 合成帧</b>（反射调用、合成的 lambda、动态代理）',
-             '控制权经过了「通用入口」，这一帧本身<b>不携带业务语义</b>——' +
-             '你不可能从 <span class="mono">Method.invoke</span> 看出它在调谁',
-             '不要在这一帧下功夫；<b>穿过它</b>，去看它下面的实际目标，或者去 hook 反射 API 拿名字（第 20 章）'],
-            ['<b>库的包装帧</b>（名字像库、调用层次很深）',
-             '第三方库在做转发；业务逻辑还在更上面或更下面',
-             '同样穿过它。判断依据是包名归属，不是调用深度'],
-            ['<b>同一帧名重复出现</b>',
-             '递归，或者调用链被折叠/内联之后的假重复',
-             '先确认是真递归还是假重复——假重复意味着这个栈的<b>关系信息已经不可信</b>'],
-            ['<b>帧上只有模块名和偏移，没有符号</b>（native 侧）',
-             '符号被剥离，或这是系统库（系统库本来就只有偏移）',
-             '把偏移映回模块基址，再用静态分析的地址去对应（下面单独讲）'],
-            ['<b>栈里一帧业务代码都没有</b>',
-             '崩溃/断点发生在框架层；或者你的目标进程不对',
-             '先怀疑「是不是 attach 错了进程」，再怀疑「业务代码不在这条路径上」']
-          ]) +
-        T.card('native 侧的栈：为什么更难读，怎么读',
-          '<p>Java 栈是「有名字的列表」，native 栈是「一块内存 + 一些约定」——' +
-          '要自己沿着帧指针/展开信息往回走，所以它天生更容易断。读的时候盯三件事：</p>' +
-          '<ul>' +
-          '<li><b>模块归属</b>：每个地址落在哪个 so 里（libc / libart / App 自带的 libxxx）。' +
-          '这一条即使在符号被剥离时也成立，因为模块映射关系是内核给的。</li>' +
-          '<li><b>模块内偏移</b>：把绝对地址减掉模块基址，得到偏移；' +
-          '这个偏移才是可以拿去静态分析里对照的稳定量（基址每次运行都变）。</li>' +
-          '<li><b>有没有 unwind 信息</b>：部分 so 带展开信息，能给出完整的 native 栈；' +
-          '没有的时候你只能拿到当前帧附近的地址，需要自己分段确认。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><b>结论：</b>native 栈给你的不是「函数名列表」，' +
-          '而是「一组（模块, 偏移）坐标」。<span class="hit">它的用法与 Java 栈相同——' +
-          '先分层（哪些是系统库、哪个是 App 自带），再把坐标交给静态分析。</span>' +
-          '第 1 章讲过 native hook 的地址问题，第 21 章的 ModuleMap 则是「几十个 so 里锁定那一个」的工程化做法。</p>') +
-        T.note('warn', '⚠️ 栈退化：三种表现，以及它给你的结论',
-          '<p style="margin-bottom:0">当你看到下面三种表现时，不要再试图从这条栈里读出业务关系——' +
-          '它已经在编译期被抹掉了：</p>' +
-          '<ul>' +
-          '<li><b>大量无行号帧</b>（Unknown Source / SourceFile:1）：说明行号信息被剥掉了，' +
-          '你无法再从「行」回到「源码」。</li>' +
-          '<li><b>名字全是单字母</b>（a.a.a）：混淆不仅让名字失去语义，也让「同名帧重复」变得无法解释。</li>' +
-          '<li><b>帧数骤减、调用关系断裂</b>：内联把函数体展开到调用处，<b>这一帧在栈上从来不存在</b>。' +
-          '你看到的调用关系会直接跳过被内联的函数。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><span class="hit">退化的结论不是「这条线索没用」，而是：' +
-          '「名字与行号这条路被关掉了，我需要一个不依赖名字的观测」</span>——' +
-          '于是转向运行时打点、指令级 trace，或者直接用地址做动态调试。</p>'),
+        '<p>本章最容易混淆的三个概念：<b>全系统模拟</b>、<b>应用级翻译</b>、<b>GKI</b>。' +
+        '前两个是"怎么执行 ARM 代码"，第三个根本不是翻译——它是内核架构。这个实验帮你把它们分清楚。</p>',
       lab: {
-        title: '实验：调用栈判读器（真实解析 + 分层 + 三坐标定位）',
-        goal: '标出三个坐标 + 说出理由',
+        title: '实验：翻译模式选型',
+        goal: '目标：按需求选对模式',
         intro:
-          '<p>下面有一段<b>真实形状</b>的崩溃栈（异常类型被改写得无害，但形态是真的）。' +
-          '点「解析这条栈」会得到每一帧的<b>语法特征</b>——注意：<b>它不会告诉你哪一帧是业务帧</b>，' +
-          '那一层判断要你自己做。</p>' +
-          '<p>你要填三个帧号与一段理由。<b>帧号就是解析结果里的 # 编号</b>（异常名那一行不计数）。' +
-          '判分用的是规则：包名归属、代理/合成帧特征、以及「从栈顶/栈底两个方向的第一帧业务代码」。<br>' +
-          '做完后可以把输入框里的栈换成<b>第二段（退化版）</b>再跑一次——那是同一套规则遇到混淆时的表现。</p>',
+          '<p>下面三个需求，分别该用哪种模式？<b>注意其中有一个需求，本身就是个错误前提。</b></p>' +
+          '<div class="tbl-wrap" style="margin:12px 0"><table class="tbl"><thead><tr><th>#</th><th>需求</th></tr></thead><tbody>' +
+          '<tr><td>①</td><td>在 x86 PC 上跑一个完整的 ARM Linux 系统（含内核），用来研究驱动行为</td></tr>' +
+          '<tr><td>②</td><td>在 x86 安卓设备上，让某个只有 armeabi-v7a so 的 App 能正常用，且性能尽量接近原生</td></tr>' +
+          '<tr><td>③</td><td>想通过"把内核换成 GKI"来让 x86 模拟器跑 ARM 的 App</td></tr>' +
+          '</tbody></table></div>',
         inputs: [
-          { key: 'stack', label: '调用栈原文', hint: '可直接替换成你手上的真实栈',
-            type: 'textarea', rows: 11, value: window.CH30X.DEMO_A },
-          { key: 'boundary', label: '① 业务边界在哪一帧？', hint: '填帧号', value: '' },
-          { key: 'wrapper', label: '② 哪一帧没有业务语义（代理 / 合成 / 紧贴边界的框架帧）？', hint: '填帧号；若确实没有填 0', value: '' },
-          { key: 'follow', label: '③ 要找到「业务入口」，顺哪一帧最有效？', hint: '填帧号', value: '' },
-          { key: 'why', label: '理由：你凭什么区分系统帧、框架帧、业务帧？', hint: '至少说两点',
-            type: 'textarea', rows: 3, value: '' }
+          { key: 'a1', label: '① 需求①该用哪种模式？', hint: '填：全系统模拟 / 应用级翻译 / GKI', ph: '全系统模拟' },
+          { key: 'a2', label: '② 需求②该用哪种模式？', hint: '', ph: '应用级翻译' },
+          { key: 'a3', label: '③ 需求③有什么问题？', hint: 'GKI 解决的是"翻译"问题吗？', ph: '问题在于……', type: 'textarea', rows: 2 }
         ],
-        runLabel: '🔍 解析这条栈',
-        autorun: true,
-        run: v => window.CH30X.framesHtml(window.CH30X.judgeStack(window.CH30X.parseStack(v.stack))),
-        expected: v => {
-          const j = window.CH30X.judgeStack(window.CH30X.parseStack(v.stack));
-          if (!j.numbered.length) {
-            return { ok: false, detail: '还没有解析出任何帧。把崩溃日志原样粘进第一个框，Java 帧要形如 <span class="mono">at com.a.B.c(B.java:12)</span>。' };
+        runLabel: '🔍 校验选型',
+        run: (v) => {
+          const L = window.LABX;
+          let html = '<table class="lab-tbl"><tr><th>模式</th><th>怎么工作</th><th>优点</th><th>代价</th><th>适用</th></tr>';
+          L.TRANSLATION_MODES.forEach(m => {
+            html += '<tr class="' + (m.id === 'gki' ? 'diff' : 'same') + '">'
+              + '<td><b>' + m.name + '</b></td>'
+              + '<td style="font-size:12px">' + m.how + '</td>'
+              + '<td style="font-size:12px">' + m.pros.join('；') + '</td>'
+              + '<td style="font-size:12px">' + m.cons.join('；') + '</td>'
+              + '<td style="font-size:12px">' + m.when + '</td></tr>';
+          });
+          html += '</table>';
+
+          // ① 判定
+          const j1 = s => window.AKKC_hasConcept(String(s || ''), ['全系统', '全系统模拟', 'qemu', 'tcg', '完整系统']);
+          if (String(v.a1 || '').trim()) {
+            const ok = j1(v.a1);
+            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>① '
+              + (ok ? '✅ 正确：全系统模拟' : '❌ 应该是全系统模拟') + '</b>'
+              + '<div class="lab-note">因为需求是"<b>跑完整的 ARM Linux（含内核）</b>"。' +
+              '应用级翻译只翻译 App 的 so，<b>它根本没有"guest 内核"这个概念</b>——' +
+              '宿主内核直接就是 Android 的内核。<br>' +
+              '要跑独立的 guest 内核，只能用全系统模拟（QEMU TCG 逐条翻译）。' +
+              '代价是慢，但兼容性最好。</div></div>';
           }
-          const num = function (s) {
-            const m = /(\d+)/.exec(String(s || ''));
-            return m ? parseInt(m[1], 10) : null;
+
+          // ② 判定
+          const j2 = s => window.AKKC_hasConcept(String(s || ''), ['应用级', '应用级翻译', 'houdini', 'ndk_translation', 'libndk']);
+          if (String(v.a2 || '').trim()) {
+            const ok = j2(v.a2);
+            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>② '
+              + (ok ? '✅ 正确：应用级翻译' : '❌ 应该是应用级翻译') + '</b>'
+              + '<div class="lab-note">关键在"<b>性能尽量接近原生</b>"这句话。' +
+              '应用级翻译让 <b>x86 安卓以原生速度运行</b>，只把 App 里的 ARM so 翻译掉——' +
+              '翻译面积从"整个系统"缩小到"一个 so"，性能差距自然小得多。<br>' +
+              '对比：如果用全系统模拟，<b>连系统本身都要逐条翻译</b>，慢得没法日常使用。</div></div>';
+          }
+
+          // ③ 判定
+          const a3 = String(v.a3 || '').trim();
+          if (a3) {
+            const hitNotTrans = window.AKKC_hasConcept(a3, ['不是翻译', '无关', '两回事', '不能', '解决不了', '不同层面', '内核架构', '不是一回事']);
+            html += '<div class="lab-msg ' + (hitNotTrans ? 'pass' : 'warn') + '"><b>③ '
+              + (hitNotTrans ? '✅ 抓到问题了' : '🟡 再想想') + '</b>'
+              + '<div class="lab-note"><b>这个需求的前提就是错的：GKI 和"指令翻译"是两个完全无关的层面。</b><br><br>'
+              + '<b>GKI 是什么：</b>Google 维护的通用内核镜像 + 厂商可加载模块，通过稳定 KMI 协作。' +
+              '它解决的是<b>"内核碎片化"</b>问题（让 Google 能独立升级内核修漏洞）。<br><br>'
+              + '<b>指令翻译是什么：</b>把一种 CPU 架构的机器码翻译成另一种，解决的是<b>"架构不兼容"</b>问题。<br><br>'
+              + '换成 GKI 内核，<b>一条 ARM 指令也不会变成 x86 指令</b>。要跑 ARM App，' +
+              '还是得靠应用级翻译（libhoudini / libndk_translation）或全系统模拟。</div></div>';
+          }
+
+          html += '<div class="lab-msg key"><b>🔑 一句话区分三者</b>'
+            + '<div class="lab-note">'
+            + '<b>全系统模拟</b> = 造一台完整的假机器（含假内核）→ 慢，但什么都能跑<br>'
+            + '<b>应用级翻译</b> = 只把 App 的 so 翻译掉，系统本身原生跑 → 快，只解决 App 兼容<br>'
+            + '<b>GKI</b> = 内核的<b>交付方式</b>（通用核心 + 厂商模块）→ <span class="bad">与指令翻译无关</span><br><br>'
+            + '判断技巧：问"这个方案解决的是<b>架构不兼容</b>，还是<b>内核碎片化</b>？"<br>'
+            + '前者是翻译问题，后者是内核工程问题。</div></div>';
+          return html;
+        },
+        expected: (v) => {
+          const ok1 = window.AKKC_hasConcept(String(v.a1 || ''), ['全系统', 'qemu', 'tcg']);
+          const ok2 = window.AKKC_hasConcept(String(v.a2 || ''), ['应用级', 'houdini', 'ndk_translation', 'libndk']);
+          const ok3 = window.AKKC_hasConcept(String(v.a3 || ''), ['不是翻译', '无关', '两回事', '不能', '解决不了', '不同层面', '内核架构']);
+          const ok = ok1 && ok2 && ok3;
+          return {
+            ok,
+            detail: ok
+              ? '<b>三问全对。</b>① 全系统模拟（要跑 guest 内核）② 应用级翻译（要性能）' +
+                '③ GKI 与指令翻译无关（它解决内核碎片化，不解决架构不兼容）。<br>' +
+                '你已经把本章最容易混的三个概念分清了。'
+              : (ok1 ? '' : '① 应为<b>全系统模拟</b>——需求要跑完整的 guest 内核。<br>')
+                + (ok2 ? '' : '② 应为<b>应用级翻译</b>——需求强调"性能接近原生"，全系统模拟太慢。<br>')
+                + (ok3 ? '' : '③ 关键错误是<b>把 GKI 当成了翻译方案</b>——GKI 是内核的交付方式，与指令翻译无关。')
           };
-          const wantBoundary = j.boundary ? j.boundary.idx : null;
-          const wantEntry = j.entry ? j.entry.idx : null;
-          const wrapOk = [];
-          if (j.proxy) wrapOk.push(j.proxy.idx);
-          if (j.nearBoundary) wrapOk.push(j.nearBoundary.idx);
-          const b = num(v.boundary), w = num(v.wrapper), f = num(v.follow);
-          const okB = b !== null && b === wantBoundary;
-          const okF = f !== null && f === wantEntry;
-          const okW = wrapOk.length
-            ? (w !== null && wrapOk.indexOf(w) >= 0)
-            : window.AKKC_hasConcept(v.wrapper || '', ['0', '无', '没有', '不存在']);
-          const hits = ['业务', '包名', '系统', '框架', '代理', '反射', '内联', '入口', '行号', 'native', '混淆', '栈顶', '栈底']
-            .filter(function (k) { return window.AKKC_hasConcept(v.why || '', [k]); });
-          const okWhy = hits.length >= 2;
-          const ok = okB && okW && okF && okWhy;
-          let detail = '<b>逐项核对</b><ul style="margin:6px 0 0 18px">' +
-            '<li>① 业务边界：你填 ' + (b === null ? '（空）' : '#' + b) + '，规则算出 ' +
-              (wantBoundary === null ? '（这条栈里没有业务帧）' : '#' + wantBoundary + ' <span class="mono small">' + j.boundary.name + '</span>') +
-              (okB ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
-            '<li>② 无业务语义帧：你填 ' + (w === null ? '（空）' : '#' + w) + '，规则算出 ' +
-              (wrapOk.length ? wrapOk.map(function (x) { return '#' + x; }).join(' 或 ') : '（这条栈里没有，应填 0）') +
-              (okW ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
-            '<li>③ 业务入口：你填 ' + (f === null ? '（空）' : '#' + f) + '，规则算出 ' +
-              (wantEntry === null ? '（无）' : '#' + wantEntry + ' <span class="mono small">' + j.entry.name + '</span>') +
-              (okF ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
-            '<li>理由：命中 ' + hits.length + ' 个判据点' + (okWhy ? ' <span class="hit">✔</span>' : '（至少要说两点）') + '</li>' +
-            '</ul>';
-          if (j.degraded) {
-            detail += '<div class="lab-note"><b>顺带提示：</b>这条栈的规则判定是「已退化」——' +
-              j.reasons.join('；') + '。退化栈的正确处理是<b>换一个不依赖名字与行号的观测</b>，' +
-              '而不是继续在这里找语义。</div>';
-          }
-          return { ok: ok, detail: detail };
         },
         showAnswer:
-          '<p><b>对上面第一段栈（DEMO_A）：</b></p>' +
-          '<ul>' +
-          '<li><b>① 业务边界 = #1</b> <span class="mono">com.target.pay.CryptoBridge.nativeSign</span>。' +
-          '从栈顶往下，它是最接近事发点的业务帧；而且它标着 <span class="mono">(Native Method)</span>，' +
-          '说明这里同时是 <b>Java → native 的交接点</b>——再往里一步就要去 so 里找地址了。</li>' +
-          '<li><b>② 无业务语义帧 = #3</b> <span class="mono">java.lang.reflect.Method.invoke</span>。' +
-          '反射是「通用入口」，它不携带业务语义。<br>' +
-          '<b>陷阱在 #2</b>：<span class="mono">com.target.pay.SignProxy.invoke</span> 名字里带 Proxy，' +
-          '但它属于应用自己的包名，是<b>业务侧的代理层</b>，不是框架包装——' +
-          '<span class="hit">判断依据永远是包名归属，不是名字里有没有 Proxy。</span></li>' +
-          '<li><b>③ 业务入口 = #5</b> <span class="mono">com.target.pay.PayActivity$2.onClick</span>。' +
-          '从栈底往上数，它是系统框架第一次把控制权交给 App 的那一帧。' +
-          '注意它是<b>匿名内部类</b>（$2），这正是「按钮点击监听器」的典型形态——' +
-          '顺着它可以找到 <span class="mono">setOnClickListener</span> 的注册点。</li>' +
-          '</ul>' +
-          '<p><b>碰到第二段栈（退化版）时应该得出什么结论：</b>规则会判它「已退化」——' +
-          '无行号帧超过一半、单字母类名、同名帧重复。此时栈上唯一有用的信息是' +
-          '「#1 是一个 native 方法」这个事实，而连它的类名都是 <span class="mono">com.target.a.a.a</span>。' +
-          '<b>正确动作是换观测：用运行时打点或指令级 trace，而不是继续读这条栈。</b></p>',
-        hint: '<b>三个规则，照着做就行：</b><br>' +
-              '① <b>分层</b>：包名以 <span class="mono">java. / javax. / android. / androidx. / com.android.</span> 开头 → 系统与框架；' +
-              '含 <span class="mono">reflect / $Proxy / $$ExternalSyntheticLambda / Lambda$</span> → 代理或合成帧；' +
-              '其余属于应用包名 → 业务帧。<br>' +
-              '② <b>业务边界</b>：从 <b>#1 往下</b>数，第一帧业务帧。<br>' +
-              '③ <b>业务入口</b>：从 <b>最后一帧往上</b>数，第一帧业务帧。<br>' +
-              '别被名字骗：叫 Proxy 的可能是业务代码，叫 invoke 的一定是通用入口。',
-        after: T.note('ok', '实验做完了，收获是什么',
-          '<p style="margin-bottom:0">你现在有一条可复核的判栈规则：<b>按包名分层 → 两个方向各取第一帧业务代码 → ' +
-          '代理帧穿过不看</b>。<br>而且你见过它的退化形态：当名字和行号都没了，规则给出的结论是' +
-          '<b>「换观测」</b>，而不是「再仔细看看」。</p>')
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">栈的三段分法、两个方向的业务坐标（边界与入口）、' +
-        '代理帧的处理方式、native 栈的「模块 + 偏移」读法，以及退化的三种表现与它的结论。<br>' +
-        '与第 1、21 章的呼应关系：本章只讲<b>怎么读栈</b>；' +
-        '<b>怎么在 Frida 里打出这条栈、怎么在几十个 so 里锁定模块</b>，分别在第 1 章与第 21.13。</p>')
+          '【① 需求① → 全系统模拟（QEMU TCG）】\n' +
+          '  因为要跑【完整的 ARM Linux（含内核）】。\n' +
+          '  应用级翻译没有"guest 内核"这个概念，宿主内核就是内核。\n' +
+          '  代价：逐条翻译整系统，慢；但兼容性最好。\n\n' +
+          '【② 需求② → 应用级翻译（libhoudini / libndk_translation）】\n' +
+          '  关键在"性能尽量接近原生"。\n' +
+          '  x86 安卓原生速度跑，只把 App 的 ARM so 翻译掉。\n' +
+          '  翻译面积：整个系统 → 一个 so，性能差距自然小。\n\n' +
+          '【③ 需求③ 前提错误】\n' +
+          '  GKI 和"指令翻译"是两个完全无关的层面：\n\n' +
+          '  GKI 解决的是【内核碎片化】\n' +
+          '    = Google 通用内核 + 厂商可加载模块 + 稳定 KMI\n' +
+          '    → 让 Google 能独立升级内核修漏洞\n\n' +
+          '  指令翻译解决的是【架构不兼容】\n' +
+          '    = 把 ARM 机器码变成 x86 指令\n' +
+          '    → 让 x86 能跑 ARM 代码\n\n' +
+          '  换成 GKI 内核，一条 ARM 指令也不会变成 x86 指令。\n' +
+          '  要跑 ARM App 还是得靠应用级翻译或全系统模拟。\n\n' +
+          '【判断技巧】\n' +
+          '  问：这个方案解决的是"架构不兼容"，还是"内核碎片化"？\n' +
+          '    架构不兼容 → 翻译问题\n' +
+          '    内核碎片化 → 内核工程问题',
+        hint:
+          '三个需求分别卡在三个不同的点上：<br>' +
+          '① 关键词是"<b>完整的 ARM Linux（含内核）</b>"——应用级翻译有"guest 内核"这个东西吗？<br>' +
+          '② 关键词是"<b>性能尽量接近原生</b>"——哪种方案的翻译面积最小？<br>' +
+          '③ 这个需求<b>假设 GKI 能解决架构问题</b>。先问自己：GKI 到底解决什么问题？',
+        after:
+          T.note('key', '🔑 这个实验训练的是"概念分层"能力',
+            '<p style="margin-bottom:0">很多人把 GKI 和翻译模式混为一谈，是因为它们<b>都出现在"模拟器"这个话题里</b>。<br>' +
+            '但出现在同一章 ≠ 属于同一层。<br><br>' +
+            '画一条线：<br>' +
+            '<b>执行层</b>（代码怎么跑起来）：全系统模拟 / 应用级翻译<br>' +
+            '<b>内核层</b>（内核怎么交付和维护）：GKI<br><br>' +
+            '<span class="hit">这种"把概念按层归类"的能力，比记住每个概念的定义更有价值。' +
+            '因为当你遇到一个新概念时，第一件事就是问它属于哪一层——' +
+            '归对了层，它和什么有关、和什么无关，自然就清楚了。</span></p>')
+      }
     },
 
-    /* ============================================================ 30.11 */
+    /* ================= 30.4C 实战案例 ================= */
     {
-      h: '30.11', title: '线索五 · UI 组件定位：从「现象」反推「代码」的最快一条路',
-      html:
-        '<p>如果你手里的线索是「这个界面上的某个按钮 / 某个列表 / 某个弹窗」，' +
-        '那么 UI 反推往往是<b>所有线索里最快的一条</b>——因为它把「找代码」变成了「找 id」。</p>' +
-        '<p>这条线索依赖一个前提：<b>界面元素与代码之间有一条稳定的桥</b>。' +
-        '在原生 Android 上，这座桥就是 <b>资源 id</b>。</p>' +
-        T.tbl(
-          ['你的起点', '要拿到什么', '拿到之后做什么'],
-          [
-            ['界面上的一个控件（按钮、输入框、列表项）',
-             '它所属的 <b>Activity / Fragment</b>，以及<b>布局文件</b>',
-             '在布局里找到这个控件的 <b>资源 id</b>，然后去代码里搜这个 id'],
-            ['一个资源 id（例如 <span class="mono">0x7f0b0056</span>）',
-             '<b>它的名字</b>（<span class="mono">R.id.xxx</span>）与使用它的代码位置',
-             '搜名字 → 命中 <span class="mono">findViewById</span> / 视图绑定 → 顺着找到<b>绑定的回调函数</b>'],
-            ['一次点击行为（不知道控件在哪）',
-             '当前界面的<b>控件树</b>与每个控件的属性',
-             '按控件属性筛出那个控件 → 取它的 id / 文字 / 类名 → 回到上一步'],
-            ['一个弹窗 / 提示（文案是动态的）',
-             '<b>是谁弹的</b>',
-             '界面层拿不到静态常量时，就用控件类型（对话框 / Toast / 自定义 View）去缩范围，再配合日志或 hook']
-          ]) +
-        T.card('三件工具，各自解决什么（命令形态随版本变化，<span class="pill warn">待核实</span>）',
-          '<ul>' +
-          '<li><b>系统侧的界面状态查询</b>：查询当前前台窗口与 Activity 归属，' +
-          '回答「我现在看到的这个界面是哪个 Activity / 哪个进程」。<br>' +
-          '<span class="small muted">输出字段名随版本变化，以目标机实测为准。</span></li>' +
-          '<li><b>控件树导出</b>：把当前界面的控件树连同属性（文本、id、类名、可点击性）导出成结构文件，' +
-          '回答「这个元素是什么、它的 id 是什么」。<br>' +
-          '<span class="small muted">输出路径与是否需要额外权限随版本/ROM 变化，以实测为准。</span></li>' +
-          '<li><b>布局检查器</b>：连接调试进程，直接看运行时的视图层级与属性，' +
-          '回答「为什么这个控件是这个样子」。<b>它要求进程可调试</b>（回到 30.5）。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><b>共同点：</b>它们三个都在回答「界面由什么组成」，' +
-          '而不回答「代码为什么这么写」。<span class="hit">所以 UI 反推的产出永远是「一个切入点」，' +
-          '不是「一个结论」。</span></p>') +
-        T.note('key', '🔑 从资源 id 反查绑定函数：这条链的每一步都要说清',
-          '<p>常见的两种绑定方式，决定你从 id 出发会遇到什么：</p>' +
-          '<ul>' +
-          '<li><b>动态绑定</b>：代码里显式注册点击回调。' +
-          '从 id 出发能搜到注册那一行，<b>回调函数就在同一处（常常是匿名内部类或 lambda）</b>——链路最短。</li>' +
-          '<li><b>静态绑定</b>：在布局里声明「点击时调用哪个方法」。' +
-          '从 id 出发会先到布局，再从布局里的声明跳到方法名，<b>链接同样明确</b>。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0">两种方式都说明同一件事：' +
-          '<b>「界面元素 → 绑定函数」这条链是有限且可枚举的。</b>' +
-          '在原生界面上，你几乎总能从「我点了这个按钮」走到「它执行了哪段代码」。' +
-          '<br>而这条链会断的唯一情况，是界面元素根本不存在这个意义上——见下。</p>') +
-        T.note('warn', '⚠️ 结构性排除：Flutter / 自绘 / 游戏引擎',
-          '<p style="margin-bottom:0">当界面由 Flutter、自绘框架或游戏引擎渲染时，' +
-          '你在屏幕上看到的一切都是<b>画出来的像素</b>：没有原生控件树、没有 resource-id、' +
-          '没有 View 层级。<br>' +
-          '此时 UI 反推不是「效果差一点」，而是<b>从概念上不成立</b>——' +
-          '控件树导出的结果通常只有一个空白的大容器。' +
-          '<span class="hit">正确反应是立刻划掉这条线索，改从别处入手</span>：' +
-          '字符串搜索（Dart 的字符串常量通常仍落在 AOT 快照里）、' +
-          '或者对渲染/通信层做动态观测。<b>不要在这里花第二个小时。</b></p>'),
+      h: '30.4C', title: '实战案例：从 logcat 里反推进程安全域——Audit 侧信道检测 root、scrcpy 与模拟器',
       case: {
         source: 'kanxue',
-        title: '[原创]Android逆向0基础入门-APK全面解析,动调与脱壳',
-        date: '2025-03-07',
-        author: 'rufeng12',
-        target: '入门体系整理 + 配合练习题（如攻防世界「基础 Android」、BUU「简单注册器」）',
+        title: '[原创] Audit 侧信道: Root, scrcpy 和模拟器的新型检测与绕过',
+        date: '2026-5-20',
+        author: 'vwvw',
+        target: 'Android 三方 App 受限沙箱 + AOSP system/logging/logd/LogAudit.cpp；三类被检测对象：Magisk root 环境、AVD 模拟器（Android Studio 自带，M 芯片 Mac + Android 13 镜像，设备名 emu64a）、scrcpy 投屏',
         background:
-          '<p>这是一篇「把入门动作串成体系」的长文：从工具链、APK 结构，到' +
-          '<b>怎么找出程序入口点</b>、<b>怎么识别加固并简单脱壳</b>、' +
-          '<b>怎么定位一个界面的布局文件</b>、<b>怎么确定按钮绑定了哪个函数</b>、' +
-          '最后到 Java 层与 Native 层的逆向分工。</p>' +
-          '<p>把它放进本章的理由很直接：它演示的正是<b>线索五（UI 组件定位）</b>的标准范式——' +
-          '<b>从一个看得见的界面元素，一步一步走到那段看不见的代码。</b></p>',
+          '<p>本章前面讲的检测，几乎都是「App 主动去问系统」：读 <code>Build.*</code>、读 <code>ro.kernel.qemu</code>、读 <code>/proc/cmdline</code>、看有没有 <code>/dev/qemu_pipe</code>。' +
+          '这篇帖子讲的是<b>另一条完全不同的路</b>——不去读，而是<b>去碰</b>，然后从系统自己留下的日志里把答案读出来。</p>' +
+          '<p>帖子的战场是<b>受限沙箱里的三方 App</b>（作者自己的 <code>com.vwww.mira</code>，安全域 <code>u:r:untrusted_app_27:s0:...</code>）和 AOSP 的 ' +
+          '<code>system/logging/logd/LogAudit.cpp</code>。作者用它分别去识别三类东西：<b>Magisk root 环境</b>、<b>AVD 模拟器</b>' +
+          '（Android Studio 自带，M 芯片 Mac + Android 13 镜像，设备名 <code>emu64a</code>）、以及 <b>scrcpy 投屏</b>。</p>' +
+          '<p>帖子的题眼是那句总结：<b>「这条链路绕过的不是 SELinux 权限检查本身，而是利用权限检查失败后的诊断信息。」</b></p>',
         points: [
-          '从 manifest 的 <span class="mono">MAIN</span> / <span class="mono">LAUNCHER</span> 声明定位入口 Activity（静态结构的最外层抓手）',
-          '在入口 Activity 的 <span class="mono">onCreate</span> 里，用 <span class="mono">setContentView</span> 的参数（资源 id）定位布局文件',
-          '用 <span class="mono">findViewById</span> 的资源 id 找到具体控件，再看它如何被绑定',
-          '区分<b>动态绑定</b>（代码里 <span class="mono">setOnClickListener</span>）与<b>静态绑定</b>（布局里声明点击方法）两条路',
-          '资源文件在 APK 中的组织方式，以及「从 id / 名称反查资源」的做法',
-          '壳的识别与简单的脱壳（<span class="mono">frida-dexdump</span> 一类的工具路线），让静态分析能继续'
+          '<b>侧信道核心思路</b>：三方 App 在受限沙箱里即使<b>不能直接读取其他进程的 <code>/proc/&lt;pid&gt;</code></b>，也可以通过访问 procfs <b>触发 SELinux Audit 日志</b>，再从 logcat 里的 <b><code>tcontext</code></b> 反推出目标进程的安全域。',
+          '<b>完整信息链</b>：App 触碰 <code>/proc/&lt;pid&gt;</code> → SELinux 拒绝访问 → kernel 产生 audit 记录 → audit 记录通过 netlink 到 logd → logd 写入 main 或 events 日志缓冲 → App 侧通过 logcat 看到 <code>tcontext</code>。',
+          '<b>Magisk 场景</b>：分块扫描从 <code>900</code> 开始按窗口触碰 <code>/proc/&lt;pid&gt;</code>，<b>每个窗口 25 个 PID</b>，命中后停止；命中窗口 <b>1025-1049</b>，日志暴露 <code>tcontext=u:r:magisk:s0</code>。',
+          '<b>日志样本</b>：<code>avc: denied { getattr } for comm="sh" path="/proc/1028" dev="proc" ... scontext=u:r:untrusted_app_27:s0:... tcontext=u:r:magisk:s0 tclass=dir permissive=0 app=com.vwww.mira</code>。',
+          '<b>AVD 模拟器特征（进程级实测）</b>：<code>ps -e | grep qemu</code> → <code>root 158 1 10780188 2184 0 0 S qemu-props</code>；<code>grep goldfish</code> → <code>[irq/46-goldfish]</code>（pid 152）、<code>android.hardware.media.c2@1.0-service-goldfish</code>（media 317）、<code>libgoldfish-rild</code>（radio 370）；<code>grep anchu</code> → <code>android.hardware.gnss@2.0-service.ranchu</code>（gps 777）。',
+          '<b>推荐匹配正则</b>：<code>MATCH=\'tcontext=u:r:qemu_props:s0|tcontext=u:r:[^ ]*(goldfish|ranchu|qemu)[^ ]*:s0\'</code>。',
+          '<b>scrcpy 场景（无文件特征）</b>：新版本基于 <b>adb shell 拉起 <code>app_process</code></b> 运行自己的 jar 包，<b>运行起来会删除 <code>/data/local/tmp/scrcpy-server.jar</code> 文件，没有文件特征</b>。',
+          '<b>scrcpy 的进程链特征</b>：<code>sh -&gt; app_process -&gt; app_process</code> 三个进程 <b>pid 很相近</b>（实测 27769 <code>sh</code> / 27771 <code>app_process</code> / 27800 <code>app_process</code>）。',
+          '<b>判定策略</b>：<b>「连续 3 个 <code>u:r:shell:s0</code>」</b>可作为疑似投屏的判据；作者强调「具体需要线上环境验证，这里只是提供一个思路」。',
+          '<b>启停对照</b>：关闭投屏后，相同高 PID 范围扫描结果为 <code>no_shell_domain_hit</code>。',
+          '<b>扫描稳定性教训（重要）</b>：该侧信道<b>不适合无脑大范围扫描</b>，「实验中出现过单点命中, 大窗口扫描反而漏检的情况」。',
+          '<b>漏检的两个原因</b>：① SELinux audit 日志存在<b>限流</b>；② <b>大窗口会制造大量无关 denial</b>，目标 PID 落在窗口后段时可能被噪声淹没。',
+          '<b>推荐扫描参数</b>：<code>START=1000 END=2500 CHUNK=10 STEP=10 WAIT_SEC=1 LOG_TAIL=400</code>；作者明确说「<b>不要只增加 <code>sleep</code>，因为失败原因通常不是日志延迟，而是 audit 限流和窗口噪声</b>」。',
+          '<b>AOSP 根因在 <code>LogAudit::logPrint</code></b>：logd 收到 audit 消息后先格式化 <code>int rc = vasprintf(&amp;str, fmt, args);</code>，此时 <code>str</code> 已含 <code>dev="proc"</code>、<code>scontext</code>、<code>tcontext</code>、<code>tclass</code>、<code>comm</code>、<code>path</code>。',
+          '随后 <code>pidToUid(pid)</code> 解析 UID，当 <b><code>uid &gt;= AID_APP_START &amp;&amp; uid &lt;= AID_APP_END</code></b> 时追加 <code>result.append(" app="s + uidname)</code>（<code>uidname = android::uidToName(uid)</code>）。',
+          '<b>双缓冲</b>：<code>logbuf->Log(LOG_ID_EVENTS, ...)</code> 写入 events buffer，后续还会构造 <b>main buffer</b> 日志 ⇒ <b>同一条 procfs denial 可能进入 main buffer 和 events buffer</b>。',
+          '<b>根因一句话</b>：「<b><code>hidepid=2</code> 保护的是 procfs 正常读取面，但原 logd 路径把 procfs 访问失败后的 audit 诊断信息转发到了 App 可见日志面。</b>」',
+          '<b>AOSP 补丁 3725346 的修复逻辑</b>：<code>if (uid &gt;= AID_APP_START &amp;&amp; strstr(str, "dev=\\"proc\\"")) { free(str); return 0; }</code>——两个条件：① 只过滤 App UID 触发的 audit；② 只过滤 procfs 相关。',
+          '「补丁<b>没有泛化过滤所有 SELinux denial</b>，而是精准阻断这条通过 <code>/proc/&lt;pid&gt;</code> 泄露其他进程安全域的路径。」',
+          '<b>SELinux audit 结构字段</b>：<code>avc: denied</code>、<code>{ getattr }</code>（<b>目录元数据探测即可触发</b>）、<code>path</code>（指向 <code>/proc/&lt;pid&gt;</code>）、<code>dev="proc"</code>、<code>scontext</code>（发起方）、<b><code>tcontext</code>（目标方——侧信道泄露的核心字段）</b>、<code>tclass</code>（如 <code>dir</code>）。',
+          '<b>为何 <code>priv_app</code> 的 <code>s0:c512,c768</code> 是算出来的</b>：<code>set_range_from_level()</code> 的 <code>LEVELFROM_USER</code> 分支 <code>snprintf(level, sizeof level, "s0:c%u,c%u", 512 + (userid &amp; 0xff), 768 + (userid &gt;&gt; 8 &amp; 0xff));</code>；主用户 userId=0 时算出 <b><code>c512</code> 和 <code>c768</code></b>。',
+          '<b>作者被公开指正的错误</b>：原本用 <code>untrusted_app</code> 的特征去匹配 <code>priv_app</code>，经 <code>mb_bvvcoitr</code> 指正后更正，并自评「<b>我原来的写法驴唇不对马嘴</b>」。',
+          '<b>隐藏成本</b>：「若想隐藏，要么使用修复后系统，要么就是得 root 设备然后 hook 系统框架将这部改掉，但<b>就会引入新的特征进入 root 对抗的范畴。提高攻击方的成本。</b>」'
         ],
         method: [
-          '先熟悉工具链与 adb（作者原话：工具部分可以掠过）',
-          '解析 APK 基本结构：manifest、classes.dex、resources.arsc、assets、lib、res、META-INF',
-          '定位入口点：manifest → 入口 Activity → <span class="mono">onCreate</span>',
-          '定位按钮绑定：先在 <span class="mono">onCreate</span> 里找动态绑定，再回到布局文件看静态绑定',
-          '定位布局与资源：从 <span class="mono">setContentView</span> 的资源 id 与控件 id 双向对上',
-          '再看 Java 层与 Native 层各自的逆向步骤，最后用四大组件与系统体系收尾'
+          '先看清约束：三方 App 在受限沙箱里读不了其他进程的 <code>/proc/&lt;pid&gt;</code>，直接探测这条路本身就是被 SELinux 拦住的。',
+          '换个方向——不追求读到内容，而是把「被拒绝」这件事当成信号：主动触碰 procfs，触发 SELinux 拒绝与 audit 记录。',
+          '跟一遍信息链：App 触碰 <code>/proc/&lt;pid&gt;</code> → SELinux 拒绝 → kernel 产生 audit 记录 → netlink 送给 logd → logd 写入 main 或 events 缓冲 → App 侧用 logcat 读到 <code>tcontext</code>。',
+          '先打 Magisk：分块扫描从 <code>900</code> 开始按窗口触碰 <code>/proc/&lt;pid&gt;</code>，每个窗口 25 个 PID，命中即停；命中窗口落在 1025-1049，<code>tcontext=u:r:magisk:s0</code> 直接暴露。',
+          '再打 AVD 模拟器：不读属性，改看进程级特征——<code>ps -e | grep qemu</code> 抓到 <code>qemu-props</code>，<code>grep goldfish</code> 抓到 <code>[irq/46-goldfish]</code>、<code>android.hardware.media.c2@1.0-service-goldfish</code>、<code>libgoldfish-rild</code>，<code>grep anchu</code> 抓到 <code>android.hardware.gnss@2.0-service.ranchu</code>。',
+          '把这些名字收成一条正则：<code>MATCH=\'tcontext=u:r:qemu_props:s0|tcontext=u:r:[^ ]*(goldfish|ranchu|qemu)[^ ]*:s0\'</code>。',
+          '再打 scrcpy：它没有文件特征（<code>/data/local/tmp/scrcpy-server.jar</code> 运行起来就被删），但进程链留痕——<code>sh -&gt; app_process -&gt; app_process</code>，三个 pid 很相近；于是改用<b>「连续 3 个 <code>u:r:shell:s0</code>」</b>作为疑似投屏的判据。',
+          '做启停对照验证：关闭投屏后，相同高 PID 范围扫描结果为 <code>no_shell_domain_hit</code>。',
+          '调扫描参数并总结教训：用 <code>START=1000 END=2500 CHUNK=10 STEP=10 WAIT_SEC=1 LOG_TAIL=400</code>，把窗口收到 10 而不是一味开大——实验中出现过单点命中、大窗口反而漏检，原因是 audit 限流与大窗口噪声。',
+          '追上 AOSP 根因：读 <code>LogAudit::logPrint</code>，看到先 <code>vasprintf(&amp;str, fmt, args)</code> 拿到含 <code>tcontext</code> 的完整字符串，再按 <code>uid &gt;= AID_APP_START &amp;&amp; uid &lt;= AID_APP_END</code> 追加 <code>app=</code> 字段，并分别写入 events buffer 与 main buffer。',
+          '最后看官方怎么修的：AOSP 补丁 3725346 只加两个条件——App UID + <code>dev="proc"</code>——精准堵掉这一条路径，而不是泛化过滤所有 denial。'
         ],
         result:
-          '<p>作者把「找入口 → 找界面 → 找控件 → 找绑定函数」整理成了一条可重复的流程，' +
-          '并在若干练习题上走通（含简单加固样本的脱壳）。' +
-          '文中对 manifest 字段、资源 id 在代码中的形态（如 <span class="mono">setContentView(0x7f04001a)</span>、' +
-          '<span class="mono">findViewById(0x7f0b0056)</span>）都给了实际反编译截图与注释。</p>',
-        terms: ['MAIN/LAUNCHER', 'setContentView', '资源 id', 'findViewById', 'setOnClickListener', '静态绑定', 'frida-dexdump'],
+          '<p>作者用这条链路<b>分别识别出了 Magisk root 环境（<code>tcontext=u:r:magisk:s0</code>）、AVD 模拟器（<code>qemu-props</code> / <code>goldfish</code> / <code>ranchu</code>）与 scrcpy 投屏（连续 3 个 <code>u:r:shell:s0</code>）</b>，' +
+          '并做了启停对照（关闭投屏后扫描结果为 <code>no_shell_domain_hit</code>）。</p>' +
+          '<p>更完整的成果是<b>根因定位与官方修复的对应</b>：问题出在 <code>LogAudit::logPrint</code> 把 procfs 访问失败后的 audit 诊断信息转发到了 App 可见的日志面，' +
+          'AOSP 补丁 <b>3725346</b> 用「App UID + <code>dev="proc"</code>」两个条件精准阻断。</p>',
+        terms: ['SELinux', 'tcontext', 'scontext', '安全域', 'avc: denied', 'AID_APP_START', 'logd', 'LogAudit::logPrint', 'main buffer', 'events buffer', 'hidepid=2', 'procfs', '侧信道', 'Magisk', 'AVD / goldfish / ranchu', 'scrcpy', 'app_process', 'AOSP 补丁 3725346'],
         limits:
-          '<p>作者自述这是一篇入门体系整理：<b>工具部分「可以掠过，只做了工具的下载地址和简单介绍」</b>；' +
-          '壳的部分是「简单分析梆梆免费加固」，属于入门强度的对抗；' +
-          '示例以 CTF / 练习题为主，<b>没有涉及商业 App 的加固与风控强度</b>。' +
-          '文章篇幅很长、覆盖面广，因此每一处的深度都有限。</p>',
+          '<p>这份材料的缺口和作者自己的保留意见都很明确，逐条列出：</p>' +
+          '<p>① <b>「绕过」一节的开头存在一个看雪加密块，无法解密，其内容未知</b>——所以本文只写了「检测」这一半，绕过部分本站不做推测；<br>' +
+          '② 多处参考链接是 <code>elink@...</code> 加密跳转，无法解析；<br>' +
+          '③ 作者明确标注 scrcpy 部分<b>「具体需要线上环境验证, 这里只是提供一个思路」</b>；<br>' +
+          '④ 作者自述失败：<b>「该侧信道不适合无脑大范围扫描，实验中出现过单点命中，大窗口扫描反而漏检的情况」</b>；<br>' +
+          '⑤ 作者自述曾被指正的错误（用 <code>untrusted_app</code> 的特征去匹配 <code>priv_app</code>）并已更正；<br>' +
+          '⑥ 配图为 webp 附件，无法读取；<br>' +
+          '⑦ 页面末尾有「回复或点赞可查看完整内容」标记。</p>' +
+          '<p>因此这条侧信道应当被理解成一个<b>思路与工程参数</b>，而不是一个可以直接照抄的检测模块——作者本人也只把它当作思路给出。</p>',
         analysis:
-          '<p><b>用本课方法论拆解：</b>这篇案例的每一步，都能对应到本章的一张表。</p>' +
-          '<ul>' +
-          '<li><b>它的起点是「现象」而不是「代码」</b>——这正是线索五的定义：' +
-          '从看得见的界面出发。案例里最值钱的一句话是「锁定入口 Activity 的 <span class="mono">onCreate</span>」，' +
-          '因为那是一个<b>确定的锚点</b>：界面→Activity→onCreate→布局→控件→绑定函数，每一步都有明确依据。</li>' +
-          '<li><b>它示范了资源 id 为什么是好锚点。</b>资源 id 是编译期分配的，' +
-          '在代码里以常量形式出现（案例截图里的 <span class="mono">0x7f…</span>），' +
-          '所以它同时满足「可搜索」与「唯一」——这是 30.7 讲的搜索词质量标准。</li>' +
-          '<li><b>它同时用到了线索二（静态结构）。</b>manifest 是「最便宜的一层结构信息」，' +
-          '案例把它放在第一步，正是 30.6 排序判据一（失败几乎不花钱）的体现。</li>' +
-          '<li><b>它没有碰到的边界，恰好是本章强调的边界。</b>案例全程在原生 View 树上工作；' +
-          '如果换成 Flutter 界面，这条路径从第二步（控件树）就会断掉——' +
-          '<span class="hit">所以学这条路径时，一定要同时记住它的失效条件。</span></li>' +
-          '</ul>' +
-          '<p>最后一点：案例里「简单加固 + 脱壳」这一段，也说明了本章的一条纪律——' +
-          '<b>当静态结构被壳拿走后，正确的动作是先恢复可读性（脱壳），而不是硬读</b>（第 19 章）。</p>',
-        link: 'https://bbs.kanxue.com/thread-285906-1.htm',
-        linkNote: '看雪论坛 Android 安全版；正文较长（含大量截图），建议按小标题跳读。'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">UI 反推的四条起点、三件工具的分工、两条绑定路径，' +
-        '以及唯一的「结构性排除」条件。<br>' +
-        '这条线索的真正价值在于：<b>它把「找一个函数」变成了「找一个 id」</b>——' +
-        '而 id 是可枚举、可搜索、可复核的。</p>')
+          '<p><b>本章第 30 章教会你怎么识别环境特征，这个案例给出的是「当代检测视角」，而且它揭示了一条比改属性更深的思路。</b></p>' +
+          '<p><b>① 检测点的层级跳跃：从「主动读」到「被动看副作用」。</b>' +
+          '本章前面讲的检测大多是读属性、读文件、读 <code>/proc</code>——都是 App 主动去问系统要信息。' +
+          '这个案例不问题系统，它<b>去碰 procfs，然后利用系统自己被拒绝时留下的日志</b>，属于被动侧信道。' +
+          '这提醒我们：<span class="hit">检测面不只在「你能读到的信息」，还在「你操作时系统产生的副作用」</span>。<br>' +
+          '而这句话正是第 24 章那条元原则的跨章呼应——<b>本课第 24 章讲过：混淆保护的是逻辑，保护不了副作用。</b>' +
+          '第 24 章用它来找检测点（挂 <code>strstr</code> 从副作用反推），这里反过来被防守方用来暴露攻击者：' +
+          '<b>你拦截一次访问，就必然留下一次拦截记录；你留下一份记录，就等于把你的安全域告诉了对方。</b>' +
+          'SELinux 的 deny 不是「什么都没发生」，而是一条带着 <code>tcontext</code> 的广播。</p>' +
+          '<p><b>② 具体的模拟器特征：从 audit 日志里看 <code>goldfish</code> / <code>ranchu</code> / <code>qemu</code>。</b>' +
+          '本章讲模拟器痕迹时提到的 <code>goldfish</code>、<code>ranchu</code>，在这里以 SELinux 域名的形式再次出现：' +
+          '<code>tcontext=u:r:qemu_props:s0</code>，以及 <code>u:r:[^ ]*(goldfish|ranchu|qemu)[^ ]*:s0</code> 这种匹配方式。' +
+          '<b>这些东西与本章讲的 QEMU 痕迹是同一类东西——它们是虚拟化架构的必然产物</b>，只是观测位置不同：' +
+          '一个是读 <code>/proc/cmdline</code>、查属性，一个是从 audit 日志里看。<br>' +
+          '<span class="hit">换个观测位置就能把同一批特征再抓一遍，这正是「检测是分层工程」的含义</span>——' +
+          '你在 App 层清理掉的东西，可能在内核日志层原样还在。第 30 章讲的「改名不改结构会被交叉检测抓到」，这里是它的升级版：' +
+          '<b>改 App 层的读取面，不改内核层的诊断面，一样会被抓到。</b></p>' +
+          '<p><b>③ 一个非常实用的工程教训：「大窗口扫描反而漏检」。</b>' +
+          '直觉上扫描应该「扫得越全越好」，作者实测却相反——出现单点命中、大窗口漏检。原因有两个：' +
+          '<b>SELinux audit 日志有限流</b>，以及<b>大窗口制造的大量无关 denial 会把目标淹没</b>。' +
+          '所以正确做法是收窄窗口（<code>CHUNK=10 STEP=10</code>），而不是加大 <code>sleep</code>、也不是开大窗口；' +
+          '作者那句话值得原样记住：<b>「不要只增加 <code>sleep</code>，因为失败原因通常不是日志延迟，而是 audit 限流和窗口噪声」</b>。<br>' +
+          '<b>这条经验的价值在于它反直觉</b>：<span class="hit">直觉上「扫得越全越好」，实际上「扫得越细越准」</span>。' +
+          '更普遍地说，<b>当你的采集手段本身会干扰被采集的系统（限流、噪声、副作用）时，「加大力度」往往让结果更差而不是更好</b>——' +
+          '这在 Frida 大规模 trace、Stalker 长时间开启上是同一个道理（第 24 章）。</p>' +
+          '<p><b>④ 作者的诚实最值得学。</b>他把「被大佬指正、我原来驴唇不对马嘴」直接写进文章，还标注 scrcpy 部分「只是思路、需线上验证」，' +
+          '并交代了隐藏成本——想藏就得改系统框架，而<b>那会把问题推进 root 对抗的范畴，提高攻击方的成本</b>。' +
+          '这跟本课程反复强调的纪律是同一条：<b>区分「我知道」和「我推测」</b>。<br>' +
+          '对照来看更清楚：他敢把「连续 3 个 <code>u:r:shell:s0</code>」写成判据，是因为启停对照跑过了（关闭投屏得到 <code>no_shell_domain_hit</code>）；' +
+          '他把 scrcpy 标注为「只是思路」，是因为线上环境还没验。<span class="hit">这条区分线画在哪里，决定了你的结论能不能被别人复用。</span></p>',
+        link: 'https://bbs.kanxue.com/thread-291290.htm',
+        linkNote: '看雪论坛原创帖'
+      }
     },
 
-    /* ============================================================ 30.12 */
+    /* ================= 30.4 ================= */
     {
-      h: '30.12', title: '线索六 · Method Profiling / Trace：给你候选集，不给你证据',
+      h: '30.4',
+      title: 'GKI：把安卓内核拆成「通用核心 + 厂商模块」',
       html:
-        '<p>这条线索回答的问题是：<b>「按钮点下去之后，到底哪些方法被调用了？」</b>' +
-        '在没有任何字符串可搜、结构也读不出来的情况下，它往往是你唯一的假设来源。</p>' +
-        T.tbl(
-          ['', '采样型（Profiling）', '插桩型（Instrument / Trace）'],
-          [
-            ['做法', '周期性抓取调用栈，统计热点', '在每个方法出入口插桩，记录完整的调用序列'],
-            ['产出', '「哪些方法花的时间多」——<b>统计信息</b>', '「按时间顺序发生了哪些调用」——<b>序列信息</b>'],
-            ['成本', '相对低（不逐方法插桩）', '高：改写字节码 / 重编译，且会显著拖慢程序'],
-            ['主要漏洞', '<b>短方法会被丢掉</b>：采样间隔内跑完的方法根本不出现', '开销本身会改变程序行为；并且可能触发耗时类反调试'],
-            ['适合', '先摸清「这段操作里的热点在哪」', '需要确认「这条链是不是真的走过」']
-          ]) +
-        T.note('key', '🔑 用它的正确姿势：当假设生成器，不当证据',
-          '<p style="margin-bottom:0">Trace 的输出有一个容易上头的特点：<b>它看起来非常「全」</b>——' +
-          '密密麻麻几千行方法调用。但请记住两件事：</p>' +
-          '<ul>' +
-          '<li><b>没出现 ≠ 没调用。</b>短方法、被内联的方法、采样窗口之外的方法，都可能不出现在结果里。' +
-          '所以「目标方法没上 trace」不能推出「它没被执行」。</li>' +
-          '<li><b>出现了 ≠ 起作用。</b>一个方法被调用，不代表它就是你要找的那一环；' +
-          '很多框架方法会被调用几百次。</li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0"><span class="hit">正确的用法是「先缩范围，再换手段验证」</span>：' +
-          '用 Trace 把可能的候选压到个位数，然后回到便宜的那几条线索' +
-          '（字符串搜索、调用栈、日志）去确认其中一个。<br>' +
-          '第 21.5 的 r0tracer 与第 21.15 的 trace 过滤实验，讲的就是「怎么把几万行压成几个候选」——' +
-          '那是这条线索真正的工程价值所在。</p>') +
-        T.note('warn', '⚠️ 两个必须知道的盲区',
-          '<p style="margin-bottom:0"><b>① 内联造成的静默缺失。</b>' +
-          '编译器把函数体展开到调用处之后，那个函数<b>在运行时的调用关系里不存在了</b>——' +
-          '你在 trace 里既看不到它，也看不到「谁调用了它」（这一点与 30.10 的栈退化是同一个根因）。<br>' +
-          '<b>② 采样丢失与「越短越容易丢」。</b>恰恰是加密、签名这类短小密集的计算，' +
-          '最容易被采样漏掉；而它们往往正是你的目标。' +
-          '<span class="hit">所以用 Trace 时要主动问一句：我的目标如果很短，它会被漏掉吗？</span></p>'),
-      quiz: {
-        id: 'q30-5', chapter: 30, answer: 2,
-        stem: '你用采样型 Profiling 采集了「点击登录按钮之后的方法调用」，' +
-              '得到的列表里出现了一堆网络、序列化、UI 相关的方法，' +
-              '<strong>但你怀疑的那个签名方法没有出现</strong>。下面哪个判断最站得住？',
-        options: [
-          { t: '可以确定签名方法没有被调用，说明签名是在别的地方（或别的进程）算的',
-            why: '把「没出现」当成了「没调用」。采样会丢短方法，内联会让函数在调用关系里消失——这两条都足以让一个确实被执行的方法不出现在结果里。这是这条线索最经典的误判。' },
-          { t: '把 Profiling 换成指令级 trace，把这段操作完整记录下来，就不会漏了',
-            why: '方向部分正确（换更强的手段），但这是个昂贵的跳跃：指令级 trace 会显著拖慢程序，可能触发耗时类反调试，而且产出量巨大到需要额外一套过滤。在还不知道「是不是被采样漏掉」之前，先做更便宜的验证更好。' },
-          { t: '先做一个便宜的验证：在目标方法上加一个计数打点，看它到底被调用几次；如果被调用却不出现，就确认是采样/内联造成的盲区',
-            why: '正确。这个动作成本极低，而且它的两种结果都有明确含义：计数为零 → 假设错了，换方向；计数不为零但 trace 里没有 → 确认了盲区，此时再决定要不要上更重的 trace。用一个便宜动作把一个模糊状态变成二值判断，是本章反复强调的思路。' },
-          { t: '说明这个 App 检测到了 Profiling 并隐藏了相关方法',
-            why: '把「工具的能力边界」当成了「对手的主动行为」。反 Profiling 确实存在，但它的表现通常是「整体采集失效或被拖慢」，而不是「精准地少了一个方法」。用对抗解释工具缺陷，会让你在一个不存在的问题上开始写脚本。' }
-        ],
-        explain: '<b>这道题的核心是「没出现 ≠ 没调用」。</b><br>' +
-                 '采样型 Profiling 的产出是<b>统计</b>，它天然会丢掉短方法；' +
-                 '而内联会让一个方法在运行时的调用关系里彻底消失（30.10 讲过同一个根因）。<br>' +
-                 '所以当你怀疑某个方法应该在、却没有出现时，正确的动作是：' +
-                 '<b>用一个独立的、便宜的观测去验证「它到底有没有被调用」</b>——' +
-                 '加一个计数打点、或者一个日志。这个动作会把「工具说没有」变成「我知道它有没有」。<br>' +
-                 '<span class="hit">Trace 是假设生成器，不是证据；把它当证据是这条线索最常见的翻车方式。</span>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">采样与插桩的分工、两条判据（没出现 ≠ 没调用、出现了 ≠ 起作用），' +
-        '以及两个盲区（内联缺失、短方法被采样丢掉）。<br>' +
-        '<b>它与逐行 hook 的成本对比也很清楚：</b>trace 一次采集覆盖全部调用，' +
-        '而逐行 hook 需要你先知道勾哪里——所以 trace 的定位价值在于「生成假设」，而不是「证明结论」。</p>')
-    },
-
-    /* ============================================================ 30.13 */
-    {
-      h: '30.13', title: '线索七 · 日志线索：最便宜的记录，以及被清理后怎么找回',
-      html:
-        '<p>日志这条线索常被低估，因为它「看起来不像技术」。但它是唯一一条' +
-        '<b>零环境依赖、零注入风险、并且天然带时间维度</b>的线索：不 root、不改包，也可能拿到关键信息。</p>' +
-        T.card('四条实用的过滤思路（命令细节随版本变化，<span class="pill warn">待核实</span>）',
-          '<ul>' +
-          '<li><b>按进程过滤，而不是按全设备。</b>设备上同时有几十个进程在打日志；' +
-          '不锁定进程，你读到的 99% 都是噪音。判据是「这条日志的进程号是不是目标进程」。</li>' +
-          '<li><b>按 TAG 过滤，再用「排除法」去看没有 TAG 的行。</b>' +
-          'TAG 是开发者留的索引，但真正关键的日志经常没有 TAG（框架输出、native 输出）。' +
-          '所以「先按 TAG 定位模块，再放开看时间窗」比一直按 TAG 过滤更有效。</li>' +
-          '<li><b>按时间窗过滤。</b>先记下「我按下按钮」的瞬间，只看那个窗口前后的日志。' +
-          '<span class="hit">这一步能把几万行压到几十行，是所有过滤技巧里收益最高的。</span></li>' +
-          '<li><b>按级别与关键字过滤。</b>错误与警告优先；关键字用业务词（订单、签名、支付）' +
-          '而不是工具词。</li>' +
-          '</ul>') +
-        T.note('key', '🔑 崩溃栈为什么是「最高质量的一条日志」',
-          '<p style="margin-bottom:0">一份崩溃日志一次给你四样东西：' +
-          '<b>① 异常类型与消息</b>（它自己在说什么）、' +
-          '<b>② 调用栈</b>（30.10 的完整入口）、' +
-          '<b>③ 触发它的那条操作</b>（你可以复现）、' +
-          '<b>④ 发生时刻</b>（可以对齐抓包与其它日志）。<br>' +
-          '所以「目标会不会崩」这件事很有价值：<b>一个会崩的目标，等于自带了一个免费的调用栈来源</b>。' +
-          '这也是 30.6 的成本阶梯里，调用栈那条线索的成本会因为「有崩溃日志」而从「中」掉到「低」的原因。</p>') +
-        T.note('warn', '⚠️ 日志被加固清理之后，怎么把它找回来',
-          '<p style="margin-bottom:0">加固方清理日志的手法很直接，找回的思路同样直接——' +
-          '<b>从「谁在输出」出发，而不是从「输出了什么」出发</b>：</p>' +
-          '<ul>' +
-          '<li><b>换观测点</b>：日志被删了，但「写日志」这个动作还在。' +
-          '在日志系统的入口（系统的日志接口、或者它自己封装的日志类）挂观测，' +
-          '比去读已被清理的输出更可靠。</li>' +
-          '<li><b>换输出目标</b>：很多日志框架支持重定向。' +
-          '如果它写文件、写 socket、或者只在 debug 构建里启用，' +
-          '那你的任务就从「读日志」变成「让它愿意写」或「找到它写的那个地方」。</li>' +
-          '<li><b>换信息载体</b>：如果日志整条路都被堵死，那么「打印」这个行为本身还能被别的手段替代——' +
-          '打调用栈（30.10）、打方法调用序列（30.12）、或者在关键 API 上直接取参数（第 24 章的自吐沙箱）。' +
-          '<b>「我要的是一个观测点」，日志只是观测点的一种实现。</b></li>' +
-          '</ul>' +
-          '<p style="margin-bottom:0">第 19 章有一张加固与反制的全景图，日志清理在其中属于「降低对手可观测性」这一类；' +
-          '第 24 章则把「让算法自己招供」做到了系统化。<b>本节只负责给你一个判断：日志这条线索失效时，' +
-          '失效的是「输出」，不是「输出这个动作」。</b></p>'),
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">四条过滤思路（进程 / TAG + 放开 / 时间窗 / 级别与关键字）、' +
-        '崩溃栈为什么质量最高，以及「日志被清理」之后的三个换向：' +
-        '<b>换观测点、换输出目标、换信息载体。</b></p>')
-    },
-    /* ============================================================ 30.14 */
-    {
-      h: '30.14', title: '收口：给你一个 App 和一句话需求，按什么顺序试这七条',
-      html:
-        '<p>前面七节把七条线索分别讲了一遍。现在把它们装回一台机器：' +
-        '<b>决策图</b>——每一步失败时你得到什么、下一步往哪走。</p>' +
-        T.note('key', '🔑 决策图的三条元规则',
-          '<p style="margin-bottom:0"><b>① 从最便宜的、失败也不花钱的动作开始</b>（字符串搜索、日志）。<br>' +
-          '<b>② 任何一步拿到强证据，都可以直接跳到最贵的那一级</b>（例如崩溃栈给了类名与行号，直接下断点）。<br>' +
-          '<b>③ 每一步失败都要能说出一句「我因此知道了什么」</b>——' +
-          '说不出来，说明这一步白做了，换一个更有判别力的动作。</p>') +
-        '<p>下表按<b>尝试顺序</b>排列——它与 30.6 的线索编号不是一回事：' +
-        '编号是线索的身份（线索 3 永远是动态调试），而这里的顺序由成本决定（便宜的排前面）。' +
-        '两者一起用，才不会把「线索几」和「第几步」混起来。</p>' +
-        T.tbl(
-          ['尝试顺序', '动作', '成功时你得到', '失败时你得到（<b>这一栏才是重点</b>）'],
-          [
-            ['<b>1</b>', '字符串搜索（URL / 提示语 / TAG / 算法常量 / 字段名）',
-             '一个可读的入口：某个类、某个方法、某段配置',
-             '「这段逻辑不是静态常量驱动的」→ 指向运行时拼接 / 服务端下发 / 字符串加密'],
-            ['<b>2</b>', '日志与崩溃栈（含时间窗过滤）',
-             '一次发生的完整记录；崩溃栈还能直接给出类名与行号',
-             '「这条路径上没有留下可读记录」→ 换观测点，或确认自己没走在这条路径上'],
-            ['<b>3</b>', '静态结构（manifest / 类型引用 / 调用图 / 注解）',
-             '一张从入口到目标的结构草图',
-             '「结构被处理过」（壳 / 混淆 / VMP）→ 这是加固的证据，转脱壳或运行时观测'],
-            ['<b>4</b>', '调用栈（顺数据流或顺调用链）',
-             '业务边界、业务入口、以及一条可复核的路径',
-             '「关系被内联或折叠」→ 停用依赖名字的观测，改用地址与运行时打点'],
-            ['<b>5</b>', 'UI 反推（控件树 / 资源 id / 绑定函数）',
-             '界面元素与代码位置的直接对应',
-             '「界面不是原生 View 树」→ 这条线索出局，字符串与运行时观测顶上'],
-            ['<b>6</b>', 'Profiling / Trace（按操作窗口采集）',
-             '一批候选方法（假设来源）',
-             '「采样丢了 / 内联缺失 / 全是框架噪音」→ 候选不可靠，回到 1–4 去交叉验证'],
-            ['<b>7</b>', '动态调试（Smali 断点 / IDA attach）',
-             '第一手现场：寄存器、内存、真实参数',
-             '「环境配不上 或 对方在检测」→ 抢时序，或把观测点下沉一层'],
-            ['<b>8</b>', '<b>七条都没成：换观测层，而不是再试一遍</b>',
-             '把观测点下沉：内核 / syscall / 自吐沙箱 / 模拟执行',
-             '——（到这一步，问题往往已经不是「工具不够」，而是「目标定义错了」，见下面的决策演练）']
-          ]),
+        '<p>安卓生态有一个持续多年的顽疾：<b>内核碎片化</b>。每台设备的 SoC 不同、驱动不同，厂商各自 fork 一份 Linux 内核改一改，于是市面上存在成百上千个互不相同的内核分支。后果是：Google 修了一个内核安全漏洞，<b>必须等每一个厂商把自己的分支合一遍</b>——而现实中很多设备永远等不到。</p>'
+        + '<p><span class="term" data-def="Generic Kernel Image，通用内核镜像：Google 统一维护、与硬件解耦的安卓内核">GKI</span> 是针对这个问题的解法。核心思想一句话：<b>把内核拆成「通用核心 + 厂商模块」</b>。</p>'
+        + T.grid(2, [
+          '<div class="card"><div class="card-title">过去：一个大内核，人人有份</div><p>厂商 fork 内核 → 把驱动直接编进内核（<span class="mono">built-in</span>）→ 内核成了「通用代码 + 厂商代码」的混合体 → 谁也没法单独升级。</p></div>',
+          '<div class="card"><div class="card-title">GKI：内核与驱动解耦</div><p>Google 维护一份统一的 GKI 内核（<span class="mono">Image</span> / <span class="mono">Image.gz</span>）；厂商的硬件驱动做成<b>可加载内核模块</b>（<span class="mono">.ko</span>），在启动时由 <span class="term" data-def="Kernel Module Interface，内核模块接口，GKI 的核心稳定契约">KMI</span> 动态装载。</p></div>'
+        ])
+        + T.note('key', '🔑 KMI 是这套方案的「合同」',
+          '<p><b>KMI（Kernel Module Interface）</b>是内核与模块之间稳定的接口契约：符号表、结构体布局、函数签名。只要 KMI 不变，<b>内核可以被替换、模块不用重编</b>。</p>'
+          + '<p>于是升级链变成两条互不干扰的线：<br>'
+          + '<b>Google 侧</b>：独立升级 GKI 内核 → 修安全漏洞、合上游 LTS 补丁，<b>不用等厂商</b>；<br>'
+          + '<b>厂商侧</b>：只维护自己的驱动模块 → 内核换了，模块照样能用。</p>'
+          + '<p>这就是为什么 GKI 被称作 Android 内核治理的结构性改变：它把「一次升级」拆成了「两个独立发布的单元」。</p>')
+        + T.note('warn', '⚠️ 内核镜像到底在哪个分区？（<span class="pill warn">待核实</span> 细节）',
+          '<p>概念上要知道的演变：<b>Android 12+</b> 引入了 <span class="mono">init_boot</span> 分区用来存放<b>通用 ramdisk</b>，<b>Android 13+</b> 强制要求。<span class="mono">vendor_boot</span> 则承载厂商相关的启动内容（厂商 ramdisk、部分模块）。</p>'
+          + '<p>所以 GKI 部署后，内核与 ramdisk 的归属被拆分到 <span class="mono">boot.img</span> / <span class="mono">vendor_boot.img</span> / <span class="mono">init_boot.img</span> 之间。<b>具体哪个分区放什么、镜像格式（header version、vendor boot header）在不同版本和不同厂商实现上有差异，动手前请用 <span class="mono">unpack_bootimg</span> 之类的工具实际解析确认，不要照抄教程。</b><span class="pill warn">待核实</span></p>'),
       stage: {
-        title: '决策图 · 拿到一个 App 和一句话需求，按这个顺序试',
+        title: 'GKI 的分层结构：Google 升级内核 vs 厂商更新驱动',
+        speed: 1800,
+        render:
+          '<div class="flow-col">'
+          + '<div class="blk" id="g1">Google 维护：GKI 通用内核核心<br><span class="small">Image / Image.gz · 调度、内存、文件系统、安全</span></div>'
+          + '<div class="arrow">↓ 通过 <b>KMI</b> 暴露稳定接口 ↓</div>'
+          + '<div class="pill" id="g2">KMI · Kernel Module Interface（稳定契约）</div>'
+          + '<div class="arrow">↓ 动态加载 ↓</div>'
+          + '<div class="flow-row">'
+          + '<div class="blk" id="g3">厂商模块 A<br><span class="small">显示驱动 .ko</span></div>'
+          + '<div class="blk" id="g4">厂商模块 B<br><span class="small">相机 / ISP .ko</span></div>'
+          + '<div class="blk" id="g5">厂商模块 C<br><span class="small">电源 / 充电 .ko</span></div>'
+          + '</div>'
+          + '<div class="arrow">↓ 打包进启动分区 ↓</div>'
+          + '<div class="flow-row">'
+          + '<div class="blk" id="g6">boot.img<br><span class="small">GKI 内核 + 通用 ramdisk</span></div>'
+          + '<div class="blk" id="g7">vendor_boot.img<br><span class="small">厂商 ramdisk / 模块</span></div>'
+          + '<div class="blk" id="g8">init_boot.img<br><span class="small">通用 ramdisk（12+/13+）</span></div>'
+          + '</div>'
+          + '<div class="pill" id="g9">起始状态</div>'
+          + '</div>',
+        reset: () => {
+          ['g1', 'g3', 'g4', 'g5', 'g6', 'g7', 'g8'].forEach((id) => S(id, ''));
+          CLS('g2', 'pill'); SET('g2', 'KMI · Kernel Module Interface（稳定契约）');
+          CLS('g9', 'pill'); SET('g9', '起始状态');
+        },
+        steps: [
+          { run: () => S('g1', 'active'),
+            note: '<b>最上层只有一份内核。</b>它由 Google 统一维护，与具体硬件无关。你在真机上 <span class="mono">uname -r</span> 看到的 <span class="mono">-androidXX-Y-gki</span> 之类的后缀，就是它的身份标记。' },
+          { run: () => { S('g1', 'done'); SET('g2', 'KMI · 符号表 / 结构体布局 / 函数签名'); CLS('g2', 'pill acc'); },
+            note: '<b>KMI 是整层的枢纽。</b>它规定了模块可以调用内核的哪些符号、结构体怎么排布、函数签名长什么样。KMI 稳定 = 模块不必随内核重编。' },
+          { run: () => { S('g3', 'active'); },
+            note: '<b>厂商模块 A（显示驱动）。</b>注意它<b>不是编进内核的</b>，而是一个独立的 <span class="mono">.ko</span>，启动时由内核加载。这正是「解耦」的物理体现。' },
+          { run: () => { S('g3', 'done'); S('g4', 'active'); },
+            note: '<b>厂商模块 B（相机 / ISP）。</b>每个模块都只依赖 KMI，不依赖某个具体内核版本。厂商的维护工作量从「整个内核分支」降到「几个驱动模块」。' },
+          { run: () => { S('g4', 'done'); S('g5', 'active'); },
+            note: '<b>厂商模块 C（电源 / 充电）。</b>模块之间也彼此独立——一个模块出问题，不必重编整个内核。' },
+          { run: () => { S('g5', 'done'); S('g6', 'active'); S('g7', 'active'); S('g8', 'active'); },
+            note: '<b>这些部件被打包进不同的启动分区。</b>GKI 内核与通用 ramdisk 归 <span class="mono">boot.img</span> 一侧，厂商相关内容归 <span class="mono">vendor_boot.img</span>，通用 ramdisk 在 Android 12+/13+ 之后独立到 <span class="mono">init_boot.img</span>。<span class="pill warn">待核实</span> 具体切分随版本与厂商实现变化，动手请实际解包确认。' },
+          { run: () => { S('g6', 'hot'); CLS('g9', 'pill bad'); SET('g9', '场景一：Google 推送内核安全更新'); },
+            note: '<b>场景一：Google 升级内核。</b>只换 <span class="mono">g1</span>（GKI 内核镜像），<b>下面三个厂商模块一行都不用改</b>——因为 KMI 没变。这就是 GKI 最大的收益：安全补丁可以绕开厂商直接下发。' },
+          { run: () => { S('g6', 'done'); S('g3', 'hot'); S('g4', 'hot'); S('g5', 'hot'); CLS('g9', 'pill acc'); SET('g9', '场景二：厂商更新驱动'); },
+            note: '<b>场景二：厂商更新驱动。</b>只重编并替换自己的 <span class="mono">.ko</span>，<b>内核完全不受影响</b>。厂商不必再维护一个庞大的内核 fork，只维护自己那几个模块。' },
+          { run: () => { ['g3', 'g4', 'g5'].forEach((id) => S(id, '')); S('g1', 'cool'); S('g6', 'cool'); CLS('g9', 'pill ok'); SET('g9', '两条升级线互不干扰 ✓'); },
+            note: '<b>两条升级线彻底分开。</b>Google 修内核漏洞不阻塞在厂商手里，厂商改驱动不用重走内核评审。这是 GKI 想解决的根本问题——<b>不是性能，是升级速度与安全响应</b>。' },
+          { run: () => { S('g1', 'cool'); S('g6', 'hot'); CLS('g9', 'pill bad'); SET('g9', '对逆向：内核可替换 = 内核级 Hook 的入口'); },
+            note: '<b>对逆向的意义（对应第 27 章内核模块技术）。</b>GKI 让「换内核」变成一件<b>规范化、文档化</b>的事：内核是一个独立的、可替换的镜像文件，模块加载机制是标准接口。这意味着内核级 Hook / 反检测有了正规入口——你可以在自己的内核或自己的模块里做事，而不必去 patch 某个厂商的定制内核。' }
+        ]
+      },
+      after: T.note('', 'GKI 对逆向工作流的三点影响',
+        '<p>① <b>内核不再是黑盒。</b>过去厂商内核 fork 满天飞，同一个 hook 点在不同设备上偏移全不一样；GKI 让内核来源统一，可复现性大幅提升。</p>'
+        + '<p>② <b>替换内核是可行路径。</b>因为内核镜像独立存在、KMI 有契约，理论上你可以准备一个自己编译的 GKI 内核镜像刷进去——这是比 patch 二进制更彻底的方案（当然也需要解锁 bootloader 等前提）。</p>'
+        + '<p>③ <b>反检测要同步升级。</b>既然内核可替换、模块可加载，风控也会开始检查内核版本字符串、已加载模块列表、KMI 相关的符号是否存在。<b>攻防的战场从 App 层下沉到了内核镜像层。</b></p>')
+    },
+
+    /* ================= 30.5 ================= */
+    {
+      h: '30.5',
+      title: 'GKI 内核的下载、解包与替换',
+      html:
+        '<p>理解了 GKI 的结构，就能理解「换内核」这件事为什么变得可行：<b>内核是一个独立的镜像文件，被放在一个独立的分区里</b>。替换它的流程和替换任何分区镜像一样——解包、换文件、重打包、刷入。</p>'
+        + T.note('warn', '⚠️ 动手前的三条前提',
+          '<p>① <b>Bootloader 必须解锁</b>，否则 <span class="mono">fastboot flash</span> 会被拒绝；<br>'
+          + '② <b>必须刷对应 KMI 版本的内核</b>——KMI 不匹配，厂商模块加载会失败，设备可能起不来；<br>'
+          + '③ <b>必须先备份原 boot 分区</b>，出事能救回来。<b>替换内核是高危操作，请在有恢复手段的设备上做。</b></p>'
+          + '<p><span class="pill warn">待核实</span> 下面每一步的具体参数（分区名、压缩格式、mkbootimg 参数）都随设备与 Android 版本变化，<b>请用你设备实际解包出来的 header 信息为准</b>。</p>'),
+      stepper: {
+        title: 'GKI 内核替换：从确认版本到刷入设备',
+        lines: [
+          { code: '<span class="c"># ① 先确认设备当前的 KMI / 内核版本</span>\nadb shell uname <span class="n">-r</span>',
+            note: '<b>第一步永远是「先看清楚现状」。</b><span class="mono">uname -r</span> 给出内核版本串，GKI 设备上通常带 <span class="mono">-gki</span> 或 <span class="mono">androidNN</span> 特征后缀。你要替换的内核，<b>KMI 版本必须和这里对得上</b>，否则厂商模块会加载失败。',
+            state: { '当前内核': '（实际读出的版本串）', 'KMI 版本': '待确认' } },
+          { code: 'adb shell cat <span class="m">/proc/version</span>',
+            note: '<b>交叉验证。</b><span class="mono">/proc/version</span> 带编译信息（编译器版本、构建时间）。两个来源对一下，确认自己没有看错——这是后面选内核产物的依据。',
+            state: { 'KMI 版本': '已确认' } },
+          { code: '<span class="c"># ② 准备对应 KMI 的 GKI 内核产物</span>\n<span class="c">#    AOSP 以 prebuilt 形式分发 GKI 内核</span>\n<span class="c">#    <span class="pill warn">待核实</span>：具体仓库/分支名随版本变化</span>',
+            note: '<b>关键：版本必须对齐。</b>GKI 内核按 KMI 版本分发（例如 <span class="mono">android12-5.10</span>、<span class="mono">android13-5.15</span> 这类「Android 版本 + 内核版本」的组合命名）。<b>下错版本 = 模块加载失败 = 设备起不来。</b><span class="pill warn">待核实</span> 具体命名与下载入口请查官方 documented 的内核分支说明。',
+            mem: 'GKI 内核产物通常是：\nImage         （未压缩）\nImage.gz      （gzip 压缩）\nImage.lz4     （lz4 压缩，常见于移动设备）\n具体用哪个 → 看原 boot.img 里 kernel 段是什么格式' },
+          { code: '<span class="c"># ③ 备份当前 boot 分区（救命步骤）</span>\nadb shell su <span class="n">-c</span> <span class="s">&quot;dd if=/dev/block/by-name/boot of=/sdcard/boot_backup.img&quot;</span>',
+            note: '<b>不做这一步就不要往下走。</b>分区名 <span class="mono">by-name/boot</span> 是常见写法，但不同设备的分区布局不同（有的用 <span class="mono">/dev/block/bootdevice/by-name/</span>）。<b>刷坏了没有备份，就只能靠官方固件包救砖。</b>',
+            state: { '备份': 'boot_backup.img 已生成' } },
+          { code: 'adb pull <span class="m">/sdcard/boot_backup.img</span> ./boot_backup.img',
+            note: '<b>把备份拉到电脑上。</b>放在手机里不算备份——万一设备进不了系统，你就拿不出来了。',
+            state: { '备份': '已落盘到 PC' } },
+          { code: '<span class="c"># ④ 解包 boot.img，看清内部结构</span>\nunpack_bootimg <span class="n">--boot_img</span> boot.img <span class="n">--out</span> ./unpacked/',
+            note: '<b>这一步是整个流程的「诊断」环节。</b>解包后你会看到 <span class="mono">kernel</span>、<span class="mono">ramdisk</span>、以及一个 header 信息文件。先读 header 再动手——它会告诉你内核用的什么压缩格式、header 版本是几、cmdline 是什么。<b>不看 header 直接换文件，是最常见的翻车点。</b>',
+            state: { 'header version': '（读出来确认）', '内核格式': '（读出来确认）' },
+            mem: 'unpacked/\n  kernel          ← 要替换的目标\n  ramdisk         ← 通用 ramdisk（可能不在 boot 里）\n  bootimg-info.txt / header 信息\n（具体文件名随工具版本变化，<span class="pill warn">待核实</span>）' },
+          { code: '<span class="c"># ⑤ 替换内核镜像</span>\ncp Image.lz4 ./unpacked/kernel',
+            note: '<b>把 GKI 内核替换进去。</b>注意<b>压缩格式必须与原文件一致</b>：原 kernel 是 lz4，你就得放 lz4 版本；是 gzip 就放 gzip 版本。格式不对会导致内核无法解压，直接卡在开机第一屏。<b>这就是上一步必须先读 header 的原因。</b>',
+            state: { 'kernel': '已替换为 GKI 内核', '格式校验': '与原文件一致 ✓' } },
+          { code: '<span class="c"># ⑥ 重新打包（参数必须与原 header 对齐）</span>\nmkbootimg <span class="n">--kernel</span> ./unpacked/kernel \\\n  <span class="n">--header_version</span> &lt;原值&gt; \\\n  <span class="n">--cmdline</span> <span class="s">&quot;&lt;原 cmdline&gt;&quot;</span> \\\n  <span class="n">--output</span> new_boot.img',
+            note: '<b>重打包不是「随便打一个」。</b>header version、cmdline、page size、os_version 等参数应当<b>沿用原镜像的值</b>——尤其 cmdline 里可能含有让系统正确启动的关键参数（如 Android 的 <span class="mono">androidboot.*</span> 项）。<span class="pill warn">待核实</span> 参数名与默认值随 mkbootimg 版本变化，请以你所用工具的 <span class="mono">--help</span> 为准。',
+            state: { '产物': 'new_boot.img' } },
+          { code: '<span class="c"># ⑦ 进入 fastboot 并刷入</span>\nadb reboot bootloader\nfastboot flash boot new_boot.img',
+            note: '<b>刷入。</b>这一步会覆盖 boot 分区。刷之前再确认一次：<b>设备型号对不对？分区名是不是 <span class="mono">boot</span>？备份是不是已经拉到电脑上了？</b>',
+            state: { 'boot 分区': '已写入新内核' } },
+          { code: 'fastboot reboot',
+            note: '<b>重启。</b>如果卡在开机 logo 或反复重启，通常就是三个原因之一：内核压缩格式不对、KMI 版本不匹配、cmdline/header 参数错了。这时用备份恢复：<span class="mono">fastboot flash boot boot_backup.img</span>。' },
+          { code: 'adb shell uname <span class="n">-r</span>\nadb shell getprop <span class="m">ro.boot.verifiedbootstate</span>',
+            note: '<b>验证。</b>内核版本串应该已经变了。同时看一眼 verified boot 状态——修改 boot 分区通常会导致验证失败（这也是为什么很多设备需要解锁并使用 <span class="mono">vbmeta</span> 相关处理）。<b>刷成功 ≠ 系统功能正常</b>，还要验证摄像头、WiFi、充电这些依赖厂商模块的功能。' },
+          { code: 'adb shell lsmod\n<span class="c"># 或 cat /proc/modules</span>',
+            note: '<b>最后确认模块有没有正常加载。</b>这直接对应 GKI 的核心契约：<b>内核换了，模块还认不认这个 KMI？</b>如果 <span class="mono">lsmod</span> 里厂商模块不在了，说明 KMI 不匹配——内核虽然起来了，硬件功能会大面积失效。这一刻你会真正体会到 KMI 为什么被叫作「合同」。',
+            state: { '厂商模块': '（lsmod 里应能看到）', '结论': 'KMI 匹配 → ✓' } }
+        ]
+      },
+      after: T.note('', '对逆向的用法',
+        '<p>替换 GKI 内核是一条<b>干净的内核级 Hook 路径</b>——对应第 27 章的内核模块技术。相比在厂商定制内核上做二进制 patch，GKI 路线有三个优势：<b>内核来源统一可复现</b>、<b>模块加载是标准接口</b>、<b>升级路径清晰</b>。</p>'
+        + '<p>反过来，做反检测时也要意识到：<b>内核版本字符串、已加载模块列表、boot 分区哈希</b>都是可以检测的对象。换过内核的环境，在这些维度上会留下痕迹。</p>')
+    },
+
+    /* ================= 30.6 ================= */
+    {
+      h: '30.6',
+      title: 'Cuttlefish：Google 官方的云端虚拟安卓设备',
+      html:
+        '<p><span class="term" data-def="Google 的 android-cuttlefish 项目，面向云端的可配置安卓虚拟设备">Cuttlefish</span> 是本章第三个主角。它不是「给终端用户用的模拟器」，而是<b>为云端设计的安卓虚拟设备</b>。官方 <span class="mono">google/android-cuttlefish</span> 仓库的原文定位是：</p>'
+        + '<p style="border-left:3px solid var(--acc,#6cf);padding-left:12px;font-style:italic">「a configurable Android Virtual Device (AVD) that targets both locally hosted Linux x86/arm64 and remotely hosted Google Compute Engine (GCE) instances rather than physical hardware.」</p>'
+        + T.note('key', '🔑 一句话记住它和模拟器的区别',
+          '<p><b>Android 官方模拟器</b>：面向<b>开发者个人</b>，跑在开发者电脑上，重点是「好用、能调试」。</p>'
+          + '<p><b>Cuttlefish</b>：面向<b>服务器与 CI/CD</b>，跑在 Linux（本地或 GCE）上，重点是「可编排、可规模化、可远程」。</p>'
+          + '<p>它主要服务于 <b>AOSP 开发与测试</b>——Google 自己跑自动化测试就用它。<b>它是理解「云手机/云测设备」的关键一环：很多云手机方案本质就是 Cuttlefish 或其变体。</b></p>')
+        + T.note('warn', '⚠️ 依赖 KVM，所以需要 Linux + 硬件虚拟化',
+          '<p>Cuttlefish 依赖 <b>KVM</b>（Linux 内核的硬件虚拟化设施）。这意味着：<b>你得有 Linux，且 CPU 支持并开启了虚拟化扩展</b>；在虚拟机里套娃跑（nested virtualization）通常还要额外开启。这也是它和「应用级容器方案」最大的分界。</p>'
+          + '<p>它还支持<b>容器镜像</b>形式（Docker / Podman），这让它在 CI 里更容易被拉起。</p>'),
+      term: {
+        title: 'Cuttlefish：在 Debian/Ubuntu 上安装并准备环境',
+        lines: [
+          { t: 'p', s: 'sudo apt install -y cuttlefish-base cuttlefish-user',
+            note: '<b>装两个包。</b><span class="mono">cuttlefish-base</span> 是<b>必需</b>的基础包；<span class="mono">cuttlefish-user</span> 提供本地 web server，让你能从浏览器里与设备交互。' },
+          { t: 'd', s: '# 其他相关包：cuttlefish-integration（在 GCE 上运行）', },
+          { t: 'd', s: '#           cuttlefish-orchestration（编排项目）', },
+          { t: 'd', s: '#           cuttlefish-common（已废弃，仅为兼容保留的 metapackage）', },
+          { t: 'p', s: 'sudo usermod -aG kvm,cvdnetwork,render $USER',
+            note: '<b>把当前用户加入三个组</b>——这是安装文档明确要求的步骤：<span class="mono">kvm</span>（访问 <span class="mono">/dev/kvm</span>，硬件虚拟化）、<span class="mono">cvdnetwork</span>（Cuttlefish 的虚拟网络）、<span class="mono">render</span>（GPU 渲染设备）。<b>不加组，跑起来会各种权限被拒。</b>' },
+          { t: 'w', s: '⚠️ 加组之后必须重启（或重新登录）才生效', },
+          { t: 'p', s: 'sudo reboot',
+            note: '<b>重启使组成员变更生效。</b>这一步常被跳过，然后卡在「为什么 /dev/kvm 打不开」上很久。' },
+          { t: 'p', s: 'ls -l /dev/kvm',
+            note: '<b>验证 KVM 可用。</b>设备节点存在且你有权限，才具备继续的前提。' },
+          { t: 'o', s: 'crw-rw---- 1 root kvm 10, 232 ... /dev/kvm', },
+          { t: 'p', s: 'egrep -c &quot;(vmx|svm)&quot; /proc/cpuinfo',
+            note: '<b>确认 CPU 支持虚拟化</b>：<span class="mono">vmx</span> 是 Intel VT-x，<span class="mono">svm</span> 是 AMD-V。输出为 0 说明 BIOS 里没开或硬件不支持。<b>KVM 是 QEMU、Cuttlefish、crosvm 的共同底座</b>——这条命令检查的正是整个虚拟化方案的地基。' },
+          { t: 'p', s: 'cvd version',
+            note: '<b>检查 Cuttlefish 工具链。</b><span class="mono">cvd</span>（Cuttlefish Device）是它的命令行入口。具体子命令与参数<span class="pill warn">待核实</span>，请以 <span class="mono">cvd help</span> 与你所用版本为准。' },
+          { t: 'p', s: 'cvd load <配置名>   # 启动一个虚拟设备',
+            note: '<b>启动设备。</b>Cuttlefish 支持用配置文件描述「要一台什么样的设备」——这正对应官方定位里的 <b>configurable</b>。启动后可以用 <span class="mono">cuttlefish-user</span> 提供的 web 界面交互，也可以用 <span class="mono">adb connect</span> 连上去。<span class="pill warn">待核实</span> 具体子命令与配置文件格式随版本变化。' }
+        ]
+      },
+      after: T.note('', '为什么逆向工程师要在意 Cuttlefish',
+        '<p>① <b>它是云手机的「官方参考答案」。</b>云手机要解决的问题——多实例、远程访问、编排与回收、无物理硬件——Cuttlefish 全都正面处理过。<b>理解了它，云手机的架构就不再神秘。</b></p>'
+        + '<p>② <b>它代表「干净、可控、可复现」的安卓环境。</b>CI 里跑安全测试、跑自动化逆向脚本，一个可脚本化创建/销毁的虚拟设备比一台真机好用得多。</p>'
+        + '<p>③ <b>它站在硬件虚拟化这条技术路线上</b>——和 QEMU + KVM、crosvm 同宗。而 Waydroid 那类容器方案走的是完全不同的路（共享宿主内核）。<b>这个分野，是下一节谱系图的主轴。</b></p>')
+    },
+
+    /* ================= 30.7 ================= */
+    {
+      h: '30.7',
+      title: '一张图看懂：模拟器、Cuttlefish、云手机、Waydroid 的谱系',
+      html:
+        '<p>这一节把整门课「运行环境」部分的方案放到一张图上。判断一个方案，只要问三个问题：<b>① 它虚拟化到什么层次？② 它跑的是不是原生架构？③ 它是给谁用的？</b></p>'
+        + T.tbl(['方案', '技术路线', '跑的系统架构', '典型场景'], [
+          ['Android 官方模拟器（QEMU + HAXM/Hyper-V）', '硬件虚拟化 + 应用级翻译层', 'x86_64 为主', '开发者本机调试'],
+          ['Android 官方模拟器（早期，QEMU + TCG）', '全系统模拟（二进制翻译）', 'ARM / ARM64', '历史方案，慢'],
+          ['Cuttlefish（google/android-cuttlefish）', '硬件虚拟化（依赖 KVM）', 'x86 / arm64，宿主 Linux', 'AOSP 开发、CI/CD、云端'],
+          ['云手机 / 云测', '硬件虚拟化 + 多租户编排 + 串流', '通常 x86_64', '规模化测试、远程真机替代'],
+          ['Waydroid', '容器（共享宿主内核）', '与宿主同架构', 'Linux 桌面上跑安卓应用']
+        ]),
+      stage: {
+        title: '方案谱系：从「全系统模拟」到「容器」',
         speed: 1900,
         render:
-          '<div class="flow-col" style="gap:9px">' +
-            '<div class="flow-row"><span class="pill ok mono">①</span>' +
-              '<span class="blk" id="f1">字符串搜索</span>' +
-              '<span class="muted small">搜不到 → 知道「不是静态常量」</span></div>' +
-            '<div class="flow-row"><span class="pill ok mono">②</span>' +
-              '<span class="blk" id="f2">日志 / 崩溃栈</span>' +
-              '<span class="muted small">没记录 → 换观测点，或确认路径不对</span></div>' +
-            '<div class="flow-row"><span class="pill acc mono">③</span>' +
-              '<span class="blk" id="f3">静态结构</span>' +
-              '<span class="muted small">读不出结构 → 这是加固的证据</span></div>' +
-            '<div class="flow-row"><span class="pill acc mono">④</span>' +
-              '<span class="blk" id="f4">调用栈</span>' +
-              '<span class="muted small">栈退化 → 停用依赖名字的观测</span></div>' +
-            '<div class="flow-row"><span class="pill acc mono">⑤</span>' +
-              '<span class="blk" id="f5">UI 反推</span>' +
-              '<span class="muted small">非原生界面 → 这条线索出局</span></div>' +
-            '<div class="flow-row"><span class="pill warn mono">⑥</span>' +
-              '<span class="blk" id="f6">Profiling / Trace</span>' +
-              '<span class="muted small">只有候选集 → 回 1–4 交叉验证</span></div>' +
-            '<div class="flow-row"><span class="pill bad mono">⑦</span>' +
-              '<span class="blk" id="f7">动态调试</span>' +
-              '<span class="muted small">挂不上 → 抢时序，或下沉观测层</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="mark">🎯 每一步的失败都要能说出一句「我因此知道了什么」</span></div>' +
-            '<div class="note" id="fb"><div class="note-h">每一步失败时，你会得到什么</div>' +
-              '<p style="margin-bottom:0">点「播放」：每点亮一条线索，下面这块就换成它失败时的信息产出。</p></div>' +
-          '</div>',
+          '<div class="flow-col">'
+          + '<div class="pill" id="x0">全部方案的共同底座：KVM / 硬件虚拟化扩展</div>'
+          + '<div class="arrow">↓ 按「虚拟化层次」从重到轻排列 ↓</div>'
+          + '<div class="blk" id="x1">① 全系统模拟<br><span class="small">QEMU + TCG：guest 架构可 ≠ host。ARM 安卓跑在 x86 上，每条指令都翻译</span></div>'
+          + '<div class="blk" id="x2">② 硬件虚拟化<br><span class="small">QEMU + KVM / HAXM / Hyper-V：guest 与 host 同架构，CPU 直接跑 guest 指令</span></div>'
+          + '<div class="blk" id="x3">③ 虚拟化 + 翻译层（现代主流）<br><span class="small">x86_64 系统镜像 + libhoudini / libndk_translation：只翻译 App 的 ARM .so</span></div>'
+          + '<div class="blk" id="x4">④ 云端编排<br><span class="small">Cuttlefish（KVM）→ 云手机 / 云测：多实例、远程串流、按需创建销毁</span></div>'
+          + '<div class="blk" id="x5">⑤ 容器方案<br><span class="small">Waydroid 等：共享宿主内核，不是虚拟机，架构必须与宿主一致</span></div>'
+          + '<div class="pill" id="x9">起始状态</div>'
+          + '</div>',
         reset: () => {
-          ['f1', 'f2', 'f3', 'f4', 'f5', 'f6', 'f7'].forEach(i => S(i, ''));
-          CLS('mark', 'pill bad');
-          SET('mark', '🎯 每一步的失败都要能说出一句「我因此知道了什么」');
-          SET('fb', '<div class="note-h">每一步失败时，你会得到什么</div><p style="margin-bottom:0">点「播放」：每点亮一条线索，下面这块就换成它失败时的信息产出。</p>');
+          ['x1', 'x2', 'x3', 'x4', 'x5'].forEach((id) => S(id, ''));
+          CLS('x0', 'pill'); SET('x0', '全部方案的共同底座：KVM / 硬件虚拟化扩展');
+          CLS('x9', 'pill'); SET('x9', '起始状态');
         },
         steps: [
-          { run: () => { S('f1', 'active');
-                         SET('fb', '<div class="note-h">① 字符串搜索失败</div><p style="margin-bottom:0">你得到：<b>这段逻辑不是静态常量驱动的</b>。<br>它把可能性砍成三支：运行时拼接（顺调用栈）、服务端下发（抓包与协议）、字符串加密（脱壳与解密）。<b>三支的下一步完全不同，但都比「继续换词搜」有价值。</b></p>'); },
-            note: '<b>第一步永远从它开始。</b>理由只有一个：搜不到的代价是三十秒。' +
-                  '<span class="hit">它是唯一一条「失败也比不做更有信息」的线索。</span>' },
-          { run: () => { S('f1', 'done'); S('f2', 'active');
-                         SET('fb', '<div class="note-h">② 日志与崩溃栈失败</div><p style="margin-bottom:0">你得到：<b>这条路径上没有留下可读记录</b>。<br>两种可能，都必须区分：是<b>被清理了</b>（加固在降低你的可观测性），还是<b>你压根没走在这条路径上</b>（操作没触发、进程不对）。<b>两者的处理方式完全相反：前者要换观测点，后者要换触发方式。</b></p>'); },
-            note: '<b>② 与 ① 同级便宜，但它的独特价值是「时间」。</b>' +
-                  '日志能对齐「我做了什么」与「程序做了什么」，这是别的线索都给不了的维度。' +
-                  '如果有崩溃栈，这一步的收益会直接顶到最高——它是完整调用栈的免费来源。' },
-          { run: () => { S('f2', 'done'); S('f3', 'active');
-                         SET('fb', '<div class="note-h">③ 静态结构失败</div><p style="margin-bottom:0">你得到：<b>结构被处理过</b>。<br>注意这个结论的分量——它不只是「静态不好读」，而是「有人在系统性地隐藏结构」。<br>下一步是明确的：<b>先恢复可读性</b>（脱壳，第 19 章），或者接受它、转而做运行时观测。<b>硬读被壳打散的结构是最亏的一种做法。</b></p>'); },
-            note: '<b>③ 的成本是「要读」。</b>它需要的不是环境，是耐心：把一堆符号关系连成一张图。' +
-                  '它的产出是一张<b>从入口到目标的结构草图</b>，这张草图后面每一步都要用。' },
-          { run: () => { S('f3', 'done'); S('f4', 'active');
-                         SET('fb', '<div class="note-h">④ 调用栈失败（或退化）</div><p style="margin-bottom:0">你得到：<b>调用关系被内联或折叠了</b>。<br>这条信息的价值在于它<b>否定了一整类手段</b>：所有「靠名字读关系」的办法（读栈、按名字筛选、按类名搜索）都会一起失效。<br>于是你转向不依赖名字的观测：<b>地址、偏移、运行时打点、指令级 trace</b>。</p>'); },
-            note: '<b>④ 的成本取决于你手上有什么。</b>有崩溃日志 → 几乎免费；' +
-                  '要靠注入打栈 → 与 Hook 环境同价；native 侧 unwind → 再贵一档。' +
-                  '<span class="hit">所以「先做②，让④变便宜」是一个很实际的策略。</span>' },
-          { run: () => { S('f4', 'done'); S('f5', 'active');
-                         SET('fb', '<div class="note-h">⑤ UI 反推失败</div><p style="margin-bottom:0">你得到：<b>界面不是原生 View 树</b>（Flutter / 自绘 / 引擎）。<br>这是唯一一条「结构性排除」的线索——<b>它不是弱，是不成立</b>，所以不要做第二次尝试。<br>有意思的是：它同时提示了另一条线索仍然有效——<b>字符串搜索</b>（Dart 的字符串常量通常仍落在 AOT 快照里）。</p>'); },
-            note: '<b>⑤ 是「从现象反推代码」最快的一条路</b>，前提是现象发生在原生界面上。' +
-                  '它的产出通常不是结论，而是<b>一个精确的切入点</b>：一个资源 id、一个 Activity。' },
-          { run: () => { S('f5', 'done'); S('f6', 'active');
-                         SET('fb', '<div class="note-h">⑥ Profiling / Trace 不够用</div><p style="margin-bottom:0">你得到：<b>一批候选，但没有证据</b>。<br>此时最危险的动作是「在候选里挑一个最像的，当成结论」——<br>正确动作是<b>回到 1–4 去验证它</b>：搜它的名字、看它的调用栈、加一条打点日志。<b>候选必须被验证成证据，否则它只是一张可能性清单。</b></p>'); },
-            note: '<b>⑥ 是「假设生成器」。</b>它的价值在「没有字符串可搜、结构也读不出来」时最明显——' +
-                  '它是你从零到有的第一份候选清单。<br>' +
-                  '<b>但请记住它的两个盲区：短方法会被采样丢掉、被内联的方法根本不在调用关系里。</b>' },
-          { run: () => { S('f6', 'done'); S('f7', 'active');
-                         SET('mark', 'pill warn'); SET('mark', '⚠️ 最贵的一级：它要求你先知道「断在哪」');
-                         SET('fb', '<div class="note-h">⑦ 动态调试失败</div><p style="margin-bottom:0">你得到的是本章最有价值的一次失败：<b>确认了「有人不希望被调试」</b>（或者你的环境确实没配通，两者要先分清，见 30.5）。<br>接下来的路只有两条：<b>抢时序</b>（在它的检测之前就位），或者<b>把观测点下沉一层</b>（syscall / 内核 / 自吐沙箱，第 13、11、24 章）。</p>'); },
-            note: '<b>⑦ 是唯一能给出第一手现场的手段，所以它必须被用在最确定的地方。</b><br>' +
-                  '它的成本有一半在环境上（debuggable、JDWP、反调试），' +
-                  '一半在选点上（断在哪一行）。<span class="hit">前六条线索的真正用途，就是替你付掉「选点」这一半的成本。</span>' },
-          { run: () => { CLS('mark', 'pill ok');
-                         SET('mark', '✅ 七条都不是「试一遍」，而是「每一步都把范围砍一半」');
-                         SET('fb', '<div class="note-h">收口</div><p style="margin-bottom:0">把这张图压缩成一句话：<br><b>从最便宜的、失败也不花钱的动作开始；每一步失败都要产出一条能把范围砍小的信息；' +
-                           '拿到强证据就跳级；被结构性排除的线索直接划掉；七条都试过还没定位到，就换的是「观测层」或「目标定义」，而不是再试一遍。</b></p>'); },
-            note: '<b>收尾：这张图不是流程，是「信息产出的账本」。</b><br>' +
-                  '每一次尝试都要记一笔：<b>我付出了什么成本，换回了哪一条能砍范围的信息。</b><br>' +
-                  '记不出来，就说明你在原地转圈——这是本章能给你的最实用的一条自检。' }
+          { run: () => S('x1', 'active'),
+            note: '<b>最重的一层：全系统模拟。</b>QEMU 的 TCG 逐条翻译指令，<b>唯一的好处是架构可以不同</b>（x86 上跑 ARM）。代价是「每条指令都要过翻译器」，性能最差。它存在的意义是<b>兼容性</b>，不是性能。' },
+          { run: () => { S('x1', 'done'); S('x2', 'active'); },
+            note: '<b>往下一层：硬件虚拟化。</b>QEMU 借助 KVM（Linux）/ HAXM（Intel）/ Hyper-V（AMD/Windows）让 CPU 直接执行 guest 指令。<b>性能接近原生，但硬条件来了：guest 与 host 必须同架构。</b>这一条限制划出了整张图的分水岭。' },
+          { run: () => { S('x2', 'done'); S('x3', 'active'); },
+            note: '<b>现代主流答案：虚拟化 + 应用级翻译层。</b>既然硬件虚拟化要求同架构，那就把<b>系统做成 x86_64 的</b>，用虚拟化跑出接近原生的速度；<b>只有 App 里的 ARM <span class="mono">.so</span> 交给翻译层</b>。翻译成本被压缩到最小比例——这就是 30.2 那条右路。' },
+          { run: () => { S('x3', 'done'); S('x4', 'active'); },
+            note: '<b>再往上：云端编排。</b>Cuttlefish 站在第 ②/③ 层之上（依赖 KVM），把虚拟设备做成<b>可配置、可脚本创建/销毁、可远程访问</b>的形态，服务于 AOSP 与 CI。<b>云手机 / 云测本质就是这一层的产品化</b>：多租户、串流、运维、计费，底下还是「虚拟安卓设备」这件事。' },
+          { run: () => { S('x4', 'done'); S('x5', 'active'); },
+            note: '<b>最后是另一个物种：容器方案。</b>Waydroid 这类方案<b>共享宿主内核</b>，用命名空间做隔离——它不是虚拟机。结果是<b>架构必须与宿主一致</b>（宿主 x86 就跑 x86 安卓，宿主 arm64 就跑 arm64），但开销极小、启动极快。它和上面四层不是同一条技术路线。' },
+          { run: () => { S('x5', 'done'); CLS('x0', 'pill ok'); SET('x0', '共同底座：虚拟化方案都要 KVM；容器方案不要'); },
+            note: '<b>回到最上面那条横向事实。</b>①–④ 都建立在硬件虚拟化之上（Linux 上是 KVM，Windows 上是 HAXM/Hyper-V 一类），<b>KVM 是它们的共同底座</b>；而 ⑤ 容器方案绕开了虚拟化，直接用宿主内核。这是两条根本不同的路，也是第 31、32 章要展开的内容。' },
+          { run: () => { S('x3', 'cool'); S('x5', 'hot'); CLS('x9', 'pill acc'); SET('x9', '选型决策：你要的是什么？'); },
+            note: '<b>怎么选？三个问题。</b>① <b>要不要跑 ARM-only 的 App？</b>要 → 走 ②/③（带翻译层），别指望容器方案能在 x86 宿主上跑 ARM so。② <b>要不要接近原生的性能？</b>要 → 放弃 ①，选 ②/③。③ <b>要不要规模化、远程、多实例？</b>要 → 走 ④（Cuttlefish/云手机路线）。<b>把这三个问题问完，方案基本就定下来了。</b>' },
+          { run: () => { CLS('x9', 'pill bad'); SET('x9', '对逆向：方案决定你的环境特征'); S('x1', 'hot'); S('x3', 'hot'); S('x5', 'hot'); },
+            note: '<b>对逆向：你选的方案，决定了你要对抗哪些特征。</b>①/② 会留下 QEMU / Goldfish / ranchu 一整套痕迹；③ 额外留下翻译层库（<span class="mono">libhoudini</span>、<span class="mono">libndk_translation</span>）与 x86 系统镜像的属性差异；⑤ 容器方案共享宿主内核，<span class="mono">/proc</span> 与内核版本会暴露宿主的真实身份。<b>没有「无特征」的方案，只有「特征在你的威胁模型里是否重要」。</b>' }
         ]
       },
-      lab: {
-        title: '实验：七条线索的选型器（真实成本-收益规则表）',
-        goal: '算出首选 + 说清理由与失败后果',
-        intro:
-          '<p>下面六条情境是真实任务里最常见的六种起点。<b>把其中一条复制到第一个输入框</b>' +
-          '（也可以写你自己的情境，规则会从文字里识别事实）。</p>' +
-          T.tbl(
-            ['#', '情境（可直接复制）'],
-            [
-              ['1', '只知道界面上一个按钮，按钮文字是「立即支付」，界面是原生的。'],
-              ['2', '只知道一句报错提示「签名校验失败」，它由服务端返回，App 用一个弹窗把它显示出来；APK 已加固，本地搜不到这句文案。'],
-              ['3', '只有一个抓到的密文参数：请求 body 里的 sign 是一串 hex，其它什么都不知道。'],
-              ['4', '只有一份崩溃日志：NullPointerException，栈顶是 com.target.pay.SignUtil.buildSign。'],
-              ['5', '界面完全是 Flutter 画的，没有任何原生 View 树；你只知道某个按钮的位置。'],
-              ['6', '目标是一个 native 里的算法，so 已经 strip，符号被剥离了。']
-            ]) +
-          '<p>规则从情境里识别 <b>事实</b>（有明文文本 / 只有密文 / 有崩溃栈 / 界面非原生 / 没有 root …），' +
-          '再按每条线索自己的<b>成本修正与收益修正</b>算出效益，最后排序。' +
-          '<span class="hit">你不需要猜评委的想法——规则全写在选型器下面那张表里，可以先自己算一遍。</span></p>',
-        inputs: [
-          { key: 'scene', label: '情境描述（复制上面任意一条，或写你自己的）',
-            hint: '规则会从文字里识别事实', type: 'textarea', rows: 3,
-            value: '只知道界面上一个按钮，按钮文字是「立即支付」，界面是原生的。' },
-          { key: 'pick', label: '你决定最先试哪一条线索？', hint: '填编号或名字，如「1」或「字符串搜索」', value: '' },
-          { key: 'why', label: '理由 + 失败后果', hint: '两件事都要写：为什么先试它；它失败时你会得到什么信息、下一步去哪',
-            type: 'textarea', rows: 3, value: '' }
-        ],
-        runLabel: '🔍 让规则算一遍',
-        autorun: true,
-        run: v => window.CH30X.rankHtml(window.CH30X.score(window.CH30X.detect(v.scene || '')), window.CH30X.detect(v.scene || '')),
-        expected: v => {
-          const factIds = window.CH30X.detect(v.scene || '');
-          const ranked = window.CH30X.score(factIds);
-          const best = ranked[0] ? ranked[0].eff : 0;
-          const acceptable = ranked.filter(c => !c.blocked && c.eff === best);
-          const pickId = window.CH30X.matchClue(v.pick);
-          const picked = pickId ? ranked.filter(c => c.id === pickId)[0] : null;
-          const okPick = !!picked && acceptable.some(c => c.id === picked.id);
-          const reasonOk = picked ? window.AKKC_hasConcept(v.why || '', picked.whyAny) : false;
-          const failOk = window.AKKC_hasConcept(v.why || '',
-            ['失败', '搜不到', '不命中', '没有命中', '得不到', '后果', '代价', '下一步', '换一条', '换线索', '退一步', '出局', '排除']);
-          const ok = okPick && reasonOk && failOk;
-          const want = acceptable.map(c => '#' + c.no + ' ' + c.name).join(' 或 ');
-          let detail = '<b>规则算出的首选：</b>' + (want || '（无）') +
-                       '<span class="muted small">（效益 ' + best + '；并列的任何一条都算对）</span><br>' +
-                       '<b>你选的是：</b>' + (picked ? ('#' + picked.no + ' ' + picked.name) : '（没填或没认出来）') +
-                       (okPick ? ' <span class="hit">✔ 在并列集合里</span>' : ' <span class="miss">✘ 不是效益最高的那一条</span>') + '<br>' +
-                       '<b>理由：</b>' + (reasonOk ? '<span class="hit">✔ 说到了这条线索的适用判据</span>' : '<span class="miss">✘ 还没说清「为什么是它」</span>') + '<br>' +
-                       '<b>失败后果：</b>' + (failOk ? '<span class="hit">✔ 写了失败时会得到什么</span>' : '<span class="miss">✘ 缺这一半——这一栏比理由更值钱</span>');
-          if (picked && picked.why.length) {
-            detail += '<div class="lab-note"><b>本情境下这条线索的修正项：</b>' + picked.why.join('；') + '</div>';
-          }
-          if (picked) {
-            detail += '<div class="lab-note"><b>它失败时你会得到：</b>' + picked.fail + '</div>';
-          }
-          return { ok: ok, detail: detail };
-        },
-        showAnswer:
-          '<p><b>规则表（和引擎里跑的是同一张）</b>：每条线索有一个基准成本与基准收益，' +
-          '情境里识别到的事实会加减它们，<b>效益 = 收益 / 成本</b>，按效益排序；' +
-          '被结构性排除的线索（例如非原生界面上的 UI 反推）直接置底。</p>' +
-          '<p><b>六条预设情境下，规则算出的首选是</b>（编号与 30.6 的线索编号一致）：</p>' +
-          '<ul>' +
-          '<li><b>情境 1（按钮文字）</b>：效益最高的是 <b>线索 1 字符串搜索</b> 与 <b>线索 5 UI 反推</b>（并列）。' +
-          '明文文案可以直接搜；而界面是原生的，资源 id 这条路也成立。</li>' +
-          '<li><b>情境 2（服务端提示 + 已加固 + 弹窗）</b>：<b>线索 5 UI 反推</b>。' +
-          '文案本地搜不到（服务端下发）、加固又压低了静态收益，' +
-          '于是从「弹窗这个控件」反查「谁弹的」成了效益最高的一步。</li>' +
-          '<li><b>情境 3（只有密文参数）</b>：<b>线索 4 调用栈</b>。' +
-          '密文是天然的锚点——从「谁写入了这串字节」出发，顺着调用链往上找，' +
-          '比漫无目的地搜字符串有效得多。</li>' +
-          '<li><b>情境 4（崩溃日志）</b>：<b>线索 4 调用栈</b> 与 <b>线索 7 日志</b>（并列）。' +
-          '崩溃栈本身就是一份高质量调用栈：它把这条线索的成本压到了最低。</li>' +
-          '<li><b>情境 5（Flutter 界面）</b>：<b>线索 1 字符串搜索</b>。' +
-          'UI 反推（线索 5）被<b>结构性排除</b>；而 Dart 的字符串常量通常仍落在 AOT 快照里，' +
-          '所以「搜字符串」这条最便宜的路并没有一起失效。</li>' +
-          '<li><b>情境 6（native 算法 + 已 strip）</b>：<b>线索 2 静态结构</b> 与 <b>线索 1 字符串搜索</b>（并列）。' +
-          '符号被剥离会压低「按名字读」的收益，但 <b>导入表、常量与交叉引用不受影响</b>——' +
-          '这三样恰好是 native 静态结构的核心抓手。</li>' +
-          '</ul>' +
-          '<p><b>这张表真正想教你的不是答案，而是「修正项」这个概念</b>：' +
-          '同一个线索在不同情境下的效益完全不同。<span class="hit">' +
-          '会做定位的人，脑子里装的是这张修正表，而不是一句「先搜字符串」。</span></p>',
-        hint: '<b>先看规则算出的表，再回来填。</b>填的时候记住三件事：<br>' +
-              '① <b>效益并列的都算对</b>——例如情境 1 里字符串搜索和 UI 反推效益相同，选哪个都对；<br>' +
-              '② <b>理由是「为什么这条线索在这个情境下便宜」</b>，要用情境里的词（明文 / 服务端 / 原生界面 / 崩溃 / 密文 / Flutter / strip / native）；<br>' +
-              '③ <b>失败后果</b>是必答项：写清「它失败时我因此知道了什么」。',
-        after: T.note('ok', '实验做完了，收获是什么',
-          '<p style="margin-bottom:0">你手上现在有一张可复算的表：<b>情境 → 事实 → 成本修正 → 效益排序</b>。<br>' +
-          '换一个真实任务时，你不需要凭感觉选线索——把手上有什么写下来，' +
-          '让同一套规则算一遍，再核对它和你的直觉是否一致。<b>不一致的地方，就是你要补的认知。</b></p>')
-      },
+      after: T.note('key', '🔑 本章要带走的三句话',
+        '<p>① <b>性能差别的根源是「有多少代码需要翻译」</b>，不是模拟器写得好不好。全系统模拟 100%，应用级翻译只翻 App 的 ARM 原生库。</p>'
+        + '<p>② <b>GKI 是内核治理的结构性改变</b>：通用内核 + 厂商模块，靠 KMI 契约解耦，让 Google 能独立升级内核、厂商只维护模块。对逆向来说，它把「换内核」变成了规范操作。</p>'
+        + '<p>③ <b>云手机不神秘</b>：它就是在 KVM 上跑一堆可编排的安卓虚拟设备。Cuttlefish 是 Google 官方的同类方案，理解它，云手机的架构就可以推导出来。</p>')
+    },
+
+    /* ================= 30.8 decision 1 ================= */
+    {
+      h: '30.8',
+      title: '决策演练一：ARM-only 的 so 摆在面前',
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境三 · 七条线索全试过，还是没定位到',
-            scenario: '<b>情境：</b>你已经做了下面这些事，并且每一步都保留了记录：<br>' +
-                      '· 字符串搜索：把 URL、界面文案、日志 TAG、常见算法常量都搜过，<b>没有可用命中</b>；<br>' +
-                      '· 静态结构：反编译出来的类全是壳的代码，调用图对不上；<br>' +
-                      '· 日志：logcat 里只有系统噪音，业务 TAG 一条都没有；<br>' +
-                      '· 调用栈：能打出来的栈全是框架帧，业务帧名字是单字母；<br>' +
-                      '· UI 反推：界面是自绘的，控件树里只有一个空白容器；<br>' +
-                      '· Trace：开了采样，得到几千行候选，逐个看下来没有一个是「签名」相关的；<br>' +
-                      '· 动态调试：一附加就退出（已确认是主动检测，不是环境问题）。<br>' +
-                      '<span class="small muted">你的需求原话是：「找出 App 本地计算签名参数的代码」。</span>',
-            q: '下一步最该做的是：',
+            label: '情境一',
+            scenario: '<b>情境：</b>目标 App 的加固壳<b>只提供 ARM64 版本的 <span class="mono">.so</span></b>。你们团队用的是一台 x86_64 的 Windows 笔记本，需要在这上面搭环境做动态分析。你手上有 AOSP 的模拟器镜像源，可以下任意架构的系统镜像。你怎么选？',
             choices: [
-              { t: 'A. 把这七条线索各再试一遍，但力度加大：搜更多关键词、开全量 trace、上更强的反调试绕过', next: 'na' },
-              { t: 'B. 回到需求本身，把「定位某个函数」拆成「可观测的输入输出」：先确定签名参数的输入（哪些字段）与输出（长度/字符集/是否随输入变化），再决定用哪一层的手段去观测', next: 'nb' },
-              { t: 'C. 直接把观测点下沉到内核：上 eBPF / 内核模块记录所有 syscall 与内存操作', next: 'nc' },
-              { t: 'D. 结论是这个 App 无法分析，向项目方报告失败', next: 'nd' }
+              { t: '下 ARM64 的系统镜像，让整个安卓系统就是 ARM 的——最接近真机，兼容性最好', next: 'n1' },
+              { t: '下 x86_64 系统镜像，让系统原生跑，只让 App 里那个 ARM so 走翻译层', next: 'n2' },
+              { t: '下 x86_64 镜像，然后把 ARM so 反编译出来、重写成 x86 版本再塞回去', next: 'n3' },
+              { t: '不用模拟器了，改用 Waydroid 这类容器方案，开销最小', next: 'n4' }
             ]
           },
-          na: {
-            label: '选 A', terminal: true, verdict: 'bad',
-            verdictTitle: '这不是「力度不够」，是「同一层次的手段已经被穷尽」',
-            result: '<b>认知根源：把「没有结果」当成了「尝试得不够狠」。</b><br>' +
-                    '请注意你这七次尝试有一个共同点：<b>它们全部发生在「用户态、运行时的同一个层次」上</b>。' +
-                    '在这个层次里，你已经把可用的观测方式几乎穷尽了。<br>' +
-                    '「加大力度」的三种形式各有硬伤：<br>' +
-                    '· <b>搜更多关键词</b>：搜索失败的结论已经明确（不是静态常量），再多关键词不会改变这个结论；<br>' +
-                    '· <b>开全量 trace</b>：候选集从几千行变成几万行，只会让筛选更难，而且耗时会触发耗时类检测；<br>' +
-                    '· <b>上更强的绕过</b>：在不知道检测点的情况下绕过，往往触发新的检测，越绕越死（30.5 决策演练）。<br>' +
-                    '<span class="hit">当同一层次的手段被穷尽时，正确的动作是「换层次」或「换问题」，不是「重复」。</span>' },
-          nb: {
-            label: '选 B', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先检查「定位目标」这件事本身是不是可执行的',
-            result: '<b>七条线索全部失败时，最可疑的往往不是工具，而是目标定义。</b><br>' +
-                    '你现在的需求是「找出本地计算签名的代码」——这是一个<b>位置型目标</b>，' +
-                    '它要求你必须先看到代码、或者看到运行中的执行者。而你已经确认：' +
-                    '代码被壳拿走了、运行时行为被反调试挡着。<b>在这个前提不变的情况下，位置型目标不可达。</b><br>' +
-                    '<b>正确的做法是把它降级成「行为型目标」：</b><br>' +
-                    '① <b>先确定输入</b>：签名参数依赖哪些字段（时间戳？订单号？设备信息？）——' +
-                    '这些可以通过<b>改动输入、观察输出</b>来确定，完全不需要看代码；<br>' +
-                    '② <b>再确定输出特征</b>：长度、字符集、是否随同一输入稳定、是否与某个已知算法（第 8、9 章的指纹库）相似；<br>' +
-                    '③ <b>然后选观测层</b>：如果只需要「同样的输入得到同样的输出」，' +
-                    '那你要的其实是<b>可复现的调用能力</b>，而不是源码——' +
-                    '第 7 章的模拟执行、第 24 章的自吐沙箱都是为这一目标设计的；' +
-                    '如果必须要看到算法内部，才谈得上第 13 章的内核观测或第 6 章更下层的手段。<br>' +
-                    '<b>为什么这个顺序是对的：</b>它把「一个做不到的位置型目标」换成了' +
-                    '「一组做得到的行为型目标」，而且<b>换完之后你立刻知道该用哪一层工具</b>——' +
-                    '因为需求已经说明了你要的是「输入输出」还是「内部过程」。<br>' +
-                    '<span class="small muted">这也解释了一个现象：经验丰富的人遇到硬目标时，' +
-                    '第一反应常常是「你到底要什么」，而不是「再试个工具」。</span>' },
-          nc: {
-            label: '选 C', terminal: true, verdict: 'bad',
-            verdictTitle: '下沉是对的，但现在下沉是盲目的',
-            result: '<b>认知根源：把「更底层」等同于「更强」。</b><br>' +
-                    '内核观测确实是本章决策图的第 8 步，也确实是打破用户态对抗的正当路线（第 11、13 章）。' +
-                    '但它有一个前提：<b>你得知道要观测什么。</b><br>' +
-                    '内核层给你的是「所有 syscall / 所有内存操作」——' +
-                    '数据量比用户态 trace 又大了一个数量级。在你还不知道「签名的输入是什么、' +
-                    '它是不是一定要发系统调用、它的输出长什么样」的时候，' +
-                    '你只是把「几千行候选」换成了「几百万行候选」。<br>' +
-                    '<b>更实际的一点：</b>签名的核心计算很可能全在用户态完成（纯数学运算，不涉及 syscall）。' +
-                    '如果它不发系统调用，内核层根本看不到它——你会得到一个「什么都抓到了，就是没有它」的结果。' +
-                    '<span class="hit">下沉的价值取决于「目标行为是否经过那一层」，' +
-                    '而判断这一点，恰恰要先用行为型目标去试探。</span>' },
-          nd: {
-            label: '选 D', terminal: true, verdict: 'bad',
-            verdictTitle: '把「当前方法不可达」当成了「目标不可达」',
-            result: '<b>认知根源：用「我这套方法失败了」代替了「目标本身无法达成」。</b><br>' +
-                    '这两件事之间有巨大的距离。你验证过的是：<b>在用户态、用这七类线索、' +
-                    '在当前的对抗强度下，位置型目标不可达。</b>' +
-                    '这是一个有边界、有前提的结论——它甚至是一份很有价值的报告结论。<br>' +
-                    '而「无法分析」是一个无边界的结论，它需要排除：换观测层（第 11、13 章）、' +
-                    '换执行环境（第 7 章的模拟执行、第 24 章的自吐沙箱）、' +
-                    '换等价目标（行为复现代替源码还原）——<b>这些都还没试。</b><br>' +
-                    '<b>报告的正确写法是分级的：</b>' +
-                    '「已完成的尝试与结论 → 失败的确切层次 → 若要继续需要的条件（设备/时间/权限）→ ' +
-                    '以及一个降级目标是否可接受」。这比一句「做不了」有用得多，' +
-                    '也是第 29 章审计视角里「结论要能被复核」的要求。' }
+          n1: {
+            label: '选 ARM64 系统镜像', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：你选择了「全系统模拟」，性能代价是数量级的',
+            result: '<b>认知根源：把「兼容性最好」当成了「最合适」。</b>ARM64 系统镜像确实能让那个 so 原生跑起来，但代价是——在 x86 宿主上，<b>整个安卓系统</b>（内核、ART、SystemServer、每一行 Java）都要经过 QEMU TCG 逐条翻译。这就是本章反复讲的「100% 的代码都要过翻译器」。<br><br>'
+              + '<b>更糟的是它不只是慢。</b>真机 CPU 和 TCG 翻译执行的性能差距是数量级的，这个差距本身就是一个极强的「非真机」信号。如果这个 App 带风控，你在还没开始分析之前就已经暴露了。<br><br>'
+              + '<b>正确做法：</b>选 <b>x86_64 系统镜像</b>——系统原生执行接近真机速度，只有那个 ARM so 在运行时被 <span class="mono">libhoudini</span> / <span class="mono">libndk_translation</span> 翻译（应用级翻译）。<b>把翻译成本从「全民负担」压到「局部负担」。</b>'
+          },
+          n2: {
+            label: '选 x86_64 镜像 + 翻译层', terminal: true, verdict: 'good',
+            verdictTitle: '正确：应用级翻译，把翻译成本压到最小',
+            result: '<b>这就是现代模拟器和云手机的主流路线。</b>系统、ART、系统应用全部是 x86 原生指令，借硬件虚拟化（Windows 上通常是 HAXM / Hyper-V）直接执行；<b>只有 App 里那个 ARM so 需要翻译</b>——因为需要被翻译的代码比例从 100% 掉到了个位数，整体体验接近真机。<br><br>'
+              + '<b>但要记住两个附带条件：</b><br>'
+              + '① <b>翻译层会引入行为差异。</b>在翻译执行路径下观察到的行为不完全等价于真机，关键结论要回真机复验；<br>'
+              + '② <b>翻译层本身就是环境特征。</b><span class="mono">libhoudini</span> / <span class="mono">libndk_translation</span> 相关库的存在，向风控暴露了「这是 x86 安卓在跑 ARM so」这个事实。<b>选它不等于没有代价，只是代价最小。</b>'
+          },
+          n3: {
+            label: '把 ARM so 重写成 x86', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：这不是工程问题，是不成立的问题',
+            result: '<b>认知根源：把「翻译」误解成了「改写」。</b>翻译层做的是<b>运行时的指令级翻译</b>，它按基本块把 ARM 指令转成等价的 x86 指令——这是可自动化、可缓存、语义可保的。<br><br>'
+              + '而你说的「重写成 x86」意味着<b>把机器码还原成高级语义再重新实现</b>。对于一个加固过的 so，它可能：自带完整性校验、被混淆/VMP 保护、依赖 ARM 特有的指令与内存模型、运行时自解密。<b>你连它的完整语义都拿不到，谈何重写。</b><br><br>'
+              + '<b>即使硬啃下来</b>，工作量以人月计且极易引入行为差异——而翻译层几秒钟就做完了这件事。<b>正确做法是让工具做翻译，你的精力放在分析上。</b>'
+          },
+          n4: {
+            label: '改用容器方案（Waydroid）', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：容器方案救不了架构不一致',
+            result: '<b>认知根源：把「开销小」当成了通用优点，忽略了架构约束。</b>容器方案（如 Waydroid）<b>共享宿主内核</b>，用命名空间做隔离——它根本不是虚拟机，因此有一个死约束：<b>guest 架构必须与宿主一致</b>。<br><br>'
+              + '你的宿主是 x86_64，容器里跑的就是 x86_64 的安卓。<b>那个 ARM-only 的 so 依然跑不了</b>——而且容器方案通常<b>没有</b>模拟器那套翻译层集成，你连 libhoudini 这条路都没有。<br><br>'
+              + '<b>容器方案的优势</b>（开销小、启动快、资源占用低）是真实存在的，但它适用于「宿主与目标架构一致」的场景。<b>选方案的第一步永远是问架构能不能对上，而不是问谁更轻。</b>'
+          }
         }
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">一张八行的决策图（七条线索 + 第 8 步「换观测层」），' +
-        '以及每个决策演练里被反复强调的那句话：<b>失败时要产出一条能把范围砍小的信息。</b><br>' +
-        '最后那个演练的结论值得单独记住：<b>当所有用户态线索都穷尽时，先检查目标定义，再考虑下沉观测层。</b></p>')
+      }
     },
 
-    /* ============================================================ 30.15 */
+    /* ================= 30.9 decision 2 ================= */
     {
-      h: '30.15', title: '实战案例：不靠符号，靠「函数形状」筛出 VMP 入口',
-      html:
-        '<p>下面这篇案例几乎是本章方法论的实物版：<b>它没有一行符号可以用</b>，' +
-        '却靠「函数的形状 + 交叉引用」把虚拟机入口从成千上万个函数里筛了出来，' +
-        '再用 Frida 做具体确认。</p>' +
-        T.note('key', '🔑 读案例时盯三件事',
-          '<p style="margin-bottom:0"><b>① 他把「经验判据」写成了可执行的条件</b>（这一步是本章最想教的技能）；' +
-          '<b>② 他的收敛依据是交叉引用</b>（很多调用者指向同一个被调用者）；' +
-          '<b>③ 他的 trace 被拆成了采集 / 查看 / 分析三段</b>——' +
-          '说明原始 trace 本身不是结论，这与 30.12 的立场一致。<br>' +
-          '<span class="pill warn">说明</span>：VMP 本身的原理在第 6 章，' +
-          '本案例在这里只作为「定位方法论」的样本，<b>不展开讲虚拟化保护本身</b>。</p>'),
-      case: {
-        source: 'kanxue',
-        title: '[原创] VMP攻略笔记',
-        date: '2026-03-02',
-        author: 'Whoami默',
-        target: '某 VMP 保护样本（ARM64 so）· 作者环境：Python 3.11 / IDA 9.2 / Frida hluda-server 16.0.10',
-        background:
-          '<p>作者记录了一次围绕 VMP 样本的完整逆向过程：<b>从入口定位开始</b>，' +
-          '再到混淆对抗、执行路径还原、关键机制理解，最后基于这些结论自己做了一个虚拟化加固。</p>' +
-          '<p>其中与本章最相关的是第一部分：<b>虚拟机入口</b>。' +
-          '作者的原话是「VMP 的入口函数特征确实不太好找」——' +
-          '因为这正是 VMP 的设计目标之一：<b>让「从哪进去」这件事无法靠名字判断</b>。' +
-          '于是他转向了「形状」。</p>',
-        points: [
-          '入口定位不依赖任何符号：改用 <b>Wrapper 函数形态</b>作为判据',
-          '六条形态判据（作者原文）：指令数极少（一般少于 20 条）、只存在一条跳转指令、' +
-          '存在一条固定目标跳转（BL 指令）、以 <span class="mono">ret</span> 结束、' +
-          'CALL 与 RET 之间指令数很少（一般小于 3）、CALL 之后不修改 <span class="mono">X0/W0</span>',
-          '用 IDAPython 遍历全部函数，按上述条件自动筛选 Wrapper，' +
-          '再按「<b>至少 15 个 Wrapper 指向同一个被调用者</b>」收敛出候选入口（原文阈值：<span class="mono">MIN_WRAPPER_COUNT = 15</span>）',
-          '混淆对抗三件套：BL 混淆还原、F5 干扰处理、BR 跳转还原（按指令 pattern 搜索 + 分段验证后 patch 回 IDA，再重新加载分析）',
-          '跟踪工具链拆成三段：Trace 工具、Trace 查看工具、Trace 分析工具',
-          '机制整理阶段落到具体结构：VmState 数据结构与管理、ByteCode 与 ReTable 的重定位、' +
-          'ByteCode 解析、不定参数与 ABI 约定、<b>符号与 RTTI 泄露的信息</b>、虚拟寄存器机制'
-        ],
-        method: [
-          '先列出可复现的环境（IDA / Frida 版本 / Python 版本）',
-          '把「什么样的函数像 VM 入口的包装器」写成六条可判定的条件',
-          '用脚本遍历函数集合做特征筛选，得到 (被调用者 → 调用者列表) 的映射',
-          '用「多个 Wrapper 指向同一目标」做阈值收敛，输出候选入口',
-          '再用 Frida 对候选地址做具体确认（动态侧验证静态结论）',
-          '还原混淆（BL / BR / F5 干扰）并重新加载分析，让结构可读',
-          '采集并分析 trace，理解执行路径',
-          '逐项整理 VM 机制（状态、字节码、ABI、符号泄露、寄存器模型）'
-        ],
-        result:
-          '<p>作者筛出了 VM Entry 候选地址（脚本会打印每个候选及其对应的 Wrapper 列表），' +
-          '并在此基础上完成了混淆还原与执行路径分析，' +
-          '最后把整理出的机制用在了自己的虚拟化实现上：' +
-          '离线把函数翻译成虚拟指令载荷、运行时接管导出符号并路由到解释执行。</p>',
-        terms: ['VMP', 'Wrapper 函数', '交叉引用', 'IDAPython', 'BL / BR 混淆', 'Trace', 'RTTI', '虚拟寄存器'],
-        limits:
-          '<p>作者自述与本文可核实的信息：</p>' +
-          '<ul>' +
-          '<li><b>样本未公开</b>：帖中写的是「金罡大佬同款」，项目与样本地址以加密字符串给出。</li>' +
-          '<li><b>脚本与 IDA 版本绑定</b>：代码使用了 IDA 9.2 的接口（例如函数指令迭代器），' +
-          '换版本可能需要改写。</li>' +
-          '<li><b>六条形态判据是经验性的</b>：作者用「至少 15 个 Wrapper 指向同一目标」来降低误报，' +
-          '这相当于承认单条判据不足以定案——<b>它给出的是候选集，不是唯一答案</b>。</li>' +
-          '<li>文章是「笔记」体裁，机制部分为要点式记录，未逐条给出完整推导。</li>' +
-          '</ul>',
-        analysis:
-          '<p><b>用本课方法论拆解：这篇案例几乎是 30.8 与 30.14 的实物演示。</b></p>' +
-          '<ul>' +
-          '<li><b>它示范了「把经验判据写成可执行条件」。</b>「VM 入口不好找」是一句经验，' +
-          '而作者把它翻译成了六条机器可判定的条件（指令条数、跳转条数、是否以 ret 结束、' +
-          '调用后是否修改返回值寄存器）。<span class="hit">这正是 30.8 讲的「静态结构」该有的样子：' +
-          '不是盯着反汇编猜，而是先把「像什么」定义成可枚举的形状。</span></li>' +
-          '<li><b>它的收敛依据是交叉引用。</b>「多个 Wrapper 指向同一个被调用者」——' +
-          '这条规则的逻辑是：一个被大量薄包装器调用的函数，几乎一定是<b>统一入口</b>。' +
-          '这正是 30.8 里 native 静态结构的第三个抓手（谁引用了这段代码）被自动化之后的样子。</li>' +
-          '<li><b>它印证了 30.6 的成本排序。</b>作者没有一上来就 attach 调试，' +
-          '而是先用 IDA 脚本做了一次<b>批量静态筛选</b>：成本低、可重复、结果可复核。' +
-          '动态侧（Frida）只用来「对候选做具体确认」——<b>先用便宜的筛，再用贵的定</b>。</li>' +
-          '<li><b>它对 trace 的处理印证了 30.12 的立场。</b>' +
-          '作者把跟踪拆成「采集 / 查看 / 分析」三段工具，' +
-          '这等于承认「原始 trace 不是结论」：<b>采集只是原料，分析才是产出。</b>' +
-          '这也是为什么本章把 Profiling 的产出定义为「候选集」。</li>' +
-          '<li><b>它还给了一个本章没强调但很重要的信号：</b>' +
-          '作者在机制整理阶段专门列了一项「符号与 RTTI 泄露信息」——' +
-          '<b>在符号被剥离的目标里，RTTI 与异常相关的元数据往往会残留</b>，' +
-          '这是 30.8「注解与泛型残留」在 native 侧的对应物。</li>' +
-          '</ul>' +
-          '<p><b>边界说明：</b>本案例的目标是 VMP，' +
-          '所以它演示的是「最难的一类静态结构」；' +
-          '普通 App 里的定位远比这简单——但<b>方法论完全相同</b>：' +
-          '先定义形状，再批量筛选，最后用动态手段确认。</p>',
-        link: 'https://bbs.kanxue.com/thread-290148-1.htm',
-        linkNote: '看雪论坛 Android 安全版；正文含 IDAPython 代码与机制整理，篇幅较长。'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">一个把「经验」变成「可执行条件」的真实样本，' +
-        '以及它展示的三条纪律：<b>先定义形状、用交叉引用收敛、动态只用来确认候选。</b><br>' +
-        '这三条与本章的七条线索并不冲突——它们是「静态结构」和「调用栈」在极端条件下的具体打法。</p>')
+      h: '30.9',
+      title: '决策演练二：风控拦住了，你打算怎么改',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境二',
+            scenario: '<b>情境：</b>你在自建的 x86_64 模拟器环境里跑目标 App，App 启动即退出，日志显示风控命中了模拟器检测。你已经确认它读了 <span class="mono">ro.kernel.qemu</span>、查了硬件名（<span class="mono">goldfish</span>/<span class="mono">ranchu</span>）、看了渲染器字符串（<span class="mono">SwiftShader</span>）。你的第一步是什么？',
+            choices: [
+              { t: '写个脚本，在 App 启动前用 setprop 把这些属性改成真机的值', next: 'n1' },
+              { t: '先搞清楚每个特征由哪一层产生、删了会破坏什么，再决定在哪一层动手', next: 'n2' },
+              { t: '用 Frida hook 掉属性读取接口，让它返回假值就够了', next: 'n3' },
+              { t: '干脆换成 ARM 全系统模拟，ARM 环境应该更「像真机」', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '用 setprop 改属性', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：ro. 开头的属性，运行时改不了',
+            result: '<b>认知根源：把属性系统当成了一个普通的键值存储。</b>安卓属性系统由 init 在启动早期从 <span class="mono">*.prop</span> 文件加载并维护，<span class="mono">ro.</span> 前缀的含义正是 <b>read-only</b>——写入一次后<b>不可更改</b>。你敲 <span class="mono">setprop ro.kernel.qemu &quot;&quot;</span>，得到的只会是静默失败或权限错误。<br><br>'
+              + '<b>更根本的问题是思路。</b>即使属性改成功了，你只处理了<b>四个特征里的一个</b>。硬件名、渲染器、设备节点都还在，风控随便交叉验证一项就穿帮了。<br><br>'
+              + '<b>正确做法：</b>把这些特征<b>归类到产生它们的那一层</b>——<span class="mono">ro.*</span> 属于属性层（要改系统镜像），<span class="mono">goldfish</span>/<span class="mono">ranchu</span> 属于虚拟硬件平台层，<span class="mono">SwiftShader</span> 属于图形栈层，<span class="mono">/dev/qemu_pipe</span> 属于进程通信层。<b>先做归因，再动手。</b>'
+          },
+          n2: {
+            label: '先归因，再决定在哪一层动手', terminal: true, verdict: 'good',
+            verdictTitle: '正确：这是反直觉但唯一站得住的做法',
+            result: '<b>这一题的正确答案是「先不动手」——听起来反直觉，但这是唯一不会浪费你两天的路径。</b><br><br>'
+              + '<b>为什么必须先归因？</b>因为每个特征的处理代价天差地别：<br>'
+              + '· <span class="mono">ro.kernel.qemu</span> —— 属性层。运行时改不了，<b>必须改系统镜像</b>（自编译 AOSP 或改 <span class="mono">*.prop</span> 后重打包分区）。<br>'
+              + '· <span class="mono">goldfish</span>/<span class="mono">ranchu</span> —— 虚拟硬件平台层。改字符串相对容易，但真机有<b>配套的设备节点、<span class="mono">/sys</span> 结构、HAL 实现</b>；只改名不改结构，会被交叉检测抓到。<br>'
+              + '· <span class="mono">SwiftShader</span> —— 图形栈层。名字好改，<b>渲染行为改不掉</b>。<br>'
+              + '· <span class="mono">/dev/qemu_pipe</span> —— 通信层。<b>删了会破坏模拟器与宿主的通信</b>（传感器注入、控制通道可能失效）——这是典型的「改了自断后路」。<br><br>'
+              + '<b>方法论：</b>看到任何一个特征，先问三个问题——<b>它是谁生成的？为什么必须存在？删了会破坏什么？</b>这三个问题问完，你才知道哪些能改、哪些该保留、哪些改了得不偿失。<b>只改字符串是「伪装」，理解架构才能「重构」。</b>'
+          },
+          n3: {
+            label: 'Frida hook 属性读取接口', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：单点 hook 会被交叉验证击穿',
+            result: '<b>认知根源：把「让一个 API 返回假值」等同于「让环境变成真机」。</b>hook <span class="mono">__system_property_get</span> 确实能让某一条读取路径返回你想要的字符串，但它有三个致命问题：<br><br>'
+              + '① <b>读属性的路径不止一条</b>——直接读 <span class="mono">/proc</span>、读 <span class="mono">/system/build.prop</span> 文件、通过其它系统接口拿，都能绕过你的 hook。<b>风控只需要换一条路，你的伪装就失效了。</b><br>'
+              + '② <b>你只处理了一个特征。</b>硬件名、渲染器、设备节点全都还在——风控根本不需要读属性就能认出这是模拟器。<br>'
+              + '③ <b>hook 框架本身也是特征。</b>Frida 的痕迹（进程名、端口、内存中的 agent）本身就是高强度检测项，你可能用一个新的暴露面换掉了一个旧的。<br><br>'
+              + '<b>正确做法：</b>能在镜像层改的就在镜像层改（一次生效、无运行时痕迹），hook 只作为最后的补丁手段，并且要覆盖全部读取路径。<b>治本 vs 治标，选错了要多花十倍力气。</b>'
+          },
+          n4: {
+            label: '换成 ARM 全系统模拟', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：ARM 模拟器的特征不是更少，而是更多',
+            result: '<b>认知根源：混淆了「guest 架构像真机」与「环境像真机」。</b>真机绝大多数确实是 ARM 的——但你换成 ARM 全系统模拟后，得到的是<b>一个跑在 QEMU TCG 上的 ARM 系统</b>，它同时背上了两套暴露面：<br><br>'
+              + '① <b>模拟器的那一整套特征一个都没少</b>——<span class="mono">ro.kernel.qemu</span>、<span class="mono">goldfish</span>/<span class="mono">ranchu</span>、<span class="mono">SwiftShader</span>、<span class="mono">/dev/qemu_pipe</span> 全都还在，因为你用的还是同一个模拟器。<br>'
+              + '② <b>额外多了性能特征。</b>TCG 逐条翻译带来的执行速度、时序分布与真机差着数量级——<b>这是一个风控跑个基准测试就能拿到的、极其廉价的判据</b>。<br><br>'
+              + '<b>结论：</b>换架构解决不了环境伪装问题，反而额外送你一个更强的暴露面。<b>要「像真机」，正确的反问是「我到底需要消除哪些特征、在哪一层消除」，而不是「换个架构碰碰运气」。</b>'
+          }
+        }
+      }
     },
 
-    /* ============================================================ 30.16 */
+    /* ================= 30.10 decision 3 ================= */
     {
-      h: '30.16', title: '本章自测：把环境与定位串起来',
-      html:
-        '<p>这一章的内容横跨「环境」与「方法论」两半，' +
-        '所以最后一道题是一道综合题：<b>把需求、环境、线索选择与失败处理串成一条链。</b></p>',
+      h: '30.10',
+      title: '决策演练三：内核刷上去了，硬件却废了',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境三',
+            scenario: '<b>情境：</b>你按 GKI 替换流程，解包 <span class="mono">boot.img</span>、换入自编译的 GKI 内核、重打包、<span class="mono">fastboot flash boot</span>、重启。<b>设备正常开机了，进了桌面</b>——但摄像头、WiFi、充电全部失效。你的下一步判断是什么？',
+            choices: [
+              { t: '设备能开机说明刷入流程没问题，应该是内核编译时少选了驱动，重新编一个带驱动的内核', next: 'n1' },
+              { t: '查 <span class="mono">lsmod</span> / <span class="mono">dmesg</span>，确认厂商模块有没有加载；大概率是 KMI 版本不匹配，换回对应 KMI 的内核', next: 'n2' },
+              { t: '刷回原始 boot 备份，放弃内核级方案，改用 App 层 hook', next: 'n3' },
+              { t: '改 cmdline 加参数，强制内核加载厂商模块', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '重新编一个带驱动的内核', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：你正在把 GKI 拆开的东西又合回去',
+            result: '<b>认知根源：把「GKI 内核」当成了「传统的一体化内核」。</b>你想「编一个带驱动的内核」——这恰恰是 GKI 要消灭的做法。<br><br>'
+              + '<b>GKI 的设计就是：内核里不含厂商驱动</b>，驱动是独立的可加载模块（<span class="mono">.ko</span>），通过 <b>KMI</b> 与内核对接。你把驱动编进内核，等于自己造了一个「厂商定制内核」，既违背了 GKI 的结构，也意味着以后每次内核升级你都要重新合一遍——<b>回到了碎片化的老路。</b><br><br>'
+              + '<b>更关键的是诊断方向错了。</b>「能开机」只说明<b>内核镜像本身可用</b>（压缩格式对、能解压、能引导），<b>完全不说明模块能用</b>。摄像头 / WiFi / 充电失效，第一嫌疑是<b>厂商模块没有成功加载</b>，而模块加载失败最常见的原因就是 <b>KMI 版本不匹配</b>。<br><br>'
+              + '<b>正确第一步：去看 <span class="mono">lsmod</span> / <span class="mono">/proc/modules</span> 和 <span class="mono">dmesg</span></b>，确认模块到底有没有加载、报了什么错，再决定动作。'
+          },
+          n2: {
+            label: '先查模块加载状态，怀疑 KMI 不匹配', terminal: true, verdict: 'good',
+            verdictTitle: '正确：能开机 ≠ 刷成功，先看模块加载',
+            result: '<b>这是最容易被跳过、也最关键的一步判断。</b>「设备能开机」制造了一种虚假的成功感——但 GKI 架构下，<b>内核和厂商模块是两个独立的东西，它们各成功各的</b>。<br><br>'
+              + '<b>诊断顺序：</b><br>'
+              + '① <span class="mono">adb shell lsmod</span>（或 <span class="mono">cat /proc/modules</span>）——厂商模块在不在列表里？<br>'
+              + '② <span class="mono">dmesg</span> ——模块加载时报了什么错？KMI 不匹配通常会表现为符号找不到、版本不兼容一类的错误。<br>'
+              + '③ <span class="mono">uname -r</span> ——你现在跑的内核版本串，KMI 版本是什么。<br><br>'
+              + '<b>如果确认是 KMI 不匹配</b>，正确动作是换一个<b>与设备原 KMI 版本一致</b>的 GKI 内核（GKI 内核是按「Android 版本 + 内核版本」的组合分发的，必须严格对齐）。<b>KMI 是合同——合同对不上，模块就不认这个内核。</b><br><br>'
+              + '<b>这件事的真正教训：</b>刷完内核必须做<b>完整验收</b>——不只看能不能开机，还要看厂商模块是否加载、依赖硬件的功能是否正常。<b>「能开机」是一个极低的标准。</b>'
+          },
+          n3: {
+            label: '刷回备份，放弃内核级方案', terminal: true, verdict: 'bad',
+            verdictTitle: '止损没错，但结论下得太早',
+            result: '<b>值得肯定的一点：你有备份，并且知道怎么回滚</b>——这是本章 stepper 里强调的救命步骤。<br><br>'
+              + '<b>但认知上有问题：把「一次参数没对齐」当成了「这条路走不通」。</b>你现在遇到的极可能只是一个<b>可诊断、可修复的版本对齐问题</b>，而不是方案层面的失败。GKI 替换是一条成熟且规范的路径——内核是独立镜像、模块加载是标准接口，这正是它比「patch 厂商定制内核」更适合工程化的原因。<br><br>'
+              + '<b>正确的处理：</b>先回滚保证设备可用（这一步你做对了），然后<b>去查日志把失败原因定位清楚</b>——是 KMI 版本错了，还是压缩格式不对，还是 header / cmdline 参数没对齐？<b>把原因搞清楚再决定放不放弃。</b><br><br>'
+              + '<b>一句话：</b>回滚是好的工程习惯，但因为没查日志就放弃一条技术路线，是拿「未知」当「不可行」。'
+          },
+          n4: {
+            label: '改 cmdline 强制加载模块', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：你打算用参数去覆盖一个结构性问题',
+            result: '<b>认知根源：把「模块加载失败」当成了「模块没被要求加载」。</b>但这是完全不同的两件事。<br><br>'
+              + '模块加载失败的原因通常是<b>接口层面的</b>：KMI 版本不匹配导致符号找不到、结构体布局对不上、模块签名验证不通过。<b>这些不是启动参数能解决的</b>——你告诉内核「去加载这个模块」，内核去加载了，然后因为符号找不到而失败，结果是同一个。<br><br>'
+              + '<b>更危险的是动 cmdline。</b>Android 的启动参数里包含大量 <span class="mono">androidboot.*</span> 项，胡乱添加或覆盖可能导致<b>更严重的启动问题</b>（甚至开不了机），把一个「硬件不可用」的问题升级成「设备变砖」。<span class="pill warn">待核实</span> 参数名与语义请以你所用内核版本的实际解析为准。<br><br>'
+              + '<b>正确做法：</b>先 <span class="mono">dmesg</span> 看真实的失败原因，再对症下药。<b>在没看清错误之前就动手改配置，是把调试变成赌博。</b>'
+          }
+        }
+      }
+    },
+
+    /* ================= 30.11 quiz 1 ================= */
+    {
+      h: '30.11',
+      title: '自测一：翻译发生在哪一层',
       quiz: {
-        id: 'q30-6', chapter: 30, answer: 1,
-        stem: '需求是「把一个 App 在<strong>启动阶段</strong>做的完整性自检还原出来」。' +
-              '已知：设备未 root；APK 未加固、能正常反编译；抓包环境可用；' +
-              '目标 App <strong>一 attach 调试器就退出</strong>。' +
-              '下面哪一条路线最符合本章的方法论？',
+        id: 'q16-1', chapter: 16, answer: 2,
+        stem: '关于「全系统模拟」与「应用级翻译」的区别，下列说法<b>正确</b>的是：',
         options: [
-          { t: '先想办法 root 这台设备，然后装 Hook 框架，用 Frida 把启动阶段所有方法都打一遍日志',
-            why: '把「先配环境」当成了默认动作。这个任务的关键信息是「未加固、能反编译」，也就是说静态与日志线索都还完好；在没确认它们不够用之前就去做最贵的一件事（解锁+root+注入），是把成本顺序搞反了。' },
-          { t: '先用静态结构找出启动链路与可疑的自检点，再用日志/打点这类不需要 root 的手段去确认；调试器挂不上这件事先记为「有人不希望被调试」，等确认需要断点再说',
-            why: '正确。三步都在本章的框架内：① 未加固 → 静态结构可用（线索三，成本中）；② 用日志/打点确认（线索二/七，成本低，且不需要 root）；③ 把「调试器被拒」当成一条信息而不是一个障碍——它同样印证了「启动阶段有主动检测」，而这正是你要找的东西之一。' },
-          { t: '既然一 attach 就退出，说明有强反调试，应该立刻上反调试绕过（改属性、hook 检测函数、换 ROM），先把调试器挂稳',
-            why: '在不知道检测点的情况下做绕过，是 30.5 决策演练里已经否掉的路径：绕过动作本身会污染现场，而且「启动阶段的自检」很可能就是那个检测——你为了调试而绕过它，恰恰把要研究的目标改掉了。' },
-          { t: '未 root 且调试器被拒，说明这个任务在当前条件下不可行，应该先申请一台已 root 的工程机',
-            why: '「不可行」的结论需要先排除便宜的路。这个任务有完好的静态结构与可用的抓包环境，而且「自检」往往会在日志、网络、时序上留下痕迹——在试过这些之前申请资源，是把可行性判断建立在工具清单上，而不是建立在证据上。' }
+          { t: '应用级翻译的翻译质量更高，所以更快', why: '不是质量差异。两者做的事本质一样（把 ARM 指令转成 x86），差别在于<b>需要被翻译的代码占多大比例</b>。' },
+          { t: '全系统模拟只能跑 ARM 系统，应用级翻译只能跑 x86 系统', why: '说法过于绝对。全系统模拟（TCG）恰恰可以做到架构不同，这是它唯一的优势；应用级翻译确实以 x86 宿主系统为前提，但把它说成「只能」是把它和硬件虚拟化的约束混在一起了。' },
+          { t: '全系统模拟要翻译整个操作系统的指令，应用级翻译只翻译 App 里 ARM 的 .so', why: '正确。全系统模拟下内核、ART、系统服务、每一行 Java 都要过翻译器（100%）；应用级翻译下系统本身是 x86 原生的，只有 App 的 ARM 原生库需要翻译（个位数比例）。这个比例差异才是性能差距的根源。' },
+          { t: '应用级翻译是硬件加速，全系统模拟是软件模拟', why: '把两个概念弄混了。硬件加速指的是 HAXM / Hyper-V / KVM 这类让 CPU 直接执行 guest 指令的机制，它和应用级翻译层是两件不同的事——实际方案里两者常常配合使用。' }
         ],
-        explain: '<b>把这一章的两半接起来看这道题：</b><br>' +
-                 '<b>① 环境这一半</b>：题目给了三个环境事实——未 root、未加固、抓包可用。' +
-                 '它们不是「条件不足」，而是<b>提前告诉你哪几条线索可用</b>：' +
-                 '未加固 → 静态结构与字符串搜索可用；未 root → 动态调试与 Hook 很贵；' +
-                 '抓包可用 → 如果自检上报，那么它的行为会在网络上留下痕迹。<br>' +
-                 '<b>② 方法论这一半</b>：从最便宜的、失败也不花钱的动作开始（静态结构 → 日志 → 抓包对齐），' +
-                 '每一步都换回一条能砍范围的信息。<br>' +
-                 '<b>③ 关于「挂不上调试器」</b>：它是这条链上的一次失败，而它的产出非常明确——' +
-                 '<span class="hit">「启动阶段有人在检测调试环境」</span>。' +
-                 '这本身就是关于自检的一个重要线索，甚至可能就是你要找的那个自检。<br>' +
-                 '所以正确的心态不是「先解决它」，而是「先记下它，继续用便宜的手段推进」。'
-      },
-      after: T.note('ok', '✅ 本章的收束',
-        '<p style="margin-bottom:0">环境是成本，定位是收益。' +
-        '每一次投入——root、证书、Hook、调试器——都应该换来一种具体的观测能力；' +
-        '每一次尝试——七条线索中的任何一条——都应该换来一条能把范围砍小的信息。<br>' +
-        '<b>这一章真正想留下的，是这两个「都应该」。</b></p>')
+        explain: '<b>核心区分：翻译的「覆盖面」。</b>全系统模拟（QEMU + TCG）面对的是一个架构完全不同的 guest，<b>没有一行代码能幸免</b>——内核、运行时、系统服务、App 全部逐条翻译。应用级翻译的宿主系统本身就是 x86_64 的（原生速度），只有 App 里那些 ARM 的 <span class="mono">.so</span> 在运行时被 <span class="mono">libhoudini</span> / <span class="mono">libndk_translation</span> 翻译。<br><br>还要分清另一组概念：<b>硬件虚拟化</b>（HAXM / Hyper-V / KVM）让 CPU 直接跑 guest 指令，<b>要求 guest 与 host 同架构</b>——它救不了 ARM 镜像，这正是现代方案改用 x86 镜像的根本原因。'
+      }
     },
-/* @@CHUNK3B@@ */
+
+    /* ================= 30.12 quiz 2 ================= */
+    {
+      h: '30.12',
+      title: '自测二：GKI 到底解决了什么',
+      quiz: {
+        id: 'q16-2', chapter: 16, answer: 1,
+        stem: '关于 <b>GKI</b>（Generic Kernel Image）与 <b>KMI</b>（Kernel Module Interface），下列哪一项<b>不符合</b>实际设计？',
+        options: [
+          { t: 'GKI 把内核拆成 Google 维护的通用核心与厂商提供的可加载模块', why: '这符合实际设计。厂商驱动做成 <span class="mono">.ko</span> 动态加载，不再编进内核。' },
+          { t: 'GKI 的主要收益是提升内核运行性能', why: '不符合。GKI 要解决的是<b>内核碎片化带来的升级困境</b>——让 Google 能独立升级内核修安全漏洞，不必等厂商合分支。它的收益在「升级速度与安全响应」，不是性能。' },
+          { t: 'KMI 保持稳定，内核可替换而厂商模块不必重新编译', why: '这符合实际设计，也是 GKI 成立的前提。KMI 规定了符号、结构体布局与函数签名。' },
+          { t: '如果新内核删除了模块依赖的符号，模块会加载失败', why: '这符合实际。KMI 一旦被破坏，厂商模块就认不了新内核，硬件功能会大面积失效——这就是为什么 KMI 被称作「合同」。' }
+        ],
+        explain: '<b>GKI 的收益不是性能，是治理结构。</b>在 GKI 之前，厂商各自 fork 内核并把驱动编进去（built-in），导致内核分支成百上千，Google 修一个漏洞必须等所有厂商合并——大量设备永远等不到。GKI 把内核拆成 <b>Google 维护的通用核心</b> + <b>厂商的可加载模块</b>，用 <b>KMI</b> 作为稳定契约连接。于是升级解耦成两条互不干扰的线：Google 独立升级内核，厂商只维护自己的模块。<br><br>对逆向的意义：内核因此变成了<b>一个独立的、可替换的镜像文件</b>，模块加载是标准接口——这让内核级 Hook / 反检测有了规范入口（对应第 27 章）。'
+      }
+    },
+
+    /* ================= 30.13 quiz 3 ================= */
+    {
+      h: '30.13',
+      title: '自测三：Cuttlefish 的定位与前提',
+      quiz: {
+        id: 'q16-3', chapter: 16, answer: [0, 2, 3],
+        stem: '关于 <b>Cuttlefish</b>，下列说法<b>正确</b>的有哪些？（多选）',
+        options: [
+          { t: '它是 Google 官方项目，定位是可配置的安卓虚拟设备（AVD），面向本地 Linux 与远程 GCE，而非物理硬件', why: '正确。这是官方仓库 <span class="mono">google/android-cuttlefish</span> 的原始定位描述。' },
+          { t: '它是给终端用户日常使用的安卓模拟器，主打游戏与多开', why: '错误。它面向的是 AOSP 开发与测试、CI/CD，<b>不是</b>终端用户产品。给开发者个人用的是 Android 官方模拟器。' },
+          { t: '它依赖 KVM，需要 Linux 宿主 + CPU 硬件虚拟化支持（并可能需要嵌套虚拟化）', why: '正确。KVM 是它的硬前提，<span class="mono">/dev/kvm</span> 必须可用。' },
+          { t: '安装时需把用户加入 kvm / cvdnetwork / render 组并重启', why: '正确。这是官方安装步骤明确要求的，加组后需重启才生效。' }
+        ],
+        explain: '<b>把三个关键词记住：可配置、云端、非物理硬件。</b>Cuttlefish 的官方定位是「a configurable Android Virtual Device (AVD) that targets both locally hosted Linux x86/arm64 and remotely hosted Google Compute Engine (GCE) instances rather than physical hardware」。<br><br>'
+          + '<b>包组成</b>：<span class="mono">cuttlefish-base</span>（必需）、<span class="mono">cuttlefish-user</span>（本地 web server，浏览器交互）、<span class="mono">cuttlefish-integration</span>（GCE 上运行）、<span class="mono">cuttlefish-orchestration</span>（编排项目）、<span class="mono">cuttlefish-common</span>（已废弃，仅为兼容保留的 metapackage）。<b>安装后必须加入 <span class="mono">kvm</span>、<span class="mono">cvdnetwork</span>、<span class="mono">render</span> 三个组并重启。</b><br><br>'
+          + '<b>为什么它重要：</b>很多<b>云手机</b>方案本质就是 Cuttlefish 或其变体。理解了它，「服务器上一堆可编排的安卓虚拟设备」这个云手机架构就不再神秘。<b>KVM 是 QEMU、Cuttlefish、crosvm 的共同底座。</b>'
+      }
+    },
+
+    /* ================= 30.14 quiz 4 ================= */
+    {
+      h: '30.14',
+      title: '自测四：模拟器特征从哪来',
+      quiz: {
+        id: 'q16-4', chapter: 16, answer: 3,
+        stem: '某风控读取 <span class="mono">ro.kernel.qemu</span> 判断是否模拟器。你想在自己的环境里处理掉它，第一步应当做什么？',
+        options: [
+          { t: '在 App 启动前用 setprop 把它清空', why: '<span class="mono">ro.</span> 前缀意味着 read-only，运行时写入无效。这条命令不会生效。' },
+          { t: '在 App 里 hook 属性读取函数，让它返回空串', why: '能让某一条读取路径失效，但读属性的路径不止一条（直接读文件、读 /proc 等都能绕过）；而且它只处理了一个特征，硬件名、渲染器、设备节点全都还在；hook 框架本身也是新的暴露面。' },
+          { t: '把模拟器换成容器方案，容器更接近真机', why: '容器方案共享宿主内核，架构必须与宿主一致，而且会暴露宿主的 /proc 与内核版本——是换了一批特征，不是消除了特征。' },
+          { t: '先确认这个属性由哪一层生成、为什么存在、删了会破坏什么，再决定在哪一层动手', why: '正确。属性层（改系统镜像）、虚拟硬件平台层、图形栈层、设备节点层各有不同的处理代价；先归因才能知道哪些能改、哪些改了会自断后路。' }
+        ],
+        explain: '<b>方法论：看到环境特征，先归因再动手。</b>本章反复强调的思维模型是——<b>这些字符串不是谁故意留下的破绽，而是虚拟化架构的必然产物</b>。'
+          + '<p style="margin-top:8px">· <span class="mono">ro.kernel.qemu</span> → <b>属性层</b>，由 init 在启动早期从 <span class="mono">*.prop</span> 加载，<span class="mono">ro.</span> 写入后不可改，<b>要在系统镜像层面改</b>；<br>'
+          + '· <span class="mono">goldfish</span>/<span class="mono">ranchu</span> → <b>虚拟硬件平台层</b>，决定设备树与驱动名；<br>'
+          + '· <span class="mono">SwiftShader</span> → <b>图形栈层</b>，「没有真 GPU」的后果，名字好改、行为难改；<br>'
+          + '· <span class="mono">/dev/qemu_pipe</span> → <b>通信层</b>，guest 与宿主 emulator 进程的通道，删了会破坏模拟器功能。</p>'
+          + '<b>而且换方案只是换一批特征</b>：容器方案会暴露宿主内核痕迹，全系统 ARM 模拟会额外背上性能与时序特征。<b>没有「无特征」的方案，只有「特征在你的威胁模型里是否重要」。</b>'
+      }
+    },
+
   ],
 
   glossary: [
-    { t: 'bootloader 解锁', d: '解除设备对「刷入非官方镜像」的限制。代价通常是清空用户数据，部分机型还会永久熔断某些安全特性；它是 root 的<b>前置条件</b>，且属于不可逆操作。' },
-    { t: 'systemless', d: '「不碰系统分区」的定制思路：把改动放在一个被挂载/覆盖上去的层里，系统分区本身保持与官方一致。收益是卸载干净、OTA 更容易过；代价是痕迹留在挂载层（第 18 章）。' },
-    { t: '用户证书库 / 系统信任库', d: 'Android 的两级信任存储。从 Android 7.0 起，App 默认只信任系统库；用户库里的证书需要在应用里显式声明才会被信任。' },
-    { t: '重打包声明信任', d: '不依赖 root 的替代路线：在 manifest 里加入信任用户 CA 的网络配置后重新签名打包。代价是签名变化引发的完整性校验与 SDK 校验问题。' },
-    { t: 'frida-server', d: 'Frida 的「按需注入」形态：一个独立进程，由你主动连接并向目标进程注入。会话级生效，重启或断连后需要重建现场（第 1、10、21 章）。' },
-    { t: 'LSPosed', d: 'Xposed 路线的现代实现，属于「常驻」形态：挂在 Zygote 上，每个 App 进程一出生就带着模块。装一次长期生效，但改逻辑要重装模块（第 22 章）。' },
-    { t: 'USB 调试', d: '设备侧的开发者选项开关，作用是「允许调试协议接入」。它打开的是<b>通道</b>，不等于「这个 App 可以被断点」。' },
-    { t: 'android:debuggable', d: '应用级标志（写在 App 自己的 manifest 里），决定这个进程是否对外暴露调试接口。<b>它是 per-app 的。</b>' },
-    { t: 'ro.debuggable', d: '系统级属性，表示这台设备的系统镜像本身是 debuggable 构建。<b>它是 per-device 的</b>，会整体放宽可调试性——这解释了「同一份 APK 在不同设备上可调试性不同」。' },
-    { t: 'JDWP', d: 'Java 调试线协议，调试器与被调试运行时之间的通信通道。能不能连上它，是「调试环境是否就绪」的唯一判据。' },
-    { t: '业务边界', d: '调用栈上「控制权第一次进入业务代码」的那一帧。两种等价描述：从栈顶往下第一帧应用包名且非代理/合成的代码；或你的目标字符串第一次出现的那一帧。' },
-    { t: '调用栈退化', d: '栈上的语义信息在编译期被抹掉的状态：大量无行号帧、单字母名、帧数骤减且关系断裂（内联导致某些帧在栈上从未存在）。结论是「换一种不依赖名字的观测」，而不是「再仔细看看」。' },
-    { t: '代理 / 合成帧', d: '反射调用、编译器生成的 lambda、动态代理等「通用入口」帧。它们本身不携带业务语义，读栈时应穿过它们，而不是在它们身上找线索。' },
-    { t: '结构性排除', d: '某条线索在当前情境下<b>逻辑上不成立</b>（而不是效果差）：例如界面由 Flutter/自绘渲染时，UI 反推没有资源 id 可反查。被结构性排除的线索要直接划掉，不要再花一轮去验证。' },
-    { t: '成本-收益选型', d: '本章的核心方法：给每条线索一个启动成本与一个收益（能缩小多少范围），按效益排序决定先试哪一条。成本不是难度，而是「启动它要付的代价」。' },
-    { t: '时间窗过滤', d: '日志排查里收益最高的一招：先记下「我做了这个操作」的时刻，只看窗口前后的日志，把几万行压到几十行。' },
-    { t: 'Method Profiling', d: '按采样或插桩方式采集方法调用。产出是<b>候选集</b>而非证据：短方法会被采样丢掉，被内联的方法根本不在调用关系里。正确用法是当「假设生成器」。' },
-    { t: '交叉引用', d: '「谁引用了这段代码」的关系。在符号被剥离的 native 目标里，它和导入表、常量并列为三大抓手（第 21.13 的 ModuleMap 是它的工程化形态）。' },
-    { t: '导入表', d: 'ELF 模块声明「我用到哪些外部函数」的表。它必须存在（动态链接依赖它），所以**符号被剥离也不会消失**——这是 native 静态分析最稳的一张地图。' },
-    { t: '基线', d: '在动手改行为之前记录下的「未干预状态下的输入输出」。没有基线，你无法判断后面的现象是目标的真实行为还是你的干预造成的。' }
+    { t: 'TCG', d: 'Tiny Code Generator，QEMU 内置的动态二进制翻译引擎。把 guest 指令逐条翻译成 host 指令并缓存为 TB（Translation Block）。全系统模拟的性能瓶颈所在。' },
+    { t: '全系统模拟', d: 'Emulation。用软件模拟整套硬件并翻译全部 guest 指令，guest 与 host 架构可以不同。兼容性最好、性能最差。典型：QEMU + TCG 跑 ARM 安卓。' },
+    { t: '硬件虚拟化', d: 'Virtualization。CPU 通过虚拟化扩展（Intel VT-x / AMD-V）直接执行 guest 指令。性能接近原生，但要求 guest 与 host 架构相同。Linux 上的实现是 KVM，Intel 侧是 HAXM，Windows/Hyper-V 侧是 Hyper-V。' },
+    { t: 'libhoudini', d: 'Intel 提供的 ARM→x86 二进制翻译层，让 x86 安卓系统能运行 ARM 的原生库（.so）。属于「应用级翻译」，与全系统模拟不同。Intel 已停止维护。' },
+    { t: 'libndk_translation', d: 'Google 在 NDK 体系下延续的 ARM→x86 翻译层方案，作用与 libhoudini 类似：让 x86/x86_64 安卓系统运行时执行 ARM 原生库。' },
+    { t: 'GKI', d: 'Generic Kernel Image，通用内核镜像。Google 为解决安卓内核碎片化推出的方案：把内核拆成 Google 统一维护的通用核心与厂商提供的可加载模块，产物形如 Image / Image.gz。' },
+    { t: 'KMI', d: 'Kernel Module Interface，内核模块接口。GKI 的核心稳定契约，规定内核暴露给模块的符号、结构体布局与函数签名。KMI 稳定意味着内核可替换而模块不必重编。' },
+    { t: 'boot.img / vendor_boot.img / init_boot.img', d: '存放内核与 ramdisk 的启动分区。GKI 部署后，内核与通用 ramdisk、厂商相关内容被拆分到这些分区中；init_boot 由 Android 12+ 引入、13+ 强制，用于存放通用 ramdisk。具体切分随版本与厂商实现变化，需实际解包确认。' },
+    { t: 'Cuttlefish', d: 'Google 的 android-cuttlefish 项目，一个可配置的安卓虚拟设备（AVD），面向本地 Linux x86/arm64 与远程 GCE 实例，而非物理硬件。主要服务 AOSP 开发与 CI/CD，依赖 KVM。' },
+    { t: 'cvdnetwork', d: 'Cuttlefish 安装时要求用户加入的系统组之一，用于访问其虚拟网络。另两个是 kvm（访问 /dev/kvm）与 render（GPU 渲染设备）。加组后需重启生效。' },
+    { t: 'Goldfish / ranchu', d: 'Android 模拟器的虚拟硬件平台代号。Goldfish 是早期平台，ranchu 是其后续实现。它们决定了设备树、驱动名与一系列模拟器特征字符串，是风控检测「是否模拟器」的重要依据。' },
+    { t: 'Waydroid', d: '基于容器（共享宿主内核）在 Linux 上运行安卓的方案。不是虚拟机，因此架构必须与宿主一致，但开销极小、启动快。与 Cuttlefish/模拟器走的是根本不同的技术路线。' }
   ],
 
   teacher: {
-    id: 't30', chapter: 30,
-    name: '定位教官',
-    sub: '我不问你会不会用工具，我只问你「凭什么这么选」',
-    intro:
-      '<p>这一章的内容谁都能看懂，但<b>判断力不是看懂就能获得的</b>。' +
-      '所以我只会问你四类问题：<b>这笔成本的价签在哪、这条线索凭什么排前面、' +
-      '失败时你到底得到了什么、以及这个结论能不能被别人复核。</b></p>' +
-      '<p>答不上来没关系，我会给你提示——但提示不算过关。</p>',
+    id: 'ch16', chapter: 16,
+    name: '追问老师 · 第 30 章',
+    sub: '拷问模拟器的架构选择：你为什么选它、它为什么快、它坏在哪',
+    intro: '<p style="margin:0">这一章的概念不难，难在<b>选型和归因</b>。我会一直追问「为什么」——为什么这条路径快、为什么这个特征会出现、为什么这个操作在你的环境里不成立。答不出机制，只说结论，是过不了的。</p>',
     questions: [
+      /* ---------- Q1 ---------- */
       {
-        id: 'c30q1', depth: 1, threshold: 0.7,
-        q: '有人跟你说：「先解锁 root 再说，反正现在都这么干。」<br>' +
-           '请你把 <b>root 这笔账</b>算清楚：代价是什么、systemless 为什么值这个价、' +
-           '以及为什么说「root 本身就是一次自我举报」。',
+        id: 'c16q1', depth: 1, threshold: 0.7,
+        q: '假设你要在一台 Windows x86_64 电脑上跑一个安卓 App，这个 App 里有一个<b>只提供 ARM64 版本</b>的加固 so。请说明：从「安卓系统在被执行」到「那段 ARM 代码真正在 CPU 上跑起来」，中间发生了哪些翻译？为什么现代方案不干脆整个系统都用 ARM 模拟？',
         concepts: [
-          { label: '解锁 bootloader 会清空数据，部分机型还会熔断安全特性、影响保修，属于不可逆操作',
-            hint: '先说不可逆的那部分代价',
-            any: ['清空', '清数据', '擦除', '恢复出厂', '熔断', '保修', '不可逆', '一次性', '拒保'] },
-          { label: 'systemless 不改系统分区，靠挂载/覆盖层叠加，所以卸载干净、OTA 与完整性校验更容易过',
-            hint: '它换来了什么',
-            any: ['systemless', '系统分区', '挂载', '覆盖', 'overlay', '叠加', '卸载', 'OTA', '镜像', '分区校验'] },
-          { label: 'root 会留下可被读取的特征：su 痕迹、挂载信息异常、属性与目录痕迹、可注入性本身',
-            hint: '风控会读什么',
-            any: ['su', '挂载', 'mount', '属性', '目录', '可注入', '特征', '检测', '风控', '暴露', '痕迹'] },
-          { label: '它是环境依赖链上的一环：证书进系统库、frida-server 注入都依赖它',
-            hint: '它买到了哪几种观测能力',
-            any: ['依赖', '证书', '系统库', '注入', 'frida', '前提', '链条', '观测', '权限'] },
-          { label: 'root 只是权限：它不能让你看懂代码，也不能让反调试失效，更不能绕过服务端风控',
-            hint: '它的边界在哪',
-            any: ['权限', '看不懂', '不是理解', '反调试', '无关', '不能绕过', '风控', '边界', '服务端'] }
+          { label: '系统本身是 x86_64 镜像，原生执行不必翻译',
+            hint: '先问一句：需要被翻译的，是「整个系统」还是「只有那一个 so」？',
+            any: ['x86 镜像', 'x86_64 镜像', 'x86系统', '系统镜像是 x86', 'x86 系统镜像', '原生执行', '不用翻译', '不需要翻译', '系统本身是 x86', 'x86 image', 'native'] },
+          { label: '只有 App 的 ARM so 被翻译层处理',
+            hint: '谁负责把 ARM 的 .so 变成 CPU 能执行的东西？',
+            any: ['libhoudini', 'houdini', 'libndk_translation', 'ndk_translation', 'ndk translation', '翻译层', '二进制翻译', '应用级翻译', 'binary translation', 'translation layer', 'arm 翻译'] },
+          { label: '加载时机：System.loadLibrary 加载到 ARM 架构 so 时接管',
+            hint: '翻译是从哪一刻开始的？是安装时还是运行时？',
+            any: ['loadLibrary', 'System.loadLibrary', '加载', '运行时', '动态加载', 'dlopen', 'so 加载', '加载器', 'linker', 'linker64'] },
+          { label: '全系统 ARM 模拟（TCG）要翻译 100% 的代码，所以慢',
+            hint: '那如果反过来，整个系统都用 ARM 跑在 x86 上，谁要被翻译？比例是多少？',
+            any: ['TCG', 'tiny code generator', '全系统模拟', '整个系统', '全部指令', '每条指令', '逐条翻译', '100%', 'qemu 翻译', '慢'] },
+          { label: 'HAXM/Hyper-V/KVM 硬件加速要求 guest 与 host 同架构',
+            hint: '硬件虚拟化能救 ARM 镜像吗？它对架构有什么要求？',
+            any: ['HAXM', 'Hyper-V', 'KVM', '硬件加速', '硬件虚拟化', 'vt-x', 'amd-v', '同架构', '架构相同', '架构一致', '同一架构'] }
         ],
         hints: [
-          '分三层说：设备层的不可逆代价、系统层的收益（为什么要 systemless）、以及检测层的暴露面。',
-          '再补一句边界：root 让你「能做」，但不让你「看懂」。'
+          '把问题拆成两半：①「安卓系统那一层」是谁在执行、要不要翻译？②「那个 ARM so」由谁负责翻译？',
+          '再想一步：为什么不全用 ARM？——因为有一种加速手段救不了 ARM 镜像，它对架构有硬性要求，说出它的名字。'
         ],
         probes: [
-          '追问：如果这台机器只是临时借来的测试机，你的答案会不会变？哪一条代价会消失，哪一条不会？',
-          '追问：假设目标 App 只检测 su 与挂载信息，你有哪些不改 root 状态就能降低暴露面的做法？（提示：第 10、13 章的思路）'
+          '你说的翻译层，具体是在什么时机介入的？安装 APK 的时候就转好了，还是每次运行时转？',
+          '如果我在这个环境里用 Frida 去 hook 那个 ARM so 里的函数，会发生什么？和真机上有什么不同？'
         ],
-        model: '<b>把 root 当成一笔有价签的支出，而且这笔支出是三条独立成本。</b><br><br>' +
-               '<b>① 设备层的不可逆代价。</b>解锁 bootloader 会触发全盘擦除（安全设计，不是可绕过的步骤）；' +
-               '部分机型还会熔断某些安全特性，之后即使刷回官方也不再恢复；' +
-               '不少厂商把解锁状态当作拒保依据。这一层的特点是<b>不可逆</b>——' +
-               '所以它必须排在所有技术讨论之前：先确认「这台机器的数据可以不要」。<br><br>' +
-               '<b>② 系统层的收益，也就是 systemless 为什么值这个价。</b>' +
-               'Magisk 的思路是不碰系统分区，把定制内容放在一个被挂载/覆盖上去的层里，' +
-               '系统分区本身保持与官方一致。收益有三条：OTA 与完整性校验更容易过、' +
-               '卸载干净（移除覆盖层即可回到原状）、模块化（证书与 Hook 各自独立）。' +
-               '<b>换句话说：systemless 用「多一层挂载」换掉了「永久改分区」。</b><br><br>' +
-               '<b>③ 检测层的暴露面。</b>站在风控角度，一台 root 设备同时给出多个独立信号：' +
-               'su 文件与调用痕迹、挂载信息异常（这一条恰恰是 systemless 的副产品）、' +
-               '属性与目录痕迹、以及最根本的一条——<b>可注入性本身</b>。' +
-               '风控真正在意的不是「你装了 Magisk」，而是「这个进程的行为可以被别人改」。<br><br>' +
-               '<b>④ 最后必须说边界：root 只是权限。</b>它不能让你看懂代码（那是分析能力），' +
-               '不能让反调试失效（TracerPid、调试标志、时序与 root 无关），' +
-               '也不能绕过服务端风控（设备指纹与行为模型都在服务端）。' +
-               '<b>能说出边界，才算把账算清。</b>',
-        after: '<p>补充一句：本章的立场不是「不要 root」，而是<b>「先知道它贵在哪，再决定这次任务值不值」</b>。' +
-               '抓一个 HTTP 接口不需要它；读一个 native 算法很可能需要它。</p>'
+        model: '<b>完整答案。</b>这条链路上有三段，只有第三段需要翻译。<br><br>'
+          + '<b>第一段：安卓系统本身。</b>现代模拟器用的系统镜像是 <span class="mono">x86_64</span> 的——内核、ART 运行时、SystemServer、系统应用，全部是 x86 原生指令。借硬件虚拟化（Linux 上的 KVM、Intel 的 HAXM、Windows/Hyper-V 下的 Hyper-V）让 CPU 直接执行 guest 指令，<b>不产生任何翻译开销</b>。这就是它比全系统 ARM 模拟快得多的根本原因。<br><br>'
+          + '<b>第二段：App 的 Java/Kotlin 代码。</b>ART 有 x86 后端，DEX 会被编译成 x86 机器码，同样是原生执行。<b>绝大多数 App 的绝大多数代码都在这一层</b>，所以整个环境的手感接近真机。<br><br>'
+          + '<b>第三段：App 里的 ARM <span class="mono">.so</span>。</b>加固壳、算法库、音视频引擎这些原生库通常只带 ARM 版本。当加载器（<span class="mono">System.loadLibrary</span> → linker）发现它是 ARM 架构、本机跑不了时，交给<b>应用级翻译层</b>——<b>libhoudini</b>（Intel，已停止维护）或 <b>libndk_translation</b>（Google 在 NDK 体系下延续的方案）。它们在<b>运行时</b>把 ARM 指令翻译成 x86 执行，对 Java 层保持透明。<br><br>'
+          + '<b>为什么不全用 ARM 模拟？</b>因为那意味着用 QEMU 的 TCG 逐条翻译<b>整个系统</b>的 ARM 指令——内核、运行时、每一行 Java、每一个系统服务，<b>100% 的代码都要过翻译器</b>。哪怕只是滑一下桌面，背后也是海量指令逐条转译。而且硬件加速救不了它：<b>HAXM / Hyper-V / KVM 都要求 guest 与 host 同架构</b>，ARM 镜像在 x86 宿主上只能退回软件翻译。<br><br>'
+          + '<b>一句话总结：</b>性能差异的根源不是翻译质量，而是<b>「需要被翻译的代码占多大比例」</b>——100% vs 个位数。这就是现代模拟器和云手机普遍选择「x86 系统镜像 + 翻译层」的原因。',
+        after: '<p>补充一个实战点：在 x86 模拟器上调试 ARM so，执行路径经过了翻译层，行为可能与真机存在差异。做<b>反调试验证</b>时要把这层差异算进去；同时也别忘了，<span class="mono">libhoudini</span>/<span class="mono">libndk_translation</span> 的存在本身就是可被风控检测的环境特征。</p>'
       },
+
+      /* ---------- Q2 ---------- */
       {
-        id: 'c30q2', depth: 1, threshold: 0.7,
-        q: '「抓包证书我装上了，但还是抓不到。」<br>' +
-           '请你说清三件事：<b>这条线上到底发生了什么变化</b>（Android 7 那条线）、' +
-           '<b>让 App 接受你的证书有哪几条路、各自代价是什么</b>、' +
-           '以及<b>「部分接口抓不到」该被归到哪一类问题</b>。',
+        id: 'c16q2', depth: 2, threshold: 0.7,
+        q: '请解释 <b>GKI</b> 要解决的核心问题是什么，它把内核拆成了哪两部分，这两部分靠什么契约连接？然后说明：为什么这个设计能让「Google 修内核漏洞」不再需要等厂商？',
         concepts: [
-          { label: 'Android 7.0 起 App 默认只信任系统信任库，不再信任用户安装的 CA',
-            hint: '那条线的准确表述',
-            any: ['android 7', '7.0', '用户证书', '系统信任库', '系统证书', '默认不信任', '用户 ca', '信任库'] },
-          { label: '装进系统库：要 root，并且会碰到分区只读、完整性校验、证书目录与命名随版本变化等代价',
-            hint: '第一条路',
-            any: ['系统库', '系统证书', 'root', '只读', '挂载', '完整性', '目录', '命名', '哈希', 'conscrypt'] },
-          { label: '重打包声明信任用户证书：不需要 root，但签名变了，完整性校验、第三方 SDK 校验、升级链路都会受影响',
-            hint: '第二条路',
-            any: ['重打包', '重签', '签名', 'manifest', '完整性', 'sdk 校验', '升级', '不需要 root', '改包'] },
-          { label: '还有一条不下证书的路：在 socket / SSL 层取明文，绕开整个证书信任问题',
-            hint: '第三、四条路',
-            any: ['socket', 'ssl', 'ssl_write', 'ssl_read', 'hook', '明文', '绕过证书', '不走代理', 'r0capture'] },
-          { label: '「部分接口抓不到」说明证书这一层是通的，问题在那条请求自身（走了别的网络栈 / 单独的校验 / body 另有加密）',
-            hint: '归类',
-            any: ['部分', '其它接口', '证书没问题', '证书是通的', '走了别的', '网络栈', '单独', 'pinning', '应用层加密', 'con 连接'] }
+          { label: '问题是内核碎片化：厂商各自 fork 内核，升级要等所有人',
+            hint: 'GKI 出现之前，安卓内核最大的痛点是什么？',
+            any: ['碎片化', '内核碎片', 'fragment', '各自 fork', 'fork 内核', '定制内核', '厂商内核', '版本分裂', '分支太多', '升级慢', '等厂商', 'kernel fragmentation'] },
+          { label: '拆成通用核心（Google 维护）+ 厂商可加载模块',
+            hint: '拆成了哪两半？分别归谁管？',
+            any: ['通用内核', '通用核心', 'gki 内核', 'vendor module', '厂商模块', '可加载模块', '内核模块', 'ko', '.ko', 'lkm', 'loadable module', '两部分', '拆成'] },
+          { label: '契约是 KMI（Kernel Module Interface）',
+            hint: '这两半之间必须有一个「不能随便变」的东西，它叫什么？',
+            any: ['KMI', 'kernel module interface', '模块接口', '内核模块接口', '符号表', '稳定接口', 'abi', '接口契约', 'stable'] },
+          { label: 'KMI 稳定 → 内核可替换而模块不必重编',
+            hint: 'KMI 保持稳定的直接后果是什么？谁可以不用重编？',
+            any: ['不用重编', '无需重编', '不必重编', '不用重新编译', '可替换', '直接替换', '内核升级', '内核换', '替换内核', '二进制兼容', '兼容'] },
+          { label: '升级解耦：Google 独立发内核，厂商只维护模块',
+            hint: '于是升级变成了几条互不干扰的线？',
+            any: ['解耦', '独立升级', '互不干扰', '两条线', '不用等厂商', '绕过厂商', '单独升级', '各自升级', 'decouple'] }
         ],
         hints: [
-          '先说清「默认信任策略」这条线，再说三种过线方式的代价——注意代价不在同一种资源上（有的是权限，有的是签名）。',
-          '最后用「能抓到一部分」这个事实去反推：如果证书真没生效，为什么别的接口能抓到明文？'
+          '先想「没有 GKI 的世界是什么样」：一个内核镜像里混着通用代码和厂商驱动，谁能单独改其中一半？',
+          '再想「要让两半能分开升级，它们之间必须约定好什么不能变」——这个东西有个专门的名字，也是 GKI 的核心契约。'
         ],
         probes: [
-          '追问：如果这台设备不能 root、目标又必须用官方包（不能重打包），你还有什么办法拿到明文？代价是什么？',
-          '追问：怎么用一次三十秒的检查，区分「证书没进系统库」与「目标不接受证书」？'
+          '如果厂商的驱动模块调用了某个内核内部函数，而新内核把这个函数删了，会发生什么？这说明了 KMI 的什么性质？',
+          'GKI 让内核变成「一个独立的、可替换的镜像文件」。这对做内核级 Hook 的逆向工程师意味着什么？'
         ],
-        model: '<b>先讲清那条线，再谈路线，最后做归类。</b><br><br>' +
-               '<b>① 变化是什么：</b>从 Android 7.0 开始，App 默认<b>不再信任用户安装的 CA</b>，' +
-               '只看系统信任库（除非应用自己声明信任用户证书）。' +
-               '所以「浏览器能抓、App 抓不到」有一个非常确定的解释：<b>你的证书在用户库里，而 App 按默认策略不看那里。</b><br><br>' +
-               '<b>② 让 App 接受证书的几条路与代价（代价不在同一种资源上）：</b><br>' +
-               '· <b>装进系统库（改分区）</b>：要重新挂载只读分区，现代设备上常被分区只读、验证启动、动态分区挡住；' +
-               '改过的分区影响完整性校验；系统升级可能覆盖。代价是<b>系统完整性</b>。<br>' +
-               '· <b>systemless 模块</b>：不改分区，靠覆盖层叠加。代价是<b>必须 root</b>，而且痕迹在挂载层。' +
-               '这是当前最通用的路线。<br>' +
-               '· <b>重打包声明信任用户证书</b>：不需要 root。代价是<b>签名变化</b>——' +
-               '完整性校验、第三方 SDK 校验、与官方包共存的升级链路都可能出问题。<br>' +
-               '· <b>不下证书，直接在 socket/SSL 层取明文</b>：这不是「装证书」，' +
-               '而是绕开整个信任问题；代价是你自己要处理明文边界与字节流。<br><br>' +
-               '<b>③ 归类：</b>「部分接口抓不到」的关键证据是——<b>同一个 App 的其它接口能抓到完整明文</b>。' +
-               '这直接证明了代理、证书、网络三层都没问题（证书信任是按进程的默认策略生效的，' +
-               '不会对首页接口有效、对支付接口无效）。' +
-               '所以它属于「那条请求自身的问题」，典型有三种：<b>它没走系统代理</b>（自带网络栈）、' +
-               '<b>它单独做了固定校验</b>（pinning 可以按域名/连接生效）、' +
-               '或者<b>它的 body 另有应用层加密</b>（握手成功但内容是密文）。<br>' +
-               '<span class="hit">归类的价值：三种成因对应三套完全不同的手段，而「证书装没装好」已经被证据排除了。</span>',
-        after: '<p>这道题是第 23.7 / 23.8 的压缩版。两者的分工：<b>第 23 章讲整条链路的原理与诊断顺序，' +
-               '本章只要求你能在「证书 / 校验 / 应用层加密」之间做出正确归类。</b></p>'
+        model: '<b>完整答案。</b><br><br>'
+          + '<b>要解决的问题：内核碎片化。</b>安卓设备 SoC 五花八门，历史上每家厂商都 fork 一份 Linux 内核、把自家驱动直接编进内核（built-in），于是市面上存在成百上千个互不相同的内核分支。后果是：Google 修了一个内核安全漏洞，<b>必须等每一个厂商把自己的分支都合一遍</b>——而现实中大量设备永远等不到这次合并。<br><br>'
+          + '<b>拆法：通用核心 + 厂商模块。</b>Google 维护一份统一的 <b>GKI</b>（Generic Kernel Image，产物形如 <span class="mono">Image</span> / <span class="mono">Image.gz</span>），只包含与硬件无关的通用内核能力（调度、内存管理、文件系统、安全机制）。厂商的硬件驱动不再编进内核，而是做成<b>可加载内核模块</b>（<span class="mono">.ko</span>），在启动时动态装载。<br><br>'
+          + '<b>连接两者的契约：KMI（Kernel Module Interface）。</b>它规定了内核暴露给模块的符号、结构体布局与函数签名。KMI 保持稳定，就意味着<b>内核可以被替换、而模块不必重新编译</b>——这是整个方案成立的前提。反过来说，如果新内核删掉了模块依赖的某个符号，模块就会加载失败，设备硬件功能大面积失效。KMI 是「合同」，违约的代价就是设备起不来。<br><br>'
+          + '<b>为什么不需要等厂商了？</b>因为升级被<b>解耦成两条独立的线</b>：<br>'
+          + '<b>Google 侧</b>——独立升级 GKI 内核，合上游 LTS 补丁、修安全漏洞，只要不动 KMI，就不影响任何厂商模块，<b>安全补丁可以绕开厂商直接下发</b>；<br>'
+          + '<b>厂商侧</b>——只维护自己那几个驱动模块，内核换了照样能用，维护工作量从「一整个内核分支」降到「几个模块」。<br><br>'
+          + '<b>要点：</b>GKI 的收益不是性能，而是<b>升级速度与安全响应</b>。它把「一次内核升级」拆成了「两个可以独立发布的单元」。',
+        after: '<p>对逆向的意义：GKI 让内核变成<b>一个独立的、格式规范的、有文档的镜像文件</b>，模块加载也是标准接口。这让「换内核做内核级 Hook / 反检测」从「patch 某个厂商的定制内核」变成了规范化操作（对应第 27 章的内核模块技术）。代价是攻防战场下沉——风控现在会检查内核版本字符串、已加载模块列表这些新的检测面。</p>'
       },
+
+      /* ---------- Q3 ---------- */
       {
-        id: 'c30q3', depth: 2, threshold: 0.7,
-        q: '有个人说：「我已经打开了 USB 调试，为什么断点还是打不上？」<br>' +
-           '请把 <b>debuggable 的两个层次</b>说清楚，说明<b>为什么调试器这条路本身会被 App 主动检测</b>，' +
-           '并给出「一 attach 就退出」时你的处理顺序。',
+        id: 'c16q3', depth: 2, threshold: 0.7,
+        q: '一个 App 检测出自己运行在模拟器上。假设它用的判据是 <span class="mono">ro.kernel.qemu</span>、硬件名 <span class="mono">goldfish</span>/<span class="mono">ranchu</span>、渲染器 <span class="mono">SwiftShader</span>、设备节点 <span class="mono">/dev/qemu_pipe</span>。请你<b>从架构层面</b>解释这些特征各自是怎么产生的——它们分别对应虚拟化方案里的哪一部分？理解了这些之后，你打算怎么改？',
         concepts: [
-          { label: 'android:debuggable 是应用级标志（per-app），决定这个 App 能不能被 JDWP 附加',
-            hint: '第一个层次',
-            any: ['android:debuggable', '应用级', 'per-app', '每个应用', 'manifest', 'jdwp', '附加', '门'] },
-          { label: 'ro.debuggable 是系统级属性（per-device），debuggable 构建的系统会整体放宽可调试性',
-            hint: '第二个层次',
-            any: ['ro.debuggable', '系统级', 'per-device', '设备', '属性', '工程机', '模拟器', '放宽', '镜像'] },
-          { label: 'USB 调试只是「允许调试协议接入」的通道，通道打开不等于目标可被调试',
-            hint: '为什么开了还是不行',
-            any: ['usb 调试', '通道', '通道打开', '不等于', '开关', '协议', '允许'] },
-          { label: '检测判据：被追踪标记、JDWP 通道/调试线程的存在、以及断点导致的耗时异常',
-            hint: 'App 怎么发现你',
-            any: ['tracerpid', 'ptrace', '被追踪', 'jdwp', '调试线程', '耗时', '时间', '标记', '检测'] },
-          { label: '「一 attach 就退出」要先分清「主动检测后退出」还是「被调试拖崩」，再决定抢时序还是换观测方式',
-            hint: '处理顺序',
-            any: ['主动检测', '检测到', '拖崩', '副作用', '抢时序', 'spawn', '提前', '日志', '打点', '分清', '取证'] }
+          { label: 'ro.kernel.qemu 是属性系统的标记，来自 QEMU 虚拟平台',
+            hint: '这是一个只读系统属性。属性是谁在什么时候写进去的？',
+            any: ['属性', 'property', 'prop', 'build.prop', 'default.prop', '只读属性', 'ro.', '属性系统', 'init', 'init.rc'] },
+          { label: 'goldfish/ranchu 是模拟器的虚拟硬件平台代号',
+            hint: '这两个名字不是随机的字符串，它们指的是什么？',
+            any: ['goldfish', 'ranchu', '虚拟硬件', '硬件平台', '平台代号', '虚拟设备', 'hardware', 'ro.hardware', '模拟硬件'] },
+          { label: 'SwiftShader 是软件渲染器，真机用 GPU 驱动',
+            hint: '为什么模拟器的图形渲染器名字这么特殊？真机上应该是什么？',
+            any: ['swiftshader', '软件渲染', '软渲染', '渲染器', 'renderer', 'gpu 驱动', 'opengl', 'vulkan', 'gralloc', '软件模拟图形'] },
+          { label: '/dev/qemu_pipe 是 guest 与宿主 emulator 进程的通信通道',
+            hint: '这个设备节点的另一端连着谁？为什么模拟器需要这样一条通道？',
+            any: ['qemu_pipe', 'qemu pipe', '设备节点', 'dev/', '通信', '通道', '宿主', 'host', '管道', 'pipe', 'goldfish_pipe'] },
+          { label: '这些特征来自「虚拟化平台」，换架构或换方案会换一批特征',
+            hint: '如果换成容器方案（共享宿主内核），这些特征还会一样吗？',
+            any: ['架构决定', '方案决定', '换方案', '不同的特征', '容器', 'waydroid', '宿主内核', '特征来源', '平台决定'] }
         ],
         hints: [
-          '先把两个同名但层次不同的东西分开：一个是 App 自己的标志，一个是设备的属性。',
-          '再想想：为什么「有人在旁边看内部状态」这件事本身值得检测——它和 Hook 是同一类风险。'
+          '把四个特征分别归类：哪个属于「属性系统」、哪个属于「虚拟硬件平台」、哪个属于「图形栈」、哪个属于「进程间通信」？',
+          '关键认知：这些字符串不是谁故意留下的「破绽」，而是这套虚拟化架构<b>必然的产物</b>。想改掉它们，得改产生它们的那一层。'
         ],
         probes: [
-          '追问：如果目标在启动的最早期就完成检测并退出，而你只能在它之后注入，这时你的选择是什么？',
-          '追问：不附加调试器、不改调试标志的前提下，你还能用什么方式确认「它到底读取了什么」？'
+          '你说要改属性系统。那 <span class="mono">ro.</span> 开头的只读属性，运行时能直接改吗？如果不能，有哪些可行的改法？',
+          '如果我把这四个特征全部改掉了，风控还有别的办法认出这是模拟器吗？举两个例子。'
         ],
-        model: '<b>第一步是把两个 debuggable 分开。</b><br><br>' +
-               '<b>android:debuggable</b> 写在 App 自己的 manifest 里，是<b>应用级</b>开关：' +
-               '它决定这个进程愿不愿意暴露调试接口。<b>ro.debuggable</b> 是<b>系统级</b>属性，' +
-               '由系统镜像的构建方决定；系统是 debuggable 构建时，很多进程的可调试性会被整体放宽。' +
-               '这就解释了「同一份 APK 在我这里能调、在你那里不能调」——差异来自设备，不来自 APK。<br>' +
-               '而开发者选项里的 <b>USB 调试</b>只是「允许调试协议进来」的<b>通道</b>：' +
-               '<span class="hit">通道打开不等于门打开</span>，门在 App 自己的 debuggable 标志上。' +
-               '这就是「USB 调试开了还是打不上断点」的标准答案。<br><br>' +
-               '<b>第二步：为什么这条路会被检测。</b>站在检测方角度，「被调试」与「被 Hook」是同一类风险——' +
-               '<b>有人在运行时看我的内部状态</b>。而调试留下的痕迹比 Hook 更集中：' +
-               '进程的追踪者标记非空（被附加的通用痕迹）、可调试进程会暴露 JDWP 通道、' +
-               '附加后进程里会多出调试相关线程、以及断点会让某段代码出现人类不可能产生的耗时。' +
-               '这些判据的共同点是：<b>它们不关心你用什么工具，只关心「有没有人在旁边看」。</b><br><br>' +
-               '<b>第三步：一 attach 就退出时的处理顺序。</b>' +
-               '① <b>先取证</b>：确认是「主动检测后退出」还是「被调试拖崩」。' +
-               '前者退出是有意图的（常伴随被清理过的假异常、或退出前一段可疑耗时）；' +
-               '后者是副作用（断点让超时、锁等待、看门狗把进程带走）。<br>' +
-               '② <b>再决定</b>：主动检测 → <b>抢时序</b>（把观测点提前到它的检测之前，或用 spawn 类手段）；' +
-               '被拖崩 → <b>换不暂停线程的观测方式</b>（打点日志、hook 取参数）。<br>' +
-               '③ <b>最后才谈绕过</b>：绕过是有副作用的，一旦挂上去，你就再也分不清' +
-               '「它退出了」是因为检测还是因为你的脚本——<b>在没有证据之前动手，等于亲手污染现场。</b>',
-        after: '<p>关联：第 10 章的八个检测点讲的是「Frida 被怎么发现」，本章问的是「调试被怎么发现」——' +
-               '两者的应对逻辑是同一套：<b>能改配置就改配置，改不了就篡改观察管道，再不行就抢时序。</b></p>'
+        model: '<b>完整答案：这些特征不是「破绽」，是架构的产物。</b><br><br>'
+          + '<b>① <span class="mono">ro.kernel.qemu</span> —— 属性系统层。</b>安卓的属性系统由 init 在启动早期从 <span class="mono">*.prop</span> 文件加载并维护，<span class="mono">ro.</span> 前缀表示「只读，写入后不可更改」。模拟器的虚拟平台（QEMU）在启动时把这个属性置位，告诉整个系统「你跑在虚拟化环境里」。它属于<b>虚拟平台 → 系统</b>的信息传递。<br><br>'
+          + '<b>② <span class="mono">goldfish</span> / <span class="mono">ranchu</span> —— 虚拟硬件平台层。</b>这是 Android 模拟器虚拟硬件的平台代号（Goldfish 是早期平台，ranchu 是其后续实现）。它们决定了设备树、驱动名字、以及 <span class="mono">ro.hardware</span> 之类的取值。真机上这里是具体的 SoC / board 名。<b>它来自「虚拟硬件长什么样」这一层。</b><br><br>'
+          + '<b>③ <span class="mono">SwiftShader</span> —— 图形栈层。</b>真机有真实的 GPU 和厂商图形驱动（Mali / Adreno 等）；模拟器没有对应的真实 GPU，只能用<b>软件渲染</b>兜底，SwiftShader 就是 Google 的软件 GL/Vulkan 实现。它出现在渲染器字符串里，是「没有真 GPU」这个事实的直接后果。<br><br>'
+          + '<b>④ <span class="mono">/dev/qemu_pipe</span> —— 进程间通信层。</b>guest（安卓）需要和宿主上的 emulator 进程通信（传感器输入、网络、显示输出、控制命令）。因为 guest 里没有真实硬件设备，就约定了一个虚拟设备节点做通道，由虚拟平台驱动支撑。它出现在设备节点列表里，是「guest 与宿主需要一条控制/数据通道」的必然产物（同类还有 <span class="mono">/dev/goldfish_pipe</span> 之类的实现）。<br><br>'
+          + '<b>怎么改？按层改，逐层切断。</b><br>'
+          + '<b>属性层</b>：<span class="mono">ro.*</span> 属性启动后不可写，所以运行时直接 <span class="mono">setprop</span> 是无效的。可行路径是<b>在系统镜像层面改</b>——自编译 AOSP 时改属性定义，或改 <span class="mono">*.prop</span> 文件后重打包 system 分区；另一种是运行时 hook 属性读取接口（<span class="mono">__system_property_get</span>），但通用性差、容易被交叉验证识破。<br>'
+          + '<b>硬件 / 渲染层</b>：改 <span class="mono">ro.hardware</span> 等字符串相对容易（同样要动镜像），但渲染器字符串涉及图形栈实际行为，改名字容易、改行为难——真机的 GPU 渲染结果和软件渲染在细节上是有差异的。<br>'
+          + '<b>设备节点层</b>：删掉 <span class="mono">/dev/qemu_pipe</span> 会直接破坏模拟器与宿主的通信（传感器、控制通道可能失效），往往得不偿失。<br><br>'
+          + '<b>最重要的结论：</b>只改字符串是「伪装」，理解架构才能「重构」。而且——<b>换一种虚拟化方案，特征就换一批</b>：容器方案共享宿主内核，暴露的会是宿主的 <span class="mono">/proc</span> 与内核版本。没有「无特征」的方案，只有「特征在你的威胁模型里是否重要」。',
+        after: '<p>方法论上的收获：看到任何一个「模拟器特征」，不要只想着「怎么把它删掉」，先问<b>「它是谁生成的、为什么必须存在、删了会破坏什么」</b>。这三个问题问完，你才知道哪些能改、哪些改了会自断后路。</p>'
       },
+
+      /* ---------- Q4 ---------- */
       {
-        id: 'c30q4', depth: 2, threshold: 0.7,
-        q: '请把「七条线索」的排序依据说清楚：<b>凭什么字符串搜索排在动态调试前面？</b><br>' +
-           '并解释<b>「结构性排除」和「成本高」有什么区别</b>——为什么前者要直接划掉，后者只是先放后面。',
+        id: 'c16q4', depth: 2, threshold: 0.7,
+        q: '你的团队要做一套<b>规模化云测平台</b>，需要同时跑几百台安卓设备、供远程访问、按需创建和销毁。有人提议「直接用 Android 官方模拟器多开」，也有人提议 Cuttlefish。请说明 Cuttlefish 到底是什么、它和官方模拟器的定位差别，并给出你的选型判断和理由（包括它对宿主环境有什么硬要求）。',
         concepts: [
-          { label: '排序的第一判据是失败代价：便宜的先做，因为搜不到只花三十秒，而调试环境加断点可能是一小时',
-            hint: '第一条判据',
-            any: ['失败', '代价', '成本', '便宜', '三十秒', '不花钱', '先试', '代价小', '试错'] },
-          { label: '第二条判据是「是否需要先知道位置」：动态调试要先知道断在哪，所以它天然排在定位类线索之后',
-            hint: '第二条判据',
-            any: ['位置', '断在哪', '前提', '先知道', '选点', '断点', '定位之后', '依赖'] },
-          { label: '第三条判据是「是否被情境结构性排除」：例如界面不是原生 View 树时，UI 反推没有资源 id 可反查',
-            hint: '结构性排除是什么',
-            any: ['结构性', '排除', '不成立', '逻辑上', 'flutter', '自绘', '资源 id', '控件树', '概念上'] },
-          { label: '被结构性排除的线索不是效果差，而是逻辑上做不到，所以不要再花一轮去验证',
-            hint: '为什么要直接划掉',
-            any: ['划掉', '不要试', '不用试', '浪费', '一轮', '直接排除', '逻辑上不成立', '验证'] },
-          { label: '成本高的线索只是排在后面，一旦前面拿到强证据就可以跳级使用',
-            hint: '两者的区别',
-            any: ['跳级', '强证据', '直接跳到', '后面', '顺序', '不冲突', '可以先', '排在'] }
+          { label: 'Cuttlefish 是 Google 官方的可配置安卓虚拟设备（AVD）',
+            hint: '官方仓库怎么定位它？它的名字后面跟的是什么缩写？',
+            any: ['cuttlefish', 'avd', 'android virtual device', '虚拟安卓设备', '虚拟设备', '可配置', 'configurable', 'google 官方', 'android-cuttlefish'] },
+          { label: '面向云端：本地 Linux x86/arm64 与远程 GCE，而非物理硬件',
+            hint: '它设计出来是给谁用的、跑在哪？不是给终端用户的吧？',
+            any: ['gce', 'google compute engine', '云端', '云', '服务器', 'server', '远程', 'linux', 'ci', 'ci/cd', 'ci cd', 'aosp 开发', '测试', '面向开发测试'] },
+          { label: '依赖 KVM，要求 Linux + 硬件虚拟化支持',
+            hint: '它对宿主有一个不可绕过的硬性要求，是什么？',
+            any: ['kvm', '硬件虚拟化', 'vt-x', 'amd-v', '虚拟化扩展', '/dev/kvm', 'linux', '内核虚拟化', 'nested', '嵌套虚拟化'] },
+          { label: '安装需加入 kvm / cvdnetwork / render 组并重启',
+            hint: '装完之后有一组必须做的权限配置，涉及几个系统组？',
+            any: ['cvdnetwork', 'cvd network', 'kvm 组', 'render', '用户组', 'usermod', '加组', '权限', '重启', 'reboot'] },
+          { label: '适合多实例/CI/编排；官方模拟器更适合开发者单机调试',
+            hint: '两者的设计目标不一样。谁更适合「可脚本化创建销毁」？',
+            any: ['编排', 'orchestration', '多实例', '规模化', '批量', '自动化', '可脚本', '脚本化', 'ci', '容器', 'docker', 'podman', '单机', '开发者'] }
         ],
         hints: [
-          '把「成本」拆开看：它不只是难度，还包括要不要环境、要不要复现、要不要中断程序、要不要先知道位置。',
-          '再想一个反例：如果界面是 Flutter 画的，你会「先试试 UI 反推，效果不好再换」吗？'
+          '先把定位说清楚：Cuttlefish 的官方定义里，它「targets ... rather than physical hardware」——那它 targeting 的是什么？',
+          '选型时别只谈「哪个强」，要谈「哪个的设计目标跟我的需求对齐」。Cuttlefish 是为云端和 CI 设计的，官方模拟器是为开发者本机调试设计的。'
         ],
         probes: [
-          '追问：举一个「虽然最贵，但应该第一个做」的真实场景，并说明为什么此时成本判据会让位。',
-          '追问：Trace 给出了一份几千行的候选清单。按本章的规则，你接下来该做什么、不该做什么？'
+          '你说 Cuttlefish 依赖 KVM。那如果我的服务器是 ARM64 的、或者跑在嵌套虚拟化的云主机上，会有什么问题？',
+          '很多商业云手机方案，你觉得它们和 Cuttlefish 是什么关系？它们额外解决了哪些 Cuttlefish 不负责的问题？'
         ],
-        model: '<b>三条判据，按优先级说。</b><br><br>' +
-               '<b>① 失败代价最小者优先。</b>搜一个字符串，搜不到只花三十秒，' +
-               '而且「搜不到」本身就是一条结论（不是静态常量）。' +
-               '而动态调试的启动成本包括：环境是否就绪（debuggable、JDWP、反调试）、' +
-               '断点选在哪、命中后要处理多少次调用——<b>一次等于几十次搜索。</b>' +
-               '所以顺序的本质是：<b>让便宜的失败为贵的成功铺路。</b><br><br>' +
-               '<b>② 需要「先知道位置」的线索排在后面。</b>动态调试回答的是' +
-               '「这一行执行时寄存器/内存是什么」——它必须建立在「断在哪一行」之上。' +
-               '前六条线索的真正用途，就是替你付掉「选点」这一半的成本。<br><br>' +
-               '<b>③ 是否被结构性排除。</b>这是与前两条性质完全不同的一种判据。' +
-               '「成本高」意味着<b>做了会有收获，只是贵</b>；' +
-               '「结构性排除」意味着<b>再怎么努力也不可能成立</b>——' +
-               '例如界面是 Flutter/自绘时，没有原生控件树、没有 resource-id，' +
-               'UI 反推从概念上就没有输入。<br>' +
-               '<span class="hit">所以前者是「排在后面」，后者是「直接划掉」。</span>' +
-               '对前者你还需要准备备用方案；对后者你连验证都不该做——' +
-               '因为它给出的失败信息是零（你早就知道它不成立）。<br><br>' +
-               '<b>最后补一句顺序的正确用法：</b>它不是流程，是梯子。' +
-               '任何一步拿到<b>强证据</b>（例如崩溃栈直接给出类名与行号），' +
-               '都可以直接跳到最贵的那一级；而拿到<b>弱证据</b>（例如 Trace 给的候选集）' +
-               '则必须回到便宜的那几级去交叉验证。' +
-               '<b>判断力就体现在：知道自己手里的是强证据还是候选集。</b>',
-        after: '<p>把这道题和 30.14 的决策图对读：图里每一行都写了「失败时你得到什么」——' +
-               '那一栏才是这张梯子的真正内容。</p>'
+        model: '<b>完整答案。</b><br><br>'
+          + '<b>Cuttlefish 是什么。</b>它是 Google 的开源项目 <span class="mono">google/android-cuttlefish</span>，官方定位是「a configurable Android Virtual Device (AVD) that targets both locally hosted Linux x86/arm64 and remotely hosted Google Compute Engine (GCE) instances <b>rather than physical hardware</b>」。注意这句话的三个关键词：<b>可配置</b>（能用配置描述出一台什么样的设备）、<b>本地 Linux 与远程 GCE</b>（宿主是 Linux 服务器，不是你的笔记本）、<b>而非物理硬件</b>（它不做真机托管）。它主要服务于 <b>AOSP 开发与测试、CI/CD</b>——Google 自己的自动化测试就跑在它上面。<br><br>'
+          + '<b>和官方模拟器的定位差别。</b>Android 官方模拟器面向<b>开发者个人</b>，跑在开发者的 Windows/macOS/Linux 桌面上，设计目标是「好用、能调试、能模拟各种设备形态」。Cuttlefish 面向<b>服务器与流水线</b>，设计目标是「可编排、可规模化、可远程、可无人值守」。两者都能跑安卓，但<b>优化目标完全不同</b>。对你们的场景（几百台、远程访问、按需创建销毁），Cuttlefish 的设计目标天然对齐。<br><br>'
+          + '<b>硬要求（必须提前确认，否则项目直接卡死）。</b>① <b>依赖 KVM</b>——Linux 宿主 + CPU 支持并开启硬件虚拟化扩展（Intel VT-x / AMD-V），<span class="mono">/dev/kvm</span> 必须可用；如果是云主机或虚拟机里再跑，还要确认是否支持<b>嵌套虚拟化</b>。② <b>权限配置</b>——安装时要装 <span class="mono">cuttlefish-base</span>（必需）等包，把用户加入 <span class="mono">kvm</span>、<span class="mono">cvdnetwork</span>、<span class="mono">render</span> 三个组，然后<b>重启</b>才生效（<span class="mono">cuttlefish-user</span> 提供本地 web server 用于浏览器交互；<span class="mono">cuttlefish-integration</span> 用于 GCE；<span class="mono">cuttlefish-orchestration</span> 是编排项目；<span class="mono">cuttlefish-common</span> 已废弃，仅为兼容保留的 metapackage）。③ 它还支持<b>容器镜像</b>形式（Docker / Podman），这在 CI 里更容易被拉起。<br><br>'
+          + '<b>我的选型判断。</b>选 Cuttlefish 路线。理由：<b>可配置 + 可编排 + 容器化</b>正好对应「按需创建销毁」和「批量」；官方模拟器多开在管理、隔离、自动化程度上都要自己补大量轮子。但落地前必须先把 KVM 可用性和宿主规格验证清楚——<b>这是这个方案的地基，地基不成立，后面全是空谈。</b><br><br>'
+          + '<b>额外认知（很重要）。</b>很多商业<b>云手机</b>方案，本质就是 Cuttlefish 这类虚拟安卓设备的产品化：在虚拟化层之上再解决<b>多租户隔离、音视频串流、设备运维、计费、反检测</b>等 Cuttlefish 本身不负责的问题。<b>理解了 Cuttlefish，云手机的架构就不再神秘——它就是「KVM 上一堆可编排的安卓虚拟设备」加上一层服务化外壳。</b>',
+        after: '<p>把这一题和 30.7 的谱系图对照看：Cuttlefish 站在「硬件虚拟化 + 云端编排」这一格。它的技术底座是 KVM，和 QEMU、crosvm 同宗；而 Waydroid 那类容器方案走的是完全不同的路（共享宿主内核，不需要 KVM）。<b>看到任何一个新方案，先问它站在哪一格。</b></p>'
       },
+
+      /* ---------- Q5 · depth 3 ---------- */
       {
-        id: 'c30q5', depth: 3, threshold: 0.7,
-        q: '<b>综合题。</b>给你一个任务：<br>' +
-           '目标 App 未加固、能正常反编译；设备未 root；抓包环境可用；' +
-           '需求是「还原出本地计算的签名参数」。<br>' +
-           '请完整说出你的<b>定位顺序</b>，并且——<b>每一步都要说清「如果这一步失败，我因此知道了什么」</b>。' +
-           '最后说明：什么情况下你会放弃「定位到那个函数」这个目标。',
+        id: 'c16q5', depth: 3, threshold: 0.65,
+        q: '<b>综合题。</b>你的目标是搭一个<b>「看起来像真机」的安卓运行环境</b>，用于对一款带反调试 / 反模拟器风控的 App 做动态分析。请给出一套完整方案：说明你会选<b>哪条技术路线</b>（模拟器 / Cuttlefish / 容器 / 真机），<b>用什么架构的系统镜像</b>，打算<b>伪装哪些环境特征</b>，这些特征<b>分别在哪一层产生、你要在哪一层消除它们</b>；以及<b>这套方案的固有代价和残余风险</b>是什么。',
         concepts: [
-          { label: '从最便宜且失败也不花钱的动作开始：字符串搜索（URL / 提示语 / TAG / 算法常量 / 字段名）',
-            hint: '第一步',
-            any: ['字符串', '搜索', '关键词', 'url', '提示', 'tag', '常量', '字段名', '最便宜'] },
-          { label: '未加固意味着静态结构可用：从 manifest、类型引用、调用图里画出从入口到目标的结构草图',
-            hint: '第二步',
-            any: ['静态', 'manifest', '调用图', '结构', '未加固', '反编译', '草图', '入口'] },
-          { label: '用日志与打点做低成本验证：崩溃栈、框架日志、时间窗过滤，必要时自己插一条观测',
-            hint: '低成本验证',
-            any: ['日志', 'logcat', '打点', '计数', '崩溃栈', '时间窗', '验证', '观测'] },
-          { label: '顺着抓到的请求反推：把「输入输出」对起来（改一个字段看输出怎么变），确定签名的输入集合',
-            hint: '利用可用的抓包环境',
-            any: ['抓包', '输入输出', '字段', '改参数', '对比', '请求', '响应', '差分'] },
-          { label: '每一步失败都能产出一条缩小范围的信息：不是静态常量 / 结构被处理过 / 关系被内联 / 路径没走到',
-            hint: '这一栏是重点',
-            any: ['失败', '得到', '缩小', '范围', '不是静态常量', '信息', '砍掉', '排除', '结论'] },
-          { label: '当「定位函数」不可达时，把目标降级成行为型：确定输入输出、可复现调用，或转向模拟执行 / 自吐沙箱',
-            hint: '什么时候放弃位置型目标',
-            any: ['降级', '行为', '输入输出', '复现', '模拟执行', 'unidbg', '自吐', '沙箱', '换目标', '黑盒'] }
+          { label: '选型：优先真机或硬件虚拟化+同架构镜像，慎用全系统模拟',
+            hint: '风控会检测 CPU 架构、性能特征。全系统 ARM 模拟这条路在性能上会露馅吗？',
+            any: ['真机', '物理机', '硬件虚拟化', 'x86_64 镜像', 'x86 镜像', '同架构', '不建议全系统模拟', '放弃 tcg', 'tcg 太慢', '硬件直跑', 'kvm', 'haxm'] },
+          { label: '伪装属性系统（ro.kernel.qemu / ro.hardware / ro.product.*）',
+            hint: '最常被检测的一层是哪一层？那些 ro. 开头的属性怎么办？',
+            any: ['ro.kernel.qemu', '属性', 'property', 'build.prop', 'ro.hardware', 'ro.product', '指纹', 'fingerprint', 'getprop', '属性系统'] },
+          { label: '伪装硬件/平台标识（goldfish、ranchu、渲染器）',
+            hint: '硬件名和渲染器字符串分别属于哪一层？',
+            any: ['goldfish', 'ranchu', 'hardware', '渲染器', 'swiftshader', 'renderer', 'gpu', '设备树', 'dtb', 'board'] },
+          { label: '清理设备节点与文件痕迹，以及翻译层库',
+            hint: '架构留下的文件级痕迹有哪些？',
+            any: ['qemu_pipe', '设备节点', '/dev/', 'goldfish_pipe', '文件痕迹', '删除痕迹', 'genyd', 'libhoudini', 'libndk_translation', '翻译层', 'so 库', '系统镜像'] },
+          { label: '内核层处理：内核版本字符串、启动参数、已加载模块',
+            hint: '还有一层比属性更深，风控也会查。是哪一层？',
+            any: ['内核', 'kernel', 'uname', '内核版本', '启动参数', 'cmdline', 'modules', 'lsmod', 'gki', '内核模块', 'boot.img', '内核镜像'] },
+          { label: '残余风险：行为/时序/传感器等无法靠改字符串解决',
+            hint: '改完所有能改的字符串，还剩哪些是改不掉的？',
+            any: ['行为', '时序', '性能', '传感器', 'sensor', '功耗', '电池', 'thermal', 'gpu 行为', '固有差异', '残余风险', '改不掉', '无法完全', '交叉验证'] }
         ],
         hints: [
-          '先按「便宜 → 贵」把顺序排出来，然后逐步说明每一步的失败信号。注意题目给了三个环境事实，它们等于提前告诉你哪几条线索可用。',
-          '最后那个问题才是重点：当所有用户态线索都穷尽时，要动的是「目标定义」，而不是再试一遍工具。'
+          '分层回答：<b>属性层 / 硬件层 / 图形层 / 设备节点层 / 内核层 / 库层</b>。每一层说清「特征是什么 → 谁生成的 → 在哪一层消除」。',
+          '别忘了第二部分：任何伪装都有代价。想想哪些东西是<b>改字符串也解决不了</b>的——这往往才是风控真正的杀手锏。'
         ],
         probes: [
-          '追问：抓包环境可用这个条件，除了「看请求」之外，还能怎么用？（提示：想想它能不能当锚点、能不能做差分）',
-          '追问：如果目标把签名结果再做一次变换（例如再哈希一次）才发出，你的「输入输出对照」还成立吗？怎么修正？'
+          '你说要在系统镜像层面改属性。如果我只有官方分发的模拟器镜像，没有条件自编译 AOSP，还有什么次优路径？各自的可靠性和代价如何？',
+          '如果风控用的不是「特征检测」而是「行为检测」（例如某段代码在真机上的执行耗时分布、传感器的物理合理性），你上面这套方案还有效吗？'
         ],
-        model: '<b>先读环境事实，再排顺序，最后给每一步的失败信号。</b><br><br>' +
-               '<b>环境事实的读法（这一步很多人会跳过）：</b>未加固 → 静态结构与字符串搜索可用；' +
-               '未 root → 动态调试与 Hook 类手段都很贵（但抓包可用，所以网络侧观测没问题）。' +
-               '<b>换句话说：题目已经把「哪几条线索便宜」告诉你了。</b><br><br>' +
-               '<b>顺序与每一步的失败产出：</b><br>' +
-               '<b>① 字符串搜索</b>（URL、字段名、提示语、常见算法常量）。' +
-               '失败 → 「签名不是由静态常量驱动的」：指向运行时拼接、服务端下发（那它就不是本地计算）、或字符串加密。<br>' +
-               '<b>② 静态结构</b>（manifest → 入口 → 调用图；从未加固这一点上吃满收益）。' +
-               '失败 → 结构被处理过；但本题未加固，所以更可能是<b>你的入口选错了</b>——这是一条很有用的自我怀疑。<br>' +
-               '<b>③ 抓包对齐</b>（这个条件必须用上）：把请求参数当<b>输入</b>、把签名当<b>输出</b>，' +
-               '做差分——改一个字段，看签名怎么变；不改任何字段重复发，看是否稳定。' +
-               '失败 → 说明签名不（只）依赖你改的那些字段，或者它掺入了时间/随机量——' +
-               '这本身就在缩小输入集合。<br>' +
-               '<b>④ 日志与打点</b>：崩溃栈优先；没有就在嫌疑点插一条很轻的观测（打点、计数）。' +
-               '失败 → 这条路径没有可读记录，或你没走在这条路径上（两者要分清）。<br>' +
-               '<b>⑤ 调用栈</b>：从「谁写入了这串字节」出发向上回溯，找业务边界。' +
-               '失败 → 调用关系被内联/折叠，或目标在 native 侧（那就转 native 的静态 + 动态）。<br>' +
-               '<b>⑥ Profiling / Trace</b>（按「点一次按钮」这个窗口采集）。' +
-               '失败 → 只有候选集：内联缺失、短方法被采样丢掉、或全是框架噪音。<b>候选必须回去验证。</b><br>' +
-               '<b>⑦ 动态调试</b>：设备未 root，所以这一步的成本极高；' +
-               '除非能拿到达成条件的设备，否则考虑用「不需要 root 的观测」（重打包 + 打点、socket 层观测）替代。' +
-               '失败 → 要么环境不成立，要么目标在检测。<br><br>' +
-               '<b>什么时候放弃「定位到那个函数」：</b>' +
-               '当你在<b>当前可用的观测层次</b>里已经把手段穷尽、且失败信息收敛到同一个结论时——' +
-               '例如「代码不在可读范围内 + 运行时行为被挡住 + 网络只给出密文」。' +
-               '此时正确的动作不是再试一遍，而是<b>把目标降级</b>：<br>' +
-               '· 如果你真正需要的是「能复现这个签名」，那就把目标改成<b>行为型</b>：' +
-               '确定输入集合、确定输出特征、拿到可稳定复现的调用能力（第 7 章的模拟执行、第 24 章的自吐沙箱都是为这个目标设计的）；<br>' +
-               '· 如果你确实需要看算法内部，才谈得上把观测点<b>下沉一层</b>（第 13、11 章），' +
-               '而且下沉之前必须先知道「要观测什么」，否则你只是把几千行候选换成几百万行。<br>' +
-               '<span class="hit">一句话：先换问题，再换层次，最后才换设备。</span>',
-        after: '<p>这道题没有标准答案的唯一性——<b>它的评分点是「每一步的失败信号」</b>。' +
-               '如果你能对七步中的五步说清失败产出，说明这套方法论已经进你的脑子了。</p>'
-      },
-      {
-        id: 'c30q6', depth: 3, threshold: 0.7,
-        q: '<b>综合题。</b>下面是一段真实的栈（异常类型被改写）：<br>' +
-           '<span class="mono small">at com.target.pay.CryptoBridge.nativeSign(Native Method)</span><br>' +
-           '<span class="mono small">at com.target.pay.SignProxy.invoke(SignProxy.java:37)</span><br>' +
-           '<span class="mono small">at java.lang.reflect.Method.invoke(Native Method)</span><br>' +
-           '<span class="mono small">at com.target.pay.PayActivity.doPay(PayActivity.java:203)</span><br>' +
-           '<span class="mono small">at com.target.pay.PayActivity$2.onClick(PayActivity.java:88)</span><br>' +
-           '<span class="mono small">at android.view.View.performClick(View.java:7792)</span><br>' +
-           '请回答四件事：<b>① 业务边界在哪一帧、为什么；② 哪一帧没有业务语义、为什么；' +
-           '③ 要找「业务入口」该往哪个方向数；④ 如果同样的栈上名字全变成 a.a.a、行号全没了，你会怎么做。</b>',
-        concepts: [
-          { label: '业务边界是第一帧（CryptoBridge.nativeSign）：从栈顶往下第一帧属于应用包名且非代理/合成的代码',
-            hint: '①',
-            any: ['第一帧', '栈顶', 'nativeSign', 'cryptobridge', '业务边界', '应用包名', '往下数', '最接近'] },
-          { label: '反射帧（java.lang.reflect.Method.invoke）没有业务语义：它是通用入口，看不出调用了谁',
-            hint: '②',
-            any: ['反射', 'reflect', 'method.invoke', '通用入口', '没有业务语义', '穿过', '代理'] },
-          { label: 'SignProxy 是陷阱：名字带 Proxy，但它属于应用自己的包名，是业务侧的代理层而不是框架包装',
-            hint: '②的陷阱',
-            any: ['signproxy', '陷阱', '名字', '包名', '业务侧', '不是框架', '误判', 'com.target'] },
-          { label: '找业务入口要从栈底（系统框架侧）往上数，第一帧业务代码就是入口（PayActivity$2.onClick）',
-            hint: '③',
-            any: ['栈底', '往上', '入口', 'onclick', 'payactivity', '第一帧业务', '方向', '从下往上'] },
-          { label: '退化的表现：大量无行号帧、单字母名、帧数骤减/同名重复（内联导致该帧在栈上从未存在）',
-            hint: '④',
-            any: ['无行号', 'unknown source', 'sourcefile', '单字母', '混淆', '同名', '重复', '内联', '骤减', '退化'] },
-          { label: '退化的结论是换观测：改用不依赖名字与行号的运行时打点、地址偏移、指令级 trace',
-            hint: '④的结论',
-            any: ['换观测', '打点', '地址', '偏移', 'trace', '运行时', '不依赖名字', '放弃读名字', '换手段'] }
-        ],
-        hints: [
-          '先按包名把五帧分成三类：应用包名、java.*（含反射）、android.*。分类做完，答案就出来一大半。',
-          '注意第二帧的名字：它在逗你。判断依据是包名归属，不是名字里有没有 Proxy。'
-        ],
-        probes: [
-          '追问：第一帧标着 (Native Method)，这对你下一步的动作意味着什么？（提示：再往里一步就不在 Java 栈上了）',
-          '追问：如果这条栈里一帧业务代码都没有，你最先怀疑的两件事是什么？'
-        ],
-        model: '<b>① 业务边界 = 第一帧</b> <span class="mono">com.target.pay.CryptoBridge.nativeSign</span>。' +
-               '规则：从栈顶往下数，第一帧属于应用包名、且不是代理/合成的代码。' +
-               '它同时标着 <span class="mono">(Native Method)</span>，' +
-               '所以它还是 <b>Java → native 的交接点</b>——再往里一步就不在 Java 栈上了，' +
-               '你需要的是 so 里的地址（转 IDA / native backtrace）。<br><br>' +
-               '<b>② 没有业务语义的是第三帧</b> <span class="mono">java.lang.reflect.Method.invoke</span>：' +
-               '反射是「通用入口」，这一帧本身不携带任何业务信息——你不可能从它看出它在调谁。' +
-               '处理方式是<b>穿过它</b>（去看它下面的实际目标，或去 hook 反射 API 拿名字）。<br>' +
-               '<b>陷阱在第二帧：</b><span class="mono">com.target.pay.SignProxy.invoke</span> 名字带 Proxy，' +
-               '但它属于应用自己的包名，是<b>业务侧的代理层</b>，不是框架包装。' +
-               '<span class="hit">判断依据永远是包名归属 + 是否合成/反射，而不是名字里有没有 Proxy。</span><br><br>' +
-               '<b>③ 业务入口要从栈底往上数</b>：最底下是 <span class="mono">android.view.View.performClick</span>（系统框架），' +
-               '往上一帧进入应用包名的就是 <span class="mono">com.target.pay.PayActivity$2.onClick</span>。' +
-               '注意它是<b>匿名内部类</b>（$2），这正是「按钮点击监听器」的典型形态——' +
-               '顺着它可以找到注册监听的那一行。' +
-               '<b>一个栈，两个方向：栈顶往上是「事发点」，栈底往下是「入口点」。</b><br><br>' +
-               '<b>④ 名字全变 a.a.a、行号全没了的时候：</b>先做一次栈质量判断——' +
-               '无行号帧占比、单字母类名数量、同名帧是否重复。' +
-               '如果三项都命中，说明这条栈<b>已经退化</b>：行号信息被剥掉、名字被混淆、' +
-               '调用关系可能被内联折叠（内联的函数在栈上从来不存在）。' +
-               '此时正确的结论是：<b>「名字与行号这条路被关掉了，我需要一个不依赖它们的观测」</b>——' +
-               '转向运行时打点、模块 + 偏移、指令级 trace。<br>' +
-               '<span class="miss">最常见的错误是继续盯着这条栈找语义，' +
-               '试图从 a.a.a 里猜出业务含义——那是在信息已经不存在的地方找信息。</span>',
-        after: '<p>这道题的三个坐标（边界 / 代理帧 / 入口）是可以自动化判定的，' +
-               '本章 30.10 的实验就是这个规则的可运行版本。</p>'
+        model: '<b>完整答案（分层来答）。</b><br><br>'
+          + '<b>一、选路线。</b>先明确一条硬约束：<b>如果目标 App 含 ARM-only 的 so，就必须选带翻译层的 x86_64 系统镜像，或者干脆用 ARM 真机。</b>全系统 ARM 模拟（QEMU + TCG）不仅慢，而且性能特征本身就是极强的「非真机」信号——真机的 CPU 性能和它的差距是数量级的，风控跑个基准测试就能看出来。<br>'
+          + '现实中的优先级大致是：<b>真机 / 云真机 &gt; 硬件虚拟化 + x86_64 镜像 + 应用级翻译层 &gt; 全系统模拟</b>。Cuttlefish 适合规模化与自动化场景（依赖 KVM），但它是为测试设计的，环境特征比官方模拟器「干净」一些、但绝不是「无特征」；容器方案（共享宿主内核）会暴露宿主 <span class="mono">/proc</span> 与内核版本，通常不适合高对抗场景。<br><br>'
+          + '<b>二、架构选择。</b>选 <b>x86_64 系统镜像</b>（原生执行、性能接近真机、且能借硬件虚拟化）。这意味着走「应用级翻译」路线：只有 App 的 ARM <span class="mono">.so</span> 被 libhoudini / libndk_translation 翻译。<b>好处是快，代价是这两类翻译层库本身会作为「x86 安卓系统」的特征暴露出来。</b><br><br>'
+          + '<b>三、伪装什么、在哪一层消除。</b><br>'
+          + '<b>① 属性层</b>——<span class="mono">ro.kernel.qemu</span>、<span class="mono">ro.hardware</span>、<span class="mono">ro.product.*</span>、<span class="mono">ro.build.fingerprint</span> 等由系统属性系统在启动早期加载。注意：<span class="mono">ro.</span> 属性写入后不可改，运行时 <span class="mono">setprop</span> 无效。<b>正解是改系统镜像</b>（自编译 AOSP 时改属性定义，或改 <span class="mono">*.prop</span> 后重打包分区）；次优是 hook 属性读取接口（<span class="mono">__system_property_get</span>），但通用性差、易被交叉验证识破。<br>'
+          + '<b>② 虚拟硬件层</b>——<span class="mono">goldfish</span>/<span class="mono">ranchu</span> 是模拟器的虚拟硬件平台代号，决定了设备树与驱动名。<b>要在系统镜像 / 内核层消除</b>；改 <span class="mono">ro.hardware</span> 之类的取值只是一半，真机还有配套的设备节点、<span class="mono">/sys</span> 目录结构、HAL 实现——只改名字不改结构，很容易被「名字对了但结构不对」的交叉检测抓到。<br>'
+          + '<b>③ 图形栈层</b>——<span class="mono">SwiftShader</span> 是软件渲染器，出现在渲染器字符串里。改字符串容易（连同 GRALLOC / EGL 相关属性一起改），但<b>渲染行为改不掉</b>：软件渲染在扩展支持、精度、性能、某些视觉细节上与真 GPU 存在差异，深度检测可以从渲染结果反推。<br>'
+          + '<b>④ 设备节点 / 文件层</b>——<span class="mono">/dev/qemu_pipe</span>（guest 与宿主 emulator 进程的通信通道）是「guest 需要和宿主通信」这个架构事实的产物。<b>直接删掉会破坏模拟器与宿主的通信</b>（传感器注入、控制通道可能失效），属于「改了自断后路」的典型。要在这一层动手，得先想清楚这条通道还有谁在用。<br>'
+          + '<b>⑤ 内核层</b>——内核版本串（<span class="mono">uname -r</span>）、启动参数（<span class="mono">androidboot.*</span>）、已加载模块列表。这一层要动，就得走 <b>GKI 内核替换</b>那条路（解包 boot 分区 → 换内核镜像 → 重打包 → 刷入），属于高危操作，且会破坏 verified boot 状态——<b>而 verified boot 状态本身就是可检测项</b>。<br>'
+          + '<b>⑥ 库层</b>——libhoudini / libndk_translation 相关库的存在，直接暴露「这是 x86 安卓跑 ARM so」的架构事实。清理或重命名要谨慎，因为它们可能被链接器按名字查找。<br><br>'
+          + '<b>四、固有代价与残余风险。</b><br>'
+          + '<b>代价</b>：改得越深，环境越脆弱（每次系统 / 内核升级都要重新适配）、越难复现、越容易在「改名不改结构」的地方被交叉检测抓到。删掉通信通道类的东西还可能直接让模拟器功能失效。<br>'
+          + '<b>残余风险（改字符串解决不了的）</b>：<b>行为与时序特征</b>——CPU 性能分布、内存延迟、指令执行耗时；<b>传感器物理合理性</b>——静止时的噪声模式、加速度计与陀螺仪的相关性；<b>功耗与热特征</b>——电池曲线、温度变化；<b>GPU 渲染行为的细微差异</b>；<b>翻译层带来的执行路径异常</b>。<b>这些都不是「改一个字符串」能解决的，它们需要风控做更复杂的采集与分析——所以在真实对抗中，最高性价比的路线往往不是「把模拟器伪装成真机」，而是「直接用真机 / 云真机」。</b><br><br>'
+          + '<b>本题的思维模型：</b>环境伪装是一项<b>分层工程</b>——先枚举特征，再为每个特征定位「它由哪一层产生」，然后判断「这一层能不能改、改了会破坏什么」。最后一定要问一句：<b>我的威胁模型里，风控到底会不会做行为检测？如果会，字符串层面的伪装收益就很有限。</b>',
+        after: '<p>这道题没有唯一正确答案，评分看的是<b>分层是否完整、归因是否准确、是否主动说出了方案的局限</b>。只列「改哪些属性」而不谈「改不掉的残余风险」的答案，在真实项目里会直接导致团队误判风险。</p>'
       }
     ]
   }

@@ -28,7 +28,7 @@
     <ul style="margin-bottom:0">
       <li><b>第一遍学完后</b>：翻一遍，凡是看到标题心里能自动补出内容的，就算过关；补不出来的，回对应章节。</li>
       <li><b>面试/分享前</b>：直接全屏播放，每页就是一个话题。</li>
-      <li>每页右上角的编号对应章节，比如 <span class="pill acc mono">CH 5</span> 就是第 5 章。</li>
+      <li>每页右上角的编号对应章节，比如 <span class="pill acc mono">CH 5</span> 就是第 19 章。</li>
     </ul>
   </div>
 
@@ -82,25 +82,25 @@
         '</tbody></table></div>',
       foot: '记住这张表，遇到问题先定位"对手在哪一层"' },
 
-    /* ---------- 第 1 章 ---------- */
-    { kicker: 'CH 1', title: 'Hook 的第一条分界线',
+    /* ---------- 第 15 章 ---------- */
+    { kicker: 'CH 15', title: 'Hook 的第一条分界线',
       body: '<div class="big">Java 层还是 Native 层？拿错工具，排查方向就全错了。</div>' +
         '<div class="grid2"><div><b>Java 层 Hook</b><ul><li>API：<code>Java.perform</code> / <code>Java.use</code></li>' +
         '<li>依赖 ART 反射机制</li><li>失败查：类加载器、方法内联</li></ul></div>' +
         '<div><b>Native 层 Hook</b><ul><li>API：<code>Interceptor.attach</code></li>' +
         '<li>直接改机器码</li><li>失败查：地址、so 加载时机、Thumb 位</li></ul></div></div>',
-      foot: '第 1 章 · Frida 高级逆向' },
+      foot: '第 15 章 · Frida 高级逆向' },
 
-    { kicker: 'CH 1', title: '两个必须记住的坑',
+    { kicker: 'CH 15', title: '两个必须记住的坑',
       body: '<ul><li><b><code>this.encode(input)</code> 为什么不会无限递归？</b><br>' +
         'Frida 在装 Hook 时<b>保存了原始方法的引用</b>，包装器上的 <code>this.encode</code> 指向那个原件。</li>' +
         '<li><b>改返回值只能靠 <code>retval.replace()</code></b><br>' +
         '写 <code>retval = ptr("0x0")</code> <b>完全无效</b>——那只是改了个 JS 局部变量，寄存器纹丝不动。</li></ul>' +
         '<div class="note key" style="margin-top:16px"><div class="note-h">🔑 记忆口诀</div>' +
         '<b>onEnter 有 args 无 retval；onLeave 有 retval 无 args；要改返回值只有 replace。</b></div>',
-      foot: '第 1 章 · 这两个点面试必问' },
+      foot: '第 15 章 · 这两个点面试必问' },
 
-    { kicker: 'CH 1', title: 'OLLVM 四大手段 → 为什么动态 Trace 永远有效',
+    { kicker: 'CH 15', title: 'OLLVM 四大手段 → 为什么动态 Trace 永远有效',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>手段</th><th>做了什么</th><th>破法</th></tr></thead><tbody>' +
         '<tr><td>控制流平坦化 <code>-fla</code></td><td>if/else 变成 switch 状态机</td><td>Trace state 的取值序列</td></tr>' +
         '<tr><td>虚假控制流 <code>-bcf</code></td><td>插入恒真谓词 + 死代码</td><td>死代码不进 trace</td></tr>' +
@@ -108,25 +108,25 @@
         '<tr><td>字符串加密 <span class="pill warn">非官方</span></td><td>常量运行时才解密</td><td>解密函数返回处 dump</td></tr>' +
         '</tbody></table></div>' +
         '<div class="big">混淆改变的是代码的"长相"，改变不了"计算结果"。</div>',
-      foot: '第 1、5 章 · 这是全课最重要的一条元原则' },
+      foot: '第 15、19 章 · 这是全课最重要的一条元原则' },
 
-    /* ---------- 第 2 章 ---------- */
-    { kicker: 'CH 2', title: '脱壳的本质：抢在解密完成的那一刻',
+    /* ---------- 第 16 章 ---------- */
+    { kicker: 'CH 16', title: '脱壳的本质：抢在解密完成的那一刻',
       body: '<p>壳把真 dex 锁起来，但<b>运行时必须把文件摊在桌上用</b>。所以你不用撬锁，只要蹲着等。</p>' +
         '<div class="big">最优脱壳窗口 = 已解密 + 结构完整（ART 刚映射进内存时）</div>' +
         '<ul><li>太早 → dump 出来是密文</li><li>太晚 → 可能已被再次保护</li></ul>',
-      foot: '第 2 章 · FART 全自动脱壳机' },
+      foot: '第 16 章 · FART 全自动脱壳机' },
 
-    { kicker: 'CH 2', title: '一代壳 vs 抽取壳：现象直接指认路线',
+    { kicker: 'CH 16', title: '一代壳 vs 抽取壳：现象直接指认路线',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>一代壳</th><th>抽取壳</th></tr></thead><tbody>' +
         '<tr><td>藏什么</td><td>整个 dex 加密</td><td>只抽走方法体 <code>code_item</code></td></tr>' +
         '<tr><td>现象</td><td>jadx <b>打不开</b></td><td>能打开，但<b>方法全空</b></td></tr>' +
         '<tr><td>破解</td><td>找对 dump 时机</td><td><b>必须主动调用触发回填</b></td></tr>' +
         '</tbody></table></div>' +
         '<div class="big">看到"打不开"是一代壳；看到"空的"是抽取壳。</div>',
-      foot: '第 2 章 · 一个问题就能定下整条技术路线' },
+      foot: '第 16 章 · 一个问题就能定下整条技术路线' },
 
-    { kicker: 'CH 2', title: 'FART 的三层嵌套循环',
+    { kicker: 'CH 16', title: 'FART 的三层嵌套循环',
       body: '<ol><li>遍历所有 <b>DexFile</b>（多 dex 机制，一个都不能漏）</li>' +
         '<li>遍历每个 dex 的所有 <b>ClassDef</b></li>' +
         '<li>遍历每个类的所有方法（<b>direct + virtual 两组都要</b>）</li>' +
@@ -134,17 +134,17 @@
         '<li>最后把散装方法体<b>合并回 dex 并修复文件头</b></li></ol>' +
         '<div class="note warn" style="margin-top:14px"><div class="note-h">⚠️ 调用会抛异常，但没关系</div>' +
         '我们要的是"回填"这个<b>副作用</b>，不是正确返回值。异常必须捕获，否则流程中断。</div>',
-      foot: '第 2 章 · 产物在 /sdcard/fart/&lt;包名&gt;/' },
+      foot: '第 16 章 · 产物在 /sdcard/fart/&lt;包名&gt;/' },
 
-    { kicker: 'CH 2', title: '实战技巧与常见坑',
+    { kicker: 'CH 16', title: '实战技巧与常见坑',
       body: '<ul><li><b>脱壳前把 App 所有功能点一遍</b> —— 抽取壳只回填"被调用过"的方法，<span class="hit">完整度 = 你的操作覆盖度</span></li>' +
         '<li><b>dump 出的 dex 必然 checksum 失配</b> —— 这是正常现象不是失败，需要修复或放宽校验</li>' +
         '<li><b>类找不到</b> → 用 <code>Java.enumerateClassLoaders</code> 找对加载器</li>' +
         '<li><b>冷门方法拿不到</b> → 用 Frida 手动调一次，再脱</li></ul>',
-      foot: '第 2、10 章' },
+      foot: '第 16、24 章' },
 
-    /* ---------- 第 3 章 ---------- */
-    { kicker: 'CH 3', title: 'ARM 三种指令集与一个致命的坑',
+    /* ---------- 第 17 章 ---------- */
+    { kicker: 'CH 17', title: 'ARM 三种指令集与一个致命的坑',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>ARM32</th><th>Thumb</th><th>AArch64</th></tr></thead><tbody>' +
         '<tr><td>指令长度</td><td>固定 4 字节</td><td><b>2/4 字节混合</b></td><td>固定 4 字节</td></tr>' +
         '<tr><td>安卓使用</td><td>较少</td><td><b>so 大量使用</b></td><td>64 位主力</td></tr>' +
@@ -152,9 +152,9 @@
         '</tbody></table></div>' +
         '<div class="note bad" style="margin-top:14px"><div class="note-h">🔥 头号静默失效原因</div>' +
         'Thumb 函数地址必须 <b>+1</b>。传错<b>不报错</b>——地址合法、attach 成功，但指令边界解析错了，Hook 永远不触发。</div>',
-      foot: '第 3 章 · "脚本不报错但 onEnter 不触发"先查这个' },
+      foot: '第 17 章 · "脚本不报错但 onEnter 不触发"先查这个' },
 
-    { kicker: 'CH 3', title: '调用约定（背下来）',
+    { kicker: 'CH 17', title: '调用约定（背下来）',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>ARM32 (AAPCS)</th><th>AArch64 (AAPCS64)</th></tr></thead><tbody>' +
         '<tr><td>整数参数</td><td><code>r0</code>-<code>r3</code></td><td><code>x0</code>-<code>x7</code></td></tr>' +
         '<tr><td>浮点参数</td><td><code>s0</code>-<code>s15</code></td><td><b><code>v0</code>-<code>v7</code></b></td></tr>' +
@@ -165,9 +165,9 @@
         '<div class="note warn" style="margin-top:12px"><div class="note-h">⚠️ 浮点参数不占整数寄存器名额</div>' +
         '<code>f(char* a, size_t b, double c, Config* d)</code> → c 走 <code>v0</code>，所以 d 进 <code>x2</code>（不是 x3）。' +
         '这就是 <code>args[]</code> 读出垃圾值的根源。</div>',
-      foot: '第 3 章 · Hook 加密函数时最常见的困惑' },
+      foot: '第 17 章 · Hook 加密函数时最常见的困惑' },
 
-    { kicker: 'CH 3', title: '虚函数：C++ 逆向的分水岭',
+    { kicker: 'CH 17', title: '虚函数：C++ 逆向的分水岭',
       body: '<p><b>对象布局</b>：vptr 在偏移 0，后面跟成员变量。</p>' +
         '<p><b>vtable 结构</b>（Itanium ABI）：</p>' +
         '<ul><li><code>[-2]</code> offset-to-top（多继承用）</li>' +
@@ -175,9 +175,9 @@
         '<li><code>[0..n]</code> 按<b>声明顺序</b>存放虚函数地址</li></ul>' +
         '<div class="big">虚调用 = <code>LDR</code>(取vptr) → <code>LDR</code>(查槽) → <code>BLR</code>(间接跳)</div>' +
         '<p>静态分析在此断链（IDA 不知道 x9 是什么），<b>破解法</b>：hook 后打印 <code>this.context.x9</code>。</p>',
-      foot: '第 3 章 · 看到三段式就知道是虚调用' },
+      foot: '第 17 章 · 看到三段式就知道是虚调用' },
 
-    { kicker: 'CH 3', title: 'Syscall：绕过 libc 的钥匙',
+    { kicker: 'CH 17', title: 'Syscall：绕过 libc 的钥匙',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>ARM32</th><th>AArch64</th></tr></thead><tbody>' +
         '<tr><td>系统调用号</td><td><b><code>r7</code></b></td><td><b><code>x8</code></b></td></tr>' +
         '<tr><td>参数</td><td><code>r0</code>-<code>r6</code></td><td><code>x0</code>-<code>x5</code></td></tr>' +
@@ -185,10 +185,10 @@
         '<tr><td>机器码</td><td><b><code>0xEF000000</code></b></td><td><b><code>0xD4000001</code></b></td></tr>' +
         '</tbody></table></div>' +
         '<div class="big">App 直接内联 SVC → 所有 Hook libc 的监控全部失效。</div>',
-      foot: '第 3、13 章 · 这两个机器码是做静态扫描的特征' },
+      foot: '第 17、27 章 · 这两个机器码是做静态扫描的特征' },
 
-    /* ---------- 第 4 章 ---------- */
-    { kicker: 'CH 4', title: 'ART 三层对象模型',
+    /* ---------- 第 18 章 ---------- */
+    { kicker: 'CH 18', title: 'ART 三层对象模型',
       body: '<div class="flow-col" style="gap:10px">' +
         '<div class="blk" style="justify-content:flex-start">Java 对象实例</div>' +
         '<div class="arrow" style="margin-left:20px">↓ 内存头部就是它</div>' +
@@ -200,9 +200,9 @@
         '</div>' +
         '<div class="note key" style="margin-top:16px"><div class="note-h">🔑 Java Hook 的底层抓手</div>' +
         'Frida 的 <code>Java.use</code> 本质就是在改 <code>ArtMethod</code>：把 flags 改成 native、替换入口。</div>',
-      foot: '第 4 章 · 定制 ART 打造动态分析沙箱' },
+      foot: '第 18 章 · 定制 ART 打造动态分析沙箱' },
 
-    { kicker: 'CH 4', title: '定制 ART：从"生成侧"解决问题',
+    { kicker: 'CH 18', title: '定制 ART：从"生成侧"解决问题',
       body: '<p><b>问题</b>：加固用 <code>RegisterNatives</code> 动态注册，函数地址运行时才确定。</p>' +
         '<p><b>Frida 的做法</b>：hook <code>RegisterNatives</code> 打印 <code>JNINativeMethod</code> 数组。<br>' +
         '<span class="miss">缺点：会被检测到 Frida 存在。</span></p>' +
@@ -210,18 +210,18 @@
         '<span class="hit">优势：虚拟机是你编译的，注册那一刻天然知道全部信息，不依赖任何 hook 框架。</span></p>' +
         '<div class="note warn" style="margin-top:14px"><div class="note-h">⚠️ lambda 的悬垂引用</div>' +
         '<code>[&amp;]</code> 捕获局部变量后延后执行 → 局部变量已销毁。这是 ART 这类长期运行系统的经典 bug 来源。</div>',
-      foot: '第 4 章 · 读懂 AOSP 源码是移植的前提' },
+      foot: '第 18 章 · 读懂 AOSP 源码是移植的前提' },
 
-    /* ---------- 第 5 章 ---------- */
-    { kicker: 'CH 5', title: 'LLVM Pass：混淆的插桩点',
+    /* ---------- 第 19 章 ---------- */
+    { kicker: 'CH 19', title: 'LLVM Pass：混淆的插桩点',
       body: '<p>LLVM 是三阶段编译器：<b>前端 Clang</b>（源码→IR）→ <b>中端优化器</b>（对 IR 做变换）→ <b>后端</b>（IR→机器码）。</p>' +
         '<p><b>Pass</b> 就是作用于 IR 的变换单元，按范围分四类：</p>' +
         '<ul><li><code>ModulePass</code> —— 整个模块</li><li><code>FunctionPass</code> —— 单个函数（<b>OLLVM 用的就是这个</b>）</li>' +
         '<li><code>BasicBlockPass</code> —— 单个基本块</li><li><code>LoopPass</code> —— 单个循环</li></ul>' +
         '<div class="big">OLLVM 的三种混淆都注册为 FunctionPass，在 runOnFunction 里遍历基本块改写 IR。</div>',
-      foot: '第 5 章 · 彻底搞懂 OLLVM' },
+      foot: '第 19 章 · 彻底搞懂 OLLVM' },
 
-    { kicker: 'CH 5', title: '⚠️ 一个常见的误导',
+    { kicker: 'CH 19', title: '⚠️ 一个常见的误导',
       body: '<div class="note bad"><div class="note-h">🔥 字符串加密不是 OLLVM 官方特性</div>' +
         '<p>OLLVM 官方 wiki 只列了四项：</p>' +
         '<ul><li><code>-mllvm -sub</code> 指令替换</li><li><code>-mllvm -bcf</code> 虚假控制流</li>' +
@@ -229,9 +229,9 @@
         '<p style="margin-bottom:0"><b>字符串加密是后续 fork / 加固厂商定制版本添加的</b>，属于国内加固实践。' +
         '很多资料把它和三大混淆并列讲，这是不准确的。</p></div>' +
         '<p>OLLVM 基于 <b>LLVM 4.0</b>；论文发表于 IEEE/ACM SPRO\'15（2015）。</p>',
-      foot: '第 5 章 · 这个细节能看出你是否真的查过资料' },
+      foot: '第 19 章 · 这个细节能看出你是否真的查过资料' },
 
-    { kicker: 'CH 5', title: '三大混淆的破解逻辑',
+    { kicker: 'CH 19', title: '三大混淆的破解逻辑',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>混淆</th><th>源码级做了什么</th><th>为什么能破</th></tr></thead><tbody>' +
         '<tr><td><code>-fla</code></td><td>造分发器 + switch(state)，原始块变成 case</td><td><b>state 取值序列动态确定</b></td></tr>' +
         '<tr><td><code>-bcf</code></td><td>不透明谓词（如 x²%2==0 恒真）拆出死代码块</td><td><b>死代码不进 trace</b></td></tr>' +
@@ -239,17 +239,17 @@
         '</tbody></table></div>' +
         '<p><b>反混淆两条路</b>：<b>通用方法</b>（识别分发器、符号执行求不透明谓词、常量折叠）vs ' +
         '<b>非通用方法</b>（针对样本特征，或直接用动态 Trace 绕开）。</p>',
-      foot: '第 5 章 · 工具如 D-810 / HexRaysDeob（仓库地址请自行确认）' },
+      foot: '第 19 章 · 工具如 D-810 / HexRaysDeob（仓库地址请自行确认）' },
 
-    /* ---------- 第 6 章 ---------- */
-    { kicker: 'CH 6', title: 'VMP：把指令翻译成自定义字节码',
+    /* ---------- 第 20 章 ---------- */
+    { kicker: 'CH 20', title: 'VMP：把指令翻译成自定义字节码',
       body: '<p><b>原理</b>：把原始 ARM 指令<b>翻译</b>成一套自定义字节码，运行时由<b>内置解释器</b>逐条解释执行。</p>' +
         '<pre data-hl><code>while (true) {\n    opcode = *pc++;        <span class="c">// 取指</span>\n    switch (opcode) {      <span class="c">// 分发</span>\n        case 0x1A: ...;    <span class="c">// Handler</span>\n    }\n}</code></pre>' +
         '<div class="big">IDA 看到的不是原始逻辑，而是"解释器循环 + 一堆当作数据的字节码"。</div>' +
         '<p>关键概念：<b>VM 入口</b> / <b>分发器 dispatcher</b> / <b>Handler</b> / <b>VMContext</b> / <b>字节码流</b>。</p>',
-      foot: '第 6 章 · 高级调试之 VMP' },
+      foot: '第 20 章 · 高级调试之 VMP' },
 
-    { kicker: 'CH 6', title: '把调试器藏到更低的层级',
+    { kicker: 'CH 20', title: '把调试器藏到更低的层级',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>层</th><th>EL</th><th>能否被反调试发现</th></tr></thead><tbody>' +
         '<tr><td>用户态调试</td><td>EL0</td><td><b>能</b>（ptrace / TracerPid / 断点改内存）</td></tr>' +
         '<tr><td>内核态调试</td><td>EL1</td><td>很难（App 看不到内核）</td></tr>' +
@@ -257,10 +257,10 @@
         '</tbody></table></div>' +
         '<div class="big">软件断点要改内存（BRK 指令），所以会被检测。硬件断点在 CPU 内部，内存一个字节都不变。</div>' +
         '<p>这是当前调试对抗的天花板：<b>把观测点放到比对手更低的层级</b>。</p>',
-      foot: '第 6、13 章 · 全课的元策略：降维' },
+      foot: '第 20、27 章 · 全课的元策略：降维' },
 
-    /* ---------- 第 7 章 ---------- */
-    { kicker: 'CH 7', title: '模拟执行三兄弟 + 补环境',
+    /* ---------- 第 21 章 ---------- */
+    { kicker: 'CH 21', title: '模拟执行三兄弟 + 补环境',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>工具</th><th>作用</th><th>方向</th></tr></thead><tbody>' +
         '<tr><td>Capstone</td><td>反汇编</td><td>机器码 → 汇编文本</td></tr>' +
         '<tr><td>Unicorn</td><td>CPU 模拟器</td><td>执行机器码</td></tr>' +
@@ -269,19 +269,19 @@
         '<p><b>Unicorn 只模拟 CPU，不模拟系统</b>——内存要自己 map，syscall 要自己实现。这个"什么都没有"恰是优点：完全可控、可单步。</p>' +
         '<div class="note key"><div class="note-h">🔑 补环境要补五类</div>' +
         '① 库函数（malloc/memcpy…）② SVC 系统调用 ③ <b>JNIEnv 函数表</b>（本质是函数指针数组）④ JavaVM ⑤ Java 层的类与方法</div>',
-      foot: '第 7 章 · Unicorn / unidbg 模拟执行' },
+      foot: '第 21 章 · Unicorn / unidbg 模拟执行' },
 
-    { kicker: 'CH 7', title: 'unidbg：算法还原的主力工具',
+    { kicker: 'CH 21', title: 'unidbg：算法还原的主力工具',
       body: '<p>官方定位："Allows you to emulate an Android native library"（另有实验性 iOS 模拟）。</p>' +
         '<p><b>官方特性</b>（摘自 README）：JNI Invocation API 模拟（可调 <code>JNI_OnLoad</code>）、支持 JavaVM/JNIEnv、' +
         '模拟 syscall、ARM32/ARM64、inline hook（<b>Dobby</b>）、import hook（<b>xHook</b>）、gdb stub、指令 trace、' +
         '支持 <b>dynarmic</b> / <b>Apple M1 hypervisor</b> / <b>Linux KVM</b> 多后端、内存泄漏检测。</p>' +
         '<p>近期加入 <b>MCP 支持</b>（AI 辅助调试）与 <b>Worker Pool</b>（高并发服务化）。</p>' +
         '<div class="big">黑盒调用的核心思想：不需要还原算法逻辑，能让它跑起来、能喂输入取输出就够了。</div>',
-      foot: '第 7 章 · 记得遵守目标软件的授权范围' },
+      foot: '第 21 章 · 记得遵守目标软件的授权范围' },
 
-    /* ---------- 第 8 章 ---------- */
-    { kicker: 'CH 8', title: '算法还原的四个特征常量',
+    /* ---------- 第 22 章 ---------- */
+    { kicker: 'CH 22', title: '算法还原的四个特征常量',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>算法</th><th>最强特征</th></tr></thead><tbody>' +
         '<tr><td><b>MD5</b></td><td>IV <code>0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476</code>；K[0]=<code>0xd76aa478</code></td></tr>' +
         '<tr><td><b>SHA-1</b></td><td>5 个 IV（前 4 个与 MD5 相同！）+ 4 个轮常量 <code>0x5A827999</code>…</td></tr>' +
@@ -291,36 +291,36 @@
         '</tbody></table></div>' +
         '<div class="note warn"><div class="note-h">⚠️ 别只看一个常量就下结论</div>' +
         '<code>0x67452301</code> 在 MD4 / MD5 / SHA-1 里都出现。要多个常量交叉验证。</div>',
-      foot: '第 8 章 · 非标准算法还原（上）' },
+      foot: '第 22 章 · 非标准算法还原（上）' },
 
-    { kicker: 'CH 8', title: '识别魔改的两个维度',
+    { kicker: 'CH 22', title: '识别魔改的两个维度',
       body: '<div class="grid2"><div><b>加盐（Salt）</b><ul>' +
         '<li>常量表<b>不变</b></li><li>改变的是<b>输入</b></li><li>→ 常量比对仍能认出算法，<b>去找盐</b></li></ul></div>' +
         '<div><b>改常量（魔改）</b><ul><li>常量表<b>变了</b></li><li>算法"内脏"被换</li><li>→ 逐字节<b>比对差异</b></li></ul></div></div>' +
         '<div class="big">看到常量没变但有额外数据混入 → 加盐；看到常量变了 → 魔改。</div>' +
         '<p>加盐的常见形式：前缀 / 后缀 / 中缀 / HMAC 式 / 多次哈希。</p>',
-      foot: '第 8、9 章 · 这是两个不同维度的改造' },
+      foot: '第 22、23 章 · 这是两个不同维度的改造' },
 
-    /* ---------- 第 9 章 ---------- */
-    { kicker: 'CH 9', title: '动态编码表：三线索定位',
+    /* ---------- 第 23 章 ---------- */
+    { kicker: 'CH 23', title: '动态编码表：三线索定位',
       body: '<p><b>场景</b>：App 不在编译期定义 Base64 表，而是运行时用算法生成——静态搜不到。</p>' +
         '<p><b>定位表内存的三个线索</b>：</p>' +
         '<ol><li>一块 <b>64 字节</b>（Base64）或 <b>256 字节</b>（AES S 盒 / RC4 S 盒）的可读内存</li>' +
         '<li>值是 <b>0-255 的一个置换</b>（无重复）</li>' +
         '<li>被<b>密集索引访问</b>（<code>LDRB [基址, 索引]</code>）</li></ol>' +
         '<div class="big">动静态比对：静态看是空的，跑起来变成完整的表 —— 差值就是运行时生成的表。</div>',
-      foot: '第 9 章 · 非标准算法还原（下）' },
+      foot: '第 23 章 · 非标准算法还原（下）' },
 
-    { kicker: 'CH 9', title: '收尾：把算法封装成服务',
+    { kicker: 'CH 23', title: '收尾：把算法封装成服务',
       body: '<p><b>Frida RPC 标准形态</b>：</p>' +
         '<pre data-hl><code>rpc.exports = {\n  encrypt: function (input) {\n    var r = null;\n    Java.perform(function () {\n      r = Java.use(<span class="s">\'com.a.b.Crypto\'</span>).encrypt(input);\n    });\n    return r;\n  }\n};</code></pre>' +
         '<p>Python 端 <code>script.exports_sync.encrypt("hello")</code>，再包成 HTTP 服务 → 实现"输入明文 → 输出密文"的批量生产。</p>' +
         '<div class="note key"><div class="note-h">🔑 工程化要点</div>' +
         '脚本常驻（不要每次 attach）、缓存类引用、处理异常与超时、注意 Java 层调用开销。</div>',
-      foot: '第 9 章 · 这是算法还原落地的最终形态' },
+      foot: '第 23 章 · 这是算法还原落地的最终形态' },
 
-    /* ---------- 第 10 章 ---------- */
-    { kicker: 'CH 10', title: 'Frida 检测与对抗：八对八',
+    /* ---------- 第 24 章 ---------- */
+    { kicker: 'CH 24', title: 'Frida 检测与对抗：八对八',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>检测点</th><th>对抗手段</th></tr></thead><tbody>' +
         '<tr><td>端口 27042 / 27043</td><td>改端口 + 重命名 server</td></tr>' +
         '<tr><td>线程名（gum-js-loop 等）</td><td>换 frida-gadget（无独立进程）</td></tr>' +
@@ -332,9 +332,9 @@
         '<tr><td>文件路径检测</td><td>换目录 + 清理</td></tr>' +
         '</tbody></table></div>' +
         '<div class="big">能改自己就改自己；改不了就改对方的观察管道；都不行就抢时序。</div>',
-      foot: '第 10 章 · 攻防闭环' },
+      foot: '第 24 章 · 攻防闭环' },
 
-    { kicker: 'CH 10', title: '核心洞察：混淆保护不了副作用',
+    { kicker: 'CH 24', title: '核心洞察：混淆保护不了副作用',
       body: '<p><b>问题</b>：检测逻辑被 OLLVM 混淆，静态找不到特征字符串、看不懂控制流。</p>' +
         '<p><b>破法</b>：不要硬看，去 hook 那些<b>"检测的必经之路"</b>——</p>' +
         '<ul><li><code>open</code>/<code>fopen</code> —— 读 <code>/proc</code> 必须经过</li>' +
@@ -342,18 +342,18 @@
         '<li><code>socket</code>/<code>connect</code> —— 连端口必须经过</li></ul>' +
         '<div class="big">混淆保护的是逻辑，保护不了副作用。检测行为必然产生可观测的系统调用。</div>' +
         '<p>在 <code>strstr</code> 的 <code>onLeave</code> 看返回值：非空且参数可疑，那就是检测点。</p>',
-      foot: '第 10 章 · 从副作用反推逻辑是通用思路' },
+      foot: '第 24 章 · 从副作用反推逻辑是通用思路' },
 
-    /* ---------- 第 11 章 ---------- */
-    { kicker: 'CH 11', title: 'eBPF：内核里的安全沙箱',
+    /* ---------- 第 25 章 ---------- */
+    { kicker: 'CH 25', title: 'eBPF：内核里的安全沙箱',
       body: '<p><b>生命周期</b>：写 C → clang 编译成 eBPF 字节码 → <code>bpf()</code> 系统调用提交 → ' +
         '<b>验证器逐项检查</b> → JIT 编译 → attach 到钩子点 → 事件触发 → 写 BPF Map → 用户态读取。</p>' +
         '<p><b>钩子类型</b>：<code>kprobe</code> / <b><code>uprobe</code></b>（对逆向最有用）/ <code>tracepoint</code> / ' +
         '<code>XDP</code> / <code>tc</code> / <code>LSM</code>。</p>' +
         '<p><b>工具链</b>：BCC（开发快）/ bpftrace（脚本快）/ <b>libbpf + CO-RE</b>（现代推荐，靠 BTF 实现一次编译到处运行）。</p>',
-      foot: '第 11 章 · eBPF 环境搭建与源码赏析' },
+      foot: '第 25 章 · eBPF 环境搭建与源码赏析' },
 
-    { kicker: 'CH 11', title: '为什么逆向该关注 eBPF',
+    { kicker: 'CH 25', title: '为什么逆向该关注 eBPF',
       body: '<div class="big">因为它跑在内核态 —— App 的检测手段完全看不到它。</div>' +
         '<p>对比 Frida：需要注入进程、改内存、留特征，容易被扫 <code>/proc/self/maps</code>、查线程名、查端口发现。<br>' +
         'eBPF 从内核侧观测，<b>上述检测全部失效</b>。</p>' +
@@ -361,10 +361,10 @@
         '① 内核版本（完整功能一般要 4.14+）② <b>厂商内核裁剪</b>（没有 <code>CONFIG_BPF_SYSCALL</code> 就直接没戏）' +
         '③ SELinux 策略限制 ④ 通常需要 root。<br>' +
         '<span class="muted">课程是 2023 年前后的情况，不同设备差异极大，请以实测为准。</span></div>',
-      foot: '第 11 章 · 时效性强，注意标注' },
+      foot: '第 25 章 · 时效性强，注意标注' },
 
-    /* ---------- 第 12 章 ---------- */
-    { kicker: 'CH 12', title: '为什么 FART 必须持续维护',
+    /* ---------- 第 26 章 ---------- */
+    { kicker: 'CH 26', title: '为什么 FART 必须持续维护',
       body: '<div class="big">每个安卓大版本，ART 内部结构都会变，脱壳点必须重新定位。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>版本</th><th>关键变化</th></tr></thead><tbody>' +
         '<tr><td>Android 5.0</td><td>ART 取代 Dalvik</td></tr>' +
@@ -375,19 +375,19 @@
         '<tr><td>Android 12–14</td><td>动态分区 / <code>init_boot</code> 等持续演进</td></tr>' +
         '</tbody></table></div>' +
         '<p><span class="pill warn">具体源码文件名与字段名随版本变化，需查对应版本 AOSP</span></p>',
-      foot: '第 12 章 · FART 10 &amp; 12 版本演进' },
+      foot: '第 26 章 · FART 10 &amp; 12 版本演进' },
 
-    { kicker: 'CH 12', title: '"秒脱"的真相',
+    { kicker: 'CH 26', title: '"秒脱"的真相',
       body: '<div class="big">秒脱不是技术简单，而是前期工作做完了。</div>' +
         '<p>当 FART 已适配好目标系统版本，脱一个新的抽取壳 App 就是几分钟的事。</p>' +
         '<p><b>前期工作需要的是理解原理</b>：知道 dex 在哪里解密、方法体什么时候回填、脱壳点在哪里。</p>' +
         '<div class="note key"><div class="note-h">🔑 本章最有价值的认知</div>' +
         '<b>逆向的护城河在于原理理解，不在于工具收藏。</b></div>' +
         '<p><b>遇到新壳的决策框架</b>：判断类型（一代/抽取/VMP）→ 选路线 → 没工具就回源码找脱壳点 → 实在脱不掉就换思路（黑盒调用 / 动态 Trace）。</p>',
-      foot: '第 12 章 · 方法论比步骤更保值' },
+      foot: '第 26 章 · 方法论比步骤更保值' },
 
-    /* ---------- 第 13 章 ---------- */
-    { kicker: 'CH 13', title: 'SVC：绕过 libc 的系统调用',
+    /* ---------- 第 27 章 ---------- */
+    { kicker: 'CH 27', title: 'SVC：绕过 libc 的系统调用',
       body: '<p><b>正常路径</b>：App → libc 的 <code>open()</code> → <code>SVC</code> → 内核。' +
         '<span class="hit">Frida 的 hook 装在这一层。</span></p>' +
         '<p><b>绕过路径</b>：App 自己设 <code>r7</code>/<code>x8</code> → <code>SVC</code> → 内核。' +
@@ -396,9 +396,9 @@
         '<ol><li><b>静态扫描代码段</b>找 <code>0xEF000000</code> / <code>0xD4000001</code> —— 最容易，但动态生成的代码扫不到</li>' +
         '<li><b>硬件断点</b> —— 精确，但数量有限（ARM 通常 4-6 个）</li>' +
         '<li><b>Hook 内核 syscall 表</b> —— 最彻底，无法被用户态绕过，但门槛最高</li></ol>',
-      foot: '第 13 章 · 内核模块绕过 Frida 检测' },
+      foot: '第 27 章 · 内核模块绕过 Frida 检测' },
 
-    { kicker: 'CH 13', title: '为什么硬件断点是决定性的',
+    { kicker: 'CH 27', title: '为什么硬件断点是决定性的',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>软件断点</th><th>硬件断点</th></tr></thead><tbody>' +
         '<tr><td>实现</td><td>改写目标指令为 BRK</td><td>CPU 调试寄存器</td></tr>' +
         '<tr><td><b>修改内存</b></td><td><b>是</b></td><td><b>否</b></td></tr>' +
@@ -407,19 +407,19 @@
         '</tbody></table></div>' +
         '<div class="big">内存一个字节都不改 → 所有"检测内存改写"的反调试手段全部失效。</div>' +
         '<p>代价是数量有限，所以必须<b>先理解目标行为才能选对布点</b>。</p>',
-      foot: '第 13 章 · 内存动态释放代码 + JNI 地址防追踪的反制' },
+      foot: '第 27 章 · 内存动态释放代码 + JNI 地址防追踪的反制' },
 
-    /* ---------- 第 14 章 ---------- */
-    { kicker: 'CH 14', title: 'iOS：消息机制与砸壳',
+    /* ---------- 第 28 章 ---------- */
+    { kicker: 'CH 28', title: 'iOS：消息机制与砸壳',
       body: '<p><b>ObjC 方法调用本质是发消息</b>：</p>' +
         '<pre data-hl><code>[obj doThing:arg];                            <span class="c">// 源码</span>\nobjc_msgSend(obj, @selector(doThing:), arg);  <span class="c">// 编译后</span></code></pre>' +
         '<p>→ 可以 hook <code>objc_msgSend</code>（拦截全部），或 hook 具体方法的 <b>IMP</b>（精准）。</p>' +
         '<div class="big">砸壳的本质：运行时内存里的代码已是明文，dump 出来 + 把 cryptid 改成 0。</div>' +
         '<p>为什么必须运行时 dump：App Store 的 App 被 <b>FairPlay DRM</b> 加密，' +
         'iOS 内核用<b>设备硬件密钥</b>在加载时解密——所以不能在别的设备上解密。</p>',
-      foot: '第 14 章 · iOS 设备指纹开发与逆向' },
+      foot: '第 28 章 · iOS 设备指纹开发与逆向' },
 
-    { kicker: 'CH 14', title: 'iOS 反调试：一场持续的博弈',
+    { kicker: 'CH 28', title: 'iOS 反调试：一场持续的博弈',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>检测</th><th>绕过</th></tr></thead><tbody>' +
         '<tr><td><code>ptrace(PT_DENY_ATTACH)</code></td><td>hook ptrace 直接返回<br><b>升级版：用 syscall 直接调用绕过符号 hook</b></td></tr>' +
         '<tr><td><code>sysctl</code> 查 <code>P_TRACED</code></td><td>hook sysctl，返回前清掉标志位</td></tr>' +
@@ -429,10 +429,10 @@
         '</tbody></table></div>' +
         '<p><b>SSL Pinning 绕过</b>：hook 校验点（<code>SecTrustEvaluate</code> / OpenSSL 的 <code>X509_verify_cert</code>）。' +
         '被 OLLVM 混淆时，<b>用动态 Trace 反推</b>——hook 那些"校验必经之路"的库函数看哪个被调用。</p>',
-      foot: '第 14 章 · 越狱工具支持矩阵变化很快，以官方仓库为准' },
+      foot: '第 28 章 · 越狱工具支持矩阵变化很快，以官方仓库为准' },
 
-    /* ---------- 第 15 章 ---------- */
-    { kicker: 'CH 15', title: '虚拟化：三个层级',
+    /* ---------- 第 29 章 ---------- */
+    { kicker: 'CH 29', title: '虚拟化：三个层级',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>类型</th><th>结构</th><th>代表</th></tr></thead><tbody>' +
         '<tr><td><b>Type-2</b> 宿主型</td><td>硬件 → 宿主 OS → Hypervisor（进程）→ Guest</td><td>VMware / VirtualBox</td></tr>' +
         '<tr><td><b>Type-1</b> 裸金属</td><td>硬件 → Hypervisor → Guest</td><td>Xen / ESXi</td></tr>' +
@@ -441,9 +441,9 @@
         '<p><b>关键机制</b>：<b>Stage-2 页表</b>（Guest 物理地址 → 真实物理地址）由 Hypervisor 管理，' +
         '所以它能完全控制 Guest 的内存访问，<b>且不修改 Guest 任何代码或内存</b>。</p>' +
         '<p>全虚拟化（不改 Guest，靠二进制翻译/硬件）vs 半虚拟化（改 Guest，靠 hypercall，如 virtio）。</p>',
-      foot: '第 15 章 · 云手机核心原理与检测' },
+      foot: '第 29 章 · 云手机核心原理与检测' },
 
-    { kicker: 'CH 15', title: 'QEMU 三种网络 + 云手机检测点',
+    { kicker: 'CH 29', title: 'QEMU 三种网络 + 云手机检测点',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>模式</th><th>原理</th><th>特点</th></tr></thead><tbody>' +
         '<tr><td><b>NAT</b></td><td>QEMU 内置 SLIRP 做用户态 NAT</td><td>免配置；<b>外网默认进不来</b>，需 <code>hostfwd</code></td></tr>' +
         '<tr><td><b>桥接</b></td><td>tap 网卡桥接到物理网卡</td><td>有独立 IP，行为最真实</td></tr>' +
@@ -453,10 +453,10 @@
         '<div class="note key"><div class="note-h">🔑 风控检测的十二个点</div>' +
         '传感器缺失 / 电池恒定 / CPU 型号 / QEMU 痕迹 / <b>GPU 渲染器（SwiftShader 是强特征）</b> / 网络信息 / ' +
         '开机时间 / <b>设备标识重复（批量检测关键）</b> / 无基带 / 无摄像头 / proc 痕迹 / 温度曲线异常</div>',
-      foot: '第 15 章 · 理解"真机有什么、虚拟环境缺什么"就能推导检测点' },
+      foot: '第 29 章 · 理解"真机有什么、虚拟环境缺什么"就能推导检测点' },
 
-    /* ---------- 第 16 章 ---------- */
-    { kicker: 'CH 16', title: '指令翻译与 GKI',
+    /* ---------- 第 30 章 ---------- */
+    { kicker: 'CH 30', title: '指令翻译与 GKI',
       body: '<p><b>两条翻译路径</b>：</p>' +
         '<ul><li><b>全系统模拟</b> —— ARM 安卓跑在 x86 上，每条指令都要翻译（QEMU TCG）→ <span class="bad">慢</span></li>' +
         '<li><b>应用级翻译</b> —— x86 安卓原生速度运行，只有 App 里的 ARM so 被翻译（libhoudini / libndk_translation）→ <span class="hit">快得多</span></li></ul>' +
@@ -464,10 +464,10 @@
         '<p>好处：Google 能独立升级内核修漏洞，厂商只管自己的驱动模块。<b>对逆向</b>：让定制内核更规范。</p>' +
         '<p><b>Cuttlefish</b>（Google 官方）：面向云端的可配置 Android 虚拟设备，依赖 KVM，' +
         '<span class="muted">很多云手机方案本质就是它或其变体</span>。</p>',
-      foot: '第 16 章 · 安卓模拟器环境与原理揭密' },
+      foot: '第 30 章 · 安卓模拟器环境与原理揭密' },
 
-    /* ---------- 第 17 章 ---------- */
-    { kicker: 'CH 17', title: '容器 = 四样东西的组合',
+    /* ---------- 第 31 章 ---------- */
+    { kicker: 'CH 31', title: '容器 = 四样东西的组合',
       body: '<div class="big">容器 = namespaces + cgroup + rootfs + capabilities/seccomp</div>' +
         '<div class="grid2"><div><b>namespaces（隔离）</b><ul>' +
         '<li><code>NEWPID</code> 进程号</li><li><code>NEWNET</code> 网络栈</li>' +
@@ -478,9 +478,9 @@
         '<li><code>cgroup.procs</code> 加入进程</li></ul></div></div>' +
         '<div class="note bad" style="margin-top:14px"><div class="note-h">🔥 容器不是虚拟机</div>' +
         '<b>共享宿主内核</b>，是软件隔离不是硬件隔离 —— 开销极小，但隔离强度弱（内核漏洞可逃逸）。</div>',
-      foot: '第 17 章 · 容器化核心原理' },
+      foot: '第 31 章 · 容器化核心原理' },
 
-    { kicker: 'CH 17', title: '容器网络与跨架构',
+    { kicker: 'CH 31', title: '容器网络与跨架构',
       body: '<p><b>docker0 网桥 + veth pair</b>：</p>' +
         '<div class="flow-row"><span class="blk">容器 eth0</span><span class="arrow">↔</span>' +
         '<span class="blk cool">veth pair（成对虚拟网卡）</span><span class="arrow">↔</span>' +
@@ -490,10 +490,10 @@
         '<div class="note key"><div class="note-h">🔑 跨架构最容易踩的坑</div>' +
         '<code>binfmt_misc</code> + <code>qemu-aarch64-static</code> 能让 x86_64 跑 arm64，' +
         '但必须<b>把 qemu-aarch64-static 复制进 rootfs</b>——因为 chroot 后看不到宿主机的路径。</div>',
-      foot: '第 17 章 · 手写迷你 Docker 的核心步骤见该章代码推演' },
+      foot: '第 31 章 · 手写迷你 Docker 的核心步骤见该章代码推演' },
 
-    /* ---------- 第 18 章 ---------- */
-    { kicker: 'CH 18', title: 'Android 启动链路（容器化的对照系）',
+    /* ---------- 第 32 章 ---------- */
+    { kicker: 'CH 32', title: 'Android 启动链路（容器化的对照系）',
       body: '<div class="flow-col" style="gap:7px;font-size:14px">' +
         '<div class="blk" style="justify-content:flex-start">BootROM</div>' +
         '<div class="blk" style="justify-content:flex-start">Bootloader（abl / lk）</div>' +
@@ -506,9 +506,9 @@
         '</div>' +
         '<p style="margin-top:14px"><b>容器化的差异</b>：硬件前缀（BootROM / Bootloader / 内核加载）整段砍掉，' +
         '只重放用户空间；init 的角色由容器运行时承担。</p>',
-      foot: '第 18 章 · 安卓容器化原理与核心点深度解析' },
+      foot: '第 32 章 · 安卓容器化原理与核心点深度解析' },
 
-    { kicker: 'CH 18', title: 'Waydroid 与 Magisk',
+    { kicker: 'CH 32', title: 'Waydroid 与 Magisk',
       body: '<p><b>Waydroid</b>（官方描述）：用容器方式在普通 GNU/Linux 上启动完整 Android 系统。</p>' +
         '<ul><li>用 Linux namespaces 隔离，<b>容器内的 Android 可直接访问硬件</b>（无虚拟化层，性能接近原生）</li>' +
         '<li>系统镜像基于 <b>LineageOS</b>，当前基于 Android 13</li>' +
@@ -516,9 +516,9 @@
         '<p><b>Magisk</b> 的核心：改 boot 镜像的 ramdisk，在 init 早期注入 → 抢在系统挂载前拿到控制权。</p>' +
         '<p><b>systemless</b>：不改 <code>/system</code> 分区，用 overlayfs / magic mount 把模块文件"叠加"上去 → ' +
         '可以 OTA、可以干净卸载。</p>',
-      foot: '第 18 章 · Zygisk 负责 Zygote 注入，DenyList 隐藏 root' },
+      foot: '第 32 章 · Zygisk 负责 Zygote 注入，DenyList 隐藏 root' },
 
-    { kicker: 'CH 18', title: '环境伪装的核心原则：自洽',
+    { kicker: 'CH 32', title: '环境伪装的核心原则：自洽',
       body: '<div class="big">只改一个 API 返回值，一定会被交叉验证识破。</div>' +
         '<p>以虚拟 WiFi 为例，App 会交叉核对：</p>' +
         '<ul><li><code>WifiManager</code> 返回的 SSID / BSSID</li>' +
@@ -529,21 +529,21 @@
         '<div class="note key"><div class="note-h">🔑 这条原则适用于所有环境伪装</div>' +
         '传感器数据要有<b>合理噪声</b>而不是恒定值；电池要有<b>放电曲线</b>；设备标识要<b>每个实例一套</b>。' +
         '伪装的目标不是"返回值正确"，而是"整个状态自洽"。</div>',
-      foot: '第 18 章 · 这也是风控检测的思路' },
+      foot: '第 32 章 · 这也是风控检测的思路' },
 
-    /* ---------- 第 19 章 ---------- */
-    { kicker: 'CH 19', title: '壳的三代演进：先知道敌人有哪几种',
+    /* ---------- 第 8 章 ---------- */
+    { kicker: 'CH 8', title: '壳的三代演进：先知道敌人有哪几种',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>代际</th><th>它做了什么</th><th>你 dump 出来会看到</th></tr></thead><tbody>' +
         '<tr><td><b>一代壳</b></td><td>整体加密 dex，启动时一次性解密到内存</td><td>结构完整的真 dex —— <b>被动 dump 就够了</b></td></tr>' +
         '<tr><td><b>二代壳（抽取壳）</b></td><td>静态抽走方法体，执行前一刻才回填</td><td>骨架完整、<b>方法体是空的</b> —— 必须主动调用逼它回填</td></tr>' +
         '<tr><td><b>三代壳</b></td><td>DEX2C / Java2C 抽到 native、或直接上 VMP</td><td>dex 里<b>找不到那段逻辑</b>，它已经不在 Java 层了</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note key"><div class="note-h">🔑 为什么必须先学这一章</div>' +
-        '第 2 章讲 FART 时默认你已知"壳分几代"；第 12 章讲 fdex2 时默认你懂"抽取壳"和"一代壳"的区别。' +
+        '第 16 章讲 FART 时默认你已知"壳分几代"；第 26 章讲 fdex2 时默认你懂"抽取壳"和"一代壳"的区别。' +
         '<b>不知道代际，你会用错工具</b>：拿被动 dump 去打抽取壳，只会得到一堆空方法体。</div>',
-      foot: '第 19 章 · 加固技术全景与壳的判定' },
+      foot: '第 8 章 · 加固技术全景与壳的判定' },
 
-    { kicker: 'CH 19', title: '半小时判定一个壳：观测 → 结论',
+    { kicker: 'CH 8', title: '半小时判定一个壳：观测 → 结论',
       body: '<div class="grid2"><div><b>静态侧看什么</b><ul>' +
         '<li>APK 结构：多 dex、<code>assets/</code> 里的加密文件、<code>lib/</code> 里的可疑 so</li>' +
         '<li><code>AndroidManifest</code> 的 <code>application:name</code> 被替换</li>' +
@@ -557,10 +557,10 @@
         '<div class="note warn"><div class="note-h">⚠️ 判定不是"猜厂商"，而是"定路线"</div>' +
         '结论要落到具体动作上：<b>能被动 dump / 必须主动调用 / 只能下沉 native / 要上动态 Trace</b>。' +
         '厂商名会变，技术路线不会。</div>',
-      foot: '第 19 章 · 先诊断，再选工具' },
+      foot: '第 8 章 · 先诊断，再选工具' },
 
-    /* ---------- 第 20 章 ---------- */
-    { kicker: 'CH 20', title: 'JNIEnv 与 JavaVM：两张可以被整体替换的函数表',
+    /* ---------- 第 9 章 ---------- */
+    { kicker: 'CH 9', title: 'JNIEnv 与 JavaVM：两张可以被整体替换的函数表',
       body: '<div class="big">槽位位置由 JNI 规范写死，但每个槽位里装谁，由环境决定。</div>' +
         '<p><code>JNIEnv*</code> 是<b>二级指针</b>：它指向一个结构体，结构体里只有一个成员 —— 指向函数指针数组的指针。' +
         '所以 C 里要写 <code>(*env)-&gt;FindClass(env, ...)</code>，解两次引用。</p>' +
@@ -571,9 +571,9 @@
         '<div class="note key"><div class="note-h">🔑 由此推出的排查纪律</div>' +
         'hook 一个 JNI 函数却零命中时，<b>第一顺位要怀疑的不是"我写错了"，而是"我改的表和它用的表是不是同一张"</b>。' +
         '验证方法：在 hook 里把<b>表本身的地址</b>打印出来。</div>',
-      foot: '第 20 章 · JNI / NDK 开发详解' },
+      foot: '第 9 章 · JNI / NDK 开发详解' },
 
-    { kicker: 'CH 20', title: '静态注册 vs 动态注册',
+    { kicker: 'CH 9', title: '静态注册 vs 动态注册',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th></th><th>静态注册</th><th>动态注册</th></tr></thead><tbody>' +
         '<tr><td>怎么绑定</td><td>靠命名约定：虚拟机把方法名按规则改写，去导出表找同名函数</td><td>运行时调 <code>RegisterNatives</code>，交一张三元组表</td></tr>' +
         '<tr><td>信息在哪</td><td><b>静态存在 so 的导出表里</b></td><td><b>只在运行时存在</b></td></tr>' +
@@ -583,10 +583,10 @@
         '它必须调用 <code>RegisterNatives</code> —— <b>这是虚拟机提供的唯一标准入口，名字固定，它改不了</b>。' +
         '而那三个参数（类、表指针、条数）就是完整答案：<b>方法名 / 签名 / 函数地址，一次到手</b>。<br>' +
         '所以加固方藏住了"静态可见性"，却创造了一个"运行时必经点"。<b>守住那个路口就行。</b></div>',
-      foot: '第 20 章 · 它藏得住名字，藏不住"注册"这个动作' },
+      foot: '第 9 章 · 它藏得住名字，藏不住"注册"这个动作' },
 
-    /* ---------- 第 21 章 ---------- */
-    { kicker: 'CH 21', title: 'Frida 自动化的三件套',
+    /* ---------- 第 10 章 ---------- */
+    { kicker: 'CH 10', title: 'Frida 自动化的三件套',
       body: '<div class="grid3">' +
         '<div><b>objection</b><p class="small">基于 Frida 的免脚本操作台。列模块/类、watch 方法、root disable、SSL pinning 绕过。</p>' +
         '<p class="small muted">底层就是 Frida —— <b>它的暴露面也是 Frida 的</b>。</p></div>' +
@@ -597,9 +597,9 @@
         '<div class="note key"><div class="note-h">🔑 自动化的边界</div>' +
         '它们解决的是<b>通用动作</b>（抓包、列类、打点），不解决<b>这个 App 的特定逻辑</b>。' +
         '真正的效率来自"用自动化把搜索空间缩小，再手工啃剩下的那一小块"。</div>',
-      foot: '第 21 章 · Frida 自动化与去特征' },
+      foot: '第 10 章 · Frida 自动化与去特征' },
 
-    { kicker: 'CH 21', title: '去特征：改名字只是第一层',
+    { kicker: 'CH 10', title: '去特征：改名字只是第一层',
       body: '<div class="big">改文件名和端口，挡不住线程名、模块名与行为特征。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>暴露点</th><th>改文件名能挡住吗</th><th>要做什么</th></tr></thead><tbody>' +
         '<tr><td>二进制路径 <code>/data/local/tmp/frida-server</code></td><td>✅ 能</td><td>改名 + 跑完就删</td></tr>' +
@@ -610,11 +610,11 @@
         '</tbody></table></div>' +
         '<div class="note warn"><div class="note-h">⚠️ 什么时候该放弃 Frida</div>' +
         '当暴露点已经落到"行为特征"这一层时，继续改 Frida 的收益递减得很快。' +
-        '<b>该换的不是配置，是层级</b> —— 这也是第 13 章（内核态）和第 6 章（Hypervisor）存在的理由。</div>',
-      foot: '第 21 章 · 编译 hluda 抹掉常规特征' },
+        '<b>该换的不是配置，是层级</b> —— 这也是第 27 章（内核态）和第 20 章（Hypervisor）存在的理由。</div>',
+      foot: '第 10 章 · 编译 hluda 抹掉常规特征' },
 
-    /* ---------- 第 22 章 ---------- */
-    { kicker: 'CH 22', title: 'Frida vs Xposed/LSPosed：五个维度的差异',
+    /* ---------- 第 11 章 ---------- */
+    { kicker: 'CH 11', title: 'Frida vs Xposed/LSPosed：五个维度的差异',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>维度</th><th>Frida</th><th>Xposed / LSPosed</th></tr></thead><tbody>' +
         '<tr><td>进程模型</td><td><b>按需注入单个进程</b></td><td><b>常驻 Zygote，对每个 App 生效</b></td></tr>' +
         '<tr><td>注入时机</td><td>你决定（attach / spawn）</td><td>Zygote fork 时就已在场</td></tr>' +
@@ -625,9 +625,9 @@
         '<div class="note key"><div class="note-h">🔑 一句话选型</div>' +
         '<b>临时进现场取证用 Frida；要给整栋楼换一套门禁系统用 LSPosed。</b><br>' +
         '要做"长期监控某个 App 的全部加密调用"，LSPosed 更合适；要"今天就把这个函数调一遍看结果"，Frida 更快。</div>',
-      foot: '第 22 章 · Xposed / LSPosed 开发指南' },
+      foot: '第 11 章 · Xposed / LSPosed 开发指南' },
 
-    { kicker: 'CH 22', title: 'Hook 时机：构造函数、loadClass、壳 dex',
+    { kicker: 'CH 11', title: 'Hook 时机：构造函数、loadClass、壳 dex',
       body: '<div class="grid2"><div><b>构造函数为什么容易漏</b><ul>' +
         '<li>对象状态<b>在构造时就定型了</b>，你在之后 hook 方法看到的是结果</li>' +
         '<li><code>hookAllConstructors</code> 与逐个 hook 各有取舍</li>' +
@@ -639,10 +639,10 @@
         '<div class="note key"><div class="note-h">🔑 和反射那条经验是同一个道理</div>' +
         '<b>凡是"名字被藏起来"的地方，就去守它绕不过去的动作。</b>' +
         '类再混淆，也<b>必须被加载</b>；而加载必然经过 ClassLoader。</div>',
-      foot: '第 22 章 · 与第 2 章的双亲委派直接呼应' },
+      foot: '第 11 章 · 与第 16 章的双亲委派直接呼应' },
 
-    /* ---------- 第 23 章 ---------- */
-    { kicker: 'CH 23', title: 'HTTPS 抓包的分界线：信任锚在哪',
+    /* ---------- 第 12 章 ---------- */
+    { kicker: 'CH 12', title: 'HTTPS 抓包的分界线：信任锚在哪',
       body: '<div class="big">"证书装了却抓不到" —— 不是没装好，是它根本不查系统证书库。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>层次</th><th>信任锚</th><th>你的处境</th></tr></thead><tbody>' +
         '<tr><td>普通 App</td><td>系统证书库</td><td>把根证书装进系统库就能抓</td></tr>' +
@@ -653,9 +653,9 @@
         '<div class="note warn"><div class="note-h">⚠️ 一个容易被忽略的分水岭</div>' +
         '<b>Android 7.0 起，用户证书默认不再被 App 信任</b> —— 这是很多人"证书明明装了"却抓不到包的真正原因，' +
         '和 SSL Pinning 是两件事，别混为一谈。</div>',
-      foot: '第 23 章 · 抓包全解与协议分析' },
+      foot: '第 12 章 · 抓包全解与协议分析' },
 
-    { kicker: 'CH 23', title: '抓不到包时的诊断顺序',
+    { kicker: 'CH 12', title: '抓不到包时的诊断顺序',
       body: '<ol style="font-size:16px;line-height:2">' +
         '<li><b>先确认流量到底有没有走代理</b> —— 是不是压根没发请求？是不是走了 QUIC / 直连 IP？</li>' +
         '<li><b>CONNECT 成功但没有后续字节</b> → 校验证书这一步被拒了（信任锚问题）</li>' +
@@ -666,10 +666,10 @@
         '<div class="note key"><div class="note-h">🔑 抓包失败的每一步都能给出信息</div>' +
         '关键是<b>别停在"抓不到"这个结论上</b> —— 要问清楚它失败在握手、校验证书、还是加密层。' +
         '这三层对应的解法完全不同。</div>',
-      foot: '第 23 章 · 分层诊断，而不是反复重装证书' },
+      foot: '第 12 章 · 分层诊断，而不是反复重装证书' },
 
-    /* ---------- 第 24 章 ---------- */
-    { kicker: 'CH 24', title: '自吐沙箱：让算法自己招供',
+    /* ---------- 第 13 章 ---------- */
+    { kicker: 'CH 13', title: '自吐沙箱：让算法自己招供',
       body: '<div class="big">从"读汇编推算法"变成"读日志抄答案"。</div>' +
         '<div class="grid2"><div><b>观测点插在框架层</b><ul>' +
         '<li>覆盖面广：<b>监控 API，而不是监控某个算法</b></li>' +
@@ -683,9 +683,9 @@
         '<b>拿到密钥之后，还原就不需要读一行汇编了。</b><br>' +
         '加密存放的数据在使用前<b>必须变成明文</b> —— 而"变成明文"的那一刻，内存里就是可以直接读的。' +
         '所以逆解密算法往往是<b>最贵的路径</b>，而观测输出是最便宜的。</div>',
-      foot: '第 24 章 · 自吐沙箱与算法自监控' },
+      foot: '第 13 章 · 自吐沙箱与算法自监控' },
 
-    { kicker: 'CH 24', title: '三个汇聚点：MessageDigest / Cipher / Mac',
+    { kicker: 'CH 13', title: '三个汇聚点：MessageDigest / Cipher / Mac',
       body: '<p>Java 密码学 API 的调用最终都会汇聚到这三个类。<b>插桩插在这里，等于插在所有算法的上游。</b></p>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>类</th><th>要抓什么</th><th>抓到了意味着</th></tr></thead><tbody>' +
         '<tr><td><code>MessageDigest</code></td><td><code>update</code> 的入参、<code>digest</code> 的输出</td><td>摘要算法（<b>注意 update 可能被多次调用，要按顺序拼接</b>）</td></tr>' +
@@ -694,30 +694,30 @@
         '</tbody></table></div>' +
         '<div class="grid2"><div><b>沙箱 vs Frida 的取舍</b><ul>' +
         '<li>沙箱：时序更早、不受反调试影响、可长期用</li>' +
-        '<li><b>代价：每换一个安卓版本都要重新适配</b>（和第 12 章同一个坑）</li></ul></div>' +
+        '<li><b>代价：每换一个安卓版本都要重新适配</b>（和第 26 章同一个坑）</li></ul></div>' +
         '<div><b>它的边界（要诚实）</b><ul>' +
         '<li>算法下沉到 native → Java 层自吐失效</li>' +
         '<li>自定义 Provider / 自实现密码学 → 插桩点零命中</li>' +
-        '<li>这时要回到第 8 章的常量比对</li></ul></div></div>',
-      foot: '第 24 章 · 与第 4 章的 ART 插桩是同一条路线' },
+        '<li>这时要回到第 22 章的常量比对</li></ul></div></div>',
+      foot: '第 13 章 · 与第 18 章的 ART 插桩是同一条路线' },
 
-    /* ---------- 第 25 章 ---------- */
-    { kicker: 'CH 25', title: '白盒密码：威胁模型完全不同',
+    /* ---------- 第 14 章 ---------- */
+    { kicker: 'CH 14', title: '白盒密码：威胁模型完全不同',
       body: '<div class="big">传统密码学假设"密钥保密、算法公开"。白盒场景下这个假设被推翻了。</div>' +
         '<p>白盒的目标是：<b>即使攻击者拥有实现的一切 —— 能读内存、能单步、能改代码 —— 也不该直接暴露密钥</b>。</p>' +
         '<div class="grid2"><div><b>怎么认出白盒</b><ul>' +
         '<li><b>没有密钥常量、没有标准 S 盒、没有标准轮密钥</b></li>' +
         '<li>取而代之的是巨大的查找表（KB 到几百 KB）</li>' +
         '<li>大量"表查找 + 异或"，以及输入输出编码</li>' +
-        '<li><span class="hit">第 8 章的常量比对法在这里会全部零命中 —— 这本身就是诊断信号</span></li></ul></div>' +
+        '<li><span class="hit">第 22 章的常量比对法在这里会全部零命中 —— 这本身就是诊断信号</span></li></ul></div>' +
         '<div><b>为什么统计上能区分它</b><ul>' +
         '<li>白盒表看起来随机，但<b>继承了 AES 的代数结构</b></li>' +
         '<li>可观测量：值分布熵、是否构成双射、行间差分分布</li>' +
         '<li>编码造成的非均匀性</li>' +
         '<li><b>这些统计特征既是识别方法，也是攻击入口</b></li></ul></div></div>',
-      foot: '第 25 章 · 白盒密码：白盒 AES 与 DFA 攻击' },
+      foot: '第 14 章 · 白盒密码：白盒 AES 与 DFA 攻击' },
 
-    { kicker: 'CH 25', title: 'DFA：故障注入在哪一轮，决定了能不能打',
+    { kicker: 'CH 14', title: 'DFA：故障注入在哪一轮，决定了能不能打',
       body: '<ol style="font-size:16px;line-height:2">' +
         '<li>在<b>倒数第二轮</b>的某个中间状态注入一个<i>已知位置</i>的单字节故障</li>' +
         '<li>观察密文怎么变 —— 由于 MixColumns 的列扩散与 ShiftRows 的行扩散，' +
@@ -731,14 +731,14 @@
         '<div class="note warn"><div class="note-h">⚠️ 最后的工程判断</div>' +
         '遇到白盒，先问<b>"值不值得攻"</b>，再问"怎么攻"。白盒不是绝对安全，它只是<b>把攻击成本抬高</b> —— ' +
         '你的时间也是成本。</div>',
-      foot: '第 25 章 · 本站唯一需要"动手算密码学"的章节' },
+      foot: '第 14 章 · 本站唯一需要"动手算密码学"的章节' },
 
-    /* ---------- 第 26 章 ---------- */
-    { kicker: 'CH 26', title: 'App 不是"一个程序"，而是一排被系统随时唤起的窗口',
+    /* ---------- 第 1 章 ---------- */
+    { kicker: 'CH 1', title: 'App 不是"一个程序"，而是一排被系统随时唤起的窗口',
       body: '<div class="big">你的代码永远不会"自己开始跑"——它总是被某个人、通过某个入口、在某个线程上调起来的。</div>' +
         '<p><b>从点击图标到首帧，九步里只有四个是逆向的必经点：</b></p>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>步骤</th><th>发生了什么</th><th>为什么它是必经点</th></tr></thead><tbody>' +
-        '<tr><td>③</td><td>Zygote <code>fork</code>（不是 exec）</td><td><b>Zygote 是所有 App 的共同祖先</b>——在它里面注入，就对之后每个 App 生效（第 22 章 LSPosed）</td></tr>' +
+        '<tr><td>③</td><td>Zygote <code>fork</code>（不是 exec）</td><td><b>Zygote 是所有 App 的共同祖先</b>——在它里面注入，就对之后每个 App 生效（第 11 章 LSPosed）</td></tr>' +
         '<tr><td>④</td><td><code>ActivityThread.main</code> → <code>Looper.loop()</code></td><td>App 唯一的 main 是<b>一句死循环</b>：之后就在"等消息"，不是"执行逻辑"</td></tr>' +
         '<tr><td>⑥</td><td><code>ContentProvider.onCreate</code></td><td><b>早于 <code>Application.onCreate</code></b>——初始化顺序、加固藏身点</td></tr>' +
         '<tr><td>⑦</td><td><code>attachBaseContext</code> → <code>Application.onCreate</code></td><td>加固壳的第一现场：业务代码一行没跑，它可以解密 dex、换类加载器</td></tr>' +
@@ -746,9 +746,9 @@
         '<div class="note warn"><div class="note-h">⚠️ 由此推出的两条实战纪律</div>' +
         '① <b>Hook 之前先问三件事：</b>它在哪个进程、什么时刻、哪条线程。<b>"装上了但零命中"的答案一半在这里。</b><br>' +
         '② <b>onDestroy 不保证被调用</b>，"退出时清理"这种设计在安卓上天生不可靠。</div>',
-      foot: '第 26 章 · 安卓应用基础模型：组件、生命周期与 IPC' },
+      foot: '第 1 章 · 安卓应用基础模型：组件、生命周期与 IPC' },
 
-    { kicker: 'CH 26', title: 'Binder：一次跨进程调用，物理落点是一次 ioctl',
+    { kicker: 'CH 1', title: 'Binder：一次跨进程调用，物理落点是一次 ioctl',
       body: '<div class="grid2"><div><b>一条调用的七步</b><ol>' +
         '<li>向 <code>ServiceManager</code>（句柄 0）取服务句柄</li>' +
         '<li>AIDL 的 <code>Proxy</code> 打包：<b>描述符 + 事务编号 + Parcel</b></li>' +
@@ -758,15 +758,15 @@
         '<li><code>BC_REPLY</code> → <code>BR_REPLY</code>，客户端被唤醒</li>' +
         '<li>变体：<code>oneway</code> 不等待回复</li></ol></div>' +
         '<div><b>三条最值钱的推论</b><ul>' +
-        '<li><b>基于文件 syscall 的监控看不到 Binder</b>——它走 ioctl，不走 open/read/write（第 24 章的真实案例）</li>' +
+        '<li><b>基于文件 syscall 的监控看不到 Binder</b>——它走 ioctl，不走 open/read/write（第 13 章的真实案例）</li>' +
         '<li><b>客户端侧只有"编号 + Parcel"，没有方法名</b>；接口描述符与服务名是明文的，这是定位线索</li>' +
         '<li><b>同进程调用不走 Binder</b>：<code>asInterface</code> 发现本地对象就直接调——"为什么只抓到一部分调用"的答案</li></ul>' +
         '<p class="small muted">安全性质：<b>身份（UID/PID）由内核填，不可伪造</b>；但它<b>不保证"返回的数据没被改过"</b>——中间人就在你自己进程里。</p>' +
         '</div></div>',
-      foot: '第 26 章 · 这一节的实战版见本章案例：GOT Hook 劫持 libbinder 的 ioctl' },
+      foot: '第 1 章 · 这一节的实战版见本章案例：GOT Hook 劫持 libbinder 的 ioctl' },
 
-    /* ---------- 第 27 章 ---------- */
-    { kicker: 'CH 27', title: 'Smali：最容易卡住的两处，一次讲透',
+    /* ---------- 第 2 章 ---------- */
+    { kicker: 'CH 2', title: 'Smali：最容易卡住的两处，一次讲透',
       body: '<div class="grid2"><div><b>① 寄存器模型</b><ul>' +
         '<li><code>.registers</code>（总数）与 <code>.locals</code>（不含参数）<b>是两种写法，不是两件事</b></li>' +
         '<li>参数寄存器 <code>p0…pN</code> <b>在编号的末尾</b>，所以 <code>v</code> 和 <code>p</code> 能互相换算</li>' +
@@ -783,52 +783,52 @@
         '</tbody></table></div>' +
         '<p class="small"><b>返回值必须紧跟 <code>move-result*</code></b>——这是"孤儿 move-result"报错的来源。<br>' +
         '<b>一行 Java 的 <code>new</code> 变成两行 Smali</b>：<code>new-instance</code> + <code>invoke-direct {…}, &lt;init&gt;</code>。</p></div></div>',
-      foot: '第 27 章 · Smali 汇编与重打包实战' },
+      foot: '第 2 章 · Smali 汇编与重打包实战' },
 
-    { kicker: 'CH 27', title: '重打包：每一步失败会长什么样',
+    { kicker: 'CH 2', title: '重打包：每一步失败会长什么样',
       body: '<div class="big">改 Smali 只是开始；装不上、闪退、拒绝运行，各有各的原因。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>步骤</th><th>失败时你会看到</th><th>真正的原因</th></tr></thead><tbody>' +
         '<tr><td>apktool 回编译</td><td>资源类报错 / 汇编报错</td><td>资源名被混淆、<code>strings.xml</code> 名不可用、指令写错</td></tr>' +
         '<tr><td><b>签名</b></td><td><code>INSTALL_FAILED_UPDATE_INCOMPATIBLE</code></td><td><b>签名与已装版本不一致，必须先卸载</b></td></tr>' +
         '<tr><td>zipalign</td><td>装上了但异常</td><td>页对齐要求（新版对 <code>-p/-P</code> 有额外要求）</td></tr>' +
-        '<tr><td><b>启动</b></td><td><b>一闪就退 / 拒绝联网</b></td><td><b>签名变了 → 触发签名校验 / 完整性校验</b>（第 19 章的"防二次打包"）</td></tr>' +
+        '<tr><td><b>启动</b></td><td><b>一闪就退 / 拒绝联网</b></td><td><b>签名变了 → 触发签名校验 / 完整性校验</b>（第 8 章的"防二次打包"）</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note key"><div class="note-h">🔑 两条判断</div>' +
         '① <b>"改完重打包就闪退"是设计使然，不是你的操作错了</b>——加固产品的默认开启项就是签名校验。<br>' +
         '② <b>后门植入的常见位置</b>（改 <code>Application</code>、加启动 Activity、插 so、劫持 <code>dlsym</code>）' +
         '同时也是你排查"这个包被动过没有"的检查点。<br>' +
         '<span class="hit">讲原理是为了识别与防范；改包重打包在带加固的样本上常常走不通，别把它当成万能钥匙。</span></div>',
-      foot: '第 27 章 · 攻防两侧看的是同一件事' },
+      foot: '第 2 章 · 攻防两侧看的是同一件事' },
 
-    /* ---------- 第 28 章 ---------- */
-    { kicker: 'CH 28', title: 'APK / DEX / ELF：三种容器，三种拆法',
+    /* ---------- 第 3 章 ---------- */
+    { kicker: 'CH 3', title: 'APK / DEX / ELF：三种容器，三种拆法',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>格式</th><th>它是什么</th><th>拆它的关键</th><th>逆向价值</th></tr></thead><tbody>' +
         '<tr><td><b>APK</b></td><td>zip 容器（本地头 / 中央目录 / EOCD）</td><td>二进制 XML、<code>resources.arsc</code>、<b>v1/v2/v3 签名块</b></td><td><b>签名块的位置就是"改完包就装不上"的结构性原因</b></td></tr>' +
-        '<tr><td><b>DEX</b></td><td>八个索引区 + data + map_list</td><td>索引区去重设计、<code>class_defs</code> → <code>code_item</code></td><td><b>抽取壳抽走的正是 code_item 里的 insns</b>（第 2、12、19 章）</td></tr>' +
+        '<tr><td><b>DEX</b></td><td>八个索引区 + data + map_list</td><td>索引区去重设计、<code>class_defs</code> → <code>code_item</code></td><td><b>抽取壳抽走的正是 code_item 里的 insns</b>（第 16、26、8 章）</td></tr>' +
         '<tr><td><b>ELF</b></td><td>头 + 程序头 + 节表 + 符号表</td><td><b>"段"给加载器看，"节"给分析者看</b></td><td>节表异常 = 加固痕迹；<code>.dynsym</code> 里的 <code>Java_</code> 是路标</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note warn"><div class="note-h">⚠️ 两个最容易搞混的地方</div>' +
         '① <b>段（segment）≠ 节（section）</b>：运行时按 <code>PT_LOAD</code> 段映射，分析时按 <code>.text/.data</code> 节理解。' +
         '<b><code>p_memsz &gt; p_filesz</code> 的那部分就是 .bss 的来源。</b><br>' +
         '② <b>strip 掉的是 <code>.symtab</code>，不是 <code>.dynsym</code></b>——动态链接器运行时还要用后者。' +
-        '所以"符号表空了"不等于"没有名字可看"；<b>真正让导出表变空的是 JNI 动态注册</b>（第 20 章）。</div>',
-      foot: '第 28 章 · APK / DEX / ELF 文件格式解析' },
+        '所以"符号表空了"不等于"没有名字可看"；<b>真正让导出表变空的是 JNI 动态注册</b>（第 9 章）。</div>',
+      foot: '第 3 章 · APK / DEX / ELF 文件格式解析' },
 
-    { kicker: 'CH 28', title: '一个 so 的四张表，各管什么',
+    { kicker: 'CH 3', title: '一个 so 的四张表，各管什么',
       body: '<div class="grid2"><div><b>ELF 头（64 字节）</b><p class="small">魔数 / 类别（32/64 位）/ 端序 / <code>e_machine</code> / <code>e_entry</code> / 各表的偏移与数量。<b>先看它合不合法——这是判断"so 有没有被整体加密"的第一判据。</b></p>' +
         '<b>程序头表（给加载器）</b><p class="small"><code>PT_LOAD</code> 决定怎么映射进内存；<code>PT_DYNAMIC</code> 指向动态信息；<code>PT_GNU_RELRO</code> 是只读重定位。<b>页对齐在这里生效。</b></p></div>' +
         '<div><b>节表（给分析者）</b><p class="small"><code>.text</code> / <code>.rodata</code> / <code>.data</code> / <code>.bss</code> / <code>.init_array</code>… ' +
-        '<b><code>sh_flags</code> 里的可写+可执行，就是 maps 里"rwx 段"的来源</b>（第 19 章的判定表）。</p>' +
+        '<b><code>sh_flags</code> 里的可写+可执行，就是 maps 里"rwx 段"的来源</b>（第 8 章的判定表）。</p>' +
         '<b>符号表（给链接器与分析者）</b><p class="small"><code>Elf64_Sym</code> 六字段；<b>绑定类型 LOCAL/GLOBAL/WEAK</b>、类型 FUNC/OBJECT。<br>' +
         '<b>导入 vs 导出怎么分</b>：看 <code>st_shndx</code> 是不是 <code>SHN_UNDEF</code>。</p></div></div>' +
         '<div class="note key"><div class="note-h">🔑 重定位是把四张表串起来的那根线</div>' +
         '<code>.rela.dyn</code> / <code>.rela.plt</code> 里的 <code>R_AARCH64_GLOB_DAT</code> / <code>JUMP_SLOT</code> ' +
-        '<b>就是 GOT / PLT 被填上的过程</b>——第 7 章"改写 GOT 做 import hook"、第 26 章案例"GOT Hook 劫持 ioctl"，' +
+        '<b>就是 GOT / PLT 被填上的过程</b>——第 21 章"改写 GOT 做 import hook"、第 1 章案例"GOT Hook 劫持 ioctl"，' +
         '用的都是这条机制。<span class="hit">看懂重定位，你才知道自己改的那张表是怎么被用的。</span></div>',
-      foot: '第 28 章 · 拿到一个 APK，先看哪几个字段' },
+      foot: '第 3 章 · 拿到一个 APK，先看哪几个字段' },
 
-    /* ---------- 第 29 章 ---------- */
-    { kicker: 'CH 29', title: '七类风险，一个共根：导出',
+    /* ---------- 第 4 章 ---------- */
+    { kicker: 'CH 4', title: '七类风险，一个共根：导出',
       body: '<div class="big">组件的"导出"就是把功能变成"任何 App 都能调的 API"。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>风险</th><th>根因</th><th>怎么查</th></tr></thead><tbody>' +
         '<tr><td>应用重打包</td><td>签名可被换掉</td><td>签名校验 / 完整性校验</td></tr>' +
@@ -842,9 +842,9 @@
         '<div class="note key"><div class="note-h">🔑 判断攻击面必须三件事一起看</div>' +
         '<code>exported</code> + <code>intent-filter</code>（隐式导出的历史规则）+ <code>permission</code>（权限门）。' +
         '<b>只看 exported 会误判。</b>另外 Android 12 起带 intent-filter 的组件必须显式声明 exported——<b>这本身就是一条版本线索。</b></div>',
-      foot: '第 29 章 · 安卓应用安全风险与审计' },
+      foot: '第 4 章 · 安卓应用安全风险与审计' },
 
-    { kicker: 'CH 29', title: '审计的两把工具，与"30 分钟清单"',
+    { kicker: 'CH 4', title: '审计的两把工具，与"30 分钟清单"',
       body: '<div class="grid2"><div><b>Drozer</b><p class="small">以"攻击者 App"的身份在真机上<b>实际调用</b>你的组件——' +
         '能发现静态扫描发现不了的问题（比如一个导出的 Provider 真的能读到别人数据）。<br>' +
         '<span class="pill warn">生态维护状态与安装方式请以官方当期说明为准</span></p>' +
@@ -861,13 +861,13 @@
         '<div class="note warn"><div class="note-h">⚠️ 换个视角看这一章</div>' +
         '前面二十多章讲的是"<b>我作为分析方怎么突破 App 的防护</b>"；这一章讲"<b>App 自己有哪些缺陷</b>"。' +
         '<span class="hit">但这两份清单是同一张：<b>导出的组件既是攻击面，也是你逆向下钩子的入口。</b></span></div>',
-      foot: '第 29 章 · 攻击面清单 = 入口清单' },
+      foot: '第 4 章 · 攻击面清单 = 入口清单' },
 
-    /* ---------- 第 30 章 ---------- */
-    { kicker: 'CH 30', title: '环境五块拼图，与 debuggable 的两个层次',
+    /* ---------- 第 5 章 ---------- */
+    { kicker: 'CH 5', title: '环境五块拼图，与 debuggable 的两个层次',
       body: '<div class="grid2"><div><b>五块拼图与它们的依赖</b><ul>' +
         '<li><b>真机 root</b>——解锁 bootloader 有代价（清数据 / 熔断 / 保修），而且 <b>root 本身就是风控信号</b></li>' +
-        '<li><b>抓包证书</b>——Android 7 起用户证书不被信任，三种过线方式各有代价（第 23 章）</li>' +
+        '<li><b>抓包证书</b>——Android 7 起用户证书不被信任，三种过线方式各有代价（第 12 章）</li>' +
         '<li><b>Hook 环境</b>——frida-server（按需注入）vs LSPosed（常驻 Zygote），一句话取舍</li>' +
         '<li><b>DEBUG 环境</b>——开发者选项、<code>am start -D</code>、JDWP 转发</li>' +
         '<li><b>设备/机型</b>——决定上面四块能不能落地</li></ul>' +
@@ -878,10 +878,10 @@
         '<tr><td><code>android:debuggable</code></td><td><b>应用清单属性</b>，决定这个 App 能否被调试</td><td>重打包改清单（<b>会破坏签名</b>）</td></tr>' +
         '</tbody></table></div>' +
         '<p class="small"><b>为什么它会被检测：</b>debuggable 状态是 <code>PackageManager</code> 里明晃晃的字段，' +
-        '风控一眼就能看到——第 26 章那个案例就是<b>在 Binder 层把 <code>FLAG_DEBUGGABLE</code> 清掉</b>来隐藏它。</p></div></div>',
-      foot: '第 30 章 · 逆向工作环境与关键代码定位' },
+        '风控一眼就能看到——第 1 章那个案例就是<b>在 Binder 层把 <code>FLAG_DEBUGGABLE</code> 清掉</b>来隐藏它。</p></div></div>',
+      foot: '第 5 章 · 逆向工作环境与关键代码定位' },
 
-    { kicker: 'CH 30', title: '定位关键代码的七条线索（按成本排序）',
+    { kicker: 'CH 5', title: '定位关键代码的七条线索（按成本排序）',
       body: '<div class="big">"怎么知道该 hook 哪里"——这一章把它变成了一个可以按顺序试的清单。</div>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>#</th><th>线索</th><th>成本</th><th>什么时候最灵 / 什么时候必然失效</th></tr></thead><tbody>' +
         '<tr><td>1</td><td><b>字符串搜索</b></td><td>最低</td><td>有明文错误提示 / URL / 日志 TAG 时最灵；字符串被加密就失效</td></tr>' +
@@ -890,29 +890,29 @@
         '<tr><td>4</td><td><b>调用栈</b></td><td>中</td><td><b>第一次出现目标的那一帧就是业务边界</b>；跨线程/跨进程后栈会断</td></tr>' +
         '<tr><td>5</td><td><b>UI 组件定位</b></td><td>中</td><td>从界面反推 Activity/资源——<b>"从现象反推代码"最快的一条</b>；非原生 UI（Flutter）失效</td></tr>' +
         '<tr><td>6</td><td>Method Profiling</td><td>较高</td><td><b>给你候选集，不给你证据</b>；采样丢失与内联是盲区</td></tr>' +
-        '<tr><td>7</td><td>日志线索</td><td>低</td><td>最便宜的记录；日志被清理后要另找（第 19 章）</td></tr>' +
+        '<tr><td>7</td><td>日志线索</td><td>低</td><td>最便宜的记录；日志被清理后要另找（第 8 章）</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note key"><div class="note-h">🔑 贯穿这一章的纪律</div>' +
         '<b>每一步都要能回答"成功时看到什么、失败时排除什么"。</b>答不上来的动作往后排。<br>' +
         '<span class="hit">七条全试过还找不到，说明问题不在"定位"而在"层次"——该换一层观测，而不是在同一层里换钩子。</span></div>',
-      foot: '第 30 章 · 把散落各章的方法收成一套方法论' },
+      foot: '第 5 章 · 把散落各章的方法收成一套方法论' },
 
-    /* ---------- 第 31 章 ---------- */
-    { kicker: 'CH 31', title: '密码学地图：六类功能，六种逆向打法',
+    /* ---------- 第 6 章 ---------- */
+    { kicker: 'CH 6', title: '密码学地图：六类功能，六种逆向打法',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>类别</th><th>代表</th><th>逆向时盯什么</th><th>已讲章节</th></tr></thead><tbody>' +
-        '<tr><td><b>编码</b></td><td>Base64 / Hex / URL</td><td><b>没有密钥，全部难度在"表"</b>——拿到表就赢</td><td>第 8 章</td></tr>' +
-        '<tr><td><b>摘要</b></td><td>MD5 / SHA-1 / SHA-256</td><td>没有密钥，长度固定，<b>常被加盐</b></td><td>第 8、9 章</td></tr>' +
-        '<tr><td><b>MAC</b></td><td>HMAC</td><td><b><code>0x36</code>/<code>0x5C</code> 的 ipad/opad 结构是最好的识别点</b></td><td>第 8 章</td></tr>' +
-        '<tr><td><b>对称加密</b></td><td>DES / AES + 模式与填充</td><td>密钥是核心；<b>模式与填充决定你能不能复现</b></td><td>第 8、9 章</td></tr>' +
+        '<tr><td><b>编码</b></td><td>Base64 / Hex / URL</td><td><b>没有密钥，全部难度在"表"</b>——拿到表就赢</td><td>第 22 章</td></tr>' +
+        '<tr><td><b>摘要</b></td><td>MD5 / SHA-1 / SHA-256</td><td>没有密钥，长度固定，<b>常被加盐</b></td><td>第 22、23 章</td></tr>' +
+        '<tr><td><b>MAC</b></td><td>HMAC</td><td><b><code>0x36</code>/<code>0x5C</code> 的 ipad/opad 结构是最好的识别点</b></td><td>第 22 章</td></tr>' +
+        '<tr><td><b>对称加密</b></td><td>DES / AES + 模式与填充</td><td>密钥是核心；<b>模式与填充决定你能不能复现</b></td><td>第 22、23 章</td></tr>' +
         '<tr><td><b>非对称</b></td><td><b>RSA</b> / ECC</td><td><b>公钥本来就是公开的</b>——这才是它与前面所有类别最大的不同</td><td><b>本章</b></td></tr>' +
-        '<tr><td><b>密钥交换 / KDF</b></td><td>ECDHE / PBKDF2</td><td>决定"密钥从哪来"；<b>会话密钥不在客户端常驻</b></td><td><b>本章</b>、第 23 章</td></tr>' +
+        '<tr><td><b>密钥交换 / KDF</b></td><td>ECDHE / PBKDF2</td><td>决定"密钥从哪来"；<b>会话密钥不在客户端常驻</b></td><td><b>本章</b>、第 12 章</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note key"><div class="note-h">🔑 三个可测量的量（拿到一段不明常量先算它们）</div>' +
         '<b>长度</b>（16/20/32/64/128/256 字节各自指向什么）、<b>字符集</b>（hex / base64 / 可见 ASCII）、' +
         '<b>熵</b>（高熵 = 密文或摘要；低熵 = 可能是编码）。<span class="hit">这三个量能在几秒内把候选范围砍掉一大半。</span></div>',
-      foot: '第 31 章 · 算法地图与 RSA 逆向' },
+      foot: '第 6 章 · 算法地图与 RSA 逆向' },
 
-    { kicker: 'CH 31', title: 'RSA 的两个坑：方向搞反、填充搞错',
+    { kicker: 'CH 6', title: 'RSA 的两个坑：方向搞反、填充搞错',
       body: '<div class="grid2"><div><b>坑一：加密与签名，方向相反</b>' +
         '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>用途</th><th>用哪把钥匙</th></tr></thead><tbody>' +
         '<tr><td>加密（保密）</td><td><b>公钥加密 → 私钥解密</b></td></tr>' +
@@ -932,15 +932,15 @@
         '① 只是把数据 Base64/Hex 了一遍，跟 RSA 毫无关系；' +
         '② <b>modulus 是固定值、e 取很小（如 3）</b>——通常意味着它只是拿公钥当固定串在做运算；' +
         '③ <b>把 RSA 当异或替代品用</b>（固定串 XOR）。<span class="hit">先排除假的，再研究真的。</span></div>',
-      foot: '第 31 章 · 本章有"小参数 RSA 全流程"实验：自己算 d、自己验证解密' },
+      foot: '第 6 章 · 本章有"小参数 RSA 全流程"实验：自己算 d、自己验证解密' },
 
-    /* ---------- 第 32 章 ---------- */
-    { kicker: 'CH 32', title: 'AI 辅助逆向：先算清时间花在哪，再说它值不值',
+    /* ---------- 第 7 章 ---------- */
+    { kicker: 'CH 7', title: 'AI 辅助逆向：先算清时间花在哪，再说它值不值',
       body: '<div class="big">把逆向的工作量拆开，才知道模型能替掉哪一格、替不掉哪一格。</div>' +
         '<div class="grid2"><div><b>它真正擅长的四件事</b><ul>' +
         '<li><b>批量命名与注释</b>——把"人读一遍 sub_xxxx"的成本压到极低，<b>人只做审核</b>。投入产出比最高</li>' +
-        '<li><b>识别库函数</b>——从特征常量与调用模式做匹配（与第 8 章的常量比对同源）</li>' +
-        '<li><b>读平坦化代码</b>——它在长距离依赖里找规律的能力比人强，<b>与第 5 章 OLLVM 是天然结合点</b></li>' +
+        '<li><b>识别库函数</b>——从特征常量与调用模式做匹配（与第 22 章的常量比对同源）</li>' +
+        '<li><b>读平坦化代码</b>——它在长距离依赖里找规律的能力比人强，<b>与第 19 章 OLLVM 是天然结合点</b></li>' +
         '<li><b>写脚本、跨语言翻译</b>——把"我要 hook 这两个参数"翻成 Frida 脚本；伪代码 → Python</li></ul></div>' +
         '<div><b>它必然出错的地方</b><ul>' +
         '<li><b>幻觉</b>：编造 API / 签名；把"看起来像"的魔改算法说成"就是标准 AES"</li>' +
@@ -951,30 +951,30 @@
         '<b>AI 的输出必须逐条验证，而"验证"本身就是逆向里最贵的一步——' +
         '如果你不懂，你无法验证；如果你懂，你可能也不需要它。</b>' +
         '<span class="hit">所以它的定位不是"替你想"，而是"替你做苦力"。</span></div>',
-      foot: '第 32 章 · AI 辅助逆向分析' },
+      foot: '第 7 章 · AI 辅助逆向分析' },
 
-    { kicker: 'CH 32', title: '分工原则：它生成候选，你承担结论',
+    { kicker: 'CH 7', title: '分工原则：它生成候选，你承担结论',
       body: '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>任务类型</th><th>交给 AI？</th><th>理由</th></tr></thead><tbody>' +
         '<tr><td>给 200 个 <code>sub_xxxx</code> 命名</td><td><b>✅ 交</b></td><td>输出可快速验证；错了改个名字而已</td></tr>' +
         '<tr><td>把伪代码翻成 Python</td><td><b>✅ 交</b></td><td>可以用样本对拍验证</td></tr>' +
         '<tr><td>写一个 hook 这两个参数的 Frida 脚本</td><td><b>✅ 交</b></td><td>跑一下就知道对不对</td></tr>' +
-        '<tr><td>判断"这段魔改算法是哪个变种"</td><td><b>❌ 不交</b></td><td><b>这是结论</b>。要用第 8 章的常量比对自己得出</td></tr>' +
+        '<tr><td>判断"这段魔改算法是哪个变种"</td><td><b>❌ 不交</b></td><td><b>这是结论</b>。要用第 22 章的常量比对自己得出</td></tr>' +
         '<tr><td>决定"这个签名算法能不能还原"</td><td><b>❌ 不交</b></td><td>这是工程判断，牵扯成本与授权</td></tr>' +
         '<tr><td>把客户 so / 密钥 / 抓包数据上传</td><td><b>先回答合规问题</b></td><td>上传之前必须先确认数据是否允许外发</td></tr>' +
         '</tbody></table></div>' +
         '<div class="note key"><div class="note-h">🔑 三条纪律 + 一条五分钟判据</div>' +
         '① 凡是 AI 给的<b>地址、偏移、版本号、API 名</b>，一律回源核对；<br>' +
         '② 让它做<b>可验证的任务</b>，不让它做<b>下结论的任务</b>；<br>' +
-        '③ 永远保留一条<b>不依赖 AI 的验证路径</b>（样本对拍 / 常量比对 / 自吐沙箱）——这是第 8、9、24 章存在的理由。<br>' +
+        '③ 永远保留一条<b>不依赖 AI 的验证路径</b>（样本对拍 / 常量比对 / 自吐沙箱）——这是第 22、23、13 章存在的理由。<br>' +
         '<span class="hit">五分钟判据：<b>输出你能在五分钟内验证，就交给它；验证它要两小时，就自己做。</b></span></div>',
-      foot: '第 32 章 · 与"让程序自己招供"（第 24 章）的分工：观测 vs 生成' },
+      foot: '第 7 章 · 与"让程序自己招供"（第 13 章）的分工：观测 vs 生成' },
 
     /* ---------- 收尾 ---------- */
     { kicker: 'SUMMARY', title: '全课的六个元原则',
       body: '<ol style="font-size:16.5px;line-height:2">' +
         '<li><b>静观看不懂的，让程序自己走一遍。</b><br><span class="muted">混淆改变逻辑的长相，改变不了运行时的行为。动态 trace 永远有效。</span></li>' +
         '<li><b>现象直接指认路线。</b><br><span class="muted">"打不开"是一代壳，"空的"是抽取壳，"看不懂"是 VMP —— 先诊断再选工具。</span></li>' +
-        '<li><b>不跟它比谁藏得好，而是守住它必须做的动作。</b><br><span class="muted">它藏得住名字，藏不住"注册 / 加载 / 查名字 / 比较"这些动作 —— 因为这些接口的名字是系统给的，它改不了。（第 19、20 章）</span></li>' +
+        '<li><b>不跟它比谁藏得好，而是守住它必须做的动作。</b><br><span class="muted">它藏得住名字，藏不住"注册 / 加载 / 查名字 / 比较"这些动作 —— 因为这些接口的名字是系统给的，它改不了。（第 8、9 章）</span></li>' +
         '<li><b>把观测点放到比对手更低的层级。</b><br><span class="muted">用户态 → 内核 → Hypervisor。层级越低，被检测的可能越小。</span></li>' +
         '<li><b>从副作用反推逻辑。</b><br><span class="muted">再怎么混淆，检测都要调 open、比字符串、连端口 —— 这些是绕不过去的。</span></li>' +
         '<li><b>护城河在原理，不在工具。</b><br><span class="muted">工具会过期、版本会变；理解了机制，你就能自己造工具、移植工具。</span></li>' +
@@ -983,21 +983,21 @@
 
     { kicker: 'NEXT', title: '接下来做什么',
       body: '<div class="grid2"><div><b>零基础从这里开始</b><ol>' +
-        '<li><b>第 19 章</b> —— 先知道敌人有哪几代</li>' +
-        '<li><b>第 20 章</b> —— JNI 怎么把两边绑起来</li>' +
-        '<li><b>第 23 章</b> —— 先抓到第一份样本</li></ol>' +
+        '<li><b>第 8 章</b> —— 先知道敌人有哪几代</li>' +
+        '<li><b>第 9 章</b> —— JNI 怎么把两边绑起来</li>' +
+        '<li><b>第 12 章</b> —— 先抓到第一份样本</li></ol>' +
         '<p class="muted small">这三章是第 1–18 章默认你已经会的前置。</p></div>' +
         '<div><b>想立刻能干活</b><ol>' +
-        '<li>第 1 章 —— 学会观测</li><li>第 3 章 —— 学会读汇编</li>' +
-        '<li>第 7 章 —— 学会黑盒调用</li><li>第 8、9 章 —— 学会识别与收尾</li></ol>' +
+        '<li>第 15 章 —— 学会观测</li><li>第 17 章 —— 学会读汇编</li>' +
+        '<li>第 21 章 —— 学会黑盒调用</li><li>第 22、23 章 —— 学会识别与收尾</li></ol>' +
         '<p class="muted small">这 5 章是算法还原的最短路径。</p></div></div>' +
         '<div class="grid2" style="margin-top:14px"><div><b>想系统补底层</b><ol>' +
-        '<li>第 5 章 OLLVM 源码级理解</li><li>第 6 章 VMP 与 Hypervisor 调试</li>' +
-        '<li>第 13 章 内核态对抗</li><li>第 17、18 章 容器化与云端安卓</li></ol>' +
+        '<li>第 19 章 OLLVM 源码级理解</li><li>第 20 章 VMP 与 Hypervisor 调试</li>' +
+        '<li>第 27 章 内核态对抗</li><li>第 31、32 章 容器化与云端安卓</li></ol>' +
         '<p class="muted small">门槛高，但掌握后对手的检测基本失效。</p></div>' +
         '<div><b>想补齐观测链路</b><ol>' +
-        '<li>第 21 章 Frida 自动化与去特征</li><li>第 22 章 Xposed / LSPosed</li>' +
-        '<li>第 24 章 自吐沙箱（让算法自己招供）</li><li>第 25 章 白盒密码与 DFA</li></ol>' +
+        '<li>第 10 章 Frida 自动化与去特征</li><li>第 11 章 Xposed / LSPosed</li>' +
+        '<li>第 13 章 自吐沙箱（让算法自己招供）</li><li>第 14 章 白盒密码与 DFA</li></ol>' +
         '<p class="muted small">观测能力不牢，前面全是碰运气。</p></div></div>' +
         '<div class="note warn" style="margin-top:16px"><div class="note-h">⚠️ 最后一句提醒</div>' +
         '这些技术只应用于<b>合法授权的安全研究、自身产品的安全加固、以及教学场景</b>。' +

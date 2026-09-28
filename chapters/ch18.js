@@ -1,993 +1,1363 @@
-/* 第 18 章 · 安卓容器化原理与核心点深度解析
-   全课程集大成者：虚拟化 + 容器化 + Android 系统三者的融合。
-   事实原则：Waydroid / Magisk / KVM / virtio-gpu 等已核实内容直接使用；
-   未核实的分区列表、remote_android 细节、具体命令一律标注「待核实」。 */
+/* 第 18 章 · C++11 & ART 打造动态分析沙箱
+   数据文件（浏览器脚本，ES 模块语法在此不可用） */
 window.CHAPTER = {
   no: 18,
-  title: '安卓容器化原理与核心点深度解析',
-  lede: '把虚拟化、容器化、Android 系统三块积木焊在一起：从 <strong>virtio-gpu</strong> 图形加速、<strong>Waydroid</strong> 容器化跑完整 Android、内核 <strong>binder</strong> 前提，到绑定挂载与命名空间下的 <code>/proc</code>、完整启动链路、<strong>Magisk</strong> systemless、虚拟 WiFi 与 <strong>KVM API</strong>，最终落到一套<strong>高度定制、可欺骗风控的云端安卓运行环境</strong>。',
+  title: 'C++11 & ART 打造动态分析沙箱',
+  lede: '前面几章我们一直在<strong>用</strong>别人的工具。这一章换一个身份：不再当工具的用户，而是当虚拟机的作者——自己读 ART 源码、自己插桩、自己编译，把 Android 变成一个「你说什么都记下来」的<strong>动态分析沙箱</strong>。',
   meta: [
-    '核心问题：<b>怎么让一个 App 相信它跑在一台真手机上？</b>性能、硬件访问、环境自洽，三者缺一不可',
-    '关键工具：<b>Waydroid · Linux namespaces · Magisk · KVM(/dev/kvm) · virtio-gpu/VirGL · remote_android</b>',
-    '对手：<b>风控 SDK 的交叉验证</b>——它不看单一 API 返回值，而是让多个证据面互相对账'
+    '核心问题：<b>一次 Java 方法调用在 Native 层到底走了几层指针？为什么读懂 ART 必须先过 C++11？</b>',
+    '关键工具：<b>auto / decltype / lambda / 模板 / RAII · mirror::Object · mirror::Class · ArtMethod · RegisterNatives</b>',
+    '对手：<b>动态注册 + 抽取壳。符号表被抹掉、真实地址运行时才产生，静态分析从这里断线</b>'
   ],
 
   sections: [
     /* ================= 18.1 ================= */
     {
       h: '18.1',
-      title: '终点站：什么叫「云端安卓运行环境」',
+      title: '换一个身份：从工具使用者到虚拟机作者',
       intuition: {
-        tag: '直觉模型 · 把手机寄养在机房',
-        body: '<p>你自己那台手机，是「一个人住一整套房」：房子（内核）、家具（系统服务）、门牌号（IMEI/序列号/传感器）全是它独占的，谁来敲门它都得应答。</p>' +
-              '<p>云端安卓是「把手机寄养到机房里的合租房」：房子还在（宿主 Linux 内核），但每个 App 只分到一个上了锁的房间（namespace）。问题来了——<b>房客会四处打量，确认自己是不是真的在独栋里住</b>：地板响不响（性能）、窗户能不能看见外面（硬件访问）、门牌号对不对得上（环境自洽）。</p>' +
-              '<p>本章所有的技术，都是在回答这三个问题里的某一个。想清楚这一点，你就不会把 Waydroid、Magisk、虚拟 WiFi 当成三个孤立的知识点。</p>'
+        tag: '直觉模型 · 换掉地基而不是换家具',
+        body: '<p>别人给的房子，你只能挪家具：装个 Frida 脚本、改改 smali，房东（ART 虚拟机）不高兴就把你赶出去。' +
+              '自己盖房子，你可以<strong>在地基里埋传感器</strong>——哪根管子流过什么，你天生就知道。' +
+              '本章说的「定制 ART」，就是自己浇一遍地基。</p>' +
+              '<p>代价是：地基是 C++ 写的，而且是<strong>现代 C++</strong>。你连图纸都读不懂，就别谈改图纸。</p>'
       },
-      html: T.note('key', '🔑 本章主线：三块积木的合体',
-              '<p><b>虚拟化</b>（怎么凭空造出「一台机器」：KVM 提供 CPU/内存虚拟化，QEMU/Cuttlefish 提供设备模型）＋ <b>容器化</b>（怎么让 Android 用户空间以为自己独占一台机器：namespaces + 绑定挂载 + 共享宿主内核）＋ <b>Android 系统本身</b>（boot.img、init、zygote、system_server、分区与检测面）。</p>' +
-              '<p>前面每一章你都在拆其中一块，这一章的任务是<b>把它们焊在一起，并且焊得让风控看不出来</b>。</p>') +
-            T.grid(3, [
-              '<div class="card"><div class="card-title">① 运行环境</div><p>Waydroid 用容器跑完整 Android；QEMU/Cuttlefish 用 KVM 跑虚拟机。两条路线的<b>性能、硬件访问、隔离强度</b>完全不同。</p></div>',
-              '<div class="card"><div class="card-title">② 内核前提</div><p>Android 的 IPC 靠 <span class="term" data-def="Android 的进程间通信机制，内核里以驱动形式提供，需要宿主内核编译了对应模块">binder</span>，共享内存靠 ashmem/memfd。<b>宿主内核不支持，容器里的 Android 起不来。</b></p></div>',
-              '<div class="card"><div class="card-title">③ 环境自洽</div><p>Magisk 隐藏 root、虚拟 WiFi 伪造网络状态、图形加速伪装渲染器——<b>伪装不是改一个返回值，而是让所有证据面互相对得上账</b>。</p></div>'
-            ]) +
-            T.note('warn', '⚠️ 本章的「待核实」约定',
-              '<p>本章涉及大量发行版/内核/固件相关的细节，<b>凡是课程没有第一时间给出官方出处的地方，一律标注 <span class="pill warn">待核实</span></b>，包括：Android 各版本的分区清单与对应关系、remote_android 的具体实现、具体发行版的编译命令。</p>' +
-              '<p>做逆向的人最忌讳「听起来很合理就当成事实」——这个习惯比任何一个 API 都值钱。</p>'),
-      after: '<p><b>这一章怎么读：</b>先建立「三条路线 + 一个自洽原则」的框架（18.1–18.2），再逐个下沉到内核层（18.3–18.6），然后用启动链路把整条路径串起来（18.7），最后是最容易被忽略、也最容易被风控抓到的两块：Magisk 与虚拟 WiFi（18.8–18.9），以及用户态直接操作 KVM 的 API 视角（18.10）。</p>'
+      html:
+        T.note('key', '🔑 本章主线',
+          '<p>整章只干三件事：<b>①</b> 能读懂 ART 的 C++ 代码（<span class="term" data-def="C++11 及以后的标准，AOSP 的 ART 大量使用其语法">C++11</span> 语法关）；' +
+          '<b>②</b> 看懂 ART 把 Java 对象和方法放在内存的哪里（对象模型关）；' +
+          '<b>③</b> 在 JNI 动态注册那一刻埋一个记录点（插桩实战关）。</p>') +
+        '<p>为什么非得自己编译虚拟机？因为 <strong>Native 保护的战场上，符号和地址正在消失</strong>：' +
+        '<span class="term" data-def="JNI 函数不是靠名字导出，而是在运行时用 RegisterNatives 把函数地址交给虚拟机">动态注册</span> 让导出表里空空如也，' +
+        '抽取壳把方法体抽走让静态反编译看到一具空壳。静态分析断线的地方，只有运行时能接上——' +
+        '而运行时里最权威的位置，不是 hook 框架，是<strong>虚拟机内部的注册函数本身</strong>。</p>' +
+        T.grid(2, [
+          '<div class="card"><div class="card-title">👤 工具使用者</div><p>在 <span class="mono">JNI_OnLoad</span> 外面挂 hook，' +
+          '指望自己比目标先抢到函数；被检测、被杀、被反调试绕开。你控制的是<b>外部</b>。</p></div>',
+          '<div class="card"><div class="card-title">🛠️ 虚拟机作者</div><p>在 ART 源码里给 <span class="mono">RegisterNatives</span> 加两行日志，' +
+          'Java 方法与 Native 地址的映射在你眼前自动铺开。你控制的是<b>内部</b>。</p></div>'
+        ]),
+      after: T.note('', '🧭 一句话总结这层的差别',
+        '<p>Hook 是在<strong>别人家的流程上加旁路</strong>，天生要与反调试对抗；定制虚拟机是<strong>改流程本身</strong>。' +
+        '前者拼隐蔽，后者拼信息完备——从「生成侧」看，注册这一事实在发生的那一刻就是完全公开的。</p>')
     },
 
     /* ================= 18.2 ================= */
     {
       h: '18.2',
-      title: '虚拟化图形硬件加速：云手机真正的第一难点',
-      html: '<p>把 Android 跑起来不难，<b>把界面画出来又画得快，才是分水岭</b>。云手机/容器化安卓的第一道坎几乎都是图形：GPU 是整个系统里最难虚拟化的硬件——它不是「一块内存 + 一组寄存器」，而是一整条有状态、有厂商私有命令流、有驱动-固件耦合的流水线。</p>' +
-            '<p>更麻烦的是：图形栈是<b>风控最好用的检测面之一</b>。渲染器的厂商/型号字符串、驱动版本、扩展列表，全是 App 可以直接读到的公开信息，而纯软件渲染的取值和真机完全不是一回事。</p>' +
-            T.tbl(['路线', '做法', '性能/能力', '代价与检测风险'], [
-              ['<b>软件渲染</b><br><span class="small">SwiftShader / llvmpipe</span>', 'Guest 里用 CPU 跑光栅化，完全没有 GPU', '差：分辨率与帧率都被 CPU 卡死', '渲染器/驱动字符串与真机差异大，<b>极易被判定为模拟器</b>'],
-              ['<b>VirGL</b><br><span class="small">半虚拟化转发</span>', 'Guest 里的 OpenGL 调用被转发给 Host 的 GPU 去真正渲染', '好：能用上宿主 GPU', '需要 Guest 侧驱动与 Host 侧组件配套；能力/扩展集合与真机仍有差别'],
-              ['<b>virtio-gpu</b><br><span class="small">半虚拟化设备</span>', 'Guest 通过 virtio 队列把渲染命令提交给 Host 的 GPU', '好：标准化的虚拟 GPU 接口，社区方案成熟', '仍然要向 Guest 暴露一套「虚拟厂商」的身份信息'],
-              ['<b>GPU 直通</b><br><span class="small">passthrough / VFIO</span>', '把物理 GPU 直接分配给虚拟机，Guest 用真驱动', '最好：接近裸机', '成本高、一台机器一张卡、隔离与运维复杂度陡增']
-            ]) +
-            '<p class="small muted">注：各路线在具体发行版/内核/Android 版本上的开关与配置细节 <span class="pill warn">待核实</span>；上表只描述机制层面的差异。</p>' +
-            T.note('bad', '❌ 纯软件渲染的两个代价，第二个才是致命的',
-              '<p>第一个代价人人看得见：<b>卡</b>。分辨率、帧率、视频解码全部被 CPU 拖死，用户体验直接崩。</p>' +
-              '<p>第二个代价才致命：<b>它会自己举报自己</b>。App 通过 OpenGL ES 查询 <span class="mono">GL_RENDERER</span> / <span class="mono">GL_VENDOR</span> / <span class="mono">GL_VERSION</span> 和扩展列表，一眼就能看出这不是手机 GPU。你可以在 Java 层把这些 API 全 hook 掉，但<b>原生层、第三方渲染库、甚至某些 SDK 自己起的 EGL 上下文</b>都会读到同样的信息——只要有一处没覆盖，前后取值不一致，伪装立刻破功。</p>') +
-            T.note('key', '🔑 一句话记住本章的底层立场',
-              '<p>图形加速在云手机上<b>不只</b>是性能问题，它同时是<b>反检测问题</b>——这就是为什么真正的云手机方案一定要在 Native 层解决图形，而不是在 Java 层「返回假字符串」。</p>') +
-            '<p>相关术语：' + T.term('virtio-gpu', '半虚拟化的 GPU 接口：Guest 通过 virtio 队列把渲染命令提交给 Host 的 GPU，由宿主真正执行') + '、' +
-            T.term('VirGL', '在 Guest 内部把 OpenGL 调用转发给宿主 GPU 渲染的方案') + '、' +
-            T.term('GPU passthrough', '把物理 GPU 通过 VFIO 直接分配给虚拟机，Guest 使用真实厂商驱动，性能接近裸机') + '、' +
-            T.term('SwiftShader', '纯 CPU 实现的图形渲染器，常见于没有 GPU 的虚拟环境，其渲染器字符串极具辨识度') + '。</p>',
-      after: '<p><b>出问题往哪查：</b>如果一台实例「界面正常但被判定为模拟器」，先抓图形栈的指纹——渲染器/厂商/版本字符串、支持的扩展列表、GPU 相关的系统属性，再看这些值在 Java 层与 Native 层是否一致。</p>'
-    },
-
-    /* ================= 18.3 ================= */
-    {
-      h: '18.3',
-      title: 'Waydroid：用容器跑一个完整的 Android',
-      html: '<p>Waydroid 官方 README 的原话是：<b>&quot;Waydroid uses a container-based approach to boot a full Android system on a regular GNU/Linux system.&quot;</b>（Waydroid 用基于容器的方式，在一个普通的 GNU/Linux 系统上启动<b>完整的</b> Android 系统。）仓库地址 <span class="mono">waydroid/waydroid</span>。</p>' +
-            '<p>它用的隔离手段就是你在第 17 章见过的 ' + T.term('Linux namespaces', 'Linux 内核的隔离机制：user / pid / uts / net / mount / ipc 六种，让一组进程看到「自己独占一套系统」') + '——<b>user、pid、uts、net、mount、ipc</b> 全套上齐，然后在里面跑 Android 的用户空间。系统镜像基于 ' + T.term('LineageOS', '基于 Android 的开源发行版，Waydroid 的系统镜像以它为底') + '，当前基于 <b>Android 13</b>（<span class="small muted">具体版本随上游演进，以官方仓库为准</span>）。它最常见的两个战场是 <b>Linux 手机</b>（比如 PinePhone）和<b>桌面 Linux</b>。</p>' +
-            T.note('key', '🔑 最关键的一句话：容器里的 Android 直接访问硬件',
-              '<p>官方原文：<b>&quot;The Android system inside the container has direct access to any needed hardware.&quot;</b>——容器内的 Android 系统<b>可以直接访问所需的硬件</b>。</p>' +
-              '<p>这就是它与模拟器/虚拟机的<b>本质分界</b>：<span class="hit">没有虚拟化层，性能接近原生</span>。摄像头、传感器、GPU、网络，走的是宿主内核里真实的驱动，中间不隔着「虚拟硬件 → Guest 驱动」这一层翻译。</p>' +
-              '<p>代价同样明确：<b>隔离强度天然弱于虚拟机</b>，而且它<b>不是一台独立机器</b>——宿主能看到的东西，容器里原则上也能碰到，这对「伪装成一台独立真机」既是便利（性能真）也是风险（暴露面多）。</p>') +
-            T.grid(2, [
-              '<div class="card"><div class="card-title">为什么性能接近原生</div><p>没有指令翻译、没有第二套内核、没有虚拟设备模型。App 的系统调用<b>直接落在宿主内核</b>上，只有命名空间决定它「看得见什么」。</p></div>',
-              '<div class="card"><div class="card-title">为什么隔离仍然存在</div><p>Android 有一套自己的用户/权限模型（uid、SELinux、沙箱），加上 namespace 把 PID、网络、挂载视图切开，App 并不能随便看见宿主进程。</p></div>'
-            ]) +
-            T.note('warn', '⚠️ 内核前提：binder 与 ashmem —— 装不上十有八九是这里',
-              '<p>Android 的进程间通信靠 <span class="term" data-def="Android 的核心 IPC 机制，内核以驱动形式提供；没有它 servicemanager/zygote 这一整套都起不来">binder</span>，而 binder <b>不是</b>标准 Linux 内核的必备组件，需要宿主内核提供支持（Linux 主线常见的做法是编译对应模块，课程中提到的名字是 <span class="mono">binder_linux</span> / <span class="mono">ashmem_linux</span>）。共享内存侧还要 <span class="term" data-def="Android 早期的匿名共享内存机制，新内核上越来越多地用 memfd 替代">ashmem</span> 或 <span class="term" data-def="Linux 的匿名文件描述符机制，可在新内核上承担 ashmem 的角色">memfd</span>。</p>' +
-              '<p><b>这是安卓容器化的核心技术前提</b>：宿主内核没有 binder，容器里的 Android 会在启动早期就卡死——<span class="mono">servicemanager</span> 起不来，后面全都谈不上。所以「编译一个带 binder 支持的宿主内核」是本路线绕不过去的一步。</p>') +
-            '<p><b>下载与编译安装：</b>官方仓库 README 给出了安装方式，不同发行版的包名、依赖与内核模块处理方式都不一样，<span class="pill warn">具体命令与版本对应关系待核实</span>。真正的硬骨头通常在「宿主内核是否带 binder/ashmem」以及「显卡与显示协议怎么对接」这两处，而不在 Waydroid 本体。</p>',
-      term: {
-        title: '先体检：宿主内核到底支不支持（示意）',
-        lines: [
-          { t: 'p', s: 'uname -r', note: '<b>先确认宿主内核版本。</b>内核太老或发行版裁剪过狠，后面都白搭。' },
-          { t: 'o', s: '6.x.y-generic' },
-          { t: 'p', s: 'zcat /proc/config.gz | grep -i -E "binder|ashmem|memfd"', note: '<b>查内核编译选项。</b>这是判断「能不能跑容器化 Android」的第一手证据——比任何文档都可靠。没有 /proc/config.gz 时改用发行版的内核配置文件。', state: { '阶段': '前提检查', '关键点': 'binder 是否内建或编成模块' } },
-          { t: 'o', s: 'CONFIG_ANDROID_BINDER_IPC=y' },
-          { t: 'o', s: 'CONFIG_ANDROID_BINDERFS=y' },
-          { t: 'd', s: '（不同发行版/内核版本的符号名可能不同，以上仅为示意）' },
-          { t: 'p', s: 'ls /dev/binder* /dev/binderfs 2>/dev/null', note: '<b>看设备节点是否真的存在。</b>内核编了不等于节点已经挂出来，这一步才是「现在能不能用」。', state: { '阶段': '前提检查', 'binder 设备': '存在 / 不存在' } },
-          { t: 'o', s: '/dev/binderfs' },
-          { t: 'w', s: '若这里为空：先解决内核与模块，不要继续往下走 —— 后面每一步都会失败在上一步的原因上。' },
-          { t: 'p', s: 'ls -l /dev/kvm', note: '<b>顺手确认硬件虚拟化设备。</b>走容器路线它未必需要，但走虚拟机路线（18.4 / 18.10）它是门票。' },
-          { t: 'o', s: 'crw-rw---- 1 root kvm 10, 232 ... /dev/kvm' }
+      title: 'ART 对象模型：一条指针链走完一次方法调用',
+      html:
+        '<p>Java 世界里 <span class="mono">new</span> 出来的对象、<span class="mono">.method()</span> 的调用，在 Native 层全是结构体和指针。' +
+        'ART 用三层结构描述这件事，把这三层记牢，后面读源码就像看地图。</p>' +
+        T.tbl(['层级', 'C++ 类型', '它回答的问题'], [
+          ['对象头', 'mirror::Object', '「我是什么类？」—— 含 klass_ 指针与 monitor 锁信息'],
+          ['类镜像', 'mirror::Class', '「我有哪些方法和字段？」—— 方法表、字段表、vtable、接口表'],
+          ['方法元数据', 'ArtMethod', '「我这个方法怎么执行？」—— 声明类、访问标志、Dex 偏移、执行入口']
+        ]) +
+        T.note('key', '🔑 关键类比',
+          '<p>这套分层与 HotSpot 的「对象头 = mark word + klass pointer」是同一个思路：对象本身不携带方法代码，' +
+          '只携带一个<strong>指向自己类描述的指针</strong>。方法是「类的属性」，不是「对象的属性」。</p>') +
+        '<p>下面把这条链一步步走一遍。注意右侧内存表格里<strong>每一次写入</strong>——那些就是你在 <span class="mono">gdb</span> 里真正会看到的东西。</p>',
+      stage: {
+        title: '一次 Java 方法调用的完整寻址路径',
+        speed: 1600,
+        render:
+          '<div class="flow-row" style="flex-wrap:wrap;gap:8px;align-items:center">' +
+            '<span class="blk" id="b_obj">Java 对象<br><span class="small">MyBean 实例</span></span>' +
+            '<span class="arrow" id="a1">—</span>' +
+            '<span class="blk" id="b_mo">mirror::Object<br><span class="small">对象头</span></span>' +
+            '<span class="arrow" id="a2">—</span>' +
+            '<span class="blk" id="b_mc">mirror::Class<br><span class="small">类镜像</span></span>' +
+            '<span class="arrow" id="a3">—</span>' +
+            '<span class="blk" id="b_am">ArtMethod<br><span class="small">方法元数据</span></span>' +
+          '</div>' +
+          '<div style="margin-top:10px"><span class="pill" id="clsbox">类尚未解析</span></div>' +
+          '<div class="grid2" style="margin-top:10px">' +
+            '<div><div class="card-title">对象实例内存（64 位）</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">+0x00</span><span class="cell" id="o_klass">klass_ = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x08</span><span class="cell" id="o_mon">monitor_ = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x10</span><span class="cell" id="o_name">name = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x18</span><span class="cell" id="o_age">age = ?</span></div>' +
+            '</div></div>' +
+            '<div><div class="card-title">ArtMethod 内存</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">+0x00</span><span class="cell" id="m_dc">declaring_class_ = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x08</span><span class="cell" id="m_af">access_flags_ = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x10</span><span class="cell" id="m_dex">dex_code_item_offset_ = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x18</span><span class="cell" id="m_entry">entry_point_..._code_ = ?</span></div>' +
+            '</div></div>' +
+          '</div>',
+        reset: () => {
+          S('b_obj', ''); S('b_mo', ''); S('b_mc', ''); S('b_am', '');
+          CLS('a1', 'arrow'); CLS('a2', 'arrow'); CLS('a3', 'arrow');
+          SET('a1', '—'); SET('a2', '—'); SET('a3', '—');
+          CLS('clsbox', 'pill'); SET('clsbox', '类尚未解析');
+          const cells = ['o_klass', 'o_mon', 'o_name', 'o_age', 'm_dc', 'm_af', 'm_dex', 'm_entry'];
+          for (const c of cells) CLS(c, 'cell');
+          SET('o_klass', 'klass_ = ?'); SET('o_mon', 'monitor_ = ?');
+          SET('o_name', 'name = ?'); SET('o_age', 'age = ?');
+          SET('m_dc', 'declaring_class_ = ?'); SET('m_af', 'access_flags_ = ?');
+          SET('m_dex', 'dex_code_item_offset_ = ?'); SET('m_entry', 'entry_point_..._code_ = ?');
+        },
+        steps: [
+          { run: () => { S('b_obj', 'active'); },
+            note: '<b>起点：栈上有一个对象引用。</b>Java 代码里写下 <span class="mono">b.getName()</span>，到 Native 层只剩一个指针——它不是「对象本体」，而是<b>指向堆上对象内存的地址</b>。',
+            state: { '阶段': '取对象地址', '类型': 'mirror::Object*' } },
+          { run: () => { S('b_obj', 'active'); CLS('o_klass', 'cell hi'); SET('o_klass', 'klass_ = 0x7f2a1000'); },
+            note: '<b>第一跳：读对象头里的 klass_。</b>对象内存最开头的字段就是 <span class="mono">klass_</span>，类型是 <span class="mono">mirror::Class*</span>。它回答「我是什么类」。',
+            state: { '读地址': 'obj + 0x00', '得到': 'mirror::Class*' } },
+          { run: () => { S('b_obj', 'done'); S('b_mo', 'active'); CLS('o_mon', 'cell wr'); SET('o_mon', 'monitor_ = 0x0（未锁）'); },
+            note: '<b>对象头的另一半：monitor 锁信息。</b>和 HotSpot 的 mark word 一样，锁状态、哈希、GC 标记这些「与类无关」的信息也塞在头部。此刻没人持有锁，值为空。',
+            state: { '锁状态': 'unlocked' } },
+          { run: () => { SET('a1', '—klass_→'); CLS('a1', 'arrow'); S('b_mo', 'done'); S('b_mc', 'active'); CLS('clsbox', 'pill acc'); SET('clsbox', 'MyBean.class → 0x7f2a1000'); },
+            note: '<b>第二跳：拿到 mirror::Class。</b>这就是 <span class="mono">MyBean.class</span> 在 Native 层的真身：整个 JVM 里 <b>MyBean 只有一份</b> Class 对象，所有 MyBean 实例共享它。',
+            state: { '实例数': 'N 个', 'Class 对象数': '1 个' } },
+          { run: () => { SET('a2', '→ 方法表'); S('b_mc', 'active'); CLS('clsbox', 'pill ok'); SET('clsbox', '解析 getName() 的方法表槽位'); },
+            note: '<b>第三跳：在类里找方法。</b>mirror::Class 里存着方法表（methods_）和 vtable（虚方法表）。调用 <span class="mono">getName()</span> 就是在这些表里定位到一个 <span class="mono">ArtMethod</span> 槽位。',
+            state: { '查找': 'method table / vtable', '结果': 'ArtMethod*' } },
+          { run: () => { S('b_mc', 'done'); S('b_am', 'active'); CLS('m_dc', 'cell hi'); SET('m_dc', 'declaring_class_ = 0x7f2a1000'); },
+            note: '<b>落到 ArtMethod：declaring_class_。</b>每个 Java 方法在 ART 里是一个 <span class="mono">ArtMethod</span> 结构体。第一个字段告诉你「我声明在哪个类里」——这也是 Hook 时用来判断有没有找错方法的关键。',
+            state: { '字段': 'declaring_class_' } },
+          { run: () => { CLS('m_af', 'cell wr'); SET('m_af', 'access_flags_ = 0x0001 (public)'); },
+            note: '<b>access_flags_：方法的访问标志。</b>public / static / final / native / synchronized 全挤在这一个位图里。记住这个字段——<b>后面 Hook 的第一刀就砍在这里</b>。',
+            state: { 'flags': '0x0001' } },
+          { run: () => { CLS('m_dex', 'cell'); SET('m_dex', 'dex_code_item_offset_ = 0x1a4c'); },
+            note: '<b>dex_code_item_offset_：源码在哪里。</b>指向该方法在 DEX 文件里 code_item 的偏移。壳如果把方法体抽走，这个偏移指向的就是空壳——<b>静态分析断线的正是这里</b>。',
+            state: { '指向': 'DEX code_item' } },
+          { run: () => { CLS('m_entry', 'cell hi'); SET('m_entry', 'entry = 0x7f6c9e40'); S('b_am', 'hot'); },
+            note: '<b>entry_point_from_quick_compiled_code_：真正会执行的地址。</b>这是整条链的终点，也是最有价值的一个字段。它可能是解释器入口、JIT 编译后的机器码、或 AOT 产物——取决于运行时。',
+            state: { '入口类型': '解释器 / JIT / AOT' } },
+          { run: () => { S('b_am', 'hot'); CLS('clsbox', 'pill ok'); SET('clsbox', '获取到可执行入口 → 跳转执行'); },
+            note: '<b>最后一个动作：跳过去。</b>ART 并不「解释」这个字段，它直接把它当函数指针调用。所以谁能改这个字段，谁就能改变这个 Java 方法的行为。',
+            state: { '调用': 'jump entry' } },
+          { run: () => { S('b_obj', 'cool'); S('b_mo', 'cool'); S('b_mc', 'cool'); S('b_am', 'cool'); CLS('clsbox', 'pill ok'); SET('clsbox', '一次调用完成：3 次指针解引用'); },
+            note: '<b>回顾整条链：对象 → klass_ → 方法表 → ArtMethod → 入口。</b>3 次指针解引用就是一次 Java 方法调用在 Native 层的全部寻址成本。理解这条链，就理解了后面所有 Hook 手段的地基。',
+            state: { '解引用次数': '3', '最短 Hook 点': 'ArtMethod.entry' } }
         ]
       },
-      after: '<p><b>常见坑：</b>①把 Waydroid 装成功当成内核没问题——它可能只是没到那一步；②宿主内核升级后模块没跟着重建，昨天好好的今天起不来；③在有 SELinux 的发行版上，模块加载与设备节点权限会额外折腾一轮。<b>出问题先看内核日志</b>，binder 相关的报错通常非常直白。</p>'
+      after: T.note('warn', '⚠️ 版本差异提醒',
+        '<p>ArtMethod 的字段名与偏移在 AOSP 不同版本间改过（例如入口字段的命名与拆分方式）。' +
+        '字段<strong>语义</strong>是稳定的（声明类 / 标志 / Dex 偏移 / 执行入口），但具体<strong>名字和偏移</strong>请以你手上的版本源码为准。' +
+        '<span class="pill warn">待核实</span></p>')
+    },
+
+    /* ================= 18.2L 动手实验 ================= */
+    {
+      h: '18.2L', title: '动手实验：推演双亲委派，定位"类找不到"',
+      html:
+        '<p>第 15 章里那个 <code>ClassNotFoundException</code>，本质是<b>双亲委派规则</b>的必然结果。' +
+        '这个实验让你把委托链走一遍，亲眼看到它为什么找不到。</p>',
+      lab: {
+        title: '实验：ClassLoader 委托链推演',
+        goal: '目标：判断该用哪个加载器',
+        intro:
+          '<p>一个加固 App 的加载器布局如下：</p>' +
+          '<div class="tbl-wrap" style="margin:12px 0"><table class="tbl">' +
+          '<thead><tr><th>加载器</th><th>负责加载什么</th><th>它认识的类</th></tr></thead><tbody>' +
+          '<tr><td><code>BootClassLoader</code></td><td>系统核心类</td><td><code>java.lang.String</code>、<code>android.app.Activity</code></td></tr>' +
+          '<tr><td><code>PathClassLoader</code>（默认）</td><td>APK 里原始的 dex</td><td><code>com.shell.StubApp</code>、<code>com.shell.ProxyApplication</code></td></tr>' +
+          '<tr><td><code>DexClassLoader</code>（壳的）</td><td>运行时解密的真 dex</td><td><code>com.example.Crypto</code>、<code>com.example.Sign</code></td></tr>' +
+          '</tbody></table></div>' +
+          '<p><b>任务：你要 hook <code>com.example.Crypto</code>，用 <code>Java.use</code> 直接写会怎样？该怎么解决？</b></p>',
+        inputs: [
+          { key: 'target', label: '① 你要找的类名', hint: '填实验里那个目标类', ph: 'com.example.XXX', value: 'com.example.Crypto' },
+          { key: 'result', label: '② 默认加载器能找到它吗？为什么？', hint: '想想双亲委派的顺序', ph: '能/不能，因为……', type: 'textarea', rows: 2 }
+        ],
+        runLabel: '🔍 推演委托链',
+        run: (v) => {
+          const L = window.LABX;
+          const target = String(v.target || '').trim() || 'com.example.Crypto';
+          const chain = L.classLoaderChain(target, {
+            boot: ['java.lang.String', 'android.app.Activity'],
+            path: ['com.shell.StubApp', 'com.shell.ProxyApplication'],
+            custom: ['com.example.Crypto', 'com.example.Sign']
+          });
+
+          let html = '<div class="lab-kv"><span>目标类 <b>' + target + '</b></span>'
+            + '<span>委派顺序 <b>Boot → Path → Custom</b></span></div>';
+
+          html += '<table class="lab-tbl"><tr><th>#</th><th>加载器</th><th>职责</th><th>认识目标类？</th></tr>';
+          chain.trace.forEach((t, i) => {
+            html += '<tr class="' + (t.hit ? 'same' : '') + '"><td>' + (i + 1) + '</td>'
+              + '<td><code>' + t.loader + '</code></td>'
+              + '<td style="font-size:12px">' + t.role + '</td>'
+              + '<td>' + (t.hit ? '✅ 命中，停止委派' : '❌ 不认识，继续往下') + '</td></tr>';
+          });
+          html += '</table>';
+
+          if (chain.delegated) {
+            html += '<div class="lab-msg fail"><b>❌ 默认加载器（PathClassLoader）找不到它</b>'
+              + '<div class="lab-note">这是双亲委派的必然结果：<br>'
+              + '<code>Java.use</code> 默认用 <code>Java.classFactory.loader</code>，也就是 App 的 <b>PathClassLoader</b>。'
+              + '它只能看到 APK 里原始的 dex（壳的代码）。<br>'
+              + '而真 dex 是 <b>壳自己 new 出来的 DexClassLoader</b> 加载的 —— '
+              + '两者是<b>平级</b>的加载器，<b>Path 看不到 Custom 加载的类</b>。</div>'
+              + '<div class="lab-note"><b>解法：</b>遍历所有加载器，找到能加载目标类的那一个，然后切换：<br>'
+              + '<code>Java.enumerateClassLoaders({ onMatch: l =&gt; { if (l.findClass("' + target + '")) Java.classFactory.loader = l; } })</code>'
+              + '</div></div>';
+          } else {
+            html += '<div class="lab-msg pass"><b>✅ 默认加载器就能找到它</b>'
+              + '<div class="lab-note">这个类属于壳自己的 dex（或普通未加固的 App），'
+              + 'PathClassLoader 直接可见，不需要切换加载器。</div></div>';
+          }
+
+          html += '<div class="lab-msg key"><b>🔑 记住这条诊断规则</b>'
+            + '<div class="lab-note"><b>报 <code>ClassNotFoundException</code> 时，先别怀疑类名写错了</code></b>——'
+            + '99% 是<b>用错了加载器</b>。<br><br>'
+            + '判断方法：问自己"这个类是谁加载的？"<br>'
+            + '• 系统类 → BootClassLoader（Java.use 能直接拿到）<br>'
+            + '• App 自己的类（未加固）→ PathClassLoader（能直接拿到）<br>'
+            + '• <b>加固后的业务类 → 壳的 DexClassLoader（拿不到，必须切换）</b></div></div>';
+          return html;
+        },
+        expected: (v) => {
+          const res = String(v.result || '').trim();
+          if (!res) return { ok: false, detail: '先回答第②问：默认加载器能找到它吗？' };
+          const saysNo = window.AKKC_hasConcept(res, ['不能', '找不到', '看不到', '不行', 'no', '无法']);
+          const saysWhy = window.AKKC_hasConcept(res, ['双亲委派', '委派', '自定义', 'DexClassLoader', '壳', '平级', '不同的加载器', '默认']);
+          const ok = saysNo && saysWhy;
+          return {
+            ok,
+            detail: ok
+              ? '<b>完全正确。</b>默认加载器（PathClassLoader）<b>看不到</b>壳的自定义 DexClassLoader 加载的类 —— ' +
+                '因为双亲委派保证的是"向上委托"，而<b>平级加载器之间互相不可见</b>。<br>' +
+                '解法：<code>Java.enumerateClassLoaders</code> 遍历找对的那一个，再设 <code>Java.classFactory.loader</code>。'
+              : (!saysNo
+                  ? '<b>结论错了：默认加载器找不到它。</b>' +
+                    '因为真 dex 不是 APK 里那个，而是壳运行时用自定义 DexClassLoader 加载的。'
+                  : '<b>结论对，但理由不够。</b>补上关键机制：<b>双亲委派只向上委托，平级加载器互不可见</b>。' +
+                    '所以 PathClassLoader 看不到 DexClassLoader 加载的类。')
+          };
+        },
+        showAnswer:
+          '【① 目标类】com.example.Crypto\n\n' +
+          '【② 默认加载器能找到吗】不能。\n\n' +
+          '推演委托链（Java.use 默认用 PathClassLoader）：\n' +
+          '  1. PathClassLoader 收到请求\n' +
+          '  2. 先委托父加载器 BootClassLoader\n' +
+          '     → Boot 只认识 java.* / android.*，不认识 com.example.Crypto → 失败\n' +
+          '  3. 父加载器都失败了，PathClassLoader 自己动手\n' +
+          '     → 它只加载 APK 里原始的 dex（壳的代码：com.shell.*）→ 失败\n' +
+          '  4. 抛出 ClassNotFoundException\n\n' +
+          '关键：真 dex 是由【壳自己创建的 DexClassLoader】加载的。\n' +
+          '      它与 PathClassLoader 是【平级】关系，\n' +
+          '      而双亲委派只保证"向上委托"，【平级加载器之间互相不可见】。\n\n' +
+          '【解法】切换加载器：\n' +
+          '  Java.enumerateClassLoaders({\n' +
+          '    onMatch: function (loader) {\n' +
+          '      try {\n' +
+          '        if (loader.findClass("com.example.Crypto")) {\n' +
+          '          Java.classFactory.loader = loader;   // 切换\n' +
+          '        }\n' +
+          '      } catch (e) {}\n' +
+          '    }, onComplete: function () {}\n' +
+          '  });\n' +
+          '  然后 Java.use("com.example.Crypto") 就能用了。',
+        hint:
+          '关键在于理解<b>双亲委派的方向性</b>：它只保证"<b>向上</b>委托父加载器"，' +
+          '但<b>没有规定平级加载器之间能互相看见</b>。<br><br>' +
+          '问自己两个问题：<br>' +
+          '① 真 dex 是谁加载的？是 APK 里那个 PathClassLoader，还是壳自己 new 出来的另一个？<br>' +
+          '② 如果它们是两个平级的加载器，PathClassLoader 能看见另一个加载的类吗？',
+        after:
+          T.note('ok', '✅ 实验的收获',
+            '<p style="margin-bottom:0">你现在有了一个<b>可复用的诊断流程</b>：<br>' +
+            '遇到 <code>ClassNotFoundException</code> → <b>不要先怀疑类名</b> → ' +
+            '直接上 <code>Java.enumerateClassLoaders</code> 找对的加载器。<br><br>' +
+            '<span class="hit">这个判断在第 15、16、18、24 章反复用到，是本课程最实用的技巧之一。</span><br>' +
+            '本质上你用的还是那条元原则：<b>先诊断（这个类归谁管），再动手（用哪个加载器）。</b></p>')
+      }
+    },
+
+    /* ================= 18.3C 实战案例 ================= */
+    {
+      h: '18.3C', title: '实战案例：从 ELF-Loader 到自定义 Linker',
+      case: {
+        source: 'kanxue',
+        title: '[原创]Android从ELF-Loader到自定义Linker的实现及原理',
+        date: '2026-4-4',
+        author: '东方玻璃',
+        target: '作者自研 SelfDefineLoader / ELF-Loader；测试样本 libtestdemo.so + 宿主 libselfdefineloader.so；参考真实样本 zgcbank-18.5.1',
+        background:
+          '<p>本课一直在讲「把观测点放到更低的层级」。这篇帖子把它做成了工程：作者从零写了一个 <b>ELF Loader</b>，' +
+          '再把它推进成 <b>自定义 Linker</b>（SelfDefineLoader），用来加载自己的 <code>libtestdemo.so</code>，' +
+          '宿主是 <code>libselfdefineloader.so</code>，参考样本是 <b>zgcbank-18.5.1</b>。</p>' +
+          '<p>它的路线很朴素：<b>先拿 200 多行 x86 代码把「装载一个 ELF」这件事完整打通，再移植到 AArch64</b>。' +
+          '这条路上有两个坑特别典型——<b>一个是缓存一致性，一个是 maps 里看不见自己</b>。下面按原帖复述。</p>',
+        points: [
+          '第一步用 <b>200 多行 x86</b> 代码打通 <b>9 步</b>流程：<code>mapFile</code> → <code>checkElfHeader</code> → <code>allocImage</code> → <code>loadSegments</code>（含 BSS 清零）→ <code>parseDynamic</code> → <code>loadDeps</code> → <code>relocate</code> → <code>setProtection</code> → 跳到 <code>e_entry</code>。',
+          '移植到 <b>AArch64</b> 有 <b>5 处</b>差异：<code>EM_AARCH64=183</code>、<code>PAGE_START</code>/<code>PAGE_END</code> 宏、额外解析 <code>DT_GNU_HASH</code>/<code>DT_HASH</code>、改用 <code>Elf64_Rela</code> 且多出 <code>R_AARCH64_ABS64</code>。',
+          '<b>第 5 处差异最要命</b>：写完代码段之后<b>必须调用 <code>__builtin___clear_cache</code></b>，否则 <b>D-Cache 与 I-Cache 不一致，直接 SIGILL</b>。',
+          '<code>callInit</code> 分三层依次调用：<code>.init</code> → <code>.init_array</code> → <code>getSymbol("JNI_OnLoad")</code>。',
+          '用 <code>constructor(101)</code> / <code>constructor(102)</code> / 不带优先级三个函数验证 <code>.init_array</code> 的<b>顺序与次数</b>，期望结果是 <code>initFlag=1</code>、<code>initArrayCount=101</code>。',
+          '构建上，CMake 用 <code>EXCLUDE_FROM_ALL</code> 让它<b>不被打进包里</b>；<code>adb push</code> 到 <code>/data/local/tmp</code> 后需要 <code>setenforce 0</code> 才能加载。',
+          '加载效果的直接证据：<b><code>/proc/self/maps</code> 里没有文件路径</b>——so 是从匿名内存起来的。',
+          '配套给出 <code>scan_hidden_modules.js</code>：用 <code>enumerateRanges</code> 找 r-x 段 + 校验 ELF magic，用 <code>enumerateModules</code> 做白名单排除，再解析 Phdr 算出 fullSize 后 dump，最后交给 <b>SoFixer</b> 修复。',
+          '对抗侧的手段叫 <code>wipeElfHeaders</code>：抹掉 ELF Header / Phdr / Dynamic，并且<b>先 mprotect 改权限、再恢复回去</b>。该功能在原帖代码中<b>默认是注释掉的</b>。',
+          '源码阅读上做了版本对照：<b>Android 18.4.4_r1</b>（32 位，<code>find_library_internal</code> 是串行的）对比 <b>Android 10.0.0_r47</b>（<code>android_dlopen_ext</code> + <code>find_libraries</code> 随机序的 LoadTask 7 步流程）。'
+        ],
+        method: [
+          '先在 x86 上把 Loader 打通：<code>mapFile</code> 读文件、<code>checkElfHeader</code> 验头、<code>allocImage</code> 申请镜像、<code>loadSegments</code> 搬段并清零 BSS、<code>parseDynamic</code> 解动态段、<code>loadDeps</code> 递归加载依赖、<code>relocate</code> 做重定位、<code>setProtection</code> 落权限，最后跳 <code>e_entry</code>。',
+          '移植到 AArch64，逐条对齐 5 处差异：<code>EM_AARCH64=183</code>、<code>PAGE_START</code>/<code>PAGE_END</code> 宏、补上 <code>DT_GNU_HASH</code>/<code>DT_HASH</code> 解析、把重定位条目换成 <code>Elf64_Rela</code> 并处理 <code>R_AARCH64_ABS64</code>。',
+          '补上 <code>__builtin___clear_cache</code>：写完全新的代码段之后，必须显式同步指令缓存，否则取指会拿到旧内容并触发 <b>SIGILL</b>。',
+          '按三层顺序跑初始化：<code>.init</code> → <code>.init_array</code> → <code>getSymbol("JNI_OnLoad")</code>，并用 <code>constructor(101)</code>/<code>constructor(102)</code>/无优先级三个函数验证顺序与次数（<code>initFlag=1</code>、<code>initArrayCount=101</code>）。',
+          '部署验证：CMake 里用 <code>EXCLUDE_FROM_ALL</code> 避免打进包，<code>adb push</code> 到 <code>/data/local/tmp</code>，<code>setenforce 0</code> 后加载，再看 <code>/proc/self/maps</code> 确认没有文件路径。',
+          '做检测与修复的闭环：跑 <code>scan_hidden_modules.js</code>（<code>enumerateRanges</code> 找 r-x + ELF magic，<code>enumerateModules</code> 排白名单，解析 Phdr 算 fullSize dump），再用 SoFixer 修好 dump 出来的 so。',
+          '读 AOSP 源码做版本对照：Android 18.4.4_r1 的 <code>find_library_internal</code>（32 位、串行）对比 Android 10.0.0_r47 的 <code>android_dlopen_ext</code> + <code>find_libraries</code>（随机序 LoadTask 共 7 步）。',
+          '最后才碰对抗手段：把 <code>wipeElfHeaders</code>（抹 ELF Header / Phdr / Dynamic，先 mprotect 再恢复权限）的注释去掉，观察检测脚本的表现变化。'
+        ],
+        result:
+          '<p>Loader 与 Linker 都能把目标 <code>libtestdemo.so</code> 加载起来并跑通初始化，' +
+          '<b>最直观的产物是 <code>/proc/self/maps</code> 里没有对应的文件路径</b>——这段代码不是从文件映射进来的，而是落在匿名内存里。</p>' +
+          '<p>同时作者给出了配套的检测与修复链（<code>scan_hidden_modules.js</code> + SoFixer），' +
+          '说明这套加载方式<b>既有对抗价值，也有确定的检测特征</b>。</p>',
+        terms: ['ELF Loader', '自定义 Linker', 'e_entry', 'DT_GNU_HASH', 'Elf64_Rela', 'R_AARCH64_ABS64', '__builtin___clear_cache', '.init_array', 'JNI_OnLoad', 'SoFixer', 'android_dlopen_ext'],
+        limits:
+          '<p>作者对局限说得很直白，原帖明示：<b>代码里存在诸多 bug，实现并不完备，并且有 AI 辅助</b>。他自己列了三条不足：</p>' +
+          '<p>① <b>Loader / Linker 的功能有限</b>，只覆盖了装载与链接的主干，比不了系统 linker；</p>' +
+          '<p>② <b>自定义 Linker 只能处理动态注册的 JNI 函数</b>——静态注册（沿用 <code>Java_包名_类名_方法名</code> 命名约定、由运行时按名字去库里找符号那一套）' +
+          '<b>没有被处理</b>，所以碰到只做静态注册的 so，这条路走不通；</p>' +
+          '<p>③ <b>Hash Table 的查找算法等细节没有深入</b>，符号查找只是够用。</p>' +
+          '<p>另外两点工程上的硬约束：<code>wipeElfHeaders</code> 在代码里<b>默认是注释掉的</b>；' +
+          '以及 Loader 的对象<b>必须用 new 放在堆上</b>，否则会直接 <b>SIGSEGV</b>。</p>',
+        analysis:
+          '<p><b>这个案例是第 18 章「把观测点放到更低层级」的工程实证。</b>本课讲定制 ART 是为了抢在 Hook 框架够不到的地方插桩；' +
+          '这里的手法更进一步——<b>干脆不用系统的 linker</b>，自己把 so 从文件读进匿名内存、自己做重定位、自己跳 <code>e_entry</code>。' +
+          '层级下沉之后，你能看见的东西就多了一层。</p>' +
+          '<p>先看那个最值得记住的坑。<b>第 5 处移植差异是必须在写完全新的代码段之后调用 <code>__builtin___clear_cache</code>，否则 D-Cache 与 I-Cache 不一致，直接 SIGILL。</b>' +
+          '这条正是本课第 17 章讲「内存里写代码」时必须处理的硬件一致性问题：<b>数据写入走 D-Cache，取指走 I-Cache，两者不是同一份</b>；' +
+          '你把新指令当数据写进去了，CPU 却可能从 I-Cache 里取到旧内容。' +
+          '<span class="hit">这不是 API 用错，是硬件层面的必然——凡是「运行时自己造代码」的技术（SMC、inline hook、自定义 Loader、JIT）都要付这笔账。</span>' +
+          '对照本课第 24 章那个案例：厂商的 shellcode 用 mmap RWX 之后直接执行，同样绕不开这一步。' +
+          '<b>所以看到「代码在内存里生成」时，第一反应就该是「谁负责刷缓存」。</b></p>' +
+          '<p>第二个重点是这个技术的<b>天然副作用</b>：<b>加载完成后 maps 里没有文件路径</b>。' +
+          '系统 linker 加载 so 会留下 <code>/data/app/.../libxxx.so</code> 这样的映射项，而自定义 Loader 从匿名内存起来，' +
+          '这一行天然不存在。<b>换句话说，第 24 章讲的那些靠扫 maps 找模块的检测手法的对手，在这里是被「顺便」绕过的</b>——' +
+          '作者甚至不需要专门做隐藏。但帖子里同时给出了 <code>scan_hidden_modules.js</code>，把检测方式也补全了：' +
+          '<b>不看路径，就看「有 r-x 段、有 ELF magic，却不在 <code>enumerateModules</code> 列表里」的内存</b>。' +
+          '<span class="hit">攻防两边都摆出来，比只讲怎么藏要有价值得多：任何隐藏都有特征，问题只是特征在哪一层。</span></p>' +
+          '<p>最后必须点出作者自列的那条限制：<b>「自定义 Linker 只能处理动态注册的 JNI 函数，静态注册未处理」</b>。' +
+          '这是这类工具的真实边界——它替换的是 linker 的<b>装载与链接</b>职责，' +
+          '而静态注册的方法表是编译期就固化在 so 里的，走的是另一条路。' +
+          '<b>第 18 章在讲 RegisterNatives 时强调过「动态注册才是主线」，这个案例从工具侧印证了这句话的分量：搞不定动态注册，等于放弃了绝大多数真实加固样本。</b>' +
+          '把边界写清楚，比把工具吹成通用方案诚实，也更有用。</p>' +
+          '<p>顺带一个方法论：作者先写 <b>200 多行 x86</b> 把 9 步流程跑通，再移植到 AArch64——' +
+          '<b>先用最熟悉的架构把「机制」验证完，再让「架构差异」变成一个只有 5 条的清单</b>。' +
+          '这和第 18 章一贯的思路一致：把不可控的大问题，拆成可控的小问题。</p>',
+        link: 'https://bbs.kanxue.com/thread-290643.htm',
+        linkNote: '看雪论坛原创帖'
+      }
+    },
+
+    {
+      h: '18.3',
+      title: '读 ART 源码的六件武器：C++11 速通',
+      html:
+        '<p>ART 是 C++ 写的，而且是「现代 C++」。如果你只学过 C++98，第一次打开 ART 源码的感受是：<strong>每个词都认识，凑起来不知道在干嘛</strong>。' +
+        '下面六件武器，是从「看不懂」到「看得懂」的最短路径。</p>' +
+        T.tbl(['武器', '长什么样', '在 ART 里解决什么问题'], [
+          ['auto / decltype', 'auto p = obj->GetClass();', '类型名长到没法手写（模板嵌套），让编译器推导'],
+          ['nullptr', 'if (ptr == nullptr)', 'NULL 就是整数 0，重载时会产生歧义；nullptr 是真正的空指针类型'],
+          ['范围 for', 'for (auto& m : methods)', '遍历方法表/字段表不用再写下标和边界'],
+          ['lambda', '[=] / [&] 的匿名回调', '把一小段逻辑当参数传进去，ART 里到处都是'],
+          ['模板', 'Handle&lt;T&gt; / ObjPtr&lt;T&gt;', '编译期多态，零运行时开销；同时保证 GC 安全'],
+          ['RAII', 'ScopedObjectAccess / MutexLock', '构造时获取资源，析构时自动释放，异常也不泄漏']
+        ]) +
+        '<p>其中 <span class="term" data-def="编译期把类型填进去，运行时不查表、不分发">模板</span> 和 ' +
+        '<span class="term" data-def="Resource Acquisition Is Initialization，资源获取即初始化">RAII</span> 是 ART 的两条命脉：' +
+        '前者让 <span class="mono">Handle&lt;T&gt;</span> 这类 GC 安全句柄既好用又不慢，后者让线程状态、锁、GC 临界区不会因为一条提前 return 就漏掉。</p>' +
+        T.grid(2, [
+          '<div class="card"><div class="card-title">编译期多态 vs 运行时分发</div>' +
+          '<p>虚函数要在对象里塞 <span class="mono">vptr</span>，调用时查 vtable——有内存开销也有性能开销。' +
+          '模板在<b>编译时</b>就把类型填死了，生成的机器码里没有任何「查表」动作。</p>' +
+          '<p>代价是：<b>代码膨胀</b>。同一个模板每实例化一种类型，就多一份机器码。</p></div>',
+          '<div class="card"><div class="card-title">RAII 为什么在虚拟机里是刚需</div>' +
+          '<p>虚拟机代码路径极长，中间任何一处提前返回、抛异常、GC 打断，都可能把锁或线程状态留在半路。' +
+          'RAII 把「释放」绑在<b>栈对象的生命周期</b>上，作用域一退出必然执行。</p>' +
+          '<p><span class="mono">MutexLock</span> 就是典型：构造加锁，析构解锁，你写代码时根本不用想「什么时候解锁」。</p></div>'
+        ]),
+      stepper: {
+        title: '六件武器在 ART 里的真实样子（逐行读）',
+        lines: [
+          { code: '<span class="c">// ① auto：类型太长，交给编译器</span>\n<span class="k">auto</span>* klass = obj-><span class="f">GetClass</span>();',
+            note: '<b>auto 不是为了少打字，是为了不被类型名淹没。</b>ART 里一个类型可能写成 <span class="mono">Handle&lt;mirror::Class&gt;</span>，手写既易错又难读。注意：auto 推导的是<b>静态类型</b>，你省掉的只是书写，不是类型本身。',
+            state: { '推导结果': 'mirror::Class*' } },
+          { code: '<span class="c">// ② decltype：反着来，从表达式问「你是什么类型」</span>\n<span class="k">decltype</span>(obj-><span class="f">GetClass</span>()) other;',
+            note: '<b>decltype 让你从「值」反推「类型」。</b>写模板代码时特别有用：你不知道调用者会传什么进来，但你能让编译器去问那个表达式。和 auto 的区别是——auto 需要一个初始值，decltype 不需要。',
+            state: { '推导结果': 'mirror::Class*（同表达式）' } },
+          { code: '<span class="c">// ③ nullptr：NULL 是 0，会撞上整数重载</span>\n<span class="k">void</span> <span class="f">Foo</span>(<span class="k">int</span>);\n<span class="k">void</span> <span class="f">Foo</span>(<span class="k">char</span>*);\n<span class="f">Foo</span>(<span class="k">NULL</span>);   <span class="c">// 调哪个？</span>\n<span class="f">Foo</span>(<span class="k">nullptr</span>); <span class="c">// 明确：char*</span>',
+            note: '<b>nullptr 解决的是重载歧义，不是「写法好看」。</b>因为 <span class="mono">NULL</span> 在 C++ 里就是整数 0，<span class="mono">Foo(NULL)</span> 会优先匹配 <span class="mono">int</span> 版本——一个语义上的空指针变成了整数运算，bug 就此埋下。ART 里指针重载很多，所以全量改用 nullptr。',
+            state: { 'NULL 的真实类型': '整数 0', 'nullptr': 'std::nullptr_t' } },
+          { code: '<span class="c">// ④ 范围 for：遍历方法表</span>\n<span class="k">for</span> (<span class="k">auto</span>&amp; m : klass-><span class="f">GetMethods</span>()) {\n  <span class="f">Visit</span>(m);\n}',
+            note: '<b>范围 for 是语法糖，本质还是迭代器。</b>注意这里的 <span class="mono">&amp;</span>：用引用避免拷贝一个完整的 ArtMethod。如果写成 <span class="mono">auto m</span>，你改的是副本，改动不会回写——这是新手很常见的沉默 bug。',
+            state: { '注意': 'auto& 才是引用' } },
+          { code: '<span class="c">// ⑤ 模板：GC 安全句柄</span>\n<span class="t">Handle</span>&lt;<span class="t">mirror::Object</span>&gt; h = ...;\n<span class="t">ObjPtr</span>&lt;<span class="t">mirror::Class</span>&gt; c = ...;',
+            note: '<b>Handle&lt;T&gt; / ObjPtr&lt;T&gt; 是「GC 安全」的指针包装。</b>GC 会移动对象，裸指针会失效；句柄让 GC 知道「这里还有一个引用」并帮你更新。类型 T 通过模板参数传进去，编译期就完全确定，运行时零额外开销。',
+            state: { '作用': 'GC 移动对象时不悬垂', '开销': '编译期解析' } },
+          { code: '<span class="c">// ⑥ RAII：构造获取，析构释放</span>\n{\n  <span class="t">MutexLock</span> lock(mutex_);\n  <span class="c">// ... 中间 return / 抛异常都无所谓</span>\n}  <span class="c">// 到这里自动解锁</span>',
+            note: '<b>RAII 把「配对操作」变成「作用域」。</b>加锁/解锁、进入/退出 GC 安全区、Attach/Detach 线程，全部靠栈对象的构造与析构自动配对。你不再需要记住「每条返回路径都要解锁」。',
+            state: { '进入作用域': '构造 → 加锁', '离开作用域': '析构 → 解锁' } },
+          { code: '<span class="c">// 智能指针：谁拥有这块内存</span>\n<span class="k">auto</span> p = std::<span class="f">make_unique</span>&lt;<span class="t">Foo</span>&gt;();\nstd::<span class="t">shared_ptr</span>&lt;<span class="t">Bar</span>&gt; s = ...;',
+            note: '<b>unique_ptr 是独占所有权，shared_ptr 是引用计数共享。</b>ART 的长期数据结构多用前者——独占意味着没有并发析构的悬念。记住原则：能用 unique_ptr 就别用 shared_ptr，引用计数是有成本的。',
+            state: { 'unique_ptr': '独占，零额外开销', 'shared_ptr': '共享，带计数' } },
+          { code: '<span class="c">// 见到这个就该警觉</span>\n<span class="k">auto</span> cb = [&amp;]() { <span class="f">Use</span>(local_var); };\n<span class="f">PostDelayedTask</span>(cb, <span class="n">5000</span>);',
+            note: '<b>危险信号出现了：引用捕获 + 延后执行。</b>下一节我们把这段 lambda 拆成匿名类和内存布局，看看 5 秒后 <span class="mono">local_var</span> 还在不在。',
+            state: { '风险': '悬垂引用（见 18.4）' } }
+        ]
+      },
+      after: T.note('warn', '⚠️ 学 C++11 的正确姿势',
+        '<p>不要抱着语法书从头背。ART 源码里 <span class="mono">auto</span> / <span class="mono">nullptr</span> / 范围 for 出现的密度极高，' +
+        '你在真实代码里撞见三次，比背十条规则有用。真正的门槛只有两个：<strong>lambda 捕获了什么</strong>，和 <strong>模板在编译期做了什么</strong>。</p>')
     },
 
     /* ================= 18.4 ================= */
     {
       h: '18.4',
-      title: '并排看：容器路线 vs 虚拟机路线',
-      html: '<p>这是全课程「运行环境」部分的收束。左边是 <b>Waydroid（容器）</b>，右边是 <b>QEMU / Cuttlefish（虚拟机）</b>。请重点看两条链路<b>差在哪一层</b>——一条共享内核，一条要过 KVM 再造一台机器。</p>' +
-            T.note('key', '🔑 一句话分辨两条路线',
-              '<p>容器路线：<b>内核是共用的，Android 只是「另一个用户空间」</b>。虚拟机路线：<b>内核是虚拟出来的，Android 跑在「另一台机器」上</b>。</p>' +
-              '<p>所有的差异——性能、硬件访问、隔离强度、能伪装成什么——都是从这一句推出来的。</p>'),
+      title: 'lambda 的内存真相：捕获列表就是成员变量',
+      html:
+        '<p>很多人对 lambda 的认知停在「匿名函数」。这个认知会让你在 ART 里踩一个经典坑。' +
+        '真相是：<strong>编译器把你的 lambda 变成了一个匿名类</strong>，捕获的变量成了这个类的<strong>成员变量</strong>。</p>' +
+        T.note('key', '🔑 lambda 三句话',
+          '<p><b>①</b> <span class="mono">[=]</span> 值捕获：把变量的<b>当前值拷贝</b>进匿名类成员——之后原变量怎么变都与你无关。' +
+          '<b>②</b> <span class="mono">[&amp;]</span> 引用捕获：把变量的<b>地址</b>存进匿名类成员——本质就是一个指针。' +
+          '<b>③</b> 一旦「引用捕获」遇上「延后执行」，那就是一颗定时炸弹：<b>匿名类活过了它引用的那个栈变量</b>。</p>' +
+          '<p>这三句不是背的，下面直接看内存。</p>') +
+        '<p>看这段代码，它同时包含两种捕获，且回调会在<strong>很久以后</strong>执行：</p>' +
+        T.code(
+          '<span class="k">void</span> <span class="f">ScheduleWork</span>() {\n' +
+          '  <span class="k">int</span> local_id = <span class="n">42</span>;\n' +
+          '  std::string local_name = <span class="s">&quot;MyBean&quot;</span>;\n\n' +
+          '  <span class="c">// [=] 值捕获：拷贝两份成员进匿名类</span>\n' +
+          '  <span class="k">auto</span> byValue = [=]() { <span class="f">Use</span>(local_id, local_name); };\n\n' +
+          '  <span class="c">// [&amp;] 引用捕获：只存两个地址</span>\n' +
+          '  <span class="k">auto</span> byRef   = [&amp;]() { <span class="f">Use</span>(local_id, local_name); };\n\n' +
+          '  <span class="f">PostDelayedTask</span>(byValue, <span class="n">5000</span>);\n' +
+          '  <span class="f">PostDelayedTask</span>(byRef,   <span class="n">5000</span>);\n' +
+          '}  <span class="c">// ← local_id / local_name 在这里被销毁</span>'),
       stage: {
-        title: '两条路线并排推演',
-        speed: 1900,
-        render: '<div class="flow-row" style="align-items:flex-start;gap:20px">' +
-                '<div class="flow-col" style="flex:1"><div class="small muted" style="margin-bottom:6px">A · 容器路线：Waydroid</div>' +
-                '<div class="blk" id="wa1">宿主 Linux 内核（共享，同一份）</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wa2">namespaces 隔离<br><span class="small">user · pid · uts · net · mount · ipc</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wa3">Android 用户空间<br><span class="small">LineageOS / Android 13</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wa4">直接访问硬件 · 无虚拟化层</div></div>' +
-                '<div class="flow-col" style="flex:1"><div class="small muted" style="margin-bottom:6px">B · 虚拟机路线：QEMU / Cuttlefish</div>' +
-                '<div class="blk" id="wb1">宿主 Linux 内核</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wb2">/dev/kvm 硬件虚拟化</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wb3">虚拟硬件<br><span class="small">virtio-gpu · virtio-net · virtio-blk</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wb4">Guest 内核<br><span class="small">另一份内核，跑在 vCPU 上</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="wb5">Android 用户空间</div></div>' +
-                '</div>' +
-                '<div class="flow-row" style="margin-top:14px;align-items:center"><span class="arrow">→</span><span class="pill" id="vd">对照结论</span></div>',
-        reset: () => { ['wa1','wa2','wa3','wa4','wb1','wb2','wb3','wb4','wb5'].forEach(i => S(i, '')); CLS('vd', 'pill'); SET('vd', '对照结论'); },
+        title: '两种捕获在内存里的真身（含悬垂现场）',
+        speed: 1700,
+        render:
+          '<div class="flow-row" style="flex-wrap:wrap;gap:10px;align-items:flex-start">' +
+            '<div><div class="card-title">栈 · ScheduleWork 帧</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">sp+0x00</span><span class="cell" id="l_id">local_id = 42</span></div>' +
+              '<div class="memrow"><span class="addr">sp+0x08</span><span class="cell" id="l_name">local_name = &quot;MyBean&quot;</span></div>' +
+              '<div class="memrow"><span class="addr">sp+0x40</span><span class="cell" id="l_state">栈帧：存活</span></div>' +
+            '</div></div>' +
+            '<div><div class="card-title">堆 · 匿名类对象 A（[=]）</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">+0x00</span><span class="cell" id="v_id">成员 id = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x08</span><span class="cell" id="v_name">成员 name = ?</span></div>' +
+            '</div></div>' +
+            '<div><div class="card-title">堆 · 匿名类对象 B（[&amp;]）</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">+0x00</span><span class="cell" id="r_id">成员 &amp;id = ?</span></div>' +
+              '<div class="memrow"><span class="addr">+0x08</span><span class="cell" id="r_name">成员 &amp;name = ?</span></div>' +
+            '</div></div>' +
+          '</div>' +
+          '<div style="margin-top:12px" class="flow-row">' +
+            '<span class="blk" id="b_task">5 秒后执行的回调</span>' +
+            '<span class="arrow">→</span>' +
+            '<span class="pill" id="verdict">等待</span>' +
+          '</div>',
+        reset: () => {
+          CLS('l_id', 'cell'); SET('l_id', 'local_id = 42');
+          CLS('l_name', 'cell'); SET('l_name', 'local_name = &quot;MyBean&quot;');
+          CLS('l_state', 'cell'); SET('l_state', '栈帧：存活');
+          CLS('v_id', 'cell'); SET('v_id', '成员 id = ?');
+          CLS('v_name', 'cell'); SET('v_name', '成员 name = ?');
+          CLS('r_id', 'cell'); SET('r_id', '成员 &amp;id = ?');
+          CLS('r_name', 'cell'); SET('r_name', '成员 &amp;name = ?');
+          S('b_task', ''); CLS('verdict', 'pill'); SET('verdict', '等待');
+        },
         steps: [
-          { run: () => { S('wa1', 'active'); S('wb1', 'active'); }, note: '<b>起点是一样的：宿主 Linux 内核。</b>整个故事从这里分岔。' },
-          { run: () => { S('wa1', 'done'); S('wa2', 'active'); }, note: '<b>容器路线在这里分岔：</b>不造新内核，只是给一组进程套上 namespaces。进程看到的 PID、网络、挂载点都是「自己那一份」。' },
-          { run: () => { S('wb1', 'done'); S('wb2', 'active'); }, note: '<b>虚拟机路线在这里分岔：</b>先开 <span class="mono">/dev/kvm</span>。宿主内核切换角色，变成 Type-1 Hypervisor，用硬件虚拟化扩展去执行 guest 的代码。' },
-          { run: () => { S('wa2', 'done'); S('wa3', 'active'); }, note: '<b>容器里直接跑 Android 用户空间。</b>系统镜像基于 LineageOS，init / zygote / system_server 一样不少，但它们发出的系统调用落在<b>宿主内核</b>上。' },
-          { run: () => { S('wb2', 'done'); S('wb3', 'active'); }, note: '<b>虚拟机要凭空造出一套硬件。</b>virtio-gpu、virtio-net 这些半虚拟化设备，就是 guest 眼里的「显卡和网卡」。图形加速的难点全在这一层。' },
-          { run: () => { S('wa3', 'done'); S('wa4', 'active'); S('wb3', 'done'); S('wb4', 'active'); }, note: '<b>关键对照出现了。</b>左边已经没有下一层了——Android <b>直接访问所需硬件</b>；右边还要再启动一个 Guest 内核，才有 Android 可用。' },
-          { run: () => { S('wb4', 'done'); S('wb5', 'active'); }, note: '<b>虚拟机里的完整链路：</b>宿主内核 → KVM → 虚拟硬件 → Guest 内核 → Android。链条越长，能对不上账的地方越多，性能损耗也越多。' },
-          { run: () => { S('wa4', 'done'); S('wb5', 'done'); CLS('vd', 'pill ok'); SET('vd', '容器：性能与硬件访问占优 / 虚拟机：隔离强度占优'); }, note: '<b>结论：这不是「谁更好」，而是「你要什么」。</b>要性能和真实硬件访问 → 容器；要强隔离、要一台「独立机器」的完整幻觉、要不共享宿主内核 → 虚拟机。' },
-          { run: () => { CLS('vd', 'pill acc'); SET('vd', '对逆向：还要叠加 Magisk + 虚拟 WiFi + 图形伪装'); }, note: '<b>但对本章的目标来说，两条路线都只是地基。</b>「看起来像真机」还要在三处补课：root 的隐藏与注入（Magisk）、网络状态的自洽伪造（虚拟 WiFi）、图形栈的指纹一致（18.2）。' }
+          { run: () => { CLS('l_id', 'cell hi'); CLS('l_name', 'cell hi'); },
+            note: '<b>先看原变量在哪。</b>local_id 和 local_name 都是 <span class="mono">ScheduleWork</span> 的局部变量，住在<b>栈帧</b>里。它们的生命周期由这个函数决定——函数返回，栈帧回收，它们就不存在了。',
+            state: { '位置': '栈', '生命周期': '函数作用域' } },
+          { run: () => { CLS('v_id', 'cell wr'); SET('v_id', '成员 id = 42'); CLS('v_name', 'cell wr'); SET('v_name', '成员 name = &quot;MyBean&quot;'); },
+            note: '<b>[=] 值捕获：拷贝进成员。</b>编译器生成的匿名类里有两个成员变量，lambda 定义的那一刻就把 42 和 &quot;MyBean&quot; <b>复制</b>了进去。这是真正的拷贝——字符串内容也在堆上另存了一份。',
+            state: { '捕获方式': '值（拷贝）', '成员类型': 'int / std::string' } },
+          { run: () => { CLS('r_id', 'cell hi'); SET('r_id', '成员 &amp;id = 0x7ffd1240'); CLS('r_name', 'cell hi'); SET('r_name', '成员 &amp;name = 0x7ffd1248'); },
+            note: '<b>[&amp;] 引用捕获：只存地址。</b>注意这里存的是 <span class="mono">0x7ffd1240</span> 这样的栈地址，<b>本质就是一个指针</b>。字符串没有被拷贝，lambda 里用的还是外面那一份。',
+            state: { '捕获方式': '引用（指针）', '成员类型': 'int&amp; → int*' } },
+          { run: () => { S('b_task', 'active'); },
+            note: '<b>两个回调都被丢进任务队列，5 秒后执行。</b>排队的是匿名类对象本身（堆上），而不是栈上的局部变量。此刻一切正常，两边都还没出问题。',
+            state: { '队列': 'byValue, byRef', '延迟': '5000 ms' } },
+          { run: () => { S('b_task', 'done'); CLS('l_state', 'cell wr'); SET('l_state', '栈帧：已销毁 ✗'); S('b_task', 'hot'); },
+            note: '<b>关键一步：ScheduleWork 返回了。</b>栈帧被回收，<span class="mono">local_id</span> 和 <span class="mono">local_name</span> 的内存<b>不再属于你</b>——它可能已经被别的函数覆盖成完全无关的字节。',
+            state: { '栈帧': '已销毁', '那块内存': '可能已被复用' } },
+          { run: () => { CLS('v_id', 'cell ok'); SET('v_id', '成员 id = 42 ✓'); CLS('v_name', 'cell ok'); SET('v_name', '成员 name = &quot;MyBean&quot; ✓'); },
+            note: '<b>值捕获的这个活下来了。</b>因为它手里是<b>自己的拷贝</b>，原变量死活与它无关。这就是为什么回调里要长期使用一个值，就该用 <span class="mono">[=]</span> 而不是 <span class="mono">[&amp;]</span>。',
+            state: { 'byValue': '安全 ✓' } },
+          { run: () => { CLS('r_id', 'cell bad'); SET('r_id', '成员 &amp;id = 0x7ffd1240 ✗ 悬垂'); CLS('r_name', 'cell bad'); SET('r_name', '成员 &amp;name = 0x7ffd1248 ✗ 悬垂'); CLS('verdict', 'pill bad'); SET('verdict', '悬垂引用 · 崩或不崩看运气'); },
+            note: '<b>灾难现场：引用捕获的回调指向一块已经死掉的内存。</b>它依然能读到「某个值」，但那个值已经不是你写下的 42。这就是 <span class="term" data-def="指针/引用指向了生命周期已经结束的对象">悬垂引用</span>——最恶劣的一类 bug，因为它<b>不一定立刻崩</b>。',
+            state: { 'byRef': '悬垂 ✗', '典型症状': '偶发崩溃 / 读到脏数据' } },
+          { run: () => { S('b_task', 'hot'); CLS('verdict', 'pill bad'); SET('verdict', '延迟越久，越可能被覆盖'); },
+            note: '<b>为什么这类 bug 特别难查？</b>因为延迟越长，那块栈内存被别的调用覆盖的概率越大。压测不崩、线上偶发；改了无关代码就复现——症状与原因之间隔着一整条时间线。',
+            state: { '复现难度': '极高' } },
+          { run: () => { S('b_task', 'cool'); CLS('verdict', 'pill ok'); SET('verdict', '正确做法：按生命周期选捕获方式'); },
+            note: '<b>结论：捕获方式的选择标准是「谁活得更久」。</b>回调比原变量活得久 → 用值捕获，或用 shared_ptr 共享所有权；只在同步调用内立即用完 → 引用捕获才是安全且高效的。ART 这种长期运行的系统里，任务队列、GC 回调、事件通知都是高危区。',
+            state: { '同步立即用': '[&] 安全', '异步延后用': '[=] 或 shared_ptr' } }
         ]
       },
-      after: T.tbl(['维度', '容器（Waydroid）', '虚拟机（QEMU / Cuttlefish）'], [
-        ['内核', '共享宿主内核', 'Guest 自带一份内核'],
-        ['性能', '接近原生（官方强调无虚拟化层）', '有虚拟化开销，图形/IO 尤甚'],
-        ['硬件访问', '容器内 Android <b>可直接访问所需硬件</b>', '只能看到虚拟硬件（virtio 等）或直通设备'],
-        ['隔离强度', '依赖 namespaces + Android 自身沙箱，较弱', '强：guest 与宿主之间有硬件级边界'],
-        ['风控视角', '<b>像真机</b>（硬件是真的），但宿主暴露面多、容易被找出「不是独立设备」的破绽', '容易被识别为模拟器（虚拟硬件指纹、渲染器字符串），但更容易伪装成「一台完整设备」'],
-        ['典型场景', 'Linux 手机 / 桌面 Linux 上跑 Android 应用', '云真机、CI 测试、需要多实例强隔离的场合']
-      ]) +
-      '<p class="small muted">关于 remote_android 具体走哪条路线、如何组合：<span class="pill warn">以作者发布为准，待核实</span>。</p>'
+      after:
+        T.note('bad', '🚫 ART 里的真实后果',
+          '<p>这不是教科书里的理论风险。<span class="mono">[&amp;]</span> 捕获局部变量后延后执行，在长期运行的虚拟机里会表现为：' +
+          '<b>GC 期间的偶发崩溃</b>、<b>线程池里的随机野指针</b>、<b>只在特定时序下出现的类解析错误</b>——' +
+          '而且栈回溯往往指向一个和 bug 毫无关系的函数。</p>') +
+        T.tbl(['场景', '该用哪种捕获', '理由'], [
+          ['同步调用，函数内立即用完', '[&amp;] 引用捕获', '零拷贝、零开销，且生命周期安全'],
+          ['丢进队列，稍后执行', '[=] 值捕获', '拷贝出自己的副本，与原变量解耦'],
+          ['共享大对象且需长期持有', 'shared_ptr 捕获', '用引用计数把生命周期绑在一起，别赌'],
+          ['循环里创建多个回调', '显式捕获所需变量', '避免 [&amp;] 在循环变量上集体踩雷']
+        ]) +
+        T.term('闭包', 'lambda 生成的匿名类对象；捕获的变量成为它的成员。') + ' ' +
+        T.term('悬垂引用', '引用指向的对象已销毁，访问行为未定义。') + ' ' +
+        T.term('生命周期', '对象从构造到析构的有效期；捕获方式必须按它来选。')
     },
-
+    ,
     /* ================= 18.5 ================= */
     {
       h: '18.5',
-      title: '内核从哪来：自己编译一个「任意版本」的虚拟机内核',
-      html: '<p>不管走哪条路线，你最终都会发现<b>宿主内核是你唯一改不动、又必须改的东西</b>：容器路线要它带 binder/ashmem，虚拟机路线要它带 KVM 与 virtio 相关支持，云上还要它带特定的网络/存储/调度特性。发行版给你的通用内核，恰好就是「什么都有一点、什么都不够」的那一个。</p>' +
-            '<p>所以这门课里会反复出现同一个动作：<b>拿一份内核源码，按自己的需求配一遍，编出一个属于你的内核</b>。它可以是 Ubuntu 的、可以是主线某个版本，甚至可以是给 Android 用的——流程是同一套。</p>' +
-            T.note('key', '🔑 三个概念先分清，别混',
-              '<p><b>内核源码</b>（决定有哪些功能）→ <b>配置 .config</b>（决定哪些功能被编进来）→ <b>产物</b>（<span class="mono">vmlinuz</span> 内核镜像 + 内核模块 <span class="mono">.ko</span>）。</p>' +
-              '<p>很多人编译失败不是不会敲命令，而是<b>没意识到「配置」才是内核的真正内容</b>：同一个源码树，两份不同的 .config，编出来就是两个完全不同的系统。</p>') +
-            T.note('warn', '⚠️ 「任意版本」的代价：模块与内核是绑定关系',
-              '<p>内核模块（<span class="mono">.ko</span>）与它被编译时的内核版本、配置<b>强绑定</b>。换内核版本却不重建模块，结果就是模块加载失败。这也是为什么「装上去了但 binder 用不了」这种问题经常出现在<b>升级内核之后</b>。</p>' +
-              '<p class="small muted">具体每个发行版、每个内核版本的编译命令与依赖包名 <span class="pill warn">待核实</span>，以下步骤只描述机制，不作为可直接粘贴的命令。</p>'),
+      title: '核心实战：在 RegisterNatives 那一刻抓住映射',
+      html:
+        '<p>先分清两种 JNI 注册方式，这决定了你的对手长什么样。</p>' +
+        T.grid(2, [
+          '<div class="card"><div class="card-title">📌 静态注册</div>' +
+          '<p>函数名必须写成 <span class="mono">Java_包名_类名_方法名</span>（下划线要转义），虚拟机会按名字去动态库里找。</p>' +
+          '<p><b>对逆向的影响：</b>符号表里明晃晃写着 <span class="mono">Java_com_demo_MyBean_getName</span>，' +
+          '<span class="mono">nm</span> / IDA 一看就知道哪个 Java 方法对应哪个 Native 函数。<b>不需要跑起来就能分析。</b></p></div>',
+          '<div class="card"><div class="card-title">📌 动态注册</div>' +
+          '<p>在 <span class="mono">JNI_OnLoad</span> 里调用 <span class="mono">env-&gt;RegisterNatives(clazz, methods, nMethods)</span>，' +
+          '把一张 <span class="mono">{名字, 签名, 函数地址}</span> 的表交给虚拟机。</p>' +
+          '<p><b>对逆向的影响：</b>函数名可以是任意字符串（根本不进符号表），地址运行时才产生。' +
+          '<b>静态分析到这里彻底断线。</b>加固方案偏爱它，正是因为这个。</b></p></div>'
+        ]) +
+        '<p>那张表的结构体就是三件事：</p>' +
+        T.code(
+          '<span class="k">typedef</span> <span class="k">struct</span> {\n' +
+          '  <span class="k">const</span> <span class="k">char</span>* name;       <span class="c">// Java 方法名</span>\n' +
+          '  <span class="k">const</span> <span class="k">char</span>* signature;  <span class="c">// 方法签名，如 (I)Ljava/lang/String;</span>\n' +
+          '  <span class="k">void</span>*       fnPtr;      <span class="c">// native 函数真实地址</span>\n' +
+          '} <span class="t">JNINativeMethod</span>;') +
+        T.note('key', '🔑 从「生成侧」动手',
+          '<p>既然映射是在 <span class="mono">RegisterNatives</span> 里被交给虚拟机的，那我们就在<b>那个函数内部</b>加一行日志。' +
+          '此刻 Java 方法、签名、函数地址三者同时在手上——<strong>这是整个系统里信息最完备的一瞬间</strong>。</p>' +
+          '<p>比起 hook <span class="mono">RegisterNatives</span> 这个 API（会被反调试发现 hook 框架的存在），' +
+          '直接改虚拟机源码<b>在代码里就完成了记录</b>，没有额外痕迹需要隐藏。</p>'),
       stepper: {
-        title: '内核是怎么被「做」出来的（机制流程）',
+        title: '给 ART 的 RegisterNatives 插一行探针（右侧看映射逐条累积）',
         lines: [
-          { code: '<span class="c"># 1. 取源码：版本由你决定，这就是「任意版本」的含义</span>\n<span class="f">git</span> clone <span class="s">内核源码仓库</span> <span class="c"># 或下载对应版本的源码包</span>',
-            note: '<b>选版本是第一个决策点。</b>版本决定了可用的特性集合，也决定了你能不能用上某个已经修好的 bug 修复。云上跑安卓容器，通常优先选<b>长期支持</b>分支而不是最新版。',
-            state: { '阶段': '取源码', '当前产物': '一份内核源码树' } },
-          { code: '<span class="c"># 2. 生成基础配置：从一个已知可用的配置出发</span>\n<span class="f">make</span> <span class="n">olddefconfig</span>   <span class="c"># 或 defconfig / 发行版配置</span>',
-            note: '<b>不要从零配。</b>先拿一份「这个平台本来就能跑」的配置当基线，只在上面做增量修改。从零开始配内核是纯粹的浪费时间。',
-            state: { '阶段': '配置', '当前产物': '.config' } },
-          { code: '<span class="c"># 3. 开需要的选项 —— 这一步决定成败</span>\n<span class="c">#   容器路线：binder / ashmem 或 memfd</span>\n<span class="c">#   虚拟机路线：KVM / virtio 系列</span>\n<span class="c">#   网络：网桥、TUN/TAP、网络命名空间相关</span>',
-            note: '<b>这是整条链路上最关键的三行注释。</b>你要开的选项和你的路线直接对应：跑容器必须有 binder，跑虚拟机必须有 KVM 与 virtio。<b>配置漏了一项，后面所有工作都会失败在这一项上。</b>',
-            state: { '阶段': '配置', '关键选项': 'binder / memfd / KVM / virtio' } },
-          { code: '<span class="c"># 4. 编译：先编内核镜像，再编模块</span>\n<span class="f">make</span> -j<span class="n">$(nproc)</span> <span class="c"># 再 make modules / modules_install</span>',
-            note: '<b>耗时最长的一步，也最不需要人盯着。</b>注意 -j 用满核心；云上编译内核是个很典型的「用钱换时间」的场景。',
-            state: { '阶段': '编译', '当前产物': 'vmlinuz + .ko 模块' } },
-          { code: '<span class="c"># 5. 安装：镜像放 /boot，模块进 /lib/modules/&lt;版本&gt;</span>',
-            note: '<b>模块必须落在以版本号命名的目录下</b>，这就是上一段说的「强绑定」在文件系统上的体现。',
-            state: { '阶段': '安装', '内核镜像': '/boot', '模块目录': '/lib/modules/&lt;版本&gt;' } },
-          { code: '<span class="c"># 6. 生成 initramfs：内核启动早期要用到的驱动与脚本打包在这里</span>',
-            note: '<b>initramfs 是内核启动链条里的「第一段用户空间」。</b>它负责把真正的根文件系统挂起来——第 18.7 节的启动链路里，它就在内核与 /init 之间。',
-            state: { '阶段': '打包', '当前产物': 'initramfs / initrd' } },
-          { code: '<span class="c"># 7. 加引导项，重启进新内核，验证</span>\n<span class="f">uname</span> -r',
-            note: '<b>验证的方式只有一个：真的重启进去，再跑一遍 18.3 那种体检。</b>不看内核版本号、不看设备节点，就等于没验证。',
-            state: { '阶段': '验证', '判据': 'uname -r 与设备节点同时符合预期' } }
+          { code: '<span class="c">// ① 目标：ART 源码里 JNI 的 RegisterNatives 实现处</span>\n' +
+                  '<span class="c">// 文件名/函数签名随 AOSP 版本变化 <span class="pill warn">待核实</span></span>\n' +
+                  '<span class="k">static</span> jint <span class="f">RegisterNatives</span>(JNIEnv* env,\n' +
+                  '        jclass java_class, <span class="k">const</span> <span class="t">JNINativeMethod</span>* methods,\n' +
+                  '        jint method_count) {',
+            note: '<b>先找到入口。</b>这是 ART 处理动态注册的唯一入口，所有 <span class="mono">env-&gt;RegisterNatives</span> 调用最终都会落到这里。找到它，就等于找到了所有加固 App 的「注册咽喉」。',
+            state: { '阶段': '定位插桩点' } },
+          { code: '  <span class="t">ScopedObjectAccess</span> soa(env);',
+            note: '<b>RAII 进场。</b>这一行同时做两件事：把当前线程切换到「可以安全访问 Java 对象」的状态，并在函数返回时<b>自动还原</b>。如果这里手写加锁/解锁，中间任何一条提前 return 都会漏掉解锁——所以 ART 用 RAII。',
+            state: { '机制': 'RAII', '进入': '对象访问安全态' } },
+          { code: '  <span class="t">mirror::Class</span>* c = soa.<span class="f">Decode</span>&lt;<span class="t">mirror::Class</span>&gt;(java_class);',
+            note: '<b>把 jclass 解成 ART 内部类型。</b>模板参数 <span class="mono">&lt;mirror::Class&gt;</span> 在编译期把返回类型钉死，运行时只是一次指针转换——这就是模板「零开销」的含义。到这里我们拿到了类的镜像。',
+            state: { '获得': 'mirror::Class* c' } },
+          { code: '  <span class="k">for</span> (jint i = <span class="n">0</span>; i &lt; method_count; ++i) {\n' +
+                  '    <span class="k">const</span> <span class="k">char</span>* name = methods[i].name;\n' +
+                  '    <span class="k">const</span> <span class="k">char</span>* sig  = methods[i].signature;\n' +
+                  '    <span class="k">void</span>*       fn   = methods[i].fnPtr;',
+            note: '<b>循环取下一样。</b>注意这里三个值同时到手：Java 方法名、签名、native 函数地址。<b>签名必须一起记</b>——因为 Java 支持方法重载，光有名字无法唯一确定一个方法。',
+            state: { 'i': '0', 'name': 'getName', 'sig': '()Ljava/lang/String;' } },
+          { code: '    <span class="t">ArtMethod</span>* m = c-&gt;<span class="f">FindDirectMethod</span>(name, sig);',
+            note: '<b>在类里反查 ArtMethod。</b>回看 18.2 的指针链：Class → 方法表 → ArtMethod。这里是同一条链的<b>反向使用</b>——用名字找槽位，而不是从槽位读名字。',
+            state: { '查表': 'Class::methods_', '命中': 'ArtMethod* m' } },
+          { code: '    <span class="c">// ★★★ 我们插入的探针（唯一改动）</span>\n' +
+                  '    <span class="f">LOG</span>(INFO) &lt;&lt; <span class="s">&quot;[TRACE] &quot;</span> &lt;&lt; c-&gt;<span class="f">PrettyDescriptor</span>()\n' +
+                  '               &lt;&lt; <span class="s">&quot;.&quot;</span> &lt;&lt; name &lt;&lt; sig &lt;&lt; <span class="s">&quot; -&gt; &quot;</span> &lt;&lt; fn;',
+            note: '<b>这就是全部改动。</b>一行日志，把「Java 方法 → native 地址」永久记录下来。注意探针位置在 <span class="mono">FindDirectMethod</span> 之后——此时类名、方法名、签名、目标地址<b>四要素齐全</b>。',
+            state: { '① com.demo.MyBean.getName()Ljava/lang/String;': '0x7f6c9e40' } },
+          { code: '    m-&gt;<span class="f">RegisterNative</span>(fn);\n' +
+                  '  }',
+            note: '<b>虚拟机自己完成绑定。</b>把 <span class="mono">fn</span> 写进 ArtMethod 的执行入口（并同步位置换 access_flags 的 native 位）。我们没有干扰它的逻辑——<b>只旁观，不改变行为</b>，这是插桩最重要的纪律。',
+            state: { '① com.demo.MyBean.getName()Ljava/lang/String;': '0x7f6c9e40',
+                     'ArtMethod 入口': '0x7f6c9e40 (native)' } },
+          { code: '    <span class="c">// i = 1</span>\n' +
+                  '    name = <span class="s">&quot;setAge&quot;</span>; sig = <span class="s">&quot;(I)V&quot;</span>; fn = <span class="n">0x7f6ca100</span>;',
+            note: '<b>第二条来了。</b>注意签名 <span class="mono">(I)V</span>：入参一个 int，返回 void。同一个 <span class="mono">setAge</span> 如果还有一个 <span class="mono">(J)V</span> 的重载，光看名字根本区分不了——这就是为什么探针必须带上签名。',
+            state: { '① com.demo.MyBean.getName()Ljava/lang/String;': '0x7f6c9e40',
+                     '② com.demo.MyBean.setAge(I)V': '0x7f6ca100' } },
+          { code: '    <span class="c">// i = 2 —— 名字被刻意混淆过</span>\n' +
+                  '    name = <span class="s">&quot;a&quot;</span>; sig = <span class="s">&quot;([B)[B&quot;</span>; fn = <span class="n">0x7f6ca880</span>;',
+            note: '<b>加固的痕迹出现了。</b>方法名被压成一个字母 <span class="mono">a</span>，入参出参都是字节数组 <span class="mono">[B</span>——' +
+                  '这几乎必然是一个<b>加解密/校验函数</b>。静态分析看到这种名字毫无办法，而我们的探针把它的<b>真实地址</b>交了出来。',
+            state: { '① com.demo.MyBean.getName()Ljava/lang/String;': '0x7f6c9e40',
+                     '② com.demo.MyBean.setAge(I)V': '0x7f6ca100',
+                     '③ com.demo.MyBean.a([B)[B': '0x7f6ca880' } },
+          { code: '    <span class="c">// i = 3</span>\n' +
+                  '    name = <span class="s">&quot;nativeCheck&quot;</span>; sig = <span class="s">&quot;()Z&quot;</span>; fn = <span class="n">0x7f6cab00</span>;',
+            note: '<b>一条更值钱的记录。</b><span class="mono">nativeCheck()Z</span> 返回 boolean——这是典型的<b>完整性校验/root 检测</b>入口。拿到地址，就能直接去看它的实现，不用再猜入口在哪。',
+            state: { '① com.demo.MyBean.getName()Ljava/lang/String;': '0x7f6c9e40',
+                     '② com.demo.MyBean.setAge(I)V': '0x7f6ca100',
+                     '③ com.demo.MyBean.a([B)[B': '0x7f6ca880',
+                     '④ com.demo.MyBean.nativeCheck()Z': '0x7f6cab00' } },
+          { code: '  <span class="k">return</span> JNI_OK;\n}',
+            note: '<b>注册结束，虚拟机继续正常工作。</b>整个过程目标 App 毫无感知——没有 hook、没有注入、没有额外的线程或内存特征可供检测。',
+            state: { '输出': '4 条映射已落盘', '目标感知': '无' } },
+          { code: '<span class="c"># 沙箱侧的产物：一份纯文本映射表</span>\n' +
+                  '<span class="c"># 直接喂给 IDA / Ghidra，或在 gdb 里下断</span>',
+            note: '<b>这就是产物。</b>一份「Java 方法 ↔ native 地址」的对照表，是后续所有动态调试的入口清单。<b>注册那一刻天然知道全部信息，这就是从生成侧动手的价值。</b>',
+            mem: '[TRACE] com.demo.MyBean.getName()Ljava/lang/String; -> 0x7f6c9e40\n' +
+                 '[TRACE] com.demo.MyBean.setAge(I)V                -> 0x7f6ca100\n' +
+                 '[TRACE] com.demo.MyBean.a([B)[B                  -> 0x7f6ca880\n' +
+                 '[TRACE] com.demo.MyBean.nativeCheck()Z           -> 0x7f6cab00\n' +
+                 '--- 4 bindings recorded (sandbox log) ---',
+            state: { '落盘位置': '/data/local/tmp/art-trace.log', '格式': 'name+sig → addr' } }
         ]
       },
-      after: '<p><b>对逆向实战有什么用：</b>当你需要「宿主内核支持某个特性」时，你要能判断这是<b>一个配置项问题</b>、<b>一个版本问题</b>，还是<b>一个模块没重建的问题</b>。这三者的排查路径完全不同，而它们在现象上全都表现为「功能不可用」。</p>'
+      after: T.note('warn', '⚠️ 这几处细节随版本变化，务必以你手上的源码为准',
+        '<p>下列内容在 AOSP 不同版本间<b>改过名字或位置</b>，写代码前先在本地源码里搜一遍，不要照抄：' +
+        '处理 JNI 注册的具体<b>文件名</b>、函数所在<b>命名空间</b>、查找方法用的<b>辅助函数名</b>、日志宏的用法。' +
+        '<span class="pill warn">待核实</span></p>' +
+        '<p><b>通用方法：</b>在 ART 源码根目录搜 <span class="mono">RegisterNatives</span> 与 <span class="mono">JNINativeMethod</span>，' +
+        '能同时命中两者的那个文件就是你的插桩点。</p>') +
+        '<div class="note ok"><div class="note-h">✅ 插桩的三条纪律</div>' +
+        '<p><b>①</b> 只读不改：探针不得改变原有控制流与返回值；<b>②</b> 别在持锁路径里做重活：日志要够轻，或先写入内存缓冲；' +
+        '<b>③</b> 记录必须含签名：同名重载会让只有名字的映射表彻底失效。</p></div>',
+      quiz: {
+        id: 'q4-1', chapter: 4, answer: 1,
+        stem: '一个加固 App 的 <span class="mono">libnative.so</span> 里，符号表只剩寥寥几个导出函数，但运行时相关 Java native 方法明显都能正常工作。下面哪个判断最准确？',
+        options: [
+          { t: '这个库被整体加密了，需要在内存里 dump 出解密后的 so', why: '整体加密的库连 JNI_OnLoad 都跑不起来。而且符号少不等于内容加密——动态注册本来就不需要导出符号。' },
+          { t: '库很可能使用动态注册：函数名不出现在符号表里，地址由运行时注册', why: '正确。动态注册的核心特征就是「符号表干净但功能正常」，因为 Java 方法与函数的对应关系只存在于运行时的那张 JNINativeMethod 表里。' },
+          { t: '这些方法其实是 Java 层实现的，只是名字像 native', why: '可以验证：反射读 ArtMethod 的 access_flags 是否带 native 位。在功能确实由 so 提供的前提下，这个解释不成立。' },
+          { t: '必须用 Frida 才能确认，静态工具完全无能为力', why: '静态工具依然能看 JNI_OnLoad 里的 RegisterNatives 调用与那张表的初始化过程，只是拿不到最终地址。说「完全无能为力」是过头了。' }
+        ],
+        explain: '<b>动态注册的判据是「符号缺失 + 功能正常」。</b>静态注册时函数名必须是 <span class="mono">Java_</span> 前缀，' +
+                 '符号表会直接暴露映射关系；动态注册把这张关系表在运行时交给虚拟机，导出表自然空空如也。' +
+                 '要恢复映射，要么在运行时观察 <span class="mono">RegisterNatives</span>，要么像本章一样直接在虚拟机内部记录它。'
+      }
     },
 
     /* ================= 18.6 ================= */
     {
       h: '18.6',
-      title: '绑定挂载与命名空间下的 /proc：容器的地基',
-      html: '<p>容器听起来很玄，拆到内核原语只有两件事：<b>namespaces 决定「看得见什么」，mount 决定「看得见的东西长什么样」</b>。而绑定挂载是其中最常用的一把螺丝刀。</p>' +
-            '<p><span class="term" data-def="把一个已存在的目录挂载到另一个位置，两个路径看到同一份内容：mount --bind olddir newdir">绑定挂载（bind mount）</span>做的事情非常朴素：<span class="mono">mount --bind olddir newdir</span>，把 <b>olddir 挂到 newdir 上</b>。挂完以后，访问 newdir 就是访问 olddir——同一份数据，两个入口。</p>' +
-            '<p>容器用它把宿主机的目录「映射」进容器：宿主准备好一份 rootfs，然后在容器自己的挂载命名空间里把它 bind 到 <span class="mono">/</span> 或 <span class="mono">/system</span> 之类的路径上。<b>宿主什么都没变，容器里却像是另一台机器。</b>这也是后面 Magisk 的 magic mount 的基础手法。</p>' +
-            T.note('key', '🔑 为什么每个 PID 命名空间都需要自己的 /proc',
-              '<p>因为 <b>/proc 里的 PID 编号是「命名空间内相对的」</b>：同一个进程，在宿主里可能是 PID 3000，在容器的命名空间里却是 PID 1。<span class="mono">/proc</span> 不是一块静态数据，它是内核<b>按当前进程所处的 PID 命名空间实时生成的视图</b>。</p>' +
-              '<p>所以容器启动时一定要在自己的挂载命名空间里重新挂一次：<span class="mono">mount -t proc proc /proc</span>。挂载动作本身会带上「是谁在挂」的上下文，内核据此生成对应的内容。</p>' +
-              '<p><b>如果忘了这一步</b>，容器里的进程会看到宿主的 /proc——`ps` 里冒出一堆不该看见的进程，PID 1 也不是它的 init。<b>这是一个既影响功能、又直接暴露环境性质的错误。</b></p>') +
-            T.grid(2, [
-              '<div class="card"><div class="card-title">其他常见挂载点</div><p><span class="mono">/dev</span>（设备节点，常配合 binderfs）、<span class="mono">/sys</span>、<span class="mono">/dev/pts</span>、<span class="mono">/dev/shm</span>。它们和 /proc 一样，都是「内核视图」，必须按命名空间重新挂。</p></div>',
-              '<div class="card"><div class="card-title">对检测的意义</div><p>风控非常喜欢读 <span class="mono">/proc</span> 和 <span class="mono">/sys</span>：进程列表、CPU 信息、设备树、网络统计。挂载没做干净，这里就是最大的破绽来源。</p></div>'
-            ]) +
-            T.note('', '📌 Linux init 进程：内核交给用户空间的第一棒',
-              '<p>内核启动的最后一步，是执行 <span class="mono">/sbin/init</span>（也可以用 <span class="mono">init=</span> 内核参数指定别的路径）。这个进程成为 <b>PID 1</b>，职责有三件：<b>挂载文件系统、启动服务、回收孤儿进程</b>。</p>' +
-              '<p>在容器里，PID 1 的角色由<b>容器运行时或一个精简 init</b> 承担。而 Android 的情况更特殊：它的用户空间里也有一份自己的 <span class="mono">/init</span>（在 ramdisk 里），负责解析 <span class="mono">init.rc</span> 并拉起 servicemanager、zygote 等一整套服务——这一层属于<b>下一节要讲的 Android 启动链路</b>。</p>' +
-              '<p><b>容易踩的坑：</b>PID 1 在 Linux 里有特殊语义（信号处理、僵尸进程回收）。container 里如果 PID 1 是一个不处理 SIGCHLD 的普通程序，就会出现「僵尸进程堆积」——症状是容器跑久了越来越怪，但单看每个服务都正常。</p>'),
-      term: {
-        title: '容器启动时的挂载与 init 时序（示意）',
+      title: 'ArtMethod：所有 Java Hook 的公共抓手',
+      html:
+        '<p>回看 18.2 的最后一格：ART 把 <span class="mono">entry_point_from_quick_compiled_code_</span> 当函数指针直接调用。' +
+        '<strong>谁能写这个字段，谁就能改变这个 Java 方法的行为。</strong>市面上所有 Java 层 Hook 框架，最终都落在这里。</p>' +
+        T.note('key', '🔑 一句话记住',
+          '<p>Frida 的 <span class="mono">Java.use()</span> 听起来很高层，本质就是：<b>找到那个 ArtMethod，把 access_flags 改成 native，' +
+          '把执行入口换成自己的 trampoline，并保存原始值以便还原。</b></p>' +
+          '<p>理解这一点，你就能解释很多「玄学现象」——比如 Hook 之后反射看到方法种类变了、或者某些 ROM 上 Hook 崩溃。</p>') +
+        '<p>下面把这条路径逐步走完，右侧跟着 ArtMethod 的字段变化。</p>',
+      stepper: {
+        title: 'Frida Java.use 在 ArtMethod 上到底改了什么',
         lines: [
-          { t: 'p', s: 'unshare --pid --mount --uts --ipc --net --fork ...', note: '<b>先把命名空间开出来。</b>这一步之后，进程看到的 PID/挂载/网络就是「自己那一份」了。' },
-          { t: 'd', s: '（下面在容器内部执行，命令为示意，具体实现随运行时不同）' },
-          { t: 'p', s: 'mount --bind /host/rootfs /container/root', note: '<b>绑定挂载 rootfs。</b>把宿主准备好的一套文件系统「接」到容器的根上——数据还是那一份，入口换了。' },
-          { t: 'p', s: 'mount -t proc proc /container/root/proc', note: '<b>重新挂 /proc，这一步最容易被漏。</b>漏了就会看到宿主的进程表，PID 1 也不是容器自己的 init。', state: { '当前命名空间': '新 PID ns', '/proc 归属': '容器命名空间' } },
-          { t: 'p', s: 'mount -t sysfs sys /container/root/sys', note: '<b>同理挂 /sys。</b>内核视图都要按命名空间重建。' },
-          { t: 'p', s: 'mount --bind /dev/binderfs /container/root/dev/binderfs', note: '<b>把 binder 设备接进容器。</b>没有它，Android 的 IPC 从第一秒就不通。' },
-          { t: 'p', s: 'chroot /container/root /sbin/init', note: '<b>切根并交棒给 init。</b>从这一刻起，容器内的 PID 1 就是它；宿主内核仍然是那个宿主内核。' },
-          { t: 'o', s: '[    0.000000] Linux version ...' },
-          { t: 'o', s: 'init: 启动用户空间服务 ...' },
-          { t: 'w', s: '注意：真实运行时的挂载顺序、参数与安全加固（只读挂载、noexec、SELinux 标签等）比这里复杂得多，以上只表达「顺序与依赖关系」。' }
+          { code: '<span class="c">// JS 侧：看起来很无害的一行</span>\n<span class="k">var</span> MyBean = Java.<span class="f">use</span>(<span class="s">&quot;com.demo.MyBean&quot;</span>);',
+            note: '<b>这一行背后发生了什么？</b>它并不是「拿到一个 Java 类」，而是让 Frida 去 ART 里定位到 <span class="mono">com.demo.MyBean</span> 对应的 <span class="mono">mirror::Class</span>，并缓存下来。寻址路径就是 18.2 里那条链的前两跳。',
+            state: { '定位': 'mirror::Class* (com.demo.MyBean)' } },
+          { code: '<span class="c">// 再找到具体方法，拿到 ArtMethod 槽位</span>\n<span class="k">var</span> m = MyBean.getName;',
+            note: '<b>第三跳：Class → 方法表 → ArtMethod。</b>到这里，<span class="mono">m</span> 背后就是一个实实在在的 ArtMethod 结构体地址。后面所有的操作都是对这个结构体的读写。',
+            state: { 'ArtMethod': '0x7f3b2040', 'access_flags_': '0x0001 (public)' } },
+          { code: '<span class="c">// ① 保存原始值 —— 决定性的一步</span>\n<span class="c">// original_flags, original_entry 存起来</span>',
+            note: '<b>先备份，再动手。</b>这一步决定了 Hook 能不能干净地卸载。任何「改状态」的操作，第一步永远是保存原始值——这不仅适用于 Hook，也是运行时插桩的通用纪律。',
+            state: { '备份': 'flags=0x0001, entry=0x7f6c9e40' } },
+          { code: '<span class="c">// ② 把 access_flags 里的 native 位置 1</span>\nkAccNative = <span class="n">0x0100</span>;\nflags |= kAccNative;',
+            note: '<b>关键手法：伪装成 native 方法。</b>为什么？因为 ART 对 native 方法的调用路径<b>最简单</b>——它不查 Dex 代码、不做解释执行，直接把 ArtMethod 上的函数指针拿去调。把普通 Java 方法「变成」native，就等于把它原有的执行路径彻底短路。',
+            state: { 'access_flags_': '0x0101 (public | native)' } },
+          { code: '<span class="c">// ③ 替换执行入口为我们的 trampoline</span>\nentry_point = my_trampoline;',
+            note: '<b>第三跳的终点被改写了。</b>回到 18.2：这个字段是「真正会执行的地址」。现在它指向 Frida 的 trampoline，虚拟机一调用就进了我们的代码。',
+            state: { 'entry_point_..._code_': '0x7f90be00 (trampoline)' } },
+          { code: '<span class="c">// ④ trampoline 内部：转给我们真正的 JS 实现</span>\n<span class="c">// 参数从 Java 调用约定转换后交给 handler</span>',
+            note: '<b>trampoline 是「转接器」。</b>它负责把 Java 层的调用约定翻译成 Frida 的调用约定，再把参数交给你写的 <span class="mono">implementation</span>。这一层是 Frida 的实现细节，但也是 Hook 开销与崩溃的主要来源。',
+            state: { '调用链': 'ART → trampoline → JS handler' } },
+          { code: '<span class="c">// ⑤ Java 侧再次调用时</span>\n<span class="k">String</span> n = bean.<span class="f">getName</span>();  <span class="c">// 进入我们的代码</span>',
+            note: '<b>生效了。</b>Java 代码毫无变化，但执行流已经改道。注意：改的是<b>类的元数据</b>而不是某个对象——所以这个类的<b>所有实例</b>都受影响。',
+            state: { '影响范围': '该类的全部实例' } },
+          { code: '<span class="c">// ⑥ 还原</span>\nflags = original_flags; entry_point = original_entry;',
+            note: '<b>把两个字段写回去就卸载完成。</b>所以备份必须是<b>两个字段都备</b>：只还原 entry 不还原 flags，方法在 ART 眼里仍然是 native，会走错执行路径——这是很多「卸载 Hook 后崩溃」的真凶。',
+            state: { '还原': 'flags / entry 双双复位' } },
+          { code: '<span class="c">// ⑦ 为什么有时会崩</span>\n<span class="c">// 入口被改后，若 GC 或并发执行正在读这个 ArtMethod…</span>',
+            note: '<b>玄学现象的解释。</b>ArtMethod 是<b>多线程共享</b>的元数据。你改它的同时，其他线程可能正在读它或正在其中执行。这就是为什么 Hook 要挑时机、要注意内存可见性——也是 ART 内部要给这类操作加同步的原因。',
+            state: { '并发风险': '多线程共享元数据', '表现': '偶发崩溃' } },
+          { code: '<span class="c">// ⑧ 同样的手法，用于定制 ART 时</span>\n<span class="c">// 我们不改 entry，只在入口处加记录点</span>',
+            note: '<b>回到本章的主线。</b>同样的位置，两种用法：Hook 框架<b>改写</b>入口以改变行为（会被检测、会崩）；定制 ART 可以只在入口<b>记录</b>而不改变逻辑——这就是「沙箱」与「Hook」的差别：前者要的是观测，后者要的是控制。',
+            state: { 'Hook': '改写，追求控制', '沙箱插桩': '只读，追求观测' } }
         ]
+      },
+      after: T.tbl(['问题现象', '底层原因', '该往哪查'], [
+        ['Hook 后反射看到方法变成 native', 'access_flags 的 native 位被置 1', '检查 Hook 框架是否暴露了原始 flags'],
+        ['卸载 Hook 后调用崩溃', '只还原了入口，没还原 flags', '两个字段都要备份与还原'],
+        ['Hook 生效但偶发崩溃', 'ArtMethod 是多线程共享元数据', '检查 Hook 时机与并发访问'],
+        ['某些 ROM 上 Hook 完全无效', '入口字段的布局/语义随版本变化', '对照该版本 AOSP 的 ArtMethod 定义']
+      ]) + ' ' + T.note('', '💡 对逆向实战的意义',
+        '<p>知道 Hook 的抓手是 ArtMethod，你就能<b>反着用</b>：检测方面可以校验 ArtMethod 的 flags 与入口是否被改过；' +
+        '分析方面，遇到 Hook 失效时也知道该去核对哪个字段。</p>'),
+      quiz: {
+        id: 'q4-2', chapter: 4, answer: 2,
+        stem: 'Java Hook 框架把一个普通 Java 方法的 <span class="mono">access_flags</span> 置上 native 位、并替换执行入口。它为什么要<b>先改成 native</b>，而不是只替换入口了事？',
+        options: [
+          { t: '因为只有 native 方法才允许修改执行入口', why: '入口字段本身没有这样的权限限制，这不是原因。' },
+          { t: '因为 native 方法的调用路径最短，能绕开解释器与 Dex 代码查找', why: '这是主要原因。改成 native 后 ART 不再去查 Dex 代码、不再走解释执行，直接取函数指针调用，替换入口才真正生效且开销最小。' },
+          { t: '为了让方法在反射时看起来像系统方法，避免被检测', why: '恰好相反——这会让反射结果出现「本该是 Java 方法却显示 native」的破绽，反而是检测点。' },
+          { t: '为了触发 GC 重新分配方法的内存', why: '与 GC 无关。ArtMethod 是类的元数据，不随对象分配移动。' }
+        ],
+        explain: '<b>核心是「短路原有的执行路径」。</b>普通 Java 方法的调用要经过 Dex 代码定位、解释器或已编译代码的进入逻辑；' +
+                 'native 方法则简单得多——虚拟机直接使用 ArtMethod 上记录的函数指针。把方法伪装成 native，' +
+                 '等于同时关掉了原路径、打开了新路径，替换入口才能干净生效。代价是留下「flags 与实际实现不符」这个可被检测的特征。'
       }
     },
-
+    ,
     /* ================= 18.7 ================= */
     {
       h: '18.7',
-      title: 'Android 完整启动链路：从通电到 App 的第一行代码',
-      html: '<p>这是全课程<b>最完整的一张系统图</b>。前面每一章你都在某个局部打转——Frida 在 App 层、unidbg 在模拟执行层、eBPF 在内核层——但它们最终都跑在下面这条链路的<b>某一环</b>上。看懂它，你就知道「我的 hook 到底插在哪一层」，也就知道<b>容器化环境下哪些环节被替换了、哪些环节反而成了新的攻击面</b>。</p>' +
-            T.note('key', '🔑 看这条链路时，永远问三个问题',
-              '<p>① <b>这一步做了什么？</b>② <b>在哪里可以看到它的痕迹？</b>（没有观测手段的步骤等于不存在）③ <b>容器化环境下有什么不同？</b></p>' +
-              '<p>第三个问题是本章独有的。因为在容器里跑 Android，<b>这条链路的前半段根本不会发生</b>——没有 BootROM、没有 Bootloader，因为宿主已经启动完了。Android 是从半途「接上」的。</p>'),
+      title: 'inline 的代价：函数在二进制里根本不存在',
+      html:
+        '<p>你写了一个函数，下了断点，跑起来——<strong>断点不生效</strong>。你以为断点打错了地方，反复确认。真相可能是：这个函数<strong>已经不在二进制里了</strong>。</p>' +
+        T.note('key', '🔑 inline 的本质',
+          '<p>编译器把函数体<b>展开到每一个调用处</b>，从而消除调用开销（压栈、跳转、返回）。' +
+          '但 <span class="mono">inline</span> 关键字<b>只是建议</b>，真正拍板的是编译器的优化决策：函数体够小 + 开了 <span class="mono">-O2</span>/<span class="mono">-O3</span>，' +
+          '它就会内联，<b>你写不写 inline 都可能被内联</b>。</p>') +
+        '<p>这带来三个连锁后果，它们全都发生在<strong>调试期</strong>，而根源在<strong>编译期</strong>：</p>',
       stage: {
-        title: 'Android 启动链路全流程',
-        speed: 1750,
-        render: '<div class="flow-col" style="max-width:820px">' +
-                '<div class="blk" id="b1">① BootROM<span class="small"> · SoC 内固化的第一段代码</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b2">② Bootloader（abl / lk）<span class="small"> · 初始化内存、校验并加载 boot.img</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b3">③ boot.img = 内核 + ramdisk<span class="small"> · ramdisk 里有 /init</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b4">④ 内核启动<span class="small"> · 解压、初始化驱动、挂载 initramfs</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b5">⑤ 执行 /init（PID 1）<span class="small"> · Android 的 init，不是 systemd</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b6">⑥ 解析 init.rc<span class="small"> · 声明式启动脚本：service / action / trigger</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b7">⑦ servicemanager<span class="small"> · binder 的「电话簿」</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b8">⑧ zygote<span class="small"> · 所有 App 进程的父进程</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b9">⑨ system_server<span class="small"> · 几百个系统服务住在里面</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b10">⑩ fork 应用进程<span class="small"> · zygote fork + ActivityThread</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="b11">⑪ App 第一行代码开始执行</div>' +
-                '<div class="flow-row" style="margin-top:14px;align-items:center;gap:10px">' +
-                '<span class="pill" id="bx1">容器化替代范围</span><span class="pill" id="bx2">当前层次</span></div>' +
-                '</div>',
+        title: 'inline 之后，调试器看到的和你想的不一样',
+        speed: 1600,
+        render:
+          '<div class="grid2">' +
+            '<div><div class="card-title">源代码（你写的）</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">L10</span><span class="cell" id="s_helper">int helper(int x) {</span></div>' +
+              '<div class="memrow"><span class="addr">L11</span><span class="cell" id="s_body">  return x * 2 + 1;</span></div>' +
+              '<div class="memrow"><span class="addr">L12</span><span class="cell" id="s_end">}</span></div>' +
+              '<div class="memrow"><span class="addr">L20</span><span class="cell" id="s_call">y = helper(a);</span></div>' +
+            '</div></div>' +
+            '<div><div class="card-title">编译后的机器码</div><div class="memgrid">' +
+              '<div class="memrow"><span class="addr">0x1000</span><span class="cell" id="b_main">main 入口</span></div>' +
+              '<div class="memrow"><span class="addr">0x1010</span><span class="cell" id="b_inl">内联后的表达式</span></div>' +
+              '<div class="memrow"><span class="addr">0x1020</span><span class="cell" id="b_next">后续指令</span></div>' +
+            '</div>' +
+            '<div style="margin-top:10px"><span class="pill" id="sym">符号表：helper 存在</span></div></div>' +
+          '</div>' +
+          '<div style="margin-top:12px" class="flow-row"><span class="blk" id="bp">🔴 断点@L10</span><span class="arrow">→</span><span class="pill" id="bpst">等待</span></div>',
         reset: () => {
-          for (let i = 1; i <= 11; i++) S('b' + i, '');
-          CLS('bx1', 'pill'); SET('bx1', '容器化替代范围');
-          CLS('bx2', 'pill'); SET('bx2', '当前层次');
+          const ids = ['s_helper', 's_body', 's_end', 's_call', 'b_main', 'b_inl', 'b_next'];
+          for (const i of ids) CLS(i, 'cell');
+          CLS('sym', 'pill'); SET('sym', '符号表：helper 存在');
+          S('bp', ''); CLS('bpst', 'pill'); SET('bpst', '等待');
         },
         steps: [
-          { run: () => S('b1', 'active'), note: '<b>① BootROM：SoC 里那段改不动的代码。</b>上电后 CPU 从固定地址取指，它只做最少的事——把下一段引导程序载入并交出去。<br><b>可观察点：</b>基本看不到，只能通过串口/调试口在最早期抓输出。<br><b>容器化差异：</b><span class="hit">整步不存在。</span>宿主早就启动完了，容器里的 Android 不会经历上电。' },
-          { run: () => { S('b1', 'done'); S('b2', 'active'); CLS('bx2', 'pill acc'); SET('bx2', '硬件层 · 容器中不存在'); }, note: '<b>② Bootloader（abl / lk 这类）：真正的「第一段可变代码」。</b>它初始化 DDR、决定从哪个分区启动、校验镜像完整性（<span class="term" data-def="Android Verified Boot：校验启动链上每个镜像的完整性，防止被篡改">AVB</span> / vbmeta），最后把 boot.img 载入内存并跳进去。<br><b>可观察点：</b>fastboot 界面、<span class="mono">fastboot getvar</span> 的解锁状态；解锁与否直接决定你能不能刷自己的镜像。<br><b>容器化差异：</b>同样跳过。这是<b>刷机/改机玩法的入口层</b>，容器里没有对应物。' },
-          { run: () => { S('b2', 'done'); S('b3', 'active'); }, note: '<b>③ boot.img 被载入：它里面装的是内核 + ramdisk。</b>ramdisk 是一个极小的根文件系统，Android 的 <span class="mono">/init</span> 就住在里面。<br><b>可观察点：</b>解包 boot.img 看内容；对比不同机型/版本的镜像结构。<br><b>容器化差异：</b>容器路线里通常没有「boot.img」这个概念——Android 的用户空间直接来自一份 rootfs 镜像；<b>但 ramdisk 与 init 的逻辑依然存在</b>，只是由容器运行时以别的方式提供（见 18.6）。' },
-          { run: () => { S('b3', 'done'); S('b4', 'active'); }, note: '<b>④ 内核启动：解压自身、初始化子系统与驱动，最后挂载 initramfs。</b>这一步结束时，内核会去找那个「要执行的第一个用户空间程序」。<br><b>可观察点：</b>内核日志 <span class="mono">dmesg</span>；启动早期的串口输出。<br><b>容器化差异：</b><span class="hit">这一步被彻底替换。</span>容器共享宿主内核，宿主内核<b>早就在跑了</b>。容器启动不会产生新的内核启动日志——<b>这本身就是一个可被检测的特征</b>（某些检测会去看内核启动时间与系统运行时间的矛盾）。' },
-          { run: () => { S('b4', 'done'); S('b5', 'active'); }, note: '<b>⑤ 内核执行 /init，它成为 PID 1。</b>Linux 的惯例是 <span class="mono">/sbin/init</span>（可用 <span class="mono">init=</span> 参数指定），Android 用的是自己那份 <span class="mono">/init</span>，在 ramdisk 里。<br><b>可观察点：</b><span class="mono">ps</span> 里 PID 1 是谁；<span class="mono">/proc/1/</span> 下的信息。<br><b>容器化差异：</b><b>这里的落点完全不同。</b>容器里的 PID 1 由容器运行时或精简 init 承担，Android 的 <span class="mono">/init</span> 往往<b>不是</b> PID 1——这是一个非常值得记住的差异点。' },
-          { run: () => { S('b5', 'done'); S('b6', 'active'); }, note: '<b>⑥ init 解析 init.rc：Android 的启动是「声明式」的。</b><span class="mono">init.rc</span> 及其包含的众多 <span class="mono">.rc</span> 文件里写着 service（要启动哪些进程）与 action/trigger（在什么条件下做什么）。<br><b>可观察点：</b>直接读 <span class="mono">/system/etc/init/</span> 等目录下的 rc 文件——<b>这是理解一台设备「为什么这样启动」最直接的材料</b>。<br><b>容器化差异：</b>逻辑基本保留（Android 用户空间还是那套），但部分 rc 会因为硬件不存在或权限不同而走不到。' },
-          { run: () => { S('b6', 'done'); S('b7', 'active'); CLS('bx2', 'pill ok'); SET('bx2', 'Android 用户空间 · 容器中保留'); }, note: '<b>⑦ servicemanager 起来，binder 的「电话簿」开张。</b>所有系统服务都要来这里注册自己的名字，客户端再按名字去查句柄。<b>没有 binder，就没有 Android。</b>这正是 18.3 强调宿主内核必须支持 binder 的原因。<br><b>可观察点：</b>进程列表里的 servicemanager；用 binder 相关的调试手段列出已注册服务。<br><b>容器化差异：</b>保留，但<b>依赖宿主内核与设备节点</b>——这是容器化 Android 最容易失败的一环。' },
-          { run: () => { S('b7', 'done'); S('b8', 'active'); }, note: '<b>⑧ zygote 启动：所有 App 进程的「母体」。</b>它预加载大量框架类与资源，之后 App 进程都从它 fork 出来——这样新 App 启动时不必重复做这些昂贵的事。<br><b>可观察点：</b>进程列表里的 zygote / zygote64（<b>这也是 Zygisk 注入的目标进程，见 18.8</b>）。<br><b>容器化差异：</b>完全保留。zygote 是 Android 用户空间的一部分，跟跑在谁的内核上无关。' },
-          { run: () => { S('b8', 'done'); S('b9', 'active'); }, note: '<b>⑨ system_server：zygote fork 出的第一个「大进程」。</b>ActivityManager、PackageManager、WifiService……几百个系统服务住在里面，它们是 App 调用一切系统能力的<b>真正服务端</b>。<br><b>可观察点：</b><span class="mono">dumpsys</span> 全家桶——<b>这是排查「系统认为自己是台什么设备」的最佳工具</b>。<br><b>容器化差异：</b>保留。而且这里就是<b>虚拟 WiFi 要动手的地方</b>（WifiService 就在这个进程里，见 18.9）。' },
-          { run: () => { S('b9', 'done'); S('b10', 'active'); }, note: '<b>⑩ 启动一个 App：zygote fork 出新进程。</b>新进程里执行到 ActivityThread，接下来才轮到 Application / Activity 的生命周期。<br><b>可观察点：</b>进程列表、<span class="mono">/proc/&lt;pid&gt;/</span> 下的信息、启动耗时日志。<br><b>容器化差异：</b>保留。<b>App 完全无法从这一层感知自己是容器还是真机</b>——它看到的永远是 Android 自己的抽象。' },
-          { run: () => { S('b10', 'done'); S('b11', 'active'); }, note: '<b>⑪ App 第一行代码开始执行。</b>从这里往后，就是你在前十七章学的所有东西的战场：Java 层 hook、Native 层 inline hook、算法还原、风控对抗。<br><b>但请记住：</b>App 的检测代码从这一刻起就在<b>向上摸</b>——它想知道自己脚下这条链路是真是假。' },
-          { run: () => { CLS('bx1', 'pill warn'); SET('bx1', '①②③④ 被跳过 / ⑤ 的 PID 1 归属改变 / 其余保留'); S('b1', 'hot'); S('b2', 'hot'); S('b3', 'hot'); S('b4', 'hot'); }, note: '<b>整体对照：容器化把这条链路的「硬件前缀」整段砍掉了。</b>①BootROM、②Bootloader、③加载 boot.img、④内核启动<b>都不会发生</b>；⑤的 PID 1 归属也变了。剩下的 ⑥–⑪ 完全是 Android 自己的用户空间逻辑，保留。<br><b>这个结论有两面：</b>一面是你<b>少了一大堆麻烦</b>（不用刷机、不用改 boot）；另一面是<b>你也少了一大堆「真机才有的痕迹」</b>——而这正是风控要找的东西。' },
-          { run: () => { CLS('bx2', 'pill'); SET('bx2', '结论：容器化 = 只重放用户空间'); }, note: '<b>一句话收束：容器化 Android 的本质，是「把 Android 的用户空间重放到另一个内核上」。</b>凡是发生在这个用户空间<b>内部</b>的事情都还在；凡是发生在它<b>下面</b>的事情都要由宿主代为「伪造」——包括内核版本、硬件信息、网络状态、启动时间。本章剩下的每一节，都是在处理这个「伪造」问题。' }
+          { run: () => { CLS('s_helper', 'cell hi'); CLS('s_body', 'cell hi'); CLS('s_end', 'cell hi'); },
+            note: '<b>先看你的意图。</b>helper 是个只有一行的小函数。你希望它作为一个独立函数存在，这样能在第 10 行下断点、单步进入、看 x 的值。这是<b>读代码的人</b>的心智模型。',
+            state: { '期望': 'helper 是独立函数' } },
+          { run: () => { CLS('s_call', 'cell hi'); },
+            note: '<b>调用点在第 20 行。</b>按照你的模型，这里应该生成一条 <span class="mono">call helper</span> 指令，跳到另一块代码去，执行完再回来。',
+            state: { '期望指令': 'call helper' } },
+          { run: () => { CLS('b_inl', 'cell wr'); SET('b_inl', 'x*2+1 展开在这里'); CLS('s_call', 'cell'); },
+            note: '<b>编译器的决定：不生成 call，直接把函数体抄过来。</b>0x1010 处是 <span class="mono">helper</span> 的表达式本身，而不是一条调用指令。省下了一次压栈/跳转/返回。',
+            state: { '实际指令': '无 call，指令直接内联' } },
+          { run: () => { CLS('b_inl', 'cell wr'); CLS('s_body', 'cell miss'); SET('s_body', '  （此函数体无独立代码）'); },
+            note: '<b>后果一：断点打不上。</b>调试断点的本质是「在某个<b>地址</b>上插一条陷阱指令」。helper 已经没有自己的地址了——你让它把断点插在哪？调试器要么拒绝，要么把它挪到最近的合法地址，于是你看到的停靠位置莫名其妙。',
+            state: { '断点@L10': '无处安放 ✗' } },
+          { run: () => { S('bp', 'hot'); CLS('bpst', 'pill bad'); SET('bpst', '断点未命中 · helper 无独立入口'); },
+            note: '<b>现象确认。</b>程序跑过去了，断点一次都没停。新手的第一反应通常是「我断点位置不对」或「调试器坏了」——真实原因是<b>这个函数在机器码层面不存在</b>。',
+            state: { '误判方向': '调试器/断点位置', '真实原因': '编译期内联' } },
+          { run: () => { CLS('s_helper', 'cell miss'); SET('s_helper', 'int helper(int x) {  ← 已展开'); },
+            note: '<b>后果二：变量看不到。</b>内联之后，参数 x 和局部变量会被尽量塞进<b>寄存器</b>，或者干脆在优化中被消除（比如常量折叠后不再需要这个值）。调试器想显示它们时只能输出 <span class="mono">&lt;optimized out&gt;</span>。',
+            state: { '变量 x': '<optimized out>' } },
+          { run: () => { CLS('b_main', 'cell'); CLS('b_inl', 'cell'); CLS('b_next', 'cell wr'); SET('b_next', '后续指令（无 call/ret 边界）'); },
+            note: '<b>后果三：调用栈不完整。</b>栈回溯是靠「压栈的返回地址」串起来的。内联没有调用，也就没有返回地址——helper 这一帧在栈上<b>从来不存在</b>。注意 0x1010 与 0x1020 <b>之间没有任何函数边界</b>，你在崩溃日志里看到的调用关系，会直接跳过 helper。',
+            state: { '栈帧': 'helper 帧不存在' } },
+          { run: () => { CLS('sym', 'pill warn'); SET('sym', '符号表：helper 仍在（调试信息）'); },
+            note: '<b>一个反直觉的细节：符号可能还在。</b>调试信息（DWARF）会记录「这段指令原本来自 helper」，用 <span class="mono">DW_TAG_inlined_subroutine</span> 表示内联进来的子程序。所以在 GDB 里 <span class="mono">info frame</span> 有时仍能看到它——<b>但它不是一个真实的栈帧</b>。',
+            state: { 'DWARF': 'DW_TAG_inlined_subroutine', 'GDB': 'info frame 可显示' } },
+          { run: () => { CLS('b_inl', 'cell cool'); CLS('bpst', 'pill ok'); SET('bpst', '用 GDB 看内联帧 / 或禁止内联'); },
+            note: '<b>两条出路。</b>要么接受内联、改用 GDB 的内联帧视图去观察；要么在编译期就禁止它——加 <span class="mono">-fno-inline</span>、给函数加 <span class="mono">__attribute__((noinline))</span>、或临时降低优化等级。',
+            state: { '出路1': 'GDB info frame', '出路2': 'noinline / 降优化' } },
+          { run: () => { CLS('bpst', 'pill bad'); SET('bpst', '反向应用：Native Hook 静默失效'); },
+            note: '<b>把这件事反过来看，就是逆向的坑。</b>你想 Hook 一个 native 函数，地址算出来了，Frida 也 attach 上了，<b>但什么反应都没有</b>——因为这个函数在编译时已经被内联进它的调用者，二进制里<b>压根没有这个函数</b>。你 Hook 的是一个不存在的地址。',
+            state: { '症状': 'Hook 无报错但无效果', '原因': '目标已被内联' } },
+          { run: () => { S('bp', 'cool'); CLS('bpst', 'pill ok'); SET('bpst', '对策：Hook 调用者 / 搜索内联后的指令序列'); },
+            note: '<b>正确对策。</b>目标函数不存在时，只能往上走一层：Hook 它的<b>调用者</b>，或者在二进制里搜索内联展开后的<b>指令特征</b>。' +
+                  '这也解释了为什么有些加固会主动利用内联——它免费获得了「让 Hook 找不到落点」的效果。',
+            state: { 'Hook 落点': '调用者 / 指令特征', '加固收益': '增加 Hook 难度' } }
         ]
       },
-      after: T.tbl(['环节', '真机', '容器化环境'], [
-        ['① BootROM', '上电执行', '<b>不存在</b>'],
-        ['② Bootloader（abl/lk）', '初始化内存、AVB 校验、加载 boot.img', '<b>不存在</b>'],
-        ['③ boot.img（内核+ramdisk）', '独立镜像', '<b>通常不存在</b>，用户空间来自 rootfs 镜像'],
-        ['④ 内核启动', '每次开机都发生', '<b>共享宿主内核</b>，不重新启动'],
-        ['⑤ /init 与 PID 1', 'Android 的 /init 是 PID 1', '<b>PID 1 归属改变</b>，由容器运行时/精简 init 承担'],
-        ['⑥ init.rc 解析', '声明式启动服务', '保留（可能因硬件缺失而跳过部分）'],
-        ['⑦ servicemanager', '注册系统服务', '保留，<b>但强依赖宿主内核的 binder</b>'],
-        ['⑧ zygote', 'App 进程的母体', '保留'],
-        ['⑨ system_server', '几百个系统服务', '保留（虚拟 WiFi 的动手处）'],
-        ['⑩⑪ fork App 进程 / 代码执行', 'App 运行', '保留'],
-        ['分区结构（boot/system/vendor/...）', '与机型、版本强相关 <span class="pill warn">待核实</span>', '动态分区等机制在容器里通常无对应物 <span class="pill warn">待核实</span>']
-      ])
-    },
-
-    /* ================= 18.7L 动手实验 ================= */
-    {
-      h: '18.7L', title: '动手实验：给启动链路排序，并标出容器化会跳过哪几步',
-      html:
-        '<p>启动链路是本章的骨架。光看动画容易"觉得懂了"，自己排一遍才知道哪几步真的记住了。</p>',
-      lab: {
-        title: '实验：Android 启动链路排序 + 容器化差异',
-        goal: '目标：排出正确顺序并标出跳过项',
-        intro:
-          '<p>下面 7 个启动阶段被打乱了。<b>任务：</b>① 排出正确顺序 ② 说出容器化时<b>哪几步根本不会发生</b>。</p>' +
-          '<div class="tbl-wrap" style="margin:12px 0"><table class="tbl"><thead><tr><th>编号</th><th>阶段</th></tr></thead><tbody>' +
-          '<tr><td>A</td><td>解析 <code>init.rc</code>，启动各 service</td></tr>' +
-          '<tr><td>B</td><td>执行 <code>/init</code>（用户空间第一个进程）</td></tr>' +
-          '<tr><td>C</td><td><code>system_server</code> 就绪 → App 可被拉起</td></tr>' +
-          '<tr><td>D</td><td>BootROM（SoC 内固化的第一段代码）</td></tr>' +
-          '<tr><td>E</td><td><code>servicemanager</code> / <code>zygote</code> 启动</td></tr>' +
-          '<tr><td>F</td><td>Bootloader（abl / lk）</td></tr>' +
-          '<tr><td>G</td><td>加载并启动 Linux 内核</td></tr>' +
-          '</tbody></table></div>',
-        inputs: [
-          { key: 'order', label: '① 正确顺序（填字母，用 → 或空格分隔）',
-            hint: '从最底层硬件开始', ph: '例如 A B C ...', value: '' },
-          { key: 'skip', label: '② 容器化时会跳过哪几步？（填字母）',
-            hint: '想想"没有真实硬件"意味着什么', ph: '例如 A、B' },
-          { key: 'why', label: '③ 为什么容器里 <code>/init</code> 的角色会变？',
-            hint: '谁承担了 PID 1？', ph: '因为……', type: 'textarea', rows: 2 }
+      after: T.tbl(['症状', '成因', '对策'], [
+        ['断点打不上 / 停靠位置怪异', '函数被内联，无独立入口地址', '-fno-inline、__attribute__((noinline))、降优化等级'],
+        ['变量显示 &lt;optimized out&gt;', '变量被放进寄存器或优化消除', '降优化等级；在汇编层看寄存器'],
+        ['调用栈缺少某一帧', '内联没有产生栈帧', 'GDB info frame 看 DW_TAG_inlined_subroutine'],
+        ['Hook 静默失效（无报错无效果）', '目标函数在二进制中不存在', 'Hook 调用者，或按内联后的指令特征定位']
+      ]) + ' ' + T.note('', '💡 这是「理论与实战的接缝」',
+        '<p>inline 看上去是编译原理的细节，实际直接决定你的 Native Hook 能不能落地。' +
+        '<b>排查顺序建议：</b>先确认符号/地址是否真实存在（反汇编看那里是不是一个函数入口），再怀疑 Hook 框架，最后才怀疑自己的代码。</p>'),
+      quiz: {
+        id: 'q4-3', chapter: 4, answer: 3,
+        stem: '你用 Frida 对某个 native 函数做了 Hook（地址计算准确、attach 无报错），但目标程序行为毫无变化，也没有任何异常输出。下面哪个原因<b>最可能</b>？',
+        options: [
+          { t: 'Frida 版本与目标不兼容，Hook 静默失败了', why: '版本不兼容通常会报错或崩溃，而不是「安静地什么都不发生」。' },
+          { t: '这个函数在程序里从未被调用过', why: '有可能，但这属于「逻辑上没执行」；相比编译期内联，它更少见，而且你可以通过调用者路径很快证伪。' },
+          { t: '函数有反调试保护，检测到 Frida 后跳过了自身逻辑', why: '反调试通常会主动崩溃或退出，而不是保留完整功能却不执行你的 Hook。' },
+          { t: '该函数已被编译器内联进调用者，二进制里没有独立函数体', why: '这正是「无报错、无效果」的最典型成因。你 Hook 的地址处根本没有那个函数，替换自然毫无影响。' }
         ],
-        runLabel: '🔍 校验顺序',
-        run: (v) => {
-          const L = window.LABX;
-          const CORRECT = ['D', 'F', 'G', 'B', 'A', 'E', 'C'];
-          const letters = String(v.order || '').toUpperCase().match(/[A-G]/g) || [];
-          const uniq = [...new Set(letters)];
-
-          let html = '';
-          if (letters.length) {
-            const ok = uniq.length === 7 && uniq.every((c, i) => c === CORRECT[i]);
-            html += '<table class="lab-tbl"><tr><th>位置</th><th>正确阶段</th><th>你填的</th><th>判定</th></tr>';
-            CORRECT.forEach((c, i) => {
-              const got = letters[i] || '—';
-              const good = got === c;
-              const st = L.BOOT_STAGES[i];
-              html += '<tr class="' + (good ? 'same' : 'diff') + '"><td>' + (i + 1) + '</td>'
-                + '<td><code>' + c + '</code> ' + st.label + '</td>'
-                + '<td><code>' + got + '</code></td>'
-                + '<td>' + (good ? '✅' : '❌') + '</td></tr>';
-            });
-            html += '</table>';
-            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>'
-              + (ok ? '✅ 顺序完全正确' : '❌ 顺序有误') + '</b>'
-              + '<div class="lab-note">正确顺序：<b>D → F → G → B → A → E → C</b><br>'
-              + '记忆线索：<b>硬件 → 引导 → 内核 → 用户空间 init → rc → 服务 → 应用框架</b>。' +
-              '注意 <code>init</code>(B) 在解析 <code>init.rc</code>(A) <b>之前</b>——先有进程，才有它的配置。</div></div>';
-          }
-
-          const skipLetters = String(v.skip || '').toUpperCase().match(/[A-G]/g) || [];
-          const skipUniq = [...new Set(skipLetters)];
-          if (skipUniq.length) {
-            const wantSkip = ['D', 'F'];
-            const okSkip = skipUniq.length === 2 && wantSkip.every(x => skipUniq.includes(x));
-            html += '<div class="lab-msg ' + (okSkip ? 'pass' : 'warn') + '"><b>'
-              + (okSkip ? '✅ 正确：跳过 D 和 F' : '🟡 不完全是') + '</b>'
-              + '<div class="lab-note"><b>D（BootROM）和 F（Bootloader）在容器里完全不存在</b> —— ' +
-              '因为它们的作用是"初始化真实硬件（DDR、存储）并加载内核"，而容器<b>共用宿主内核</b>，' +
-              '根本没有"上电启动"这个动作。<br><br>'
-              + '容易混淆的是 <b>G（内核启动）</b>：它不是"不存在"，而是<b>"已经发生过了"</b> —— ' +
-              '宿主机的内核早就跑起来了，容器只是共享它。<br>'
-              + '这个区别很重要：<b>不存在</b>与<b>已发生</b>在对检测的含义上完全不同。</div></div>';
-          }
-
-          const why = String(v.why || '').trim();
-          if (why) {
-            const hitRuntime = window.AKKC_hasConcept(why, ['容器运行时', 'runtime', 'docker', 'runc', '迷你 init', '精简 init', '自己']);
-            const hitPid1 = window.AKKC_hasConcept(why, ['pid 1', 'pid1', '第一个进程', '一号进程']);
-            html += '<div class="lab-msg ' + (hitRuntime || hitPid1 ? 'pass' : 'warn') + '"><b>'
-              + (hitRuntime || hitPid1 ? '✅ 抓住了要点' : '🟡 再补充一下') + '</b>'
-              + '<div class="lab-note">在容器里，<b>PID 1 的角色由容器运行时（或一个精简 init）承担</b>，' +
-              '而不是 Android 自己的 <code>/init</code>。<br><br>'
-              + '但 Android 的情况<b>更特殊</b>：它的用户空间里<b>也有一份自己的 init 体系</b>' +
-              '（init.rc 声明式启动服务）。所以容器化 Android 时，' +
-              '通常的做法是<b>保留 Android 的 init 流程，只是把它挂到容器的 PID 命名空间里</b>——' +
-              '这样 Android 的服务依赖关系（比如 zygote 必须在 servicemanager 之后）才能正常工作。<br><br>'
-              + '<b>所以准确的说法是：</b>不是"Android 的 init 消失了"，而是<b>"硬件引导段消失了，用户空间段被保留但换了宿主"</b>。</div></div>';
-          }
-          return html || '<div class="lab-msg warn">先填第①问的顺序。</div>';
-        },
-        expected: (v) => {
-          const CORRECT = ['D', 'F', 'G', 'B', 'A', 'E', 'C'];
-          const letters = [...new Set(String(v.order || '').toUpperCase().match(/[A-G]/g) || [])];
-          const skip = [...new Set(String(v.skip || '').toUpperCase().match(/[A-G]/g) || [])];
-          const okOrder = letters.length === 7 && letters.every((c, i) => c === CORRECT[i]);
-          const okSkip = skip.length === 2 && skip.includes('D') && skip.includes('F');
-          return {
-            ok: okOrder && okSkip,
-            detail: (okOrder ? '✅ 顺序正确：D→F→G→B→A→E→C。'
-                             : '❌ 顺序应为 <b>D → F → G → B → A → E → C</b>。' +
-                               '注意 <code>init</code> 进程先于 <code>init.rc</code> 解析。')
-              + '<br>'
-              + (okSkip ? '✅ 跳过项正确：D（BootROM）和 F（Bootloader）在容器里根本不存在。'
-                        : '❌ 跳过项应为 <b>D 和 F</b>。注意 G（内核启动）不是"不存在"，而是宿主机早就完成了。')
-          };
-        },
-        showAnswer:
-          '【① 正确顺序】D → F → G → B → A → E → C\n\n' +
-          '  D  BootROM           SoC 内固化，只负责加载下一级\n' +
-          '  F  Bootloader        初始化 DDR，校验并加载 boot 分区\n' +
-          '  G  Linux 内核         解析 cmdline，挂载 ramdisk\n' +
-          '  B  执行 /init         用户空间第一个进程（PID 1）\n' +
-          '  A  解析 init.rc       按声明启动各 service\n' +
-          '  E  servicemanager / zygote\n' +
-          '  C  system_server 就绪 → App 可被拉起\n\n' +
-          '  记忆线索：硬件 → 引导 → 内核 → 用户空间 → 服务 → 框架\n' +
-          '  易错点：init(B) 在 init.rc(A) 之前 —— 先有进程，才有它的配置。\n\n' +
-          '【② 容器化时跳过的步骤】D 和 F\n' +
-          '  原因：它们的作用是初始化真实硬件并加载内核，\n' +
-          '        而容器【共用宿主内核】，没有"上电"这个动作。\n\n' +
-          '  ⚠️ 注意区分：G（内核启动）不是"不存在"，而是"已发生"。\n' +
-          '     宿主内核早就跑起来了，容器只是共享它。\n' +
-          '     "不存在"与"已发生"对检测的含义完全不同。\n\n' +
-          '【③ 为什么 /init 的角色会变】\n' +
-          '  在通用容器里，PID 1 由容器运行时（或精简 init）承担。\n\n' +
-          '  但 Android 更特殊：它的用户空间里【也有一份自己的 init 体系】\n' +
-          '  （init.rc 声明式启动服务）。所以容器化 Android 时，\n' +
-          '  通常【保留 Android 的 init 流程】，只是把它挂到容器的 PID 命名空间里，\n' +
-          '  这样 zygote 依赖 servicemanager 之类的顺序关系才能正常工作。\n\n' +
-          '  准确说法：不是"Android 的 init 消失了"，\n' +
-          '            而是"硬件引导段消失了，用户空间段被保留但换了宿主"。',
-        hint:
-          '从最底层开始想：<b>谁最先跑？</b>（提示：芯片里固化的那段代码）<br>' +
-          '然后依次是：谁来初始化内存并找内核 → 内核起来后第一个用户空间进程是谁 → ' +
-          '那个进程接下来读什么文件 → 再往上是哪些服务。<br><br>' +
-          '第②问的关键：容器<b>共用宿主内核</b>，所以"上电""初始化硬件""加载内核"这些事情……' +
-          '在容器里发生过吗？',
-        after:
-          T.note('key', '🔑 这个实验的深层价值',
-            '<p style="margin-bottom:0">排序本身不难，难的是回答第②问时那个<b>微妙的区分</b>：<br>' +
-            '<b>D/F 是"不存在"，G 是"已发生"。</b><br><br>' +
-            '为什么这个区分重要？因为它直接决定检测手段的可行性：<br>' +
-            '• 如果某一步<b>从没发生过</b>，你无法"伪装"它——只能伪造它的<b>痕迹</b><br>' +
-            '• 如果某一步<b>已经发生</b>（在宿主机上），你可以<b>转述</b>它的结果<br><br>' +
-            '<span class="hit">这条推理和第 15 章"真机有什么、虚拟环境缺什么"是同一个思路：' +
-            '先弄清机制上什么是可能的，再推导出检测点和对抗方案。' +
-            '不需要背特征清单。</span></p>')
-      }
-    },
-
-    /* ================= 18.7C 实战案例 ================= */
-    {
-      h: '18.7C', title: '实战案例：freeRASP 的多层环境检测与"不 hook 应用代码"的绕过思路',
-      case: {
-        source: 'kanxue',
-        title: '[原创]freeRASP签名检测和其他设备环境的绕过方案',
-        date: '2026-1-18',
-        author: 'wohowo',
-        target: 'Talsec freeRASP（第三方 RASP SDK）',
-        background:
-          '<p>freeRASP 是一套被广泛集成的第三方运行时应用自保护（RASP）SDK——它不绑定某个 App，' +
-          '而是作为库嵌进去，负责检测 root、模拟器、调试器、签名篡改等环境异常。</p>' +
-          '<p>这个案例的价值在于它展示了一种<b>与第 10 章完全不同层级的对抗思路</b>：' +
-          '作者明确提出总原则——<b>"不 hook 任何应用代码，全部走系统底层以求通杀"</b>。' +
-          '因为 RASP 是<b>被集成方</b>，逐个 hook 各 App 的检测调用不现实，' +
-          '只有在系统层做拦截才能一次覆盖所有集成方。</p>',
-        points: [
-          '<b>第一层（Native 层 BPF 系统调用拦截）</b>：在内核层拦 <code>syscall</code>，' +
-            '用 <b>SIGSYS 处理器伪造返回值</b>，让被拦的调用"看起来成功了"',
-          '① 拦 <code>openat</code> / <code>read</code> / <code>fstat</code>，把 APK 签名读取<b>重定向到预存的原包</b>——' +
-            '作者自己加了 PS：freeRASP 其实并不直接读 APK 验签，这只是他给出的 svc 签名绕过方案',
-          '② 拦 <code>read</code> 以<b>隐藏 <code>/proc/self/maps</code> 的敏感行</b>（注入库等映射项）',
-          '③ 伪造 <code>/proc/self/status</code>，把 <code>Seccomp:</code> 字段从 <code>2</code> 改成 <code>0</code>——' +
-            '作者自评该方案<b>不完整</b>，因为 Zygote 自身也装了 BPF',
-          '④ 过滤 <code>/proc/self/mounts</code>，剔除含 <code>magisk</code> / <code>zygisk</code> / <code>core</code> / <code>mirror</code> 的行',
-          '⑤ 伪造 <code>/proc/sys/kernel/ftrace_enabled</code> 与 <code>/sys/kernel/debug/tracing/current_tracer</code>',
-          '<b>第二层（Java 层 API hook 伪造设备安全状态）</b>：直接改写系统 API 的返回值',
-          '① <code>File.exists()</code> → 恒 <code>false</code>：隐藏 <code>/system/bin/su</code> 等 <b>70+ 个 root 路径</b>',
-          '② <code>Runtime.exec()</code> → 拦截对 <code>su</code> / <code>which su</code> 的调用',
-          '③ <code>PackageManager.getPackageInfo()</code> → 抛异常：隐藏 Magisk / KernelSU 等 <b>50+ 个 root 包名</b>',
-          '④ <code>System.getenv("PATH")</code> → 过滤掉 <code>/sbin</code> 等可疑目录',
-          '三组清单（70+ 路径 / 50+ 包名 / PATH 项）<b>均从某个加密数组解密得到</b>，文中未给出明文'
-        ],
-        method: [
-          '<b>判断集成层级</b>：先确认 freeRASP 的检测是 Native 实现还是 Java 实现，决定拦截点放在 BPF 还是 Java API',
-          '<b>定原则</b>：确立"不 hook 应用代码"——只在系统层（syscall / 系统 API）动手，对所有集成方通用',
-          '<b>Native 层拦 syscall</b>：挂 BPF 程序拦目标 syscall，用 SIGSYS 处理器改写返回值和输出缓冲',
-          '<b>Java 层改 API 返回值</b>：对文件检查、进程调用、包管理、环境变量四类 API 做统一改写',
-          '<b>逐项验证</b>：关掉对应检测项看 RASP 是否还上报，确认拦截生效'
-        ],
-        result:
-          '<p>给出了一套<b>跨 App 通用</b>的 freeRASP 绕过方案：Native 层 5 项 + Java 层 4 项，' +
-          '覆盖签名、maps、seccomp、mounts、ftrace、root 路径、root 包名、PATH 等检测面。</p>' +
-          '<p>核心思路不是"针对 freeRASP 的某个检测函数做 hook"，而是<b>从它读取环境信息的通道上做手脚</b>——' +
-          '让所有走这些通道的检测都拿到伪造结果。</p>',
-        terms: ['RASP', 'BPF 系统调用拦截', 'SIGSYS', '/proc/self/maps', 'Seccomp', 'Magisk', 'Zygisk', 'PackageManager'],
-        limits:
-          '<p><b>⚠️ 该帖正文被论坛门控截断</b>：正文在"二、设备安全状态伪造 / Root 检测绕过' +
-          '（<code>System.getenv("PATH")</code> 那一行）"处即结束，作者所称<b>"四层防护体系"的第三、第四层完全不可见</b>。' +
-          '抓取时已核对页面 HTML，源码中确实不存在"三、""四、"标题，因此本站<b>不对后两层做任何推测</b>。</p>' +
-          '<p>其他限制：① 三组清单（70+ root 路径、50+ root 包名、PATH 项）<b>均从加密数组解密得到，文中未给出明文</b>，' +
-          '具体拦截列表<b>不可复现</b>；② 作者<b>自认 seccomp 隐藏方案不完整</b>（Zygote 自身也装了 BPF）；' +
-          '③ 案例针对 2026 年初的 freeRASP 版本，后续版本行为可能变化。</p>',
-        analysis:
-          '<p><b>本课第 18 章讲过"环境伪装的核心原则：自洽"</b>——只改一个 API 返回值一定会被交叉验证识破。' +
-          '这个案例正好从攻防两个方向印证了这条原则。</p>' +
-          '<p><b>① 检测方用"交叉验证"，绕过方用"统一数据源"。</b>' +
-          'freeRASP 不只查一个 <code>su</code> 文件，而是同时看 root 路径、root 包名、PATH 环境变量、' +
-          'mounts 挂载项、seccomp 状态多个维度——这正是第 18 章讲的"整个状态自洽"。' +
-          '而作者的应对同样精彩：他不逐个去堵这些检查，而是<b>在它们共同的数据来源（syscall 与系统 API）上做统一改写</b>。' +
-          '<span class="hit">这是"点防御"与"面防御"的区别。</span></p>' +
-          '<p><b>② 为什么必须走系统层？</b>作者那句"不 hook 任何应用代码，全部走系统底层以求通杀"值得反复读。' +
-          '因为 RASP 是<b>被集成方</b>，你面对的不是一个 App 而是无数个——' +
-          '在系统层拦截一次，所有集成方同时生效。' +
-          '这跟第 13 章"把观测点放到比对手更低的层级"是同一条思路，只不过这里的目的从"观测"变成了"篡改"。</p>' +
-          '<p><b>③ 最值得记的是作者的自我限定。</b>他主动标注 seccomp 方案"不完整"，' +
-          '也没把加密清单当成果展示。<b>这种"知道自己方案边界在哪"的态度，比方案本身更有价值</b>——' +
-          '因为环境伪装永远是军备竞赛，清楚地知道你堵住了哪些口子、还漏着哪些，' +
-          '才能判断当前方案在目标 App 上够不够用。</p>',
-        link: 'https://bbs.kanxue.com/thread-289794.htm',
-        linkNote: '看雪论坛原创帖（正文被论坛门控截断，后两层未公开）'
+        explain: '<b>先建立正确的排查顺序：地址真实性 → 框架 → 自己的代码。</b>' +
+                 '内联是编译器在<b>优化期</b>做的决定，函数体被展开进调用者之后就不再存在独立入口。' +
+                 '此时你算出的「函数地址」可能落在调用者中间、或落在相邻函数的边界上——Hook 能装上，却永远不会被走到。' +
+                 '对策是 Hook 调用者，或按内联后指令序列的特征去搜索真正的执行位置。'
       }
     },
 
     /* ================= 18.8 ================= */
     {
       h: '18.8',
-      title: 'Magisk：systemless 挂载原理与「看起来像真机」',
-      html: '<p>仓库是 <span class="mono">topjohnwu/Magisk</span>。它的定位有两层：<b>Android 的 Root 方案</b>，以及<b>模块化框架</b>。但真正精彩的是它怎么做到的——<b>不碰系统分区，却能让系统「看见」被修改过的文件</b>。</p>' +
-            T.note('key', '🔑 核心原理一句话',
-              '<p><b>修改 boot 镜像的 ramdisk，在 init 启动的极早期注入 Magisk 自己的 init 逻辑</b>（常见做法是替换 <span class="mono">init</span> 或者修改 <span class="mono">.rc</span> 文件，由 <span class="mono">magiskinit</span> 打补丁），<b>从而在系统把各个分区挂载起来之前就拿到控制权</b>。</p>' +
-              '<p>为什么必须「早」？因为一旦 /system 已经被按原样挂上并跑了半天服务，你再去改就晚了、也脏了。<b>抢在挂载之前动手，才有资格决定「系统最终看到什么」。</b></p>'),
-      stage: {
-        title: 'Magisk 的 systemless 挂载',
-        speed: 1800,
-        render: '<div class="flow-col" style="max-width:780px">' +
-                '<div class="blk" id="m1">boot.img 的 ramdisk<span class="small"> · 里面原本是系统的 init</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m2">注入 magiskinit<span class="small"> · 替换 init / 打补丁 .rc</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m3">系统启动：magiskinit 先拿到控制权</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m4">以只读方式挂载真实 /system</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m5">magic mount / overlayfs：把模块文件「叠加」上去</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m6">系统看到的是「被覆盖」的文件</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m7">真实 /system 分区<span class="hit">一个字节都没改</span></div><div class="arrow">↓</div>' +
-                '<div class="blk" id="m8">所以：可以 OTA 升级 · 可以随时卸载干净</div>' +
-                '<div class="flow-row" style="margin-top:14px;gap:10px;flex-wrap:wrap">' +
-                '<span class="pill" id="mp1">MagiskSU</span><span class="pill" id="mp2">Zygisk</span><span class="pill" id="mp3">DenyList</span></div>' +
-                '</div>',
-        reset: () => {
-          for (let i = 1; i <= 8; i++) S('m' + i, '');
-          ['mp1','mp2','mp3'].forEach(i => { CLS(i, 'pill'); });
-          SET('mp1', 'MagiskSU'); SET('mp2', 'Zygisk'); SET('mp3', 'DenyList');
-        },
-        steps: [
-          { run: () => S('m1', 'active'), note: '<b>起点：boot.img 的 ramdisk。</b>系统正常启动时，内核会执行这里的 init，由它去挂载 /system、/vendor 等分区并启动服务。<b>谁控制了这个 init，谁就控制了「系统将看到的世界」。</b>' },
-          { run: () => { S('m1', 'done'); S('m2', 'active'); }, note: '<b>关键动作：往 ramdisk 里注入 magiskinit。</b>常见做法是替换掉系统的 init，或修改 <span class="mono">.rc</span> 文件让它先执行 Magisk 的逻辑。<br><b>可观察点：</b>解包/重打包 boot 镜像；对比原厂与打过补丁的 ramdisk。<br><b>这一步是「systemless」这个词的真正来源</b>——改动发生在 <b>boot 分区</b>，不在系统分区。' },
-          { run: () => { S('m2', 'done'); S('m3', 'active'); }, note: '<b>系统启动，magiskinit 抢在最前面运行。</b>此时还没人挂载 /system，Magisk 拥有完全的主动权。<br><b>这就是「早」的价值：</b>它不是事后往一个已经跑起来的系统里塞东西，而是在系统成型之前就站在了路口。' },
-          { run: () => { S('m3', 'done'); S('m4', 'active'); }, note: '<b>它把真实的 /system 以只读方式挂载起来。</b>注意：<b>只读</b>。真实分区的完整性从一开始就被保护住——这是后面「能 OTA、能干净卸载」的物理基础。' },
-          { run: () => { S('m4', 'done'); S('m5', 'active'); }, note: '<b>核心手法：magic mount / overlayfs 叠加。</b>把模块里的文件「覆盖」到对应的系统路径上。<span class="term" data-def="一种联合文件系统：把多个目录按层叠起来，上层同名文件覆盖下层，对外表现为一个目录">overlayfs</span> 是 Linux 的联合挂载机制；Magisk 的 magic mount 则是在挂载层面做等价的叠加（手法与 18.6 的<b>绑定挂载</b>一脉相承）。<br><b>记忆锚点：</b>播放列表叠加——底层歌单没变，你在上面盖了一张新歌单，播放器只认最上面那张。' },
-          { run: () => { S('m5', 'done'); S('m6', 'active'); }, note: '<b>结果：系统看到的是「被覆盖」的文件。</b>对 Android 来说，这个文件就是这样；它<b>无法从文件内容本身</b>判断下面还有一层。<br><b>对逆向的意义：</b>这意味着你可以往系统路径上「注入」几乎任何东西——定制的系统属性、被替换的库、额外的配置文件——而系统会当成原生的接受。' },
-          { run: () => { S('m6', 'done'); S('m7', 'active'); }, note: '<b>最关键的一点：真实 /system 分区一个字节都没改。</b>所有修改都活在<b>挂载层</b>，随启动建立、随卸载消失。<br><b>对比传统改法：</b>直接改系统分区会破坏校验、导致无法 OTA，而且改动是「永久性的脏」——出了问题很难回到干净状态。' },
-          { run: () => { S('m7', 'done'); S('m8', 'active'); }, note: '<b>两个直接好处：</b>① <b>可以 OTA 升级</b>——系统分区是原厂的，校验能过；② <b>可以随时卸载干净</b>——把挂载层撤掉，系统回到出厂状态。<br><b>这就是 systemless 的全部价值：把「修改」从磁盘上搬到挂载层。</b>' },
-          { run: () => { CLS('mp1', 'pill ok'); SET('mp1', 'MagiskSU · 权限管理'); }, note: '<b>MagiskSU：提供 root 权限管理。</b>它决定「哪个 App 可以拿到 root」，以及以什么身份拿。<br><b>注意它的双重身份：</b>对你自己是便利（调试、抓包、注入），对风控是<b>明确的信号</b>——所以才有下面两个组件。' },
-          { run: () => { CLS('mp2', 'pill ok'); SET('mp2', 'Zygisk · 注入 Zygote'); }, note: '<b>Zygisk：在 Zygote 进程注入代码的机制。</b>因为 Zygote 是<b>所有 Android 应用进程的父进程</b>（回看 18.7 第⑧步），在这里注入就等于<b>每个 App 进程一出生就带着你的代码</b>。<br><b>这是模块 Hook 最有效的位置</b>——比在 App 里事后 hook 更早、更全面。' },
-          { run: () => { CLS('mp3', 'pill ok'); SET('mp3', 'DenyList · 隐藏 root'); }, note: '<b>DenyList（旧称 MagiskHide）：隐藏 root 状态，对抗检测。</b>它的存在本身就说明了一个事实：<b>「有 root」和「不被发现」是两件必须同时做到的事</b>。<br><b>对逆向的意义：</b>Magisk 是让云手机/容器化安卓<span class="hit">看起来像真机</span>的关键一环——隐藏 root、注入定制模块、按 App 白名单决定谁看得见什么。' },
-          { run: () => { CLS('mp1', 'pill acc'); CLS('mp2', 'pill acc'); CLS('mp3', 'pill acc'); }, note: '<b>三个组件合起来，就是一台「可编程的真机」：</b>你能拿到最高权限（MagiskSU）、能在每个进程出生时注入（Zygisk）、还能对着风控装作什么都没有（DenyList）。<br><b>但要清醒：</b>隐藏是一个<b>持续对抗</b>的过程，不是装完就赢。检测方会看挂载表、看进程、看属性、看行为——<b>任何一处不自洽，前功尽弃</b>。这就是下一节的主题。' }
+      title: '定制 ART 的方案比较与实施流程',
+      html:
+        '<p>「定制 ART」听上去很重，实际有<strong>不同重量级</strong>的做法。先选路线，再谈流程——选错路线会让你在编译上浪费几周。</p>' +
+        T.tbl(['方案', '做法', '成本', '适用场景'], [
+          ['运行时 Hook（Frida 等）', '不改源码，挂载时改写 ArtMethod', '低，分钟级', '快速验证、单点观察、样本量小'],
+          ['改 ART 源码并编译', '插桩后重新编译 art 模块，刷入设备', '高，天到周级', '需要完整、稳定、不可被检测的记录能力'],
+          ['使用现成定制 ROM', '基于他人已改好的产物二次开发', '中', '通用需求（如整体方法跟踪），无特殊插桩点'],
+          ['模拟器 / 容器内运行', '把 App 放进可控环境执行', '中', '批量自动化分析；但环境特征明显，易被识别']
+        ]) +
+        T.note('key', '🔑 选择的第一原则：先问「我要观测什么」',
+          '<p>如果你只是想知道「这个方法有没有被调用」，运行时 Hook 就够了，别去编译 ART。' +
+          '只有当你要观测的东西<b>发生在 Hook 框架能够介入之前</b>（比如注册那一刻本身），或者你需要<b>环境本身不可被发现</b>时，改虚拟机才有意义。</p>') +
+        T.grid(2, [
+          '<div class="card"><div class="card-title">✅ 定制 ART 的收益</div>' +
+          '<p>· 记录点在你自己的代码里，不依赖 hook 框架<br>' +
+          '· 没有 Frida/注入的进程特征可供检测<br>' +
+          '· 能看到框架看不到的东西（如注册映射的生成过程）<br>' +
+          '· 一次插桩，长期复用；可做成产品化的沙箱</p></div>',
+          '<div class="card"><div class="card-title">⚠️ 定制 ART 的代价</div>' +
+          '<p>· <b>编译环境</b>：AOSP 体积大、依赖多，首次搭建最痛<br>' +
+          '· <b>版本绑定</b>：源码随 AOSP 版本变化，换版本要重新定位插桩点<br>' +
+          '· <b>刷机风险</b>：刷错会导致设备无法启动<br>' +
+          '· <b>完整性校验</b>：部分 App 会校验系统镜像，定制 ROM 可能被拒</p></div>'
+        ]) +
+        '<p>下面用终端把整个流程走一遍。注意每一步的<b>失败信号</b>——出问题时按这个顺序回查最快。</p>',
+      term: {
+        title: '定制 ART 沙箱的实施流程（概念层）',
+        lines: [
+          { t: 'd', s: '# 步骤 1：确定目标版本 —— 版本必须与设备/目标严格对应' },
+          { t: 'p', s: 'adb shell getprop ro.build.version.release && getprop ro.build.version.sdk', note: '<b>先问清楚设备是什么版本。</b>ART 源码随 AOSP 版本变化很大，插桩点必须和设备的 SDK/版本对得上。若用真机，还需确认设备的 Build ID 与源码分支一致。' },
+          { t: 'o', s: '12\n31' },
+          { t: 'd', s: '# 步骤 2：下载并准备 AOSP 源码（体积大，首次最耗时）' },
+          { t: 'p', s: 'repo init -u <AOSP_MANIFEST_URL> -b <对应分支>', note: '<b>分支要和步骤 1 的版本对应。</b>具体 manifest 地址与分支名请以官方文档为准。这一步的主要成本是磁盘与时间。' },
+          { t: 'w', s: 'warning: 源码树体积可达上百 GB，请预留足够磁盘空间', note: '<b>提前规划磁盘。</b>中途磁盘满会导致 sync 中断，排查起来很费时间。' },
+          { t: 'd', s: '# 步骤 3：定位插桩点（本章的 RegisterNatives）' },
+          { t: 'p', s: 'grep -rn "RegisterNatives" art/ | grep -i "JNINativeMethod"', note: '<b>用两个关键词交叉搜索。</b>能同时命中 <span class="mono">RegisterNatives</span> 与 <span class="mono">JNINativeMethod</span> 的那个文件，就是处理动态注册的地方。<span class="pill warn">具体文件名随版本变化，待核实</span>' },
+          { t: 'o', s: 'art/runtime/jni/jni_internal.cc: ... RegisterNatives(...)' },
+          { t: 'd', s: '# 步骤 4：插桩 —— 在循环体里加一行只读日志' },
+          { t: 'p', s: 'vim art/runtime/jni/jni_internal.cc', note: '<b>只加记录，不改逻辑。</b>这是最重要的纪律：探针必须保证虚拟机行为完全不变，否则你的沙箱本身就成了不可信环境。' },
+          { t: 'd', s: '# 步骤 5：只编译 art 模块（不要全量编译 AOSP）' },
+          { t: 'p', s: 'source build/envsetup.sh && lunch <对应产品>' },
+          { t: 'p', s: 'm art  # 或 mm -j$(nproc)', note: '<b>关键技巧：只编 art。</b>全量编译 AOSP 动辄数小时；只编译 art 模块通常在可接受范围内，迭代插桩时这一点决定了你的效率。' },
+          { t: 'e', s: 'error: 依赖缺失 / 头文件路径不对', note: '<b>最常见的失败。</b>多是因为没执行 <span class="mono">lunch</span> 选对产品，或环境变量未 source。看到这类错误先回查环境初始化步骤。' },
+          { t: 'd', s: '# 步骤 6：把产物送到设备并生效' },
+          { t: 'p', s: 'adb root && adb remount && adb push <art 相关产物> /system/lib64/', note: '<b>注意位与 ABI。</b>32/64 位产物路径不同，推错会导致开机失败。<b>强烈建议先在模拟器或可恢复的设备上验证。</b>刷入前务必确认有回滚手段（备份原文件/可重刷的镜像）。' },
+          { t: 'w', s: 'warning: 修改系统分区有变砖风险，请先备份原始产物', note: '<b>这不是客套话。</b>ART 是系统启动的关键组件，替换错误会让设备卡在开机动画。' },
+          { t: 'd', s: '# 步骤 7：验证插桩是否生效' },
+          { t: 'p', s: 'adb logcat | grep TRACE', note: '<b>验证信号：日志里出现你插桩时打的标记。</b>如果没有输出，按「编译有没有真的重新生成产物 → 推入的文件有没有生效 → 目标 App 是否真的触发了 RegisterNatives」的顺序回查。' },
+          { t: 'o', s: '[TRACE] com.demo.MyBean.getName()Ljava/lang/String; -> 0x7f6c9e40' },
+          { t: 'o', s: '[TRACE] com.demo.MyBean.nativeCheck()Z           -> 0x7f6cab00' },
+          { t: 'd', s: '# 步骤 8：把日志变成可用的分析输入' },
+          { t: 'p', s: 'adb pull /data/local/tmp/art-trace.log ./bindings.txt', note: '<b>产物落地。</b>把映射表拉回主机，交给 IDA/Ghidra 标注函数名，或在 gdb 里按地址下断——沙箱的价值最终体现在这张表上。' },
+          { t: 'o', s: '--- 4 bindings recorded ---', note: '<b>到这里，动态分析沙箱的最小闭环就通了。</b>你有了一套自己掌控、能记录关键事件的运行环境。' }
         ]
       },
-      after: T.note('warn', '⚠️ 容器化环境下 Magisk 的位置会变',
-              '<p>在真机上，Magisk 改的是 boot 镜像的 ramdisk；而在<b>容器化 Android</b> 里，你往往<b>本来就控制着整个用户空间镜像</b>——很多在真机上要靠 Magisk 才能做到的事情（替换系统文件、注入 init 逻辑），在这里可以直接在镜像层面完成。</p>' +
-              '<p>但 Magisk 依然有两个不可替代的价值：<b>① 模块化的增量修改</b>（可开关、可卸载、可组合）；<b>② Zygisk 的注入时机</b>（每个 App 进程出生即被注入）。<span class="pill warn">具体在 remote_android 中的取舍与实现以作者发布为准，待核实</span>。</p>')
+      after: T.note('warn', '⚠️ 本章所有源码细节的定位方法',
+        '<p>本节刻意只给出<b>方法</b>而不给出<b>确定的行号与文件名</b>——因为 AOSP 结构随版本变化很大，写死细节等于制造错误。' +
+        '凡标注 <span class="pill warn">待核实</span> 的地方，请在<b>你手上那个版本</b>的源码里用关键词搜索确认。</p>' +
+        '<p><b>通用检索词：</b><span class="mono">RegisterNatives</span>、<span class="mono">JNINativeMethod</span>、' +
+        '<span class="mono">ArtMethod</span>、<span class="mono">RegisterNative</span>。</p>') +
+        T.note('', '💡 沙箱的终局形态',
+        '<p>插一个点只是开始。同一套方法可以扩展成：JNI 注册跟踪、类加载跟踪、方法调用跟踪、反射调用跟踪……' +
+        '当这些记录点都在你自己编译的虚拟机里，你得到的就不只是一个工具，而是一个<b>可编程的观测平台</b>——' +
+        '这就是「<span class="term" data-def="一套你自己掌控、能记录一切关键事件的 Android 运行环境">动态分析沙箱</span>」的真正含义。</p>')
     },
 
     /* ================= 18.9 ================= */
     {
       h: '18.9',
-      title: '虚拟 WiFi：让「网络环境」自己讲得通',
-      html: '<p>这是本章最能体现「伪装思维」的一节。App 检查自己是不是在真机上跑，<b>网络环境是最便宜、也最常用的判据之一</b>：真机往往连着 WiFi 或蜂窝网，而机房里的实例可能只有一张 <span class="mono">eth0</span>，网段还长得像数据中心。</p>' +
-            '<p>容器化环境下<b>根本没有真实 WiFi 硬件</b>。那要怎么办？新手的第一反应是：「我把 <span class="mono">WifiManager</span> 的返回值 hook 掉不就行了？」——<b>这正是最容易翻车的地方。</b></p>' +
-            T.note('bad', '❌ 为什么「只改一个 API 返回值」一定会被识破',
-              '<p>因为 App 不会只问一个问题。它会从<b>多个互相独立的数据源</b>去问<b>同一件事</b>，然后<b>对账</b>：</p>' +
-              '<p>Java 层的 <span class="mono">WifiManager</span> 说「我连着 BSSID=<span class="mono">aa:bb:...</span> 的路由器」，但内核视角的 <span class="mono">/proc/net/wireless</span> 是空的；扫描结果是空列表，可 RSSI 却有一个漂亮的 <span class="mono">-45 dBm</span>；IP 是 <span class="mono">10.0.x.x</span> 的数据中心网段，网关却号称是一台家用路由器……</p>' +
-              '<p><b>任何一处对不上账，前面所有的伪装都白做。</b>风控不需要证明你是假的，它只需要发现你的证据链有矛盾。</p>'),
-      stage: {
-        title: '虚拟 WiFi 的自洽性要求',
-        speed: 1850,
-        render: '<div class="flow-col" style="max-width:860px">' +
-                '<div class="blk" id="w1">App 发起「网络环境」检查</div><div class="arrow">↓</div>' +
-                '<div class="flow-row" style="gap:8px;flex-wrap:wrap">' +
-                '<div class="blk" id="w2">WifiManager<br><span class="small">SSID / BSSID</span></div>' +
-                '<div class="blk" id="w3">信号强度<br><span class="small">RSSI 及其变化</span></div>' +
-                '<div class="blk" id="w4">IP / 网关 / DNS<br><span class="small">网络参数</span></div>' +
-                '<div class="blk" id="w5">扫描结果列表<br><span class="small">周围有哪些 AP</span></div>' +
-                '<div class="blk" id="w6">/proc/net/wireless<br><span class="small">内核视角</span></div>' +
-                '</div><div class="arrow">↓</div>' +
-                '<div class="blk" id="w7">交叉对账：这些值互相说得通吗？</div><div class="arrow">↓</div>' +
-                '<div class="flow-row" style="gap:10px"><span class="pill" id="wr1">自洽</span><span class="pill" id="wr2">矛盾</span></div>' +
-                '</div>',
-        reset: () => {
-          ['w1','w2','w3','w4','w5','w6','w7'].forEach(i => S(i, ''));
-          CLS('wr1', 'pill'); CLS('wr2', 'pill');
-          SET('wr1', '自洽'); SET('wr2', '矛盾');
-        },
-        steps: [
-          { run: () => S('w1', 'active'), note: '<b>App 在启动或关键操作前做一次网络环境检查。</b>成本极低、不需要任何权限（有些信息连权限都不要），却是判断运行环境的强信号——所以它是风控的常客。' },
-          { run: () => { S('w1', 'done'); S('w2', 'active'); }, note: '<b>第一问：SSID / BSSID。</b>这些值由系统服务提供，真机上源自驱动的扫描与关联结果。<br><b>容器里的现实：</b>没有 WiFi 硬件，这些值要么不存在，要么是编的。<b>关键不只是「有没有值」，而是这个值和其他证据对不对得上。</b>' },
-          { run: () => { S('w2', 'done'); S('w3', 'active'); }, note: '<b>第二问：信号强度。</b>真机的 RSSI 是<b>持续波动</b>的——你手一挡就掉，走动一下就变。<br><b>自洽要求：</b>如果每次查询都返回同一个完美值（比如恒定 <span class="mono">-50 dBm</span>），这本身就是异常——<b>真实世界是不停抖动的</b>。' },
-          { run: () => { S('w3', 'done'); S('w4', 'active'); }, note: '<b>第三问：IP / 网关 / DNS。</b>这一项最容易被忽略，也最容易露馅：BSSID 指向一台家用路由器，IP 却是数据中心网段、网关是 <span class="mono">10.x</span> 内网地址——<b>两者物理上不可能同时成立</b>。<br><b>对账关系：</b>BSSID ↔ 网关 ↔ 网段 ↔ DNS，这是一条链。' },
-          { run: () => { S('w4', 'done'); S('w5', 'active'); }, note: '<b>第四问：扫描结果列表。</b>真机在居民区/办公楼里扫一圈，能看到一堆邻居 AP，强度有高有低、加密方式五花八门。<br><b>自洽要求：</b>扫描结果是空列表、或者清一色信号满格、或者邻居 AP 的名字明显是生成的——<b>都会被立刻标记</b>。' },
-          { run: () => { S('w5', 'done'); S('w6', 'active'); }, note: '<b>第五问：/proc/net/wireless —— 内核视角。</b>这一项最狠，因为它绕过了整个 Java 层与系统服务：<b>你 hook 了 WifiManager，不代表内核里真有这张网卡。</b><br><b>这是「交叉验证」的教科书案例：</b>上层说有一套 WiFi，底层说没有。<br><b>对逆向的意义：</b>凡是同时存在「上层 API」和「内核视图」的信息，都要两边一起动，否则必然矛盾。' },
-          { run: () => { S('w6', 'done'); S('w7', 'active'); CLS('wr2', 'pill bad'); SET('wr2', '矛盾 → 判定为异常运行环境'); }, note: '<b>对账：三条证据指向两个不同的世界。</b>风控不需要抓到「你在用云手机」的铁证，它只要发现<b>证据之间不自洽</b>，就可以按高风险处理——降权、加验证码、拒绝登录。' },
-          { run: () => { S('w7', 'done'); CLS('wr2', 'pill'); SET('wr2', '矛盾'); CLS('wr1', 'pill ok'); SET('wr1', '自洽 → 通过这一层检查（不代表全部通过）'); }, note: '<b>正确姿势：伪造一整套「自洽的状态」，而不是伪造一个「正确的返回值」。</b>这意味着要同时覆盖：系统服务层（WifiManager 背后的服务）、内核可读的视图（<span class="mono">/proc</span> 等）、以及<b>时间维度</b>。' },
-          { run: () => { S('w2', 'cool'); S('w3', 'cool'); S('w4', 'cool'); S('w5', 'cool'); S('w6', 'cool'); }, note: '<b>时间维度是最容易被忽略的一层。</b>真机的 WiFi 状态有历史：信号在抖动、偶尔切换 AP、断开又重连、扫描列表随位置变化。<br><b>一个「刚刚才有、而且永远不变」的 WiFi，比没有 WiFi 更可疑。</b>' },
-          { run: () => { CLS('wr1', 'pill acc'); SET('wr1', '核心原则：伪装必须自洽'); }, note: '<b>本节的核心原则：伪装必须自洽。</b>不是「让 API 返回真」，而是<b>让一整套状态机看起来被真实使用过</b>——包括它的历史、它的波动、它和其他子系统之间的约束关系。<br><b>这条原则适用于本章所有的伪装工作：</b>root 的隐藏、图形指纹的一致、设备信息的完整，都是同一件事。' }
-        ]
-      },
-      after: T.tbl(['检测面', 'App 会读到什么', '只改单一 API 会怎样', '自洽要求'], [
-        ['SSID / BSSID', '当前关联的无线网络标识', 'Java 层说有，底层设备不存在 → 当场矛盾', 'BSSID 的格式与厂商前缀要像真的，并与网关/网段配套'],
-        ['RSSI 信号强度', '信号强度及其随时间的变化', '恒定值 = 明显不真实', '要有抖动，且抖动范围符合物理直觉'],
-        ['扫描结果列表', '周围可见的 AP 列表', '空列表或过于整齐 → 立刻可疑', '数量、强度分布、加密方式、名称都要合理'],
-        ['IP / 网关 / DNS', '网络参数', '与 BSSID 描述的场景不匹配', '与「这台设备连的是什么网」保持一致'],
-        ['<span class="mono">/proc/net/wireless</span>', '<b>内核视角</b>的无线设备信息', '<b>上层改了这里没改 → 最硬的矛盾</b>', '要么真有对应支撑，要么在更底层一起伪造'],
-        ['连接历史 / 网络切换', '系统记录过的网络', '从未连接过任何网络，却一直在线', '要有可解释的历史轨迹']
-      ]) +
-      T.note('warn', '⚠️ 边界声明',
-              '<p>本节讲的是<b>机制与自洽性原理</b>，用于理解风控如何做环境检测、以及容器化环境为什么难做真。<b>具体到某个 App 的检测项清单、某个虚拟 WiFi 方案的实现细节，都不在本章断言范围内</b> <span class="pill warn">待核实</span>。</p>' +
-              '<p><b>出问题往哪查：</b>当实例「功能正常但被风控拦」时，按本节表格<b>逐行对账</b>——先找出哪两条证据互相矛盾，再决定在哪一层修。<b>不要在没有定位矛盾点之前就开始 hook</b>，那是纯粹的碰运气。</p>')
+      title: '决策演练①：目标 so 的符号表是空的',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境一',
+            scenario: '<b>情境：</b>你接到一个加固样本。用 IDA 打开它的 <span class="mono">libprotect.so</span>，导出表里只有 ' +
+                      '<span class="mono">JNI_OnLoad</span> 和 <span class="mono">JNI_OnUnload</span>，' +
+                      '所有 <span class="mono">Java_</span> 前缀的函数一个都没有。但 App 的 native 功能运行完全正常。<br><br>' +
+                      '<b>你的第一步是什么？</b>',
+            choices: [
+              { t: '先跑起来，用 Frida 脚本列出这个 so 里所有已注册的 native 方法', next: 'n1' },
+              { t: '用脱壳工具先脱壳，把真正的 dex 和 so dump 出来再说', next: 'n2' },
+              { t: '猜测函数在 JNI_OnLoad 里被手动调用，试着跟 JNI_OnLoad 的控制流', next: 'n3' },
+              { t: '在 IDA 里按字符串搜索加密算法特征（如 AES S-box）来定位关键函数', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选 A', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先确认「注册」这件事本身',
+            result: '<b>符号表为空 + 功能正常 = 动态注册的教科书特征。</b>正确的第一步是<b>确认并枚举</b>注册关系，' +
+                    '而不是急着去 dump 或猜函数。<br><br>' +
+                    '具体做法有两层：用 Frida hook <span class="mono">RegisterNatives</span> 看参数，' +
+                    '或直接 hook <span class="mono">JNI_OnLoad</span> 的返回值；更彻底的，就是本章的路子——' +
+                    '在自己编译的 ART 里把注册映射记下来。<br><br>' +
+                    '<b>为什么这是最优解：</b>它直接产出「Java 方法 ↔ native 地址」的对照表，' +
+                    '让后续所有分析都有了锚点。你会知道哪个地址对应哪个 Java 方法，而不是面对一堆无名函数。'
+          },
+          n2: {
+            label: '选 B', terminal: true, verdict: 'bad',
+            verdictTitle: '方向偏了：这里的问题不是壳，是注册方式',
+            result: '<b>你把「符号表为空」误判成了「内容被加密」。</b>这是很常见的条件反射——见到看不懂的就上脱壳工具。<br><br>' +
+                    '<b>认知根源：</b>混淆了两件不同的事。<b>动态注册</b>是 JNI 的正常机制，函数本来就不需要导出符号；' +
+                    '<b>加壳</b>是另一回事。符号表干净不代表代码被加密——IDA 里那些函数体很可能清清楚楚，' +
+                    '只是没有名字，你不知道哪个是哪个。<br><br>' +
+                    '脱壳工具在这里既解决不了问题（没有壳可脱），又会浪费大量时间。<b>先判断问题类型，再选工具。</b>'
+          },
+          n3: {
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '不算错但效率低：你会淹死在指针运算里',
+            result: '<b>方向对了一半，但手段选错了。</b>动态注册确实发生在 <span class="mono">JNI_OnLoad</span> 的执行过程中，' +
+                    '跟着它的控制流理论上能看到注册。<br><br>' +
+                    '<b>问题在于量级：</b>JNI_OnLoad 里往往是一长串初始化逻辑——解密字符串、拼装 <span class="mono">JNINativeMethod</span> 数组、' +
+                    '可能还有反调试。静态跟下来，你要在汇编里手工推算出每个 <span class="mono">fnPtr</span> 的值（常常是运行时计算的，静态根本算不出），' +
+                    '成本极高。<br><br>' +
+                    '<b>正确姿势：</b>让虚拟机在运行时把结果告诉你。同一件事，动态观测的成本低几个数量级。'
+          },
+          n4: {
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：先建映射，再找算法',
+            result: '<b>这是「跳过地图直接找宝藏」。</b>按算法特征搜字符串确实是实用技巧，但它解决的是「我已知要找什么」的问题。<br><br>' +
+                    '<b>现在你连有哪些函数都不知道。</b>一个加密函数可能用了自定义 S-box、可能用了白盒、可能压根不是标准实现——' +
+                    '特征搜索的命中率极低。就算侥幸命中，你也不知道它被哪个 Java 方法调用、在业务里扮演什么角色。<br><br>' +
+                    '<b>顺序应该是：</b>先拿到「Java 方法 → native 地址」的映射表（建立地图），再针对可疑方法（比如名字叫 <span class="mono">check</span>、' +
+                    '签名返回 boolean 的那些）深入分析。有了地图，搜索范围能缩小一两个数量级。'
+          }
+        }
+      }
     },
-
+    ,
     /* ================= 18.10 ================= */
     {
       h: '18.10',
-      title: 'KVM API：从用户态亲手造一台机器',
-      html: '<p><span class="term" data-def="Kernel-based Virtual Machine：Linux 内核的硬件虚拟化接口，把内核变成 Type-1 Hypervisor">KVM</span> 是 Linux 内核的硬件虚拟化接口。它最迷人的地方在于<b>接口极其简单</b>：内核通过一个字符设备 <span class="mono">/dev/kvm</span> 暴露 API，用户态程序（QEMU、Cuttlefish、crosvm 都是这么干的）用 <b>ioctl</b> 去调用它。</p>' +
-            '<p><b>前提：</b>CPU 要支持硬件虚拟化（Intel VT-x / AMD-V / ARM Virtualization Extensions）<b>而且 BIOS/UEFI 里开启了</b>。这个前提不满足时，<span class="mono">/dev/kvm</span> 根本不会出现——这也是你应该养成习惯的<b>第一个检查动作</b>（回看 18.3 的体检）。</p>' +
-            '<p>下面用一个极简的 vmm（虚拟机监视器）骨架，把 KVM 的主要 ioctl 走一遍。<b>看懂它，你就看懂了 QEMU 这类程序的骨架</b>——它们无非是把这套调用做得更完整、更工程化。</p>' +
-            T.note('key', '🔑 记住三样东西就够了',
-              '<p><b>一个设备</b>：<span class="mono">/dev/kvm</span>。<b>三类 fd</b>：kvm（系统）→ vm（虚拟机）→ vcpu（虚拟 CPU）。<b>一个循环</b>：<span class="mono">KVM_RUN</span> 进去、VM Exit 出来、处理完再进去。</p>' +
-              '<p>所有虚拟化软件，本质上都是这三样东西的扩展：<b>虚拟机是 fd，vCPU 是线程，VM Exit 是事件源。</b></p>'),
-      stepper: {
-        title: 'KVM API 调用流程（vmm 骨架）',
-        lines: [
-          { code: '<span class="k">int</span> kvm_fd = <span class="f">open</span>(<span class="s">"/dev/kvm"</span>, O_RDWR);',
-            note: '<b>第一步永远是打开设备。</b>打开失败基本只有三种原因：CPU 不支持硬件虚拟化、BIOS 里没开、或者权限不够。<b>先把这三条排除掉，再怀疑别的。</b>',
-            state: { 'kvm_fd': '3（打开成功）', '前提': 'CPU 虚拟化扩展 + BIOS 已开启', '失败时': '/dev/kvm 不存在或无权限' } },
-          { code: '<span class="k">int</span> api = <span class="f">ioctl</span>(kvm_fd, KVM_GET_API_VERSION, <span class="n">0</span>);',
-            note: '<b>先问版本，再动手。</b>确认这个内核暴露的 KVM 接口版本与你的程序预期一致（KVM_API_VERSION 为 12）。这是 ioctl 协议的标准开场——<b>不打招呼就调用后面的接口，出了问题你连「是版本不匹配」都想不到。</b>',
-            state: { 'kvm_fd': '3', 'API 版本': '12', '含义': '接口协议对得上' } },
-          { code: '<span class="k">int</span> vm_fd = <span class="f">ioctl</span>(kvm_fd, KVM_CREATE_VM, <span class="n">0</span>);',
-            note: '<b>创建虚拟机，拿到 vm_fd。</b>注意层级：KVM_CREATE_VM 是<b>系统级</b> ioctl（作用在 kvm_fd 上），从这里往后都是<b>虚拟机级</b> ioctl（作用在 vm_fd 上）。<b>这一个 fd，就代表「一台机器」。</b>',
-            state: { 'kvm_fd': '3', 'vm_fd': '4（新建）', 'vm 状态': '已创建，尚无内存与 CPU' } },
-          { code: '<span class="k">struct</span> kvm_userspace_memory_region r = { .slot = <span class="n">0</span>, .guest_phys_addr = <span class="n">0</span>, .memory_size = SIZE, .userspace_addr = (<span class="k">unsigned long</span>)mem };',
-            note: '<b>准备内存映射结构体。</b>看清楚这四个字段的意思：<b>slot</b>（第几号映射）、<b>guest_phys_addr</b>（guest 眼里的物理地址）、<b>memory_size</b>（多大）、<b>userspace_addr</b>（<span class="hit">你自己进程里那块内存的地址</span>）。',
-            state: { 'vm_fd': '4', 'slot': '0', 'guest 物理地址': '0x0 起', '宿主内存': '用户态缓冲区' } },
-          { code: '<span class="f">ioctl</span>(vm_fd, KVM_SET_USER_MEMORY_REGION, &amp;r);',
-            note: '<b>KVM 最关键的一步。</b>KVM <b>不替你分配 guest 的物理内存</b>——它让你把<b>自己进程里的一块内存</b>登记成 guest 的物理地址空间。<br><b>由此推出两件重要的事：</b>① guest 读写的每一个字节，最终都落在你用户态的缓冲区里；② 你<b>随时可以直接读写 guest 的内存</b>，不需要走任何虚拟机接口。<b>这就是调试器、内存取证、脱壳工具能工作在虚拟机上的根本原因。</b>',
-            state: { 'vm_fd': '4', '内存 slot': 'slot 0 已登记', '宿主视图': 'mem[] 可被本进程直接读写' } },
-          { code: '<span class="k">int</span> vcpu_fd = <span class="f">ioctl</span>(vm_fd, KVM_CREATE_VCPU, <span class="n">0</span>);',
-            note: '<b>创建第 0 号虚拟 CPU。</b>多核就是循环创建多个 vCPU（1、2、3……），每个 vCPU 通常由一个<b>独立的宿主线程</b>去驱动。<br><span class="small muted">vCPU 的初始寄存器状态与体系结构相关，实际 vmm 还需要额外设置。</span>',
-            state: { 'vm_fd': '4', 'vcpu_fd': '5（新建）', 'vCPU 状态': '已创建，未运行' } },
-          { code: '<span class="k">struct</span> kvm_run *run = <span class="f">mmap</span>(NULL, mmap_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu_fd, <span class="n">0</span>);',
-            note: '<b>把 vCPU 的 kvm_run 结构映射到本进程。</b>这是很多人第一次写 vmm 时漏掉的一步，也是<b>整个循环能成立的关键</b>：guest 每次因某个原因退出时，退出原因与相关参数就写在这块共享内存里；你的程序读它来决定下一步做什么。',
-            state: { 'vcpu_fd': '5', 'kvm_run': '已映射（共享内存）', '作用': '读取 VM Exit 原因' } },
-          { code: '<span class="f">ioctl</span>(vcpu_fd, KVM_SET_REGS, &amp;regs); <span class="c">/* 设置初始寄存器，把 PC 指向 guest 入口 */</span>',
-            note: '<b>给这台「机器」设置上电后的第一站。</b>在真机上这件事由 BootROM 完成（回看 18.7 第①步）；在这里，<b>你就是那个 BootROM</b>——你直接告诉 vCPU 从哪里开始执行。<br><b>这个对照非常有价值：</b>它说明「引导」本质上是「设定初始状态」，而虚拟化只是让你有权设定它。',
-            state: { 'vcpu_fd': '5', '初始 PC': 'guest 内核入口', 'vCPU 状态': '已就绪' } },
-          { code: '<span class="k">while</span> (<span class="n">1</span>) { <span class="f">ioctl</span>(vcpu_fd, KVM_RUN, <span class="n">0</span>); <span class="f">switch</span> (run-&gt;exit_reason) { <span class="c">/* 处理各类 VM Exit */</span> } }',
-            note: '<b>虚拟机的心脏：KVM_RUN 循环。</b>这个 ioctl 会<b>阻塞</b>，直到 guest 因为某个原因退出（访问了未映射的地址、执行了需要模拟的指令、等待中断、关机等）。你处理完，再调一次 KVM_RUN 继续。<br><b>CPU 的开销几乎全在 guest 里</b>，宿主只是在每次退出时做一点点事——这就是硬件虚拟化比软件模拟快几个数量级的根本原因。',
-            state: { 'vCPU 状态': '运行中 ↔ 已退出（循环）', '宿主线程': '每个 vCPU 一个', '退出原因': 'run->exit_reason' } },
-          { code: '<span class="c">/* VM Exit 处理：按 exit_reason 分派 */</span>',
-            note: '<b>VM Exit 就是虚拟机的「事件循环」。</b>典型的处理包括：模拟一次设备 IO（对应 18.4 里那些 virtio 设备）、处理 MMIO 访问、注入中断、响应关机请求。<br><b>到这里可以下结论了：所谓「虚拟机」，就是一个用户态程序在不停地接住 CPU 抛出来的事件。</b>',
-            state: { 'vCPU 状态': '已退出，等待处理', '典型事件': 'IO / MMIO / 中断 / 关机' } },
-          { code: '<span class="f">close</span>(vcpu_fd); <span class="f">close</span>(vm_fd); <span class="f">close</span>(kvm_fd);',
-            note: '<b>清理。</b>三层 fd 依次关闭，mmap 的内存解除映射。<br><b>顺带记住这个层级关系</b>：kvm → vm → vcpu，<b>上面的一关，下面的全部失效</b>。这是排查「为什么我的 vm 忽然不可用」时最该先想到的方向。',
-            state: { 'kvm_fd': '已关闭', 'vm_fd': '已关闭', 'vcpu_fd': '已关闭', 'vCPU 状态': '已销毁' } }
-        ]
-      },
-      after: T.note('', '📌 KVM 在移动端的演进：AVF 与 pKVM',
-              '<p>Android 上的 <b>Android Virtualization Framework（AVF）</b> 与 <b>pKVM（protected KVM）</b> 是 KVM 在移动端的延伸。它们的动机和服务器虚拟化不同：不是「多租户」，而是<b>把安全敏感的东西（密钥、支付、DRM）放进一个即使主系统被攻破也攻不破的隔离域里</b>。</p>' +
-              '<p><b>对逆向的含义：</b>如果你的目标把关键逻辑放进了这类受保护的环境，那么在主系统里做的一切 hook 都够不着它——<b>攻击面从「代码」变成了「两个世界之间的接口」</b>。这是移动安全对抗正在滑向的方向，值得持续关注。<span class="pill warn">具体版本与机型支持情况待核实</span>。</p>')
+      title: '决策演练②：那个偶发崩溃的回调',
+      decision: {
+        start: 'n0',
+        nodes: {
+          n0: {
+            label: '情境二',
+            scenario: '<b>情境：</b>你在给一个定制 ART 写功能：需要在类加载完成后，<b>延迟一段时间</b>再去检查某个类的状态。' +
+                      '你写了这样一段代码：<br><br>' +
+                      '<span class="mono">void OnClassLoaded(mirror::Class* c) {</span><br>' +
+                      '<span class="mono">&nbsp;&nbsp;std::string name = c-&gt;PrettyDescriptor();</span><br>' +
+                      '<span class="mono">&nbsp;&nbsp;auto task = [&amp;]() { Check(name); };</span><br>' +
+                      '<span class="mono">&nbsp;&nbsp;PostDelayedTask(task, 2000);</span><br>' +
+                      '<span class="mono">}</span><br><br>' +
+                      '编译通过，功能大部分时候正常，但<b>偶尔崩溃</b>，栈回溯指向一些毫不相关的函数。<br><br>' +
+                      '<b>你判断问题出在哪？</b>',
+            choices: [
+              { t: 'ART 的线程模型有问题，回调没有在正确的线程上执行', next: 'n1' },
+              { t: 'lambda 用了 [&] 按引用捕获局部变量 name，而回调在它销毁之后才执行', next: 'n2' },
+              { t: 'PostDelayedTask 的延迟时间太短，任务队列还没准备好', next: 'n3' },
+              { t: 'mirror::Class* 的类对象在 GC 中被移动了，需要改成 Handle', next: 'n4' }
+            ]
+          },
+          n1: {
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '误判：把生命周期问题当成了线程问题',
+            result: '<b>线程确实要注意，但它解释不了「大部分时候正常」。</b>线程问题通常表现为更稳定的错误：数据竞争、断言失败、或者干脆必然崩溃。<br><br>' +
+                    '<b>认知根源：</b>「偶发 + 栈回溯乱」很容易被归因为并发。但请注意这里的<b>时间结构</b>：' +
+                    '延迟 2 秒后执行，而局部变量在函数返回时就没了——这是一个<b>确定的时序缺陷</b>，' +
+                    '只是因为那块栈内存「有时还没被覆盖」，所以有时侥幸不崩。<br><br>' +
+                    '<b>怎么区分：</b>并发 bug 与负载/核数相关；生命周期 bug 与<b>栈使用深度、调用时序</b>相关。' +
+                    '把延迟调长、或在内层多嵌套几层函数调用，如果崩溃率显著上升，就是生命周期问题。'
+          },
+          n2: {
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：这是典型的悬垂引用',
+            result: '<b>正是这一处。</b><span class="mono">[&amp;]</span> 会生成一个匿名类，把 <span class="mono">name</span> 的<b>地址</b>存成成员变量。' +
+                    '<span class="mono">OnClassLoaded</span> 返回后，<span class="mono">name</span> 所在的栈帧被回收。' +
+                    '2 秒后回调执行，读的是一个<b>已经失效的地址</b>。<br><br>' +
+                    '<b>为什么难查：</b>那块内存可能还留着原来的字节（侥幸正常），也可能早被后续调用覆盖成任意内容。' +
+                    '崩溃时栈回溯指向「正在覆盖那块内存的无辜函数」，所以看起来毫不相关。<br><br>' +
+                    '<b>正确改法：</b>把捕获改成值捕获 <span class="mono">[name]</span> 或 <span class="mono">[=]</span>，' +
+                    '让匿名类持有<b>自己的拷贝</b>；如果代价太大（比如是很大的对象），就用 <span class="mono">shared_ptr</span> 共享所有权，' +
+                    '把生命周期显式绑在一起。<br><br>' +
+                    '<b>在 ART 里还要多问一句：</b>捕获的东西里如果有裸的 Java 对象指针，还要考虑 GC 移动的问题——' +
+                    '值捕获只解决栈生命周期，不解决 GC 移动。'
+          },
+          n3: {
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '误判：任务队列不会因为「太早」而崩',
+            result: '<b>任务队列的成熟度不是崩溃原因。</b>队列要么可用、要么根本没法提交任务，不会表现出「2 秒后偶发段错误」。<br><br>' +
+                    '<b>认知根源：</b>把「延迟参数」当成了可疑变量。延迟时间影响的是<b>什么时候</b>执行，' +
+                    '而这里的问题是<b>执行时访问的内存已经无效</b>——把延迟改成 1 秒或 10 秒，bug 依然存在，只是概率变化。<br><br>' +
+                    '<b>一个有用的习惯：</b>面对偶发 bug，先问「这件事在时间轴上的依赖关系是什么」。' +
+                    '如果答案是「A 的数据比 A 自己活得更久」，那十有八九是生命周期问题，而不是调度问题。'
+          },
+          n4: {
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '抓错了对象：问题不在参数，在捕获列表',
+            result: '<b>方向有道理，但没找对位置。</b>GC 移动对象确实要求用 <span class="mono">Handle&lt;T&gt;</span> / ' +
+                    '<span class="mono">ObjPtr&lt;T&gt;</span> 这类 GC 安全句柄——这个知识点本身是对的，' +
+                    '而且在 ART 里极其重要。<br><br>' +
+                    '<b>但这里的问题不在这儿：</b>注意代码里 <span class="mono">name</span> 是 <span class="mono">std::string</span>，' +
+                    '一个 C++ 对象，不是 Java 对象引用，GC 根本不管它。它的死因是<b>栈帧销毁</b>，不是 GC 移动。<br><br>' +
+                    '<b>认知根源：</b>学到「ART 里要注意 GC 移动」之后，容易到处套用。' +
+                    '诊断时要先分清：这个崩溃涉及的是 <b>C++ 对象的生命周期</b>，还是 <b>Java 对象的 GC 生命周期</b>？' +
+                    '两者都可能出问题，但对策完全不同——前者靠捕获方式与智能指针，后者靠 Handle/ObjPtr。'
+          }
+        }
+      }
     },
 
     /* ================= 18.11 ================= */
     {
       h: '18.11',
-      title: '综合情境演练：三个真实的抉择',
-      html: '<p>下面三个情境，都来自「把安卓搬进容器/云端」这条路上真实会做的判断。请先想清楚<b>你依据什么做决定</b>，再看结果——本章考的不是记忆力，是<b>决策模型</b>。</p>',
-
+      title: '决策演练③：断点打不上的那个函数',
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境一 · 路线选型',
-            scenario: '<b>情境：</b>你要搭一套云端安卓环境，业务方给出两条硬性要求：<b>① 首屏与视频必须流畅</b>；<b>② 目标 App 的风控很激进，会读大量设备与硬件信息</b>。你需要在「Waydroid 容器路线」与「QEMU/Cuttlefish 虚拟机路线」之间做选择。你怎么决策？',
+            label: '情境三',
+            scenario: '<b>情境：</b>你怀疑目标 App 的一个 native 函数 <span class="mono">verify_signature</span> 是校验入口。' +
+                      '你用 gdb attach 上去，在 <span class="mono">verify_signature</span> 上下了断点。' +
+                      '程序能正常跑完整个校验流程（不符合预期时会弹提示框，说明确实执行了校验），' +
+                      '<b>但断点一次都没命中</b>。<br><br>' +
+                      '而且你注意到：在这个函数里定义的局部变量，就算在别处断下来也看不到。<br><br>' +
+                      '<b>你的下一步是？</b>',
             choices: [
-              { t: '选容器路线。因为它没有虚拟化层、性能接近原生，而且容器内的 Android 可以直接访问真实硬件——真硬件比虚拟硬件更不容易露馅', next: 'n1' },
-              { t: '选虚拟机路线。因为「一台独立的机器」这个幻觉更完整，隔离也更强，设备信息全部由我自己提供，检测面反而更好控制', next: 'n2' },
-              { t: '两条都不用：直接把安卓刷到一台真手机上，用远程桌面/远程控制访问，性能和真实性都最好', next: 'n3' },
-              { t: '先看风控具体读哪些信息再定：如果它主要读虚拟硬件的指纹，就用容器；如果它主要核对「设备是否独立」，就用虚拟机', next: 'n4' }
+              { t: '怀疑是反调试：目标检测到 gdb 后让断点失效，先去做反反调试', next: 'n1' },
+              { t: '先反汇编确认那个地址上到底有没有一个独立函数，再决定改在哪里下断', next: 'n2' },
+              { t: '换个更强的调试器，比如 IDA 的远程调试服务', next: 'n3' },
+              { t: '在函数入口的地址上直接改内存插一条断点指令，绕过 gdb 的符号处理', next: 'n4' }
             ]
           },
           n1: {
-            label: '选容器路线', terminal: true, verdict: 'good',
-            verdictTitle: '正确：性能这一条，只有容器路线能干净地满足',
-            result: '<b>为什么对：</b>官方明确说容器里的 Android <b>直接访问所需硬件</b>，没有虚拟化层、性能接近原生。要求①（首屏、视频流畅）在虚拟机路线上要额外付出图形加速的成本——virtio-gpu / VirGL 每条路线都有自己的坑，GPU 直通又要求一台机器一张卡。<br><b>要求②也支持这个选择：</b>风控读硬件信息时，容器给的是<b>宿主的真实硬件</b>，这恰恰是最难伪造也最不需要伪造的部分——它本来就是真的。<br><b>但要记住代价：</b>容器路线的隔离强度弱、宿主暴露面多，你得用别的手段（namespace 配置、挂载清理、命名空间内的 /proc 处理）去控制「App 能看见宿主多少东西」。',
-            after: '<p><b>认知要点：</b>性能与硬件真实性这两件事在容器路线上是<b>一起解决</b>的，这是它最大的结构性优势。</p>'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '过早归因于对抗：还有一个更平淡的解释',
+            result: '<b>反调试确实存在，但你跳过了最便宜的那个排查步骤。</b>注意情境里的第二条线索：' +
+                    '<b>局部变量也看不到</b>。反调试通常只影响「能不能停住」，不会让变量消失。<br><br>' +
+                    '<b>认知根源：</b>一旦把逆向当成「人 vs 人」的对抗，就容易把所有异常都解读为对方的招数。' +
+                    '但这里的两个症状——断点不命中 + 变量不可见——指向同一个<b>编译期</b>原因：函数被内联了，' +
+                    '既没有独立入口可供下断，局部变量也被优化进了寄存器或直接消除。<br><br>' +
+                    '<b>正确顺序：</b>先排除非对抗性解释（编译优化、符号缺失、地址算错），再考虑对抗。' +
+                    '否则你会花几天做反反调试，最后发现对手根本没出手。'
           },
           n2: {
-            label: '选虚拟机路线', terminal: true, verdict: 'bad',
-            verdictTitle: '方向偏了：你用「更好控制的检测面」换掉了硬性要求',
-            result: '<b>认知根源：</b>把「可控性」误当成第一优先级。<b>业务方的两条要求里没有一条是「更好控制」</b>——而要求①是硬指标。<br>虚拟机路线上，guest 只能看到 virtio 之类的虚拟硬件，你还得单独解决图形加速问题（这本身就是云手机公认的第一难点）。更要命的是：<b>虚拟硬件的指纹恰恰是风控最容易识别的部分</b>——你以为「全部由我提供」很好控制，实际上「全部由我编造」意味着每一处都要编得对，成本高得多。<br><b>正确做法：</b>先满足硬性要求（容器路线），再用配置与伪装手段去补齐隔离与自洽性。<b>不要用「架构上更优雅」去替换「业务上必须满足」。</b>'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：先验证「这个函数在二进制里存在吗」',
+            result: '<b>这是最省时间的下一步。</b>在反汇编视图里跳到 <span class="mono">verify_signature</span> 的地址，' +
+                    '看那里到底是什么：<br><br>' +
+                    '<b>·</b> 如果是标准的函数序言（保存寄存器、调整栈指针）→ 函数真实存在，问题在调试器/符号侧；<br>' +
+                    '<b>·</b> 如果落在一段普通指令中间、或者跟相邻函数没有边界 → <b>它被内联了</b>，' +
+                    '二进制里没有这个函数体。<br><br>' +
+                    '<b>为什么这个顺序对：</b>它用一次反汇编就区分了两类完全不同的原因，' +
+                    '而两类原因的后续动作差别巨大（一个去调调试器，一个去改 Hook 落点）。' +
+                    '加上「局部变量不可见」这条线索，答案几乎已经写出来了：<b>这是内联的典型症状组合</b>。<br><br>' +
+                    '<b>后续动作：</b>往上找<b>调用者</b>——校验一定会被某处调用，在那层的函数边界上下断；' +
+                    '或者按内联展开后的指令特征去搜索。'
           },
           n3: {
-            label: '用真机 + 远程访问', terminal: true, verdict: 'bad',
-            verdictTitle: '看似最真，实则把「可定制」和「可欺骗」这两件事一起放弃了',
-            result: '<b>认知根源：</b>把「真实性」等同于「环境影响最小」。真机的真实性确实最好，但本章的目标是<b>高度定制 + 可欺骗风控</b>——真机上你要改任何东西都得先解锁、刷机，而且一旦刷了就不再「最真」了。<br>更现实的问题是规模与成本：真机方案难以弹性扩缩，一台机器一个环境，出了故障要人工介入。<br><b>什么时候真机才是对的？</b>当你需要的是<b>少量、高保真、长期稳定</b>的验证环境，而不是大规模的云端实例时——<b>技术选型永远要回到规模和目标上，而不是「哪个更真」。</b>'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '换工具解决不了不存在的东西',
+            result: '<b>如果目标函数在二进制里根本不存在，任何调试器都断不下来。</b>换 IDA、换 lldb、换硬件断点，结果都一样。<br><br>' +
+                    '<b>认知根源：</b>把「调试器不好用」当成根因。工具差异确实存在（比如对符号、对内联帧的支持程度不同），' +
+                    '但那是<b>观测能力</b>的差异，不是<b>观测对象存在与否</b>的差异。<br><br>' +
+                    '有意思的是：某些调试器确实能更好地显示内联帧（靠 DWARF 的 <span class="mono">DW_TAG_inlined_subroutine</span>），' +
+                    '所以换工具<b>可能让你看到更多信息</b>——但前提是你已经知道问题是内联。' +
+                    '顺序应该是：先诊断，再换工具，而不是用换工具来替代诊断。'
           },
           n4: {
-            label: '先看风控读什么再定', terminal: true, verdict: 'bad',
-            verdictTitle: '思路方向对，但它不能替代这个决策',
-            result: '<b>为什么这个选项有吸引力：</b>「先侦察再决策」是很好的工程习惯，但它在这里解决不了问题——因为<b>要求①（性能）与风控读什么完全无关</b>。<br><b>认知根源：</b>把「对抗目标的差异」当成了选型的唯一变量，忽略了同时存在的<b>非对抗性硬约束</b>（性能、成本、弹性、交付时间）。<br><b>正确做法：</b>先用硬约束筛掉不可能的选项（这一步就能定下容器路线），再针对风控做定制。<b>决策的顺序是「先可行域、后最优化」，反了就会一直纠结在错误的问题上。</b>'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '手段升级了，但目标地址依然是错的',
+            result: '<b>这是「用更硬的手段做同一件错事」。</b>手工往内存里写断点指令（比如 ARM64 的 <span class="mono">BRK</span>）确实能绕过调试器的一些机制，' +
+                    '如果真的是反调试在捣鬼，这招有用。<br><br>' +
+                    '<b>但这里的问题是地址本身没有意义。</b>如果函数被内联，你算出的地址落在调用者的指令流中间——' +
+                    '在那里插断点，要么破坏了一条正常指令导致崩溃，要么停在一个语义上毫无意义的位置，' +
+                    '让你误以为「断点生效了」而看到一堆看不懂的寄存器。<br><br>' +
+                    '<b>更糟的是它掩盖了真相：</b>你会以为问题解决了，然后在错误的方向上继续投入。' +
+                    '记住：<b>对抗性手段的前提是诊断已经完成。</b>没搞清楚对手是谁之前，升级手段只会让排查更难。'
           }
         }
       }
     },
 
+    /* ================= 18.12 ================= */
     {
       h: '18.12',
-      title: '综合情境演练（二）：内核与检测面的取舍',
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境二 · 卡在启动',
-            scenario: '<b>情境：</b>你按容器路线部署，Android 镜像、rootfs、namespace 配置都做好了，但容器里的 Android <b>启动到一半就卡死</b>：日志显示某个系统服务起不来。你已经确认宿主内核版本不算老。你第一步应该查什么？',
-            choices: [
-              { t: '去查 Android 的 init.rc，看是不是某个 service 的定义有问题', next: 'n1' },
-              { t: '先确认宿主内核有没有 binder 支持、设备节点有没有正确暴露给容器——因为 servicemanager 依赖它，这一环不通后面全都不通', next: 'n2' },
-              { t: '先把宿主内核升级到最新版本，新内核一般兼容性更好', next: 'n3' },
-              { t: '直接给 Android 镜像打补丁，把这个起不来的服务从 init.rc 里注释掉，先让它跑起来', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '查 init.rc', terminal: true, verdict: 'bad',
-            verdictTitle: '查错了层：rc 文件通常不是根因，只是「症状的传出地」',
-            result: '<b>认知根源：</b>「日志出现在哪就查哪」——这是排查启动问题最常见的陷阱。<b>rc 只是声明「要启动什么」，服务起不来往往是因为它依赖的东西不存在。</b><br>而且这是<b>容器化环境</b>：同一个 Android 镜像在真机上能跑，说明 rc 本身没问题，变量在<b>下面那一层</b>——宿主内核提供了什么。<br><b>正确顺序：</b>先确认容器化 Android 的<b>核心技术前提</b>（binder 与共享内存机制），再看 IPC 中枢（servicemanager），最后才轮到上层服务的 rc。'
-          },
-          n2: {
-            label: '先查宿主内核的 binder 支持', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先验证「容器化 Android 的核心技术前提」',
-            result: '<b>为什么这是第一顺位：</b>Android 的一切系统服务都通过 <b>binder</b> 注册与调用。宿主内核没有 binder（或设备节点没有接进容器），<span class="mono">servicemanager</span> 就起不来——而它是「电话簿」，它不在，后面所有服务都找不到彼此，症状就是<b>五花八门的服务启动失败</b>。<br><b>怎么查：</b>看内核编译配置里 binder/ashmem（或 memfd）相关的选项，再确认设备节点在容器里真的可见可用（回看 18.3 的体检命令）。<br><b>顺带记住：</b>内核模块与内核版本强绑定，<b>「昨天好好的今天起不来」几乎一定是内核升级后模块没重建</b>。',
-            after: '<p><b>认知要点：</b>排查启动问题要从<b>依赖链的最底层</b>往上查。<b>哪一层缺了，上面所有层都会以各种奇怪的方式失败</b>，而失败信息通常出现在最上面那层。</p>'
-          },
-          n3: {
-            label: '升级宿主内核', terminal: true, verdict: 'bad',
-            verdictTitle: '把「配置缺失」误判成「版本落后」',
-            result: '<b>认知根源：</b>把内核当成一个「越新越全」的整体。<b>内核是「源码 × 配置」的产物</b>：发行版给你的通用内核，很可能就是「什么都有点、但恰好没编 binder」。<br>盲目升级还有实实在在的风险：升级后<b>依赖这个内核的模块全部要重建</b>，容器里的东西也可能一起坏掉——你会在一堆新问题里找不到原来那个问题。<br><b>正确做法：</b>先确定是<b>配置问题</b>还是<b>版本问题</b>。方法就是直接查编译选项与设备节点，而不是靠猜。<b>「升级」应该是一个有依据的动作，不是一种祈祷。</b>'
-          },
-          n4: {
-            label: '注释掉起不来的服务', terminal: true, verdict: 'bad',
-            verdictTitle: '最危险的一条：你把「症状」删掉了，把「病因」留下了',
-            result: '<b>为什么危险：</b>注释掉一个系统服务，会引发一连串你完全预料不到的连锁失败（权限、资源、依赖它的其他服务）。更糟的是<b>你会失去那条唯一能指向根因的错误信息</b>，之后就只能靠猜。<br><b>认知根源：</b>把「让它跑起来」当成了目标，而真正的目标是「让它<b>正确地</b>跑起来」。在环境伪装这个领域，这个区别是致命的：<b>一个被阉割过的系统，会在别的检测面上以更隐蔽的方式暴露自己</b>（少了服务、少了进程、少了该有的行为）。<br><b>正确做法：</b>卡住的时候，宁可停下来定位根因，也不要靠删功能过关——<b>欠下的技术债，风控会替你收。</b>'
-          }
-        }
-      }
-    },
-
-    {
-      h: '18.13',
-      title: '综合情境演练（三）：伪装的自洽性',
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境三 · 全部改完之后仍被拦',
-            scenario: '<b>情境：</b>你的容器化安卓实例已经做了这些事：Magisk 装上并配置了 DenyList 隐藏 root；在 Java 层用 Zygisk 模块 hook 了 <span class="mono">WifiManager</span>，让它返回一个合理的 SSID/BSSID；图形栈也换成了带 GPU 加速的方案。功能全部正常。但目标 App 依然<b>在启动后不久就把你拦下</b>了。最应该先做什么？',
-            choices: [
-              { t: '加大隐藏力度：把 DenyList 的覆盖范围扩大，再多加几个隐藏 root 的模块', next: 'n1' },
-              { t: '做交叉验证排查：把 App 可能读到的各条信息列出来（WiFi 各数据源、/proc 内核视图、图形指纹、内核与设备信息），逐条比对它们是否互相矛盾，先定位矛盾点', next: 'n2' },
-              { t: '直接逆向上这个 App 的风控逻辑，把检测函数全 hook 掉', next: 'n3' },
-              { t: '换一条路线：容器路线天生容易被识破，改用 QEMU 虚拟机，从零开始重做一套', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '加大隐藏力度', terminal: true, verdict: 'bad',
-            verdictTitle: '在没定位矛盾点之前，加码隐藏基本是无效努力',
-            result: '<b>认知根源：</b>默认「被拦 = 隐藏得不够」。但你要想清楚：<b>你已经做了不少伪装，如果还失败，更可能的原因不是「藏得不够深」，而是「藏得不一致」。</b><br>本章反复讲过：风控不需要找到「你在用云手机」的铁证，它只要发现<b>你的证据链内部有矛盾</b>。继续堆隐藏模块，往往是给一个已经有裂缝的体系再加一层漆——<b>反而增加新的暴露面</b>（多一个模块，多一处可被读到的痕迹）。<br><b>正确做法：</b>先把「有没有矛盾」这个疑问解决掉，再决定要不要加码。'
-          },
-          n2: {
-            label: '做交叉验证排查', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先定位「哪两条证据对不上账」',
-            result: '<b>为什么这是第一顺位：</b>你前面做的每一件事都可能是<b>局部正确、整体矛盾</b>的。典型的矛盾组合：<br>· Java 层说连着 WiFi，但<span class="mono">/proc/net/wireless</span> 是空的（内核视角没有这张网卡）；<br>· RSSI 恒定不变，而扫描列表每次完全一样（缺时间维度）；<br>· 图形栈的渲染器字符串与 GPU 型号对不上（伪装不彻底）；<br>· 内核启动时间与系统运行时间互相矛盾（容器共享宿主内核的典型痕迹）。<br><b>做法：</b>按 18.9 的表格逐行对账，先从最便宜、最能一票否决的地方查起，找到矛盾点，再去对应的层修。<br><b>这一步的本质是：把「猜」换成「对账」。</b>',
-            after: '<p><b>认知要点：</b>在环境伪装这类工作里，<b>排查的粒度是「证据面」而不是「功能」</b>——功能正常不代表证据自洽。</p>'
-          },
-          n3: {
-            label: '直接逆向风控逻辑', terminal: true, verdict: 'bad',
-            verdictTitle: '代价最高的路径，而且很可能盖不住',
-            result: '<b>为什么不是第一选择：</b>逆向风控当然有用，但它是<b>成本最高、最不可持续</b>的手段——对方更新一次你就重来一次。而且风控越来越依赖原生层、甚至依赖你够不着的组件（回看 18.10 里的 pKVM/AVF 方向），此时在主系统里 hook 根本无效。<br><b>更根本的问题：</b>它没有解决「环境本身是否自洽」。哪怕你这次把检测函数全 hook 掉了，<b>环境里的矛盾依然存在</b>，下次换个入口又会撞上。<br><b>正确顺序：</b>先让环境经得起查（自洽），再用逆向手段处理个别强检测点。<b>把逆向当第一手段，等于把地基问题当成装修问题。</b>'
-          },
-          n4: {
-            label: '换路线重做', terminal: true, verdict: 'bad',
-            verdictTitle: '在有定位手段之前换路线，是拿成本换不确定性',
-            result: '<b>认知根源：</b>把架构当成了问题的原因。你已经花了大力气做出一个功能正常的实例，<b>但你还不知道它为什么被拦</b>——此时换路线，等于把「不明确的问题」带到「新的、你还更不熟悉的实现」里去，很可能在新路线上遇到同类问题还找不到原因。<br>而且两条路线各有各的破绽：容器路线的真硬件是优势，虚拟化路线的完整设备幻觉也是优势——<b>没有哪条路线是「天生不被识破」的</b>。<br><b>正确做法：</b>先定位矛盾点（选项 B）。如果定位结果是「这个矛盾在架构上无法解决」（比如某个必须在硬件层存在的证据），<b>那时候换路线才是一个有依据的决定。</b>'
-          }
-        }
-      }
-    },
-
-    /* ================= 18.14 ================= */
-    {
-      h: '18.14',
-      title: '自测：四个必须过关的判断',
+      title: '自测：把三件事连起来',
       quiz: {
-        id: 'q18-1', chapter: 18, answer: 1,
-        stem: 'Waydroid 与 QEMU 这类模拟器/虚拟机方案相比，<b>最本质</b>的区别是什么？',
+        id: 'q4-4', chapter: 4, answer: [0, 2],
+        stem: '<b>多选：</b>关于「定制 ART 来跟踪 JNI 注册」相比「用 Frida hook RegisterNatives」，下面哪些说法是正确的？',
         options: [
-          { t: 'Waydroid 性能更好，因为它做了更多的优化', why: '性能更好是<b>结果</b>，不是本质区别。说「优化得好」没有解释为什么它会快。' },
-          { t: 'Waydroid 用容器方式共享宿主内核运行完整 Android，容器内的 Android 可直接访问所需硬件，中间没有虚拟化层', why: '正确。官方 README 的两句话正好覆盖了这两点：container-based approach 启动 full Android system；容器内的 Android has direct access to any needed hardware。' },
-          { t: 'Waydroid 只能在 Linux 手机上运行，桌面 Linux 用不了', why: '与事实不符：桌面 Linux 也是它的常见使用场景。' },
-          { t: 'Waydroid 不需要内核支持，因为它不碰内核', why: '恰好相反：它<b>极度</b>依赖内核支持——binder 与 ashmem/memfd 是它能跑起来的技术前提。' }
+          { t: '定制 ART 的记录发生在虚拟机代码内部，不引入可在运行时被检测的 hook 框架特征', why: '正确。探针是你编译进虚拟机的普通代码，进程里没有额外的注入模块或 hook 框架痕迹。' },
+          { t: '定制 ART 可以在不改变目标程序行为的前提下完成记录', why: '正确，但这不是定制独有的优势——Frida hook 同样可以只观测不改写。所以这条不构成两者的区别（本项为干扰项）。' },
+          { t: '定制 ART 能拿到 Java 方法名、签名与 native 地址的完整对应关系', why: '正确。注册那一刻这三者同时在手上，这正是插桩点选在 RegisterNatives 里的原因。' },
+          { t: '定制 ART 不需要编译，因此比 Frida 更快落地', why: '错误，正好相反。定制 ART 需要准备 AOSP 环境并编译、刷入，落地成本远高于 Frida。' }
         ],
-        explain: '<b>解析：</b>本质区别在<b>是否共享内核、是否经过虚拟化层</b>。容器路线里 Android 只是「另一个用户空间」，系统调用直接落在宿主内核上，硬件也是真的；虚拟机路线要经过 KVM → 虚拟硬件 → Guest 内核三道门。<br><b>由此推出的所有差异：</b>性能（容器占优）、隔离强度（虚拟机占优）、硬件访问（容器是真的）、检测面（容器给的是真硬件，但共享内核本身也是可检测特征）。<br><b>注意：</b>这也意味着 <span class="mono">binder</span> 是这条路线的硬前提——宿主内核没有它，容器里的 Android 起不来。'
+        explain: '<b>定制 ART 的核心优势只有一个词：位置。</b>你的记录点位于虚拟机<b>内部</b>——' +
+                 '① 没有 hook 框架特征可供检测；② 天然掌握注册的全部四要素（类、方法名、签名、地址）。<br><br>' +
+                 '<b>而它的代价是工程成本</b>：AOSP 环境、编译、刷机、版本绑定。所以要按需选择：' +
+                 '只是想快速看一个方法有没有被调用，Frida 是更理性的选择；需要长期、稳定、不可被发现的观测能力时，才值得去编译虚拟机。<br><br>' +
+                 '注意 B 选项是一个典型干扰项：<b>「只观测不改写」是插桩纪律，不是定制 ART 的独有优势</b>。'
       }
     },
+  ],
+  glossary: [
+    { t: 'mirror::Object', d: 'Java 对象在 Native 层的镜像结构，也是所有 Java 对象的内存头部。第一个字段 klass_ 指向该对象的 mirror::Class，另有 monitor 锁信息。类似 HotSpot 的 mark word + klass pointer。' },
+    { t: 'mirror::Class', d: 'Java 类的镜像，描述「这个类有哪些方法和字段」。含方法表、字段表、vtable、接口表。同一个类在虚拟机里只有一份，全部实例共享。' },
+    { t: 'ArtMethod', d: '单个 Java 方法的元数据。关键字段：declaring_class_（声明类）、access_flags_（访问标志）、dex_code_item_offset_（Dex 代码偏移）、entry_point_from_quick_compiled_code_（实际执行入口，可为解释器/JIT/AOT）。是所有 Java Hook 的底层抓手。' },
+    { t: 'JNINativeMethod', d: 'JNI 动态注册用的结构体，三个字段：name（Java 方法名）、signature（方法签名）、fnPtr（native 函数地址）。' },
+    { t: 'RegisterNatives', d: 'JNI 函数，在 JNI_OnLoad 中被调用，把一张 JNINativeMethod 表交给虚拟机完成绑定。动态注册的唯一入口，也是本章的插桩点。' },
+    { t: '动态注册', d: '不在符号表中暴露 Java_ 前缀函数名，而在运行时用 RegisterNatives 把「方法名 + 签名 + 函数地址」交给虚拟机。函数名可为任意字符串，地址运行时才定，静态分析难以恢复映射。' },
+    { t: 'lambda 捕获', d: 'lambda 编译后生成匿名类（闭包类型），捕获的变量成为该类的成员变量。[=] 值捕获把值拷贝进成员；[&] 引用捕获把地址（本质是指针）存进成员。' },
+    { t: '悬垂引用', d: '引用或指针指向的对象生命周期已结束。[&] 捕获局部变量后延后执行是典型成因：匿名类活过了它引用的栈变量。症状是偶发崩溃或读到脏数据，不一定立刻崩。' },
+    { t: 'RAII', d: 'Resource Acquisition Is Initialization。构造时获取资源、析构时释放，把「配对操作」绑定到栈对象的生命周期上。ART 中用 ScopedObjectAccess、MutexLock 等保证异常与提前返回时也不泄漏。' },
+    { t: 'Handle&lt;T&gt; / ObjPtr&lt;T&gt;', d: 'ART 的 GC 安全句柄。GC 会移动对象，裸指针会失效；句柄让 GC 知道这里还有一个引用并帮忙更新。类型 T 由模板参数在编译期确定，运行时零额外开销。' },
+    { t: 'inline（内联）', d: '编译器把函数体展开到每个调用处以消除调用开销。关键字只是建议，真正决定的是优化决策（函数体小 + -O2/-O3）。后果：断点打不上、局部变量显示 optimized out、调用栈缺帧。' },
+    { t: '动态分析沙箱', d: '一套你自己掌控、能记录一切关键事件的 Android 运行环境。虚拟机是你自己编译的，想记录什么就插桩记录什么，不依赖外部 hook 框架。' }
+  ],
+  teacher: {
+    id: 'ch4', chapter: 4,
+    name: '追问老师 · 第 18 章',
+    sub: 'C++11 不是装饰品，ART 对象模型也不是背诵题——这里只问「为什么」。',
+    intro: '<p style="margin:0">这一章的内容很容易被背成名词表。所以我的问题不会问你「ArtMethod 有哪些字段」，' +
+           '而会问你「如果那个字段不存在，会发生什么」。答不上来我会给提示，两次之后给追问——三次都答不上，我会把标准答案讲给你听，但你的进度条不会动。</p>',
+    questions: [
+      /* ---------- 第 1 题 ---------- */
+      {
+        id: 'c4q1', depth: 1, threshold: 0.7,
+        q: '一个 Java 对象在 Native 层就是一块内存。这块内存的<b>最开头</b>放着什么？为什么对象本体里<b>不直接存方法代码</b>，而要多绕一层？',
+        concepts: [
+          { label: '对象头第一个字段是 klass_，指向 mirror::Class',
+            hint: '对象头里有一个指针，它回答「我是什么类」。',
+            any: ['klass_', 'klass', '类指针', '指向类', '指向 class', 'mirror::class', '类镜像', 'class 指针', '对象头', '头部'] },
+          { label: '同一个类的 Class 只有一份，被所有实例共享',
+            hint: '如果每个实例都存一份自己的方法表，内存会怎样？',
+            any: ['共享', '共用', '只有一份', '一份', '同一个类', '所有实例', '复用', '单例', 'unique'] },
+          { label: '方法属于类，通过类里的方法表 / vtable 查找',
+            hint: '方法是「类的属性」还是「对象的属性」？',
+            any: ['方法表', 'method table', 'vtable', '虚方法表', '类里', '类中', '元数据', '方法属于类', '方法在类'] },
+          { label: '对象头还含 monitor 锁等与类无关的信息',
+            hint: '除了「我是什么类」，对象头还要记什么状态？',
+            any: ['monitor', '锁', 'lock', 'mark word', '锁信息', '哈希', 'hash', 'gc 标记'] }
+        ],
+        hints: [
+          '先想「对象」和「类」在内存里分别是什么：一个是实例数据，一个是描述。',
+          '如果每个对象都自带一份方法表，100 万个对象要浪费多少内存？'
+        ],
+        probes: [
+          '那你说说，从对象引用出发，要经过几次指针解引用才能拿到真正可执行的入口？',
+          '如果把 klass_ 改成指向别的类，会发生什么？'
+        ],
+        model: 'Java 对象在 Native 层就是一块连续内存，<b>最开头是对象头</b>，而对象头的第一个字段是 <span class="mono">klass_</span>——' +
+               '一个指向 <span class="mono">mirror::Class</span> 的指针，它回答「我是什么类」。对象头里还有一个 monitor 字段，' +
+               '记录锁状态、GC 标记这类与「类」无关的信息。这套布局和 HotSpot 的 mark word + klass pointer 是同一个思路。<br><br>' +
+               '<b>为什么方法不放在对象里？</b>因为方法属于<b>类</b>，不属于对象。同一个类可以创建一百万个实例，' +
+               '它们的字段值各不相同，但方法代码完全一样。如果把方法表放进每个对象，内存会爆炸。' +
+               '所以虚拟机把所有「类级别」的信息——方法表、字段表、vtable、接口表——集中放在一份 <span class="mono">mirror::Class</span> 里，' +
+               '所有实例通过 <span class="mono">klass_</span> 共享它。<br><br>' +
+               '这也解释了为什么「改一个类的元数据会影响它的所有实例」——这是后面理解 Hook 影响范围的关键。',
+        after: '<p>三次指针解引用：<b>对象 → klass_ → 方法表 → ArtMethod → 入口</b>。这条链是本章所有内容的骨架。</p>'
+      },
 
-    {
-      h: '18.15',
-      title: '自测二：Magisk 到底改了哪里',
-      html: '<p>这道题考的是「systemless」这个词的字面含义——<b>改动到底落在磁盘上，还是落在挂载层上</b>。</p>',
-      quiz: {
-        id: 'q18-2', chapter: 18, answer: 2,
-        stem: 'Magisk 的「systemless（无系统分区修改）」是靠什么实现的？',
-        options: [
-          { t: '把 /system 分区重新挂载为可写，然后直接改里面的文件，改完再改回只读', why: '这正是 systemless 要避免的做法——它会破坏分区完整性，导致无法 OTA、也无法干净卸载。' },
-          { t: '把整个 /system 分区解包、修改后重新打包成镜像刷回去', why: '那叫改系统镜像，不是 systemless。而且同样会破坏校验。' },
-          { t: '修改 boot 镜像的 ramdisk 注入 magiskinit，在 init 早期拿到控制权，再用 overlayfs/magic mount 把模块文件叠加到系统路径上', why: '正确。改动落在 <b>boot 分区</b>，真实 /system 分区一个字节都没改——修改活在挂载层。' },
-          { t: '在 App 进程里用 Xposed 那样的 hook 把读文件的调用重定向到模块目录', why: '那是运行时的 hook 思路，不是 Magisk systemless 的机制；而且它覆盖面远不如挂载层。' }
+      /* ---------- 第 2 题 ---------- */
+      {
+        id: 'c4q2', depth: 1, threshold: 0.7,
+        q: '你在 ART 里看到 <span class="mono">auto cb = [&amp;]() { Use(local); };</span>，然后这个 cb 被丢进队列延迟执行。' +
+           '<b>编译器为这个 lambda 生成了什么？</b>它和 <span class="mono">[=]</span> 生成的有什么本质区别？为什么延迟执行时 <span class="mono">[&amp;]</span> 危险？',
+        concepts: [
+          { label: 'lambda 编译后生成一个匿名类（闭包类型）',
+            hint: 'lambda 不是「函数」，编译后它变成了一个什么东西？',
+            any: ['匿名类', '闭包', 'closure', 'functor', '仿函数', '生成类', '类对象', '一个类', '对象'] },
+          { label: '捕获的变量成为该匿名类的成员变量',
+            hint: 'lambda 要能访问外部变量，这些变量存在哪里？',
+            any: ['成员变量', '成员', '字段', 'member', '变成成员', '存进'] },
+          { label: '[=] 值捕获：把值拷贝进成员',
+            hint: '一个存的是内容，一个存的是位置。',
+            any: ['拷贝', '复制', '副本', 'copy', '值捕获', '按值', '值拷贝'] },
+          { label: '[&] 引用捕获：成员里存的是地址（本质是指针）',
+            hint: '引用在机器层面是什么？',
+            any: ['地址', '指针', 'pointer', 'address', '引用捕获', '按引用', '存地址'] },
+          { label: '延迟执行导致悬垂引用：局部变量已随栈帧销毁',
+            hint: '函数返回后，栈上的局部变量去哪了？',
+            any: ['悬垂', '野指针', 'dangling', '失效', '已销毁', '生命周期', '栈帧销毁', '局部变量销毁', '已释放', '死掉'] }
         ],
-        explain: '<b>解析：</b>记住两句话：<b>① 抢早</b>——在系统挂载分区之前拿到控制权（所以要在 ramdisk 里注入 magiskinit）；<b>② 改挂载不改磁盘</b>——用 overlayfs/magic mount 做叠加，系统看到的是被覆盖后的文件，而真实分区保持原样。<br><b>两个直接好处：</b>可以 OTA 升级、可以随时卸载干净。<br><b>对逆向的意义：</b>这意味着你可以在系统路径上「注入」几乎任何东西，而系统会当成原生内容接受——配合 <b>Zygisk</b>（在 Zygote 注入，等于每个 App 进程出生即带代码）和 <b>DenyList</b>（隐藏 root），Magisk 是让云端安卓「看起来像真机」的关键一环。'
-      }
-    },
+        hints: [
+          '不要把 lambda 当函数看，把它当一个「带成员变量的对象」看。',
+          '函数返回时栈帧被回收，局部变量的内存会发生什么？'
+        ],
+        probes: [
+          '那为什么这个 bug 经常表现为「偶发」而不是「必崩」？',
+          '值捕获一定安全吗？如果捕获的是一个 Java 对象指针呢？'
+        ],
+        model: 'lambda 的真相是：<b>编译器为它生成了一个匿名类</b>（闭包类型），lambda 体成为这个类的调用运算符，' +
+               '而<b>捕获的变量成为这个类的成员变量</b>。所谓「捕获方式」，就是决定这些成员变量存的是什么。<br><br>' +
+               '<span class="mono">[=]</span> 是值捕获：lambda 定义的那一刻，把变量的<b>值拷贝</b>进成员。此后原变量怎么变、' +
+               '甚至被销毁，都不影响 lambda 里的那份副本。<span class="mono">[&amp;]</span> 是引用捕获：成员里存的是变量的<b>地址</b>，' +
+               '本质就是一个指针——它不拥有任何数据，只是记住「东西在哪」。<br><br>' +
+               '危险就在这个组合里：<b>引用捕获 + 延后执行</b>。回调被丢进队列时，它记住的是<b>栈上的地址</b>；' +
+               '而函数一旦返回，栈帧被回收，那块内存不再属于你——可能立刻被别的调用覆盖成完全无关的字节。' +
+               '这就是<span class="term" data-def="指针指向的对象已销毁，访问行为未定义">悬垂引用</span>。<br><br>' +
+               '<b>为什么它特别难查？</b>因为那块内存「有时还没被覆盖」，所以有时侥幸正常、有时读到垃圾、有时直接段错误。' +
+               '崩溃时的栈回溯会指向「正在覆盖那块内存的无辜函数」，和真正的病灶隔着一整条时间线。<br><br>' +
+               '<b>正确做法：</b>按生命周期选捕获方式。同步立即用完 → 引用捕获高效安全；会活过原变量 → 值捕获，' +
+               '或用 <span class="mono">shared_ptr</span> 显式共享所有权。ART 这种长期运行的系统里，任务队列、GC 回调、事件通知全是高危区。'
+      },
 
-    {
-      h: '18.16',
-      title: '自测三：虚拟 WiFi 为什么藏不住',
-      html: '<p>这道题考的是本章的核心原则——<b>伪装必须自洽</b>。请特别注意「多选」两个字。</p>',
-      quiz: {
-        id: 'q18-3', chapter: 18, answer: [1, 2],
-        stem: '<b>多选。</b>容器化环境下做虚拟 WiFi，为什么「只在 Java 层 hook 掉 <span class="mono">WifiManager</span> 的返回值」会被识破？',
-        options: [
-          { t: '因为 hook 技术本身一定会被反调试检测到', why: '这不是本题的原因。hook 是否被发现是另一个问题，而这里的破绽来自<b>信息之间的不一致</b>，与 hook 是否暴露无关。' },
-          { t: '因为 App 会从多个互相独立的数据源交叉验证同一件事，比如内核视角的 /proc/net/wireless 与上层的 WifiManager 会互相矛盾', why: '正确。上层说有 WiFi，内核视图说没有这张网卡——这是最硬的一类矛盾。' },
-          { t: '因为真实世界的 WiFi 状态有历史与波动（信号抖动、扫描结果变化、连接记录），而伪造的返回值往往是静态的', why: '正确。时间维度极容易被忽略：一个「刚刚才有、永远不变」的 WiFi 比没有 WiFi 更可疑。' },
-          { t: '因为 WifiManager 的返回值是加密的，hook 之后校验会失败', why: '不存在这种机制，属于编造。' }
+      /* ---------- 第 3 题 ---------- */
+      {
+        id: 'c4q3', depth: 2, threshold: 0.7,
+        q: '一个加固 App 的 so 里没有任何 <span class="mono">Java_</span> 前缀的导出函数，但 Java 层的 native 方法都能正常工作。' +
+           '<b>请解释这是怎么做到的，以及你怎么把丢失的映射关系找回来。</b>再说说：为什么「改 ART 源码」比「用 Frida hook 注册函数」更彻底？',
+        concepts: [
+          { label: '动态注册：名字不出现在符号表，映射运行时才建立',
+            hint: '如果函数不是靠名字被找到的，那它是靠什么？',
+            any: ['动态注册', 'registerNatives', 'register natives', '运行时注册', '注册表'] },
+          { label: 'JNINativeMethod 三元组：名字 + 签名 + 函数地址',
+            hint: '注册时交给虚拟机的那张表，每一行有几个字段？',
+            any: ['jninativemethod', '签名', 'signature', '函数地址', 'fnptr', '三元组', '名字和签名'] },
+          { label: '在 RegisterNatives 处插桩，记录完整映射',
+            hint: '映射是在哪个函数的执行过程中被交给虚拟机的？',
+            any: ['插桩', '记录', '注册那一刻', '源码', '改 art', '定制 art', '编译', '虚拟机内部', 'log'] },
+          { label: '不依赖 hook 框架，不引入可被检测的运行时特征',
+            hint: 'Frida 在进程里会留下什么？改虚拟机又留下什么？',
+            any: ['检测', '被发现', 'hook 框架', 'frida', '痕迹', '隐蔽', '反调试', '特征', '无痕', '不引入'] },
+          { label: '必须在注册发生的那一刻就位，事后 hook 可能错过时机',
+            hint: '如果注册在你 attach 之前就完成了呢？',
+            any: ['时机', '错过', '来不及', '先于', '早于', '刚启动', 'jni_onload', '竞态'] }
         ],
-        explain: '<b>解析：</b>本节的核心原则是<b>「伪装必须自洽」</b>。风控通常不需要证明你是假的，它只要发现<b>你提供的证据链内部互相矛盾</b>就够了。<br><b>要覆盖的至少四层：</b>① 系统服务层（WifiManager 及其背后的服务）；② 内核可读的视图（<span class="mono">/proc</span>、<span class="mono">/sys</span>）；③ 网络参数之间的配套关系（BSSID ↔ 网关 ↔ 网段 ↔ DNS）；④ <b>时间维度</b>（历史、抖动、切换）。<br><b>推广：</b>这条原则适用于本章所有的伪装工作——隐藏 root、图形指纹、设备信息，全都是「让一整套状态自洽」而不是「让一个 API 返回真」。'
-      }
-    },
+        hints: [
+          '符号表为空但功能正常——这说明函数不是靠「名字」被找到的。',
+          '映射关系是在哪个函数里、什么时刻被交给虚拟机的？'
+        ],
+        probes: [
+          '那为什么记录时必须带上方法签名，只有方法名行不行？',
+          '如果目标 App 会校验系统镜像的完整性，你的定制 ROM 怎么办？'
+        ],
+        model: '这是<b>动态注册</b>。静态注册要求函数名写成 <span class="mono">Java_包名_类名_方法名</span>，虚拟机会按名字去动态库里找；' +
+               '而动态注册是在 <span class="mono">JNI_OnLoad</span> 里调用 <span class="mono">env-&gt;RegisterNatives(clazz, methods, nMethods)</span>，' +
+               '主动把一张表交给虚拟机。表里每一行是一个 <span class="mono">JNINativeMethod</span>：' +
+               '<span class="mono">{name, signature, fnPtr}</span>。<br><br>' +
+               '于是<b>函数名可以是任意字符串</b>（根本不进符号表），<b>地址是运行时才产生的</b>（常常是计算或解密出来的）。' +
+               '静态分析在这里彻底断线：IDA 里一堆无名函数，你不知道哪个对应哪个 Java 方法。<br><br>' +
+               '<b>映射怎么找回来？</b>关键洞察是：不管怎么混淆，注册这一动作<b>必须经过虚拟机的 RegisterNatives</b>。' +
+               '所以我们在 ART 源码的这个函数里插一行日志——此刻类名、方法名、签名、目标地址<b>四要素齐全</b>。' +
+               '注意<b>签名必须一起记</b>：Java 支持重载，光有名字无法唯一确定一个方法。<br><br>' +
+               '<b>为什么比 Frida hook 更彻底？</b>三个层面：<br>' +
+               '<b>① 位置</b>——记录代码在虚拟机内部，进程里没有额外的注入模块或 hook 框架痕迹可供检测；<br>' +
+               '<b>② 时机</b>——无论 App 什么时候注册、注册多少次，都在你的观测范围内，不存在「attach 晚了」的竞态；<br>' +
+               '<b>③ 完备性</b>——你是从<b>生成侧</b>看的，注册这一事实在发生的那一刻就是完全公开的，不需要去推断或猜测。<br><br>' +
+               '<b>代价也要说清楚：</b>需要 AOSP 编译环境、源码随版本变化要重新定位插桩点、刷机有风险，' +
+               '部分 App 还会校验系统镜像完整性。<b>所以它适合「需要长期稳定且不可被发现的观测能力」的场景，不适合快速验证。</b>',
+        after: '<p>一句话记住：<b>Hook 是在别人的流程上加旁路，定制虚拟机是改流程本身。</b></p>'
+      },
 
-    {
-      h: '18.17',
-      title: '自测四：KVM 的内存是谁的内存',
-      html: '<p>最后一道自测，回到最底层：<b>KVM 只是接口，它不替你做任何事</b>。想清楚这一点，你对所有虚拟化软件的理解都会不一样。</p>',
-      quiz: {
-        id: 'q18-4', chapter: 18, answer: 3,
-        stem: '关于 KVM 的 <span class="mono">KVM_SET_USER_MEMORY_REGION</span>，下列说法<b>正确</b>的是？',
-        options: [
-          { t: '它是让 KVM 内核模块为虚拟机分配一块物理内存', why: '反了。KVM <b>不</b>替 guest 分配物理内存——它让你把<b>自己进程里的一块内存</b>登记成 guest 的物理地址空间。' },
-          { t: '它必须在 KVM_CREATE_VCPU 之后调用，因为内存是挂在 vCPU 上的', why: '顺序反了，而且归属也错了：设备内存映射作用在 <b>vm_fd</b> 上，通常在 KVM_CREATE_VM 之后、创建 vCPU 之前完成。' },
-          { t: '它只能用于把内存映射到 guest 的物理地址 0，其他地址必须用别的接口', why: '该结构体里有 guest_phys_addr 字段，可以把用户态内存映射到任意的 guest 物理地址区间。' },
-          { t: '它把宿主用户态的一块内存登记为 guest 的物理地址空间，因此宿主进程可以直接读写 guest 内存', why: '正确。这正是调试器、内存取证与脱壳工具能够工作在虚拟机上的根本原因。' }
+      /* ---------- 第 4 题 ---------- */
+      {
+        id: 'c4q4', depth: 2, threshold: 0.7,
+        q: '你给一个 native 函数下了断点，程序明明执行了那段逻辑，断点却一次都没命中；而且这个函数里的局部变量也看不到。' +
+           '<b>请解释原因，并说明这件事对 Native Hook 意味着什么。</b>',
+        concepts: [
+          { label: '函数被内联：函数体被展开到调用处',
+            hint: '如果编译器把函数体直接抄到了调用点，原函数还需要存在吗？',
+            any: ['内联', 'inline', '展开', '抄到调用', '内联展开'] },
+          { label: '断点本质是在地址上插指令，函数无独立入口就打不上',
+            hint: '断点是怎么实现的？它需要一个什么？',
+            any: ['地址', '没有地址', '无入口', '找不到入口', '独立入口', '不存在', '没入口'] },
+          { label: '局部变量被放进寄存器或被优化消除（optimized out）',
+            hint: '内联后参数和局部变量会去哪？',
+            any: ['寄存器', '优化', '消除', 'optimized out', '常量折叠', '看不到'] },
+          { label: '没有调用就没有栈帧，调用栈缺帧',
+            hint: '栈回溯是靠什么串起来的？',
+            any: ['栈帧', '返回地址', '调用栈', '帧', '不完整', '缺少'] },
+          { label: '对策：-fno-inline / __attribute__((noinline)) / 降优化等级',
+            hint: '想让编译器别内联，有哪些开关？',
+            any: ['noinline', 'fno-inline', 'fno inline', '降优化', '关闭优化', 'o0', 'attribute', '禁止内联'] },
+          { label: '对 Hook 的启示：被内联的函数在二进制里根本不存在，Hook 会静默失效',
+            hint: '你要 Hook 的地址上如果没有函数，会发生什么？',
+            any: ['hook', '失效', '无效', '不生效', '没反应', '不存在', '静默', 'hook 不到', '目标不存在'] }
         ],
-        explain: '<b>解析：</b>KVM 的 API 设计非常克制：内核只提供 <b>CPU 虚拟化 + 内存虚拟化</b>这两件事的接口，其余一切（设备模型、镜像格式、显示、网络）都由用户态程序自己实现。QEMU、Cuttlefish、crosvm 都是这套接口的不同封装。<br><b>顺序要记牢：</b>open(<span class="mono">/dev/kvm</span>) → KVM_GET_API_VERSION → KVM_CREATE_VM（得到 vm_fd）→ KVM_SET_USER_MEMORY_REGION（作用在 vm_fd 上）→ KVM_CREATE_VCPU（得到 vcpu_fd）→ mmap kvm_run → 循环 KVM_RUN。<br><b>最值得记住的一点：</b>guest 的物理内存就是你进程里的一块缓冲区——<b>你随时可以直接读写它</b>。'
+        hints: [
+          '注意两个症状是同时出现的：断点不命中 + 变量看不到。它们有共同的根源。',
+          '如果函数体被抄进了调用者，那么「那个函数」在二进制里还需要存在吗？'
+        ],
+        probes: [
+          '那 gdb 里为什么有时还能看到这个函数的名字？',
+          '既然 Hook 不到，正确的做法是什么？'
+        ],
+        model: '根源是<b>内联</b>。编译器为了消除调用开销（压栈、跳转、返回），把函数体<b>直接展开到每一个调用处</b>。' +
+               '注意 <span class="mono">inline</span> 关键字只是<b>建议</b>，真正拍板的是优化决策——函数体够小、开了 <span class="mono">-O2</span>/<span class="mono">-O3</span>，' +
+               '它就会内联，你写不写关键字都可能被内联。<br><br>' +
+               '<b>三个连锁后果：</b><br>' +
+               '<b>① 断点打不上</b>——断点的本质是「在某个地址上插一条陷阱指令」。函数被展开后没有自己的地址，断点无处安放；<br>' +
+               '<b>② 变量看不到</b>——参数和局部变量被尽量塞进寄存器，或在优化中被消除，调试器只能显示 <span class="mono">&lt;optimized out&gt;</span>；<br>' +
+               '<b>③ 调用栈不完整</b>——栈回溯靠压栈的返回地址串联，内联没有调用也就没有返回地址，这一帧在栈上从来不存在。<br><br>' +
+               '<b>一个反直觉的细节：</b>符号和调试信息可能还在。DWARF 用 <span class="mono">DW_TAG_inlined_subroutine</span> 记录' +
+               '「这段指令原本来自哪个函数」，GDB 的 <span class="mono">info frame</span> 有时仍能看到它的名字——但它不是一个真实的栈帧。<br><br>' +
+               '<b>对 Native Hook 的意义（这才是重点）：</b>内联会让 Hook <b>静默失效</b>。你地址算得准、Frida attach 成功、没有任何报错，' +
+               '但目标行为毫无变化——因为你 Hook 的地址上根本没有那个函数。遇到这种情况，<b>排查顺序应该是：' +
+               '先反汇编确认那里是不是一个真实的函数入口 → 再怀疑框架 → 最后才怀疑自己的代码</b>。' +
+               '正确的对策是往上走一层：Hook 它的<b>调用者</b>，或按内联展开后的<b>指令特征</b>去搜索。' +
+               '也正因为如此，有些加固会有意利用内联——它免费获得了「让 Hook 找不到落点」的效果。',
+        after: '<p><b>编译期的决定，决定调试期的能力。</b>这是本章最值得带走的一句话。</p>'
+      },
+
+      /* ---------- 第 5 题（综合，depth 3） ---------- */
+      {
+        id: 'c4q5', depth: 3, threshold: 0.6,
+        q: '<b>综合题。</b>有人说：「定制 ART 和用 Frida hook RegisterNatives，拿到的信息是一样的，只是实现方式不同。」<br>' +
+           '请从<b>信息完备性</b>和<b>可检测性</b>两个角度评价这句话，并说明：如果你要建一套长期使用的动态分析沙箱，' +
+           '你会怎么设计插桩点，以及必须遵守什么纪律？最后说说这套方案的代价。',
+        concepts: [
+          { label: '信息在「生成时刻」是完备的，不需要推断',
+            hint: '注册这件事，是谁「产生」了那条映射？',
+            any: ['完备', '完整', '全部', '天然', '生成侧', '源头', '第一手', '本质', '产生', '不遗漏'] },
+          { label: 'Hook 是事后观测，存在时机竞态 / 可能错过',
+            hint: '如果 App 在你 attach 之前就注册完了呢？',
+            any: ['事后', '错过', '时机', '竞态', '来不及', '先于', 'attach', '晚了', '追赶'] },
+          { label: '定制 ART 不引入可在运行时被检测的 hook 框架特征',
+            hint: 'Frida 必须在目标进程里留下什么？',
+            any: ['检测', '特征', '痕迹', 'frida', 'hook 框架', '隐蔽', '不引入', '无痕', '反调试', '进程特征'] },
+          { label: '插桩必须是只读的，不改变虚拟机原有行为',
+            hint: '探针如果影响了控制流或返回值，你的沙箱还可信吗？',
+            any: ['只读', '不改变', '不改逻辑', '观测', '不影响', '行为不变', '旁观', '无副作用', '原逻辑'] },
+          { label: '记录必须在四要素齐全的位置：类 + 方法名 + 签名 + 地址',
+            hint: '为什么不能只记名字？',
+            any: ['签名', 'signature', '四要素', '重载', '唯一', '类名', '方法名', '地址', '完整信息'] },
+          { label: '代价：编译环境 / 版本绑定 / 刷机风险 / 完整性校验',
+            hint: '这条路不是免费的，成本在哪？',
+            any: ['编译', 'aosp', '版本', '刷机', '成本', '环境', '维护', '风险', '校验', '完整性', '变砖'] }
+        ],
+        hints: [
+          '先问一个更基础的问题：「注册」这个事实，是谁产生的？观测者和产生者，谁的信息更全？',
+          '再从对抗角度想：Frida 要在目标进程里存在，定制 ART 不需要——这带来什么差别？'
+        ],
+        probes: [
+          '如果目标 App 会校验系统镜像完整性，你的沙箱还能用吗？有什么出路？',
+          '插桩点除了 RegisterNatives，你还会选哪些位置？判断标准是什么？'
+        ],
+        model: '<b>这句话只对了一半，而错的那一半恰恰是关键的。</b><br><br>' +
+               '<b>先说对的部分：</b>两者确实都能拿到「Java 方法 → native 地址」的映射。如果目标 App 注册得比较晚、你在它注册前就 attach 上了，' +
+               'Frida hook <span class="mono">RegisterNatives</span> 也能看到完整参数，此时信息确实等价。<br><br>' +
+               '<b>错的部分在「完备性」这个词上。</b>Hook 是<b>事后观测</b>：你在外面加一个拦截点，赌自己比目标先就位。' +
+               '而注册这件事是虚拟机<b>自己产生</b>的——在生成侧，这条映射在产生的那一刻就是<b>完全公开、无需推断</b>的。' +
+               '这个差别在两种情况下会变成决定性的：一是目标在极早期（比如 <span class="mono">JNI_OnLoad</span> 阶段、甚至你还没 attach）就完成注册；' +
+               '二是目标主动检测并规避 hook 框架，此时你的拦截点可能压根没装上，而你<b>不知道</b>自己漏了什么——' +
+               '观测者最怕的不是看到错的东西，而是以为自己看到了全部。<br><br>' +
+               '<b>可检测性上差别更明显。</b>Frida 必须把代码注入目标进程，必然留下可枚举的痕迹：模块、线程、内存特征、' +
+               '被改写过的 ArtMethod 标志。定制 ART 则是把记录逻辑<b>编译进了虚拟机本身</b>，进程里没有多出任何东西——' +
+               '对目标而言，这就是一台普通的 Android。<br><br>' +
+               '<b>插桩点的设计原则：</b>选在<b>四要素齐全</b>的位置（类、方法名、签名、地址同时在手），' +
+               '<span class="mono">RegisterNatives</span> 的循环体正是这样的位置；签名绝不能省，否则方法重载会让映射表出现歧义。' +
+               '同类候选还有类加载、方法入口等——判断标准是「那一刻我要的全部信息是否都已就位、且不需要推断」。<br><br>' +
+               '<b>必须遵守的纪律：</b><b>①</b> <b>只读不改</b>——探针不得改变控制流、返回值或时序，否则你观测的是一个被你改变过的系统；' +
+               '<b>②</b> <b>轻量</b>——不要在高频或持锁路径里做重活，宁可先写内存缓冲再统一落盘；' +
+               '<b>③</b> <b>可关闭</b>——插桩要能一键关掉，用于对照验证（关掉后行为应当完全一致）。<br><br>' +
+               '<b>代价必须讲清楚：</b>要搭 AOSP 编译环境（首次最痛）、源码随版本变化导致插桩点要重新定位、刷机有变砖风险、' +
+               '而且部分 App 会校验系统镜像完整性——定制 ROM 本身就是一个可被识别的特征。' +
+               '<b>所以结论是：</b>需要快速验证用 Frida，需要长期、稳定、不可被发现的观测能力才上定制 ART。' +
+               '把它当成一种「昂贵但信息完备」的手段，而不是默认选择。',
+        after: '<p><b>动态分析沙箱的终点不是一个工具，而是一个可编程的观测平台。</b>插一个点是开始，' +
+               '把类加载、方法调用、反射调用都纳入进来，你才真正拥有了「想记录什么就记录什么」的能力。</p>'
       }
-    }
-     ],
-     glossary: [
-       { t: 'Waydroid', d: '用基于容器的方式在普通 GNU/Linux 上启动完整 Android 系统的开源项目（仓库 waydroid/waydroid）。使用 Linux namespaces 隔离，容器内的 Android 可直接访问所需硬件。' },
-       { t: 'Linux namespaces', d: '内核隔离机制，包括 user / pid / uts / net / mount / ipc。容器化 Android 的基础：让一组进程看到「自己独占一套系统」。' },
-       { t: 'binder', d: 'Android 的核心 IPC 机制，以内核驱动形式提供。宿主内核不支持 binder，容器里的 Android 根本起不来。相关模块名常见为 binder_linux / ashmem_linux。' },
-       { t: 'ashmem / memfd', d: 'Android 的匿名共享内存机制。早期用 ashmem，新内核上越来越多改用通用的 memfd。' },
-       { t: 'virtio-gpu', d: '半虚拟化的 GPU 接口：Guest 通过 virtio 队列把渲染命令提交给 Host 的 GPU 执行。' },
-       { t: 'VirGL', d: '在 Guest 内把 OpenGL 调用转发给宿主 GPU 渲染的方案，属于半虚拟化图形加速的一种。' },
-       { t: 'GPU passthrough / VFIO', d: '把物理 GPU 直接分配给虚拟机，Guest 使用真实厂商驱动，性能接近裸机，但成本与运维复杂度高。' },
-       { t: '绑定挂载（bind mount）', d: 'mount --bind olddir newdir：把一个已存在的目录挂到另一个位置，两个入口共享同一份内容。容器映射宿主目录、Magisk magic mount 的基础手法。' },
-       { t: 'Magisk', d: 'Android 的 Root 方案与模块化框架（仓库 topjohnwu/Magisk）。核心是修改 boot 镜像的 ramdisk，在 init 早期注入自己的逻辑，再用 overlayfs/magic mount 实现 systemless 修改。' },
-       { t: 'Zygisk', d: 'Magisk 提供的在 Zygote 进程注入代码的机制。Zygote 是所有 App 进程的父进程，因此在这里注入等于每个 App 进程出生即带代码。' },
-       { t: 'DenyList', d: 'Magisk 中用于隐藏 root 状态的功能（旧称 MagiskHide），对抗环境检测。' },
-       { t: 'KVM', d: 'Kernel-based Virtual Machine：Linux 内核的硬件虚拟化接口，通过 /dev/kvm 以 ioctl 暴露 API（KVM_CREATE_VM / KVM_CREATE_VCPU / KVM_SET_USER_MEMORY_REGION / KVM_RUN）。要求 CPU 支持硬件虚拟化且 BIOS 开启。' }
-     ],
-     teacher: { id: 'ch18', chapter: 18, name: '追问老师 · 第 18 章', sub: '把虚拟化、容器化与 Android 系统焊成一套能骗过风控的云端环境', intro: '<p style="margin:0">这是全课程最后一章，我会问得最狠：不只问你「怎么做」，还问你「为什么这样做是对的」。</p>', questions: [
-      {
-        id: 'c18q1', depth: 1, threshold: 0.7,
-        q: 'Waydroid 用容器方式在 Linux 上跑完整 Android。<b>它为什么能做到「性能接近原生」？这条路线的技术前提又是什么？</b>请把「为什么快」和「靠什么才能跑起来」分开说。',
-        concepts: [
-          { label: '共享宿主内核、没有虚拟化层，Android 只是另一个用户空间',
-            hint: '它和模拟器/虚拟机差在哪一层？有没有第二份内核？',
-            any: ['共享内核', '同一个内核', '同一份内核', '共用内核', '没有虚拟化层', '无虚拟化', '不经虚拟化', '不是虚拟机', 'container', '容器', 'namespaces', '命名空间', '用户空间', 'user space', 'shared kernel', '宿主内核', '直接跑在'] },
-          { label: '容器内的 Android 可直接访问所需硬件（真实硬件，非虚拟硬件）',
-            hint: '官方 README 里特别强调的那一句是什么？',
-            any: ['直接访问硬件', '访问硬件', '真实硬件', '真硬件', 'direct access', 'hardware', '显卡', 'gpu', '驱动', '原生驱动', '设备', '传感器', '摄像头', '网卡'] },
-          { label: '前提：宿主内核必须支持 binder 与 ashmem/memfd',
-            hint: 'Android 的进程间通信靠什么机制？它是内核的必备组件吗？',
-            any: ['binder', 'ashmem', 'memfd', 'binderfs', 'binder_linux', 'ashmem_linux', '内核模块', 'kernel module', '内核支持', '内核编译', '编译选项', '配置项', 'config', '设备节点', 'dev/binder', '内核前提'] }
-        ],
-        hints: ['先问自己：容器里的 Android 发出的系统调用，最后落在哪个内核上？', '再问：Android 里所有系统服务互相之间是怎么「找到对方」的？这个机制需要内核提供什么？'],
-        probes: ['如果宿主内核不带 binder，容器里的 Android 会死在启动链路的哪一步？', '「没有虚拟化层」带来的代价是什么？它在隔离强度上意味着什么？'],
-        model: '<b>为什么快：因为它根本没有虚拟化层。</b>官方 README 说 Waydroid 用 container-based approach 在普通 GNU/Linux 上启动一个<b>完整的</b> Android 系统，隔离手段是 Linux namespaces（user、pid、uts、net、mount、ipc）。也就是说：Android 只是宿主系统上的「另一个用户空间」，它发出的系统调用<b>直接落在宿主内核</b>上，中间没有指令翻译、没有第二份内核、没有虚拟设备模型。而官方同时说明：容器内的 Android 系统<b>可以直接访问所需的硬件</b>——摄像头、传感器、GPU 走的都是宿主内核里真实的驱动。<b>没有那一层「虚拟硬件 → Guest 驱动」的翻译，性能自然接近原生。</b><br><br><b>靠什么才能跑起来：内核前提。</b>Android 的进程间通信靠 <b>binder</b>，而 binder 不是标准 Linux 内核的必备组件，需要宿主内核提供支持（课程中提到的模块名是 <span class="mono">binder_linux</span> / <span class="mono">ashmem_linux</span>）；共享内存侧还要 ashmem 或新内核上的 memfd。<b>这是安卓容器化的核心技术前提</b>：宿主内核没有 binder，<span class="mono">servicemanager</span> 就起不来，而它是 binder 的「电话簿」——它不在，后面所有系统服务都找不到彼此，症状是各式各样的启动失败。<br><br><b>结论：</b>「快」来自共享内核与真实硬件；「能跑」取决于内核配置。这也解释了为什么这条路上真正的硬骨头常常是「编译一个带 binder 支持的宿主内核」，而不是 Waydroid 本体本身。',
-        after: '<p>顺手记住一个工程细节：内核模块与内核版本、配置<b>强绑定</b>。「昨天好好的今天起不来」几乎一定发生在内核升级之后、模块没重建。</p>'
-      },
-      {
-        id: 'c18q2', depth: 2, threshold: 0.7,
-        q: '容器启动时用<b>绑定挂载</b>把宿主目录映射进来。<b>为什么每个 PID 命名空间必须重新挂一次自己的 <span class="mono">/proc</span>？不挂会怎样？</b>顺带说清绑定挂载本身在容器里承担什么角色。',
-        concepts: [
-          { label: '/proc 是内核按当前 PID 命名空间实时生成的视图，PID 编号是命名空间内相对的',
-            hint: '同一个进程，在宿主和容器里看到的 PID 一样吗？/proc 是静态文件吗？',
-            any: ['pid 命名空间', 'pid namespace', '命名空间相对', '相对编号', 'pid 相对', '实时生成', '动态生成', '内核生成', '内核视图', '视图', '视图按命名空间', 'pid 1', '命名空间内', '同一个进程不同 pid', '由内核提供'] },
-          { label: '必须在容器内重新 mount -t proc proc /proc，否则会看到宿主的进程表',
-            hint: '不重新挂载的话，ps 输出的是谁的进程？',
-            any: ['重新挂载', '重新 mount', 'mount -t proc', '挂 proc', '重挂', 'mount proc', 'proc 挂载', '看到宿主进程', '宿主进程表', 'ps 看到宿主', '没隔离', '泄漏', '暴露宿主', '必须重挂'] },
-          { label: '绑定挂载把一个已存在目录挂到另一个位置，两个入口共享同一份内容，是容器映射宿主目录的基础',
-            hint: 'mount --bind olddir newdir 到底做了什么？',
-            any: ['bind mount', '绑定挂载', 'mount --bind', '--bind', '同一份内容', '同一份数据', '两个入口', '映射目录', '挂载点', '把目录挂到', '映射进容器', 'rootfs'] },
-          { label: '这也是 Magisk magic mount / overlayfs 叠加的基础手法',
-            hint: '本章还有哪个技术是在「挂载层」做文章的？',
-            any: ['magisk', 'magic mount', 'overlayfs', 'overlay', '叠加', '挂载层', '联合挂载', 'systemless'] }
-        ],
-        hints: ['想清楚 PID 这个数字是「全局唯一」还是「相对于某个命名空间」。', '/proc 不是磁盘上的一堆文件，那它是什么？谁在什么时候生成它？'],
-        probes: ['如果容器里忘了重挂 /proc，除了 ps 会看到多余进程，还可能带来什么安全/检测上的后果？', '/dev、/sys 为什么也要按命名空间重新挂？它们和 /proc 的共同点是什么？'],
-        model: '<b>根本原因：/proc 里的 PID 编号是「命名空间内相对的」。</b>同一个进程，在宿主命名空间里可能是 PID 3000，在容器的 PID 命名空间里却是 PID 1。<span class="mono">/proc</span> 不是磁盘上的静态数据，而是<b>内核根据「谁在读、它在哪个 PID 命名空间里」实时生成的视图</b>。所以容器必须在自己的挂载命名空间里重新执行一次 <span class="mono">mount -t proc proc /proc</span>——挂载动作本身携带了「是谁在挂」的上下文，内核据此生成对应内容。<br><br><b>不挂会怎样：</b>容器里的进程会看到<b>宿主的 /proc</b>——<span class="mono">ps</span> 里冒出一堆本不该看见的进程，PID 1 也不是容器自己的 init。这既是功能问题（依赖 /proc 的程序行为异常），更是<b>暴露问题</b>：风控非常喜欢读 <span class="mono">/proc</span> 与 <span class="mono">/sys</span>（进程列表、CPU 信息、设备树、网络统计），挂载没做干净，这里就是最大的破绽来源。<br><br><b>绑定挂载的角色：</b><span class="mono">mount --bind olddir newdir</span> 把一个已存在的目录挂到另一个位置，两个入口共享<b>同一份内容</b>。容器用它把宿主准备好的 rootfs接」到容器的根上——宿主什么都没变，容器里却像是另一台机器。同一手法也是 Magisk magic mount / overlayfs 叠加的基础：<b>不改磁盘，只改挂载层</b>。<br><br><b>补一句：</b>内核启动的最后一步是执行 <span class="mono">/sbin/init</span>（可用 <span class="mono">init=</span> 指定），它成为 PID 1，负责挂载文件系统、启动服务、回收孤儿进程。在容器里，这个角色由容器运行时或一个精简 init 承担——这也正是「容器里谁才是 PID 1」这个问题的答案。'
-      },
-      {
-        id: 'c18q3', depth: 2, threshold: 0.6,
-        q: 'Magisk 号称「systemless」——<b>它到底改了哪里？又是怎么让系统「看见」模块文件的？</b>为什么这种做法能带来 OTA 升级与干净卸载？再说说 Zygisk 和 DenyList 各解决什么问题。',
-        concepts: [
-          { label: '改 boot 镜像的 ramdisk，注入 magiskinit（替换 init 或改 .rc），在 init 启动早期拿到控制权',
-            hint: '它改的是 /system 吗？如果不是，那是哪个分区？什么时机动手？',
-            any: ['ramdisk', 'boot 镜像', 'boot.img', 'boot 分区', 'magiskinit', '替换 init', '改 init', '替换掉 init', '打补丁', '.rc', 'rc 文件', '早期', '启动早期', 'init 之前', '注入', '抢先'] },
-          { label: '用 overlayfs / magic mount 把模块文件叠加到系统路径上，系统看到的是被覆盖的文件',
-            hint: '它是怎么让 /system 里「出现」一个原本不存在的文件的？',
-            any: ['overlayfs', 'overlay', 'magic mount', 'magisk mount', '叠加', '覆盖', '挂载层', 'mount 层', '联合挂载', '联合文件系统', '覆盖文件', '被覆盖'] },
-          { label: '真实 /system 分区一个字节都没改，所以能 OTA、能随时卸载干净',
-            hint: '好处有哪两个？为什么改磁盘就做不到？',
-            any: ['未修改', '没改', '不修改 system', '不改 system', 'systemless', '无系统分区修改', 'ota', '升级', '卸载', '卸载干净', '干净', '还原', '可逆', '只读挂载', '校验', '完整性'] },
-          { label: 'Zygisk 在 Zygote（所有 App 进程的父进程）注入；DenyList 隐藏 root 对抗检测',
-            hint: '模块 hook 插在哪里最有效？对抗检测靠哪个组件？',
-            any: ['zygisk', 'zygote', '注入 zygote', 'denylist', 'magiskhide', 'magisk hide', '隐藏 root', 'hide', '白名单', '黑名单', '权限管理', 'magisksu', 'root 权限'] }
-        ],
-        hints: ['「systemless」这个词的字面意思就是「没有系统（分区修改）」——那改动只能落在别的地方。', '注意时机：它必须比系统挂载分区更早动手，否则就没有资格决定「系统最终看到什么」。'],
-        probes: ['为什么「抢早」这件事是必须的？如果系统已经挂载完并跑起了服务，再动手会有什么后果？', '在容器化 Android 里，你本来就控制整个用户空间镜像——那 Magisk 还有哪些不可替代的价值？'],
-        model: '<b>它改了哪里：boot 镜像的 ramdisk，不是系统分区。</b>核心原理是在 ramdisk 里注入 Magisk 自己的 init 逻辑（常见做法是替换系统的 <span class="mono">init</span>，或者修改 <span class="mono">.rc</span> 文件，由 <span class="mono">magiskinit</span> 打补丁），从而在<b>系统把各分区挂载起来之前</b>就拿到控制权。为什么必须「早」？因为一旦 /system 已经按原样挂上、服务已经跑起来，你再去改就晚了、也脏了——<b>只有抢在挂载之前，才有资格决定「系统最终看到什么」</b>。<br><br><b>它怎么让系统「看见」模块文件：</b>以只读方式挂载真实的 /system，然后用 <b>overlayfs / magic mount</b> 把模块里的文件「叠加」到对应的系统路径上。系统看到的是<b>被覆盖后</b>的文件，它无法从文件内容本身判断下面还有一层。这个手法与绑定挂载一脉相承：<b>不改磁盘，只改挂载层</b>。<br><br><b>两个好处：</b>① 可以 OTA 升级——系统分区是原厂的，校验能过；② 可以随时卸载干净——把挂载层撤掉，系统回到出厂状态。相比之下，直接改系统分区会破坏校验、无法 OTA，而且改动是「永久性的脏」。<b>这就是 systemless 的全部价值：把「修改」从磁盘搬到挂载层。</b><br><br><b>另外两个组件：</b><b>MagiskSU</b> 提供 root 权限管理（决定哪个 App 能以什么身份拿 root）；<b>Zygisk</b> 在 <b>Zygote</b> 进程注入代码，而 Zygote 是<b>所有 Android 应用进程的父进程</b>，因此在它这里注入等于每个 App 进程<b>一出生就带着你的代码</b>——这是模块 Hook 最有效的位置；<b>DenyList</b>（旧称 MagiskHide）用于隐藏 root 状态、对抗环境检测。<b>对逆向的意义：</b>Magisk 是让云手机/容器化安卓「看起来像真机」的关键一环。'
-      },
-      {
-        id: 'c18q4', depth: 2, threshold: 0.65,
-        q: '容器化环境下没有真实 WiFi 硬件。你要伪造出「这台机器连着 WiFi」。<b>为什么只在 Java 层 hook 掉 <span class="mono">WifiManager</span> 的返回值一定会被识破？</b>要让这套伪装自洽，至少要覆盖哪些方面？',
-        concepts: [
-          { label: 'App 会从多个互相独立的数据源交叉验证同一件事（WifiManager vs /proc 等内核视图）',
-            hint: 'App 会只问一个地方吗？除了 Java API，它还能从哪里看到网络状态？',
-            any: ['交叉验证', '交叉', '对账', '多个来源', '多数据源', '多个数据源', 'proc/net/wireless', 'proc', '内核视图', '内核视角', 'sys', '不一致', '矛盾', '互相验证', '多个 api', '不同来源'] },
-          { label: '时间维度：信号强度会抖动、扫描结果会变化、有连接历史，静态值本身就可疑',
-            hint: '真机上的 RSSI 是恒定的吗？一个「永远不变」的状态正常吗？',
-            any: ['时间', '历史', '抖动', '波动', '变化', '动态', 'rssi 变化', '信号变化', '扫描结果变化', '静态', '恒定', '永远不变', '一成不变', '轨迹', '记录'] },
-          { label: '网络参数之间要配套：BSSID ↔ 网关 ↔ 网段 ↔ DNS 必须说得通',
-            hint: '如果 BSSID 指向家用路由器，而 IP 在数据中心网段，会怎样？',
-            any: ['bssid', '网关', '网段', 'dns', 'ip', '配套', '说得通', '匹配', '家用路由器', '场景', '一致', '自相矛盾'] },
-          { label: '核心原则：伪装必须自洽——伪造一整套状态，而不是伪造一个返回值',
-            hint: '本节的核心原则是哪四个字？',
-            any: ['自洽', '一致', '协调', '说得通', '整体', '状态机', '完整', '逻辑一致', '不矛盾', '可信', '合理', '证据链'] }
-        ],
-        hints: ['想一想本章反复出现的那句话：风控不需要证明你是假的，它只需要发现什么？', '除了「值对不对」，还要问「这个值有没有被真实使用过的痕迹」。'],
-        probes: ['如果 /proc/net/wireless 是空的，而上层说连着 WiFi，你会在哪一层修这个问题？各方案的成本差别在哪？', '这条「自洽」原则怎么推广到 root 隐藏和图形指纹上？'],
-        model: '<b>因为 App 不会只问一个问题。</b>它会从<b>多个互相独立的数据源</b>去问<b>同一件事</b>，然后对账。典型矛盾：Java 层的 <span class="mono">WifiManager</span> 说「连着 BSSID=aa:bb:... 的路由器」，但<b>内核视角</b>的 <span class="mono">/proc/net/wireless</span> 是空的；扫描结果是空列表，可 RSSI 却有个漂亮的 <span class="mono">-45 dBm</span>；IP 在数据中心网段，网关却号称是家用路由器。<b>风控不需要证明你是假的，它只需要发现你的证据链内部有矛盾。</b><br><br><b>至少要覆盖四层：</b>① <b>系统服务层</b>——WifiManager 及其背后的服务（system_server 里的 WifiService，回看 18.7 第⑨步）；② <b>内核可读的视图</b>——<span class="mono">/proc</span>、<span class="mono">/sys</span> 这类绕过整个 Java 层的信息源，这一项最狠，因为你 hook 了上层不代表内核里真有这张网卡；③ <b>参数之间的配套关系</b>——BSSID ↔ 网关 ↔ 网段 ↔ DNS 必须共同描绘出同一个场景；④ <b>时间维度</b>——真机的 WiFi 状态有历史：信号在抖动、偶尔切换 AP、断开又重连、扫描列表随位置变化。<b>一个「刚刚才有、而且永远不变」的 WiFi，比没有 WiFi 更可疑。</b><br><br><b>核心原则四个字：伪装必须自洽。</b>不是「让 API 返回真」，而是<b>让一整套状态机看起来被真实使用过</b>。这条原则适用于本章所有的伪装工作：root 的隐藏、图形指纹的一致、设备信息的完整，全都是同一件事——<b>排查的粒度是「证据面」，不是「功能」</b>。'
-      },
-      {
-        id: 'c18q5', depth: 3, threshold: 0.5,
-        q: '<b>综合题（全课程收束）：</b>现在要你构建一套<b>高度定制、可欺骗风控检测的云端安卓运行环境</b>。请说明这套系统需要用到<b>本课程哪些章节的知识</b>——从最底层的运行环境，一直到最上层的对抗与验证。不要求你背出章节号，<b>要讲清每一块技术在这个系统里承担什么职责、缺了它会怎样</b>。',
-        concepts: [
-          { label: '运行环境层：容器化（Waydroid / namespaces）或虚拟化（KVM / QEMU / Cuttlefish）路线选型',
-            hint: 'Android 最终要跑在什么东西上面？有哪两条路线？',
-            any: ['waydroid', '容器', '容器化', 'container', 'namespaces', '命名空间', 'lxc', 'docker', 'kvm', 'qemu', 'cuttlefish', '虚拟机', '虚拟化', 'avf', 'pkvm', 'remote_android', '云手机', '云端', '实例'] },
-          { label: '内核与挂载层：宿主内核配置（binder / ashmem / memfd）、绑定挂载、命名空间下的 /proc',
-            hint: '容器里的 Android 靠什么才能起来？文件系统视图是怎么拼出来的？',
-            any: ['binder', 'ashmem', 'memfd', '内核', 'kernel', '编译内核', '内核配置', '绑定挂载', 'bind mount', 'mount', '/proc', 'proc', '挂载', 'rootfs', '分区'] },
-          { label: 'Android 系统与启动链路：boot.img/ramdisk、init 与 init.rc、servicemanager、zygote、system_server',
-            hint: 'Android 自己是怎么从「一行代码都不跑」到「App 起来」的？',
-            any: ['boot.img', 'ramdisk', 'init', 'init.rc', 'zygote', 'system_server', 'servicemanager', '启动链路', '启动流程', '启动过程', '动态分区', 'super 分区', 'vbmeta', 'lineageos'] },
-          { label: '图形与性能：GPU 加速（virtio-gpu / VirGL / 直通），以及渲染器指纹的一致性',
-            hint: '界面怎么画出来？为什么这也和检测有关？',
-            any: ['virtio', 'gpu', '图形', '渲染', '加速', 'virgl', 'swiftshader', '直通', 'passthrough', 'vfio', '显卡', 'opengl', 'egl', '渲染器'] },
-          { label: 'Root 与注入：Magisk（systemless / MagiskSU / Zygisk / DenyList）及其隐藏能力',
-            hint: '你要改系统、要注入代码，靠什么框架？同时又要让检测看不见它。',
-            any: ['magisk', 'zygisk', 'denylist', 'magiskhide', 'systemless', 'overlayfs', 'root', '隐藏', '模块', '注入', 'xposed', 'frida', 'hook'] },
-          { label: '环境伪装与反检测：设备信息、虚拟 WiFi、传感器等「自洽的假状态」',
-            hint: '风控会问哪些问题？你要怎么让它问不出破绽？',
-            any: ['伪装', '反检测', '风控', '检测', '指纹', '环境', '设备信息', '序列号', 'imei', 'build.prop', '系统属性', '虚拟 wifi', 'wifi', 'bssid', 'ssid', '传感器', '自洽', '交叉验证', '模拟器检测', '真机'] },
-          { label: '逆向对抗技术（前面各章）：hook 框架、脱壳、混淆对抗、Native 分析、算法还原、流量与签名',
-            hint: '环境搭好之后，真正要对付 App 的那些手段来自哪里？',
-            any: ['frida', 'hook', 'unidbg', 'ida', '反调试', 'ollvm', 'vmp', '脱壳', 'fart', 'native', '算法', '还原', 'ebpf', '沙箱', '签名', 'ssl', '抓包', '证书', '混淆', 'dex'] },
-          { label: '观测与验证：内核日志、系统日志、dumpsys、进程与 /proc 检查——没有观测就没有对抗',
-            hint: '你怎么知道自己的环境是自洽的？靠猜吗？',
-            any: ['logcat', 'dmesg', 'dumpsys', 'ps', '观测', '验证', '对账', '排查', '测试', '检查', '证据', '日志'] }
-        ],
-        hints: ['按「层」来组织答案：硬件/内核 → 内核上的运行环境 → Android 用户空间 → 系统之上的定制与注入 → 面向检测的伪装 → 面向 App 的逆向对抗 → 贯穿始终的观测手段。', '每一层都问一遍：这一层如果缺失或做错，会在哪一步暴露？风控会从哪个信息源看到它？'],
-        probes: ['这套系统里，哪一层是「性能问题」，哪一层是「伪装问题」，哪一层两者都是？', '如果目标 App 把关键逻辑放进了受保护的环境（比如 AVF/pKVM 那类方向），你这套体系里的哪些部分会失效？你打算怎么办？'],
-        model: '<b>这套系统是一条自下而上的栈，每一层都承担一个明确职责，缺一层则上层全部失效。</b><br><br><b>① 运行环境层（选型）</b>：Android 最终跑在容器（Waydroid，共享宿主内核 + namespaces 隔离，容器内可直接访问硬件、性能接近原生）还是虚拟机（KVM + QEMU/Cuttlefish，隔离强但多一层虚拟硬件）之上。这一层决定性能上限、硬件真实性、隔离强度——<b>选错路线，后面所有努力都在错误的地基上</b>。<br><br><b>② 内核与挂载层</b>：容器路线的硬前提是宿主内核支持 <b>binder</b> 与 ashmem/memfd，没有它 servicemanager 起不来、Android 根本无法启动；虚拟机路线则要求 KVM 与 virtio 相关支持。同时要用<b>绑定挂载</b>拼出容器里的文件系统视图，并在命名空间内重新挂载 <span class="mono">/proc</span>、<span class="mono">/sys</span>、<span class="mono">/dev</span>——<b>挂载没做干净，/proc 就是最大的破绽来源</b>。<br><br><b>③ Android 系统与启动链路</b>：从 boot.img（内核+ramdisk）→ init → init.rc → servicemanager → zygote → system_server → fork App 进程。容器化会<b>整段砍掉硬件前缀</b>（BootROM、Bootloader、内核启动、boot.img 加载都不发生），PID 1 的归属也变了——<b>这些「缺失的痕迹」正是风控要找的东西</b>。<br><br><b>④ 图形与性能</b>：virtio-gpu / VirGL / GPU 直通解决「画得快」；但图形加速在云手机上<b>同时是反检测问题</b>——纯软件渲染（SwiftShader 一类）的渲染器字符串极具辨识度。这一层是性能与伪装的双重战场。<br><br><b>⑤ Root 与注入</b>：Magisk 的 systemless（改 ramdisk + overlayfs/magic mount）让你在<b>不碰系统分区</b>的前提下定制系统；Zygisk 在 Zygote 注入，使每个 App 进程出生即带代码。这是「高度定制」的实现手段。<br><br><b>⑥ 环境伪装</b>：虚拟 WiFi 是典型例子——不能只改 WifiManager，必须让系统服务层、内核视图（<span class="mono">/proc</span>）、参数配套关系（BSSID↔网关↔网段↔DNS）、时间维度（抖动与历史）全部自洽。<b>核心原则：伪装必须自洽，风控只要发现证据链矛盾就赢了。</b><br><br><b>⑦ 逆向对抗技术</b>：环境只是地基，真正对付 App 还要靠前十七章的 hook 框架、脱壳、混淆对抗、Native 分析、算法还原、流量与签名等一整套手段。<br><br><b>⑧ 观测与验证</b>：以上每一层都需要可观测手段（内核日志、系统日志、dumpsys、进程与 /proc 检查）来确认「我的环境是不是自洽的」——<b>没有观测就没有对抗，只能靠猜。</b><br><br><b>最后一句：</b>这套系统的难点从来不是「把某一块做出来」，而是<b>让所有块之间的证据互相对得上账</b>。这也是整个课程反复训练的那件事：<b>不要停在「功能正常」，要追到「为什么它是对的」。</b>',
-        after: '<p><b>课程到此结束。</b>如果你能不看笔记把这条栈讲一遍、并在每一层说出「这一层错了会在哪暴露」，那你已经具备了独立设计云端安卓对抗环境的能力——剩下的只是动手与踩坑。</p>'
-      }
-    ] }
-   };
+    ]
+  }
+};

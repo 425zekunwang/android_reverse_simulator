@@ -428,6 +428,16 @@ if (!COURSE || !Array.isArray(COURSE.chapters)) {
 }
 if (QUIET === false) console.log(`课程元数据：${COURSE.chapters.length} 章，${Object.keys(COURSE.tracks).length} 个阶段\n`);
 
+/* 「后补章节」判定：课程最初写就 18 章（在 COURSE 里标记 legacy: true），
+   只有其后的补充章节才受「新章密度下限」约束。
+   章号重排后不能再按 no 判断，因此改为读显式标记；未标记的默认从严。 */
+const LEGACY_NOS = new Set(COURSE.chapters.filter(c => c.legacy).map(c => c.no));
+function isLaterAddition(no) { return !LEGACY_NOS.has(no); }
+if (QUIET === false) {
+  console.log(`历史 18 章（不受密度下限约束）：${[...LEGACY_NOS].sort((a, b) => a - b).join(', ')}`);
+  console.log(`后补章节（受密度下限约束）：${COURSE.chapters.filter(c => !c.legacy).map(c => c.no).join(', ')}\n`);
+}
+
 /* 元数据自身一致性 */
 const nos = COURSE.chapters.map(c => c.no);
 const dupNo = nos.filter((n, i) => nos.indexOf(n) !== i);
@@ -455,6 +465,19 @@ for (const meta of COURSE.chapters) {
   const dm = /data-chapter="(\d+)"/.exec(shell);
   if (!dm) err(label, `${meta.file} 缺少 data-chapter 属性`);
   else if (Number(dm[1]) !== no) err(label, `${meta.file} 的 data-chapter=${dm[1]}，与 COURSE 里的 ${no} 不一致`);
+
+  // <title> 里的「第 N 章」也必须同号。
+  // 为什么必须单独查：章号重排时 "第 N 章" 与 "chNN-" 链接由两条规则先后命中，
+  // 会出现「1 → 15 → 29」这种二次改写，data-chapter 是对的、只有标题被改坏。
+  const tm = /<title>第\s*(\d+)\s*章/.exec(shell);
+  if (!tm) err(label, `${meta.file} 的 <title> 缺少「第 N 章」`);
+  else if (Number(tm[1]) !== no) err(label, `${meta.file} 的 <title> 写的是第 ${tm[1]} 章，与 COURSE 里的 ${no} 不一致`);
+
+  // 外壳引用的数据文件也必须同号
+  const sf = /chapters\/ch(\d{2})\.js/.exec(shell);
+  if (sf && Number(sf[1]) !== no) {
+    err(label, `${meta.file} 引用 chapters/ch${sf[1]}.js，与 COURSE 里的 ${no} 不一致`);
+  }
 
   // 数据文件
   const dataFile = `chapters/ch${String(no).padStart(2, '0')}.js`;
@@ -538,9 +561,12 @@ for (const meta of COURSE.chapters) {
 
   if (ch.teacher) checkTeacher(label, ch.teacher);
 
-  // 组件密度下限：只约束 CH19 之后新写的章节。
-  // 现有 18 章是已验收的历史内容，密度本就参差，对它们报"低于下限"只是噪音。
-  if (no >= 19) {
+  // 组件密度下限：只约束"后补章节"，不约束最初写就的 18 章。
+  // 那 18 章是已验收的历史内容，密度本就参差，对它们报"低于下限"只是噪音。
+  //
+  // 注意：不能用章号判断。章号已按学习顺序重排（入门 → 基础补遗 → 进阶），
+  // 最初的 18 章现在编号为 15–32。这里改读 COURSE 里的显式标记 legacy。
+  if (isLaterAddition(no)) {
     const MIN = { stepper: 1, stage: 2, decision: 3, quiz: 3, lab: 1, case: 1, intuition: 2, term: 0 };
     Object.keys(MIN).forEach(k => {
       if (counts[k] < MIN[k]) err(label, `${k} 只有 ${counts[k]} 个，低于新章质量下限 ${MIN[k]}`);

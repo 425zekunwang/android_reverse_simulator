@@ -1,2663 +1,1175 @@
-/* 第 31 章数据 —— 算法地图与 RSA 逆向
-   主线：① 一张按「功能」分成的密码学地图，让读者先知道该往哪一类想；
-        ② RSA 这一类的逆向方法——它在移动端的形态与对称算法完全不同，
-           你面对的往往是公钥、证书、签名，而不是 16 字节的密钥常量。
-   数据文件：只写 window.CHAPTER，禁止 require/import/fetch/async。 */
+/* 第 31 章 · 容器化核心原理
+   数据文件：window.CHAPTER（浏览器脚本，禁止 import/require/export）
+   约定：字符串内的单引号一律改用中文引号「」或 &quot;，避免转义地狱 */
 window.CHAPTER = {
   no: 31,
-  title: '算法地图与 RSA 逆向',
-  lede: '前面几章把 MD5、SHA、Base64、RC4、AES、HMAC 一个个拆开讲完了，但一直没人回答一个更前置的问题：' +
-        '<strong>手里这段密文，我该往哪一类想？</strong><br>' +
-        '而六类里有一类始终是空的——<strong>RSA</strong>。它在第 8 章只以「计数为 0」出现过，在第 9 章只以「一段分片的公钥」出现过，' +
-        '算法本身一次也没讲。这一章补两件事：<strong>把地图画全</strong>，然后<strong>把 RSA 这一类的逆向方法讲透</strong>——' +
-        '它的公钥本来就是公开的，所以你的战场不在「找密钥」，而在「看懂结构、判断方向、对上填充」。',
+  title: '容器化核心原理',
+  lede: '容器既不是黑魔法，也不是「小虚拟机」——它是 <strong>namespaces + cgroup + rootfs + capabilities/seccomp</strong> 四样东西同时作用在<strong>一个普通进程</strong>上的结果。这一章我们亲手拆开 Docker：用命令行造一个迷你容器，把 docker0 网桥上的数据流跑一遍，再打通 x86_64 上运行 arm64 的整条链路。',
   meta: [
-    '核心问题：<b>拿到一段密文 / 一大段常量 / 一个 PEM 块，你先按哪一类算法查，依据是什么？</b>',
-    '关键机制：<b>六类功能的分工、非对称的公私钥方向、填充（padding）、公钥的 DER/SPKI 结构</b>',
-    '对手：<b>假 RSA（只做了编码）、模数固定、小指数、客户端持有私钥、以及「抓不到的会话密钥」</b>'
+    '核心问题：<b>Docker 到底做了什么？容器与虚拟机的边界在哪里？</b>',
+    '关键工具：<b>clone / unshare / setns、cgroup v2、pivot_root、binfmt_misc + QEMU、debootstrap</b>',
+    '对手：<b>容器环境检测（云手机风控、环境伪装）、x86 服务器跑 ARM 负载</b>'
   ],
 
   sections: [
-    /* ============================================================ 31.1 */
+    /* ============ 31.1 ============ */
     {
-      h: '31.1', title: '先把地图画出来：六类功能，与它们在 App 里的样子',
+      h: '31.1',
+      title: '先摆正认知：容器不是「小虚拟机」',
       intuition: {
-        tag: '直觉模型 · 六种不同的封条',
-        body:
-          '<p>想象你要把一封信交给别人。你能做的保护动作，其实只有六种，而且它们<strong>解决的问题各不相同</strong>。</p>' +
-          '<p><strong>编码</strong>是换一个信封——信还是那封信，只是从白纸写成了电报码。谁都能拆开，它只是为了让内容能塞进 URL、JSON 或日志里。</p>' +
-          '<p><strong>摘要</strong>是把信烧成一小撮灰。灰只有固定的一小把，你没法从灰还原出信，但只要原文一样，灰就一模一样——所以它能回答「这封信有没有被改过」，却回答不了「这封信写了什么」。</p>' +
-          '<p><strong>MAC</strong> 是「带着火漆印的灰」：火漆印需要一把只有你和对方知道的印章才能盖出来。灰本身谁都能验，印章不能。</p>' +
-          '<p><strong>对称加密</strong>是同一把钥匙的锁——锁上和打开用同一把钥匙。快，但钥匙必须两边都有，于是「钥匙怎么送过去」成了新问题。</p>' +
-          '<p><strong>非对称加密</strong>是一把<strong>只能锁、不能开</strong>的挂锁。你可以把这把锁挂在广场上让任何人拿走（这就是「公钥是公开的」），但只有你有开它的钥匙。</p>' +
-          '<p><strong>密钥交换 / 派生</strong>不是锁，而是<strong>两个人各出一半、当场拼出一把新钥匙</strong>的仪式。这把新钥匙从不旅行，所以谁也没法在路上截住它。</p>' +
-          '<p>这一章的第一件事，就是让你看到一段东西时，先判断它属于这六种里的哪一种。<strong>判断错了类别，后面所有努力都是白费。</strong></p>'
+        tag: '直觉模型 · 合租公寓 vs 独栋别墅',
+        body: '<p>虚拟机像<b>独栋别墅</b>：自带地基、水电、锅炉，甚至自带一套门牌系统 —— 每一位住户（Guest OS）都有自己的内核、自己的驱动、自己的资源管理。想再住一户？先盖一栋楼，从打地基（引导内核）开始，几十秒起步、几百 MB 内存打底。</p>'
+          + '<p>容器像<b>合租公寓</b>：楼（宿主内核）只有一栋，所有住户共用同一套水电管道和同一面承重墙。公寓管理做的事情只有四件 —— 给每户发<b>独立门牌号</b>（namespace 决定「看得见什么」）、给每户<b>限水限电</b>（cgroup 决定「能用多少」）、给每户配<b>独立家具</b>（rootfs 决定「有哪些文件」）、给每户拉<b>独立网线</b>（veth 决定「怎么连出去」）。</p>'
+          + '<p>这个类比直接解释了两件事：为什么容器启动只要几十毫秒 —— 它<b>只是一个加了四层约束的普通进程</b>，没有引导过程；为什么容器隔离比虚拟机弱 —— 承重墙是共用的，一旦有人凿穿内核这面墙（内核漏洞逃逸），整栋楼一起遭殃。</p>'
       },
       html:
-        '<p>下面这张表是本章的骨架。请把「逆向时你盯什么」那一列读两遍——它才是你真正要背下来的东西。</p>' +
-        T.tbl(
-          ['类别', '代表算法', '有密钥吗', '在 App 里长什么样', '逆向时你盯什么'],
-          [
-            ['<b>编码</b>',
-             'Base64 / Hex / URL 编码',
-             '<b>没有</b>',
-             '一长串可打印字符（末尾常有 <span class="mono">=</span>）；或者 <span class="mono">%E4%B8%AD</span> 这种百分号转义',
-             '字符集合与变体（<span class="mono">-_</span> 还是 <span class="mono">+/</span>）、填充符、' +
-             '<b>那张 64 字符的表有没有被换</b>（第 8 章 8.4 / 8.5）'],
-            ['<b>摘要</b>',
-             'MD5 / SHA-1 / SHA-256',
-             '<b>没有</b>',
-             '输出<b>定长</b>：16 / 20 / 32 字节。调用点旁边往往同时出现「签名」「校验」「token」等字样',
-             '输出<b>长度</b>先定性；再找 IV / K 表这类常量判断有没有被魔改（第 8 章 8.3）；' +
-             '最后问<b>盐加在哪、怎么拼</b>'],
-            ['<b>MAC</b>',
-             'HMAC-MD5 / HMAC-SHA256',
-             '<b>有</b>（一把共享密钥）',
-             '输出同样是定长，但要经过<b>两次哈希调用</b>；内存里能看到连续 64 个 <span class="mono">0x36</span> 和 64 个 <span class="mono">0x5C</span>',
-             '<b>结构</b>：固定填充 + 两次调用就是 HMAC，与常量表无关（第 8 章 8.8）'],
-            ['<b>对称加密</b>',
-             'DES / 3DES / AES',
-             '<b>有</b>（密钥是核心）',
-             '密文长度是<b>块大小的整数倍</b>（AES 是 16）；旁边必然有 Key / IV 的构造调用',
-             '<b>密钥与 IV 从哪来</b>：硬编码、派生、还是从别处传来（第 24 章自吐沙箱就是干这个的）；' +
-             '以及<b>模式与填充</b>'],
-            ['<b>非对称加密</b>',
-             'RSA / ECC',
-             '<b>有，但公钥通常是公开的</b>',
-             '一大段常量（modulus / exponent）、一个 PEM 块、一张证书，或者 ' +
-             '<span class="mono">KeyFactory</span> / <span class="mono">Signature</span> / <span class="mono">Cipher</span> 的调用',
-             '<b>这一章的主场。</b>先认出它是公钥还是私钥，再判断<b>方向</b>（加密还是验签），最后抠<b>填充</b>'],
-            ['<b>密钥交换 / 派生</b>',
-             'ECDHE / PBKDF2 / HKDF',
-             '<b>没有固定密钥</b>（密钥是算出来的）',
-             'TLS 的握手流量；Java 层的 <span class="mono">KeyAgreement</span>、' +
-             '<span class="mono">SecretKeyFactory("PBKDF2WithHmacSHA1")</span>',
-             '<b>不要去「找」密钥，要去理解它怎么被算出来</b>：' +
-             '协商（第 23 章）还是口令派生（本章 31.13 / 31.14）']
-          ]
-        ) +
-        T.note('key', '🔑 六类里只有一类的「密钥可以公开」，而这一条决定了它的全部逆向形态',
-          '<p style="margin-bottom:0">前五类里，密钥都是秘密。<b>只有非对称加密相反：公钥的设计目的就是让全世界都拿到它。</b><br>' +
-          '所以逆向 RSA 和逆向 AES 是两件完全不同的事——<b>逆向 AES 的核心动作是「把密钥找出来」，' +
-          '逆向 RSA 的核心动作是「把结构读出来、把方向判断对」。</b>公钥你不需要找，它就在那里，甚至可能写在一张证书里等着你去下载。<br>' +
-          '这句话是本章所有具体技术的总纲。</p>') +
-        '<h4>已经讲过的不再重复：一张分工对照表</h4>' +
-        '<p>本项目前面几章已经把这张地图的<strong>大部分格子</strong>填满了。为了不让本章变成重复劳动，这里把边界划清楚：</p>' +
-        T.tbl(
-          ['主题', '在哪一章讲过', '本章怎么处理'],
-          [
-            ['MD5 / SHA-1 / SHA-256 的 IV、K 表与魔改识别', '<b>第 8 章 8.3</b>', '只在地图上定位，<b>不重复讲</b>'],
-            ['Base64 换表、CRC32 换多项式', '<b>第 8 章 8.4 / 8.5</b>', '只在地图上定位'],
-            ['RC4 的 S 盒、AES 的 S 盒、HMAC 的 ipad/opad 结构', '<b>第 8 章 8.6 / 8.7 / 8.8</b>', '只在地图上定位'],
-            ['动态编码表、加盐改常量的组合变种、黑盒调用收尾', '<b>第 9 章</b>', '只在地图上定位'],
-            ['自吐沙箱：在 MessageDigest / Cipher / Mac 处插桩', '<b>第 24 章</b>', '本章 31.14 只回答「它覆盖了密钥来源的哪几种」'],
-            ['白盒 AES 与 DFA 密钥提取', '<b>第 25 章</b>', '本章 31.14 只回答「密钥从哪来」里的白盒那一格'],
-            ['TLS 握手、证书链、密钥交换', '<b>第 23 章</b>', '本章 31.13 只讲<b>它对逆向的意义</b>：为什么会话密钥拿不到'],
-            ['<b>RSA 本身</b>、算法分类地图、密钥来源收口', '<b>← 本章（第 31 章）</b>',
-             '<b>这三件事前面没讲过</b>。第 8 章只在案例里出现过「RSA 计数为 0」，第 9 章只出现过「RSA 公钥分片」——都没有讲 RSA 是什么']
-          ]
-        ) +
-        T.note('warn', '⚠️ 一个容易误判的地方',
-          '<p style="margin-bottom:0">「这个 App 用了 RSA」这句话，在整个分析里的权重<strong>远低于</strong>你以为的。' +
-          '因为公钥是公开的，<b>用了 RSA 本身不构成任何保护</b>——真正决定你能不能复现的，是它把 RSA 用在哪一步、' +
-          '是加密还是签名、用什么填充、以及对端的私钥在哪。<br>' +
-          '所以看到 RSA 先别兴奋，先问：<b>它想解决什么问题？</b></p>'),
-      term: {
-        title: '六类功能的「一句话判据」（照着自上而下试，成本从低到高）',
-        lines: [
-          { t: 'o', s: '能被我手工解码成可读文本吗？（Base64 / Hex / URL）', note: '<b>能 → 先当编码处理，别急着找密钥。</b>多数「加密参数」在这一步就掉一层皮。' },
-          { t: 'o', s: '输出长度是固定的 16 / 20 / 28 / 32 / 48 / 64 字节吗？', note: '<b>是 → 大概率是摘要（或 MAC）。</b>摘要的长度是规范定死的，而密文的长度随明文变化。' },
-          { t: 'w', s: '密文长度是 8 或 16 的整数倍，且同一明文两次加密结果不同吗？', note: '<b>是 → 分组对称加密 + 随机 IV / 随机填充。</b>下一步去找 Key 和 IV 的构造点。' },
-          { t: 'w', s: '长度等于密钥长度（128 / 256 / 384 / 512 字节）且与明文长度无关吗？', note: '<b>是 → 非对称加密的密文。</b>RSA-2048 的密文恒为 256 字节，无论明文是 1 字节还是 190 字节。' },
-          { t: 'd', s: '是一大段与请求内容无关、每次都一样的常量吗？', note: '<b>是 → 公钥 / 证书 / 或者一个固定填充的假加密。</b>这正是本章 31.9～31.12 要分辨的东西。' }
+        '<p>先把最容易搞错的一件事摆正：<b>容器和虚拟机之间没有继承关系</b>。容器不是「瘦身版的虚拟机」，它是 Linux 内核几套既有机制被组合出来的一种<b>用法</b>。把这一点想通，后面所有细节都会自动归位。</p>'
+        + T.tbl(['维度', '容器', '虚拟机'], [
+            ['内核', '<b>共享宿主内核</b>（同一份）', '<b>独立内核</b>（Guest OS 自带）'],
+            ['隔离机制', 'namespace —— <b>软件隔离</b>，改的是「视图」', '硬件虚拟化 VT-x / AMD-V —— <b>硬件隔离</b>'],
+            ['隔离强度', '<b>弱</b>：内核漏洞 / 危险 capabilities 可逃逸', '强：逃逸要靠虚拟化层本身的漏洞'],
+            ['启动开销', '极小 —— <b>就是一个进程</b>，毫秒级', '大 —— 要引导完整 OS，秒级'],
+            ['资源占用', '低（MB 级）', '高（GB 级）'],
+            ['单机密度', '几十到几百个', '几个到十几个（受内存限制）']
+          ])
+        + T.note('key', '🔑 一句话记牢', '<p><code>docker run</code> 的本质，是内核的 <b>clone() 带上一堆 <code>CLONE_NEW*</code> 标志</b>创建了一个新进程，给它换了个根目录，再用 cgroup 给它套上额度。<b>没有任何虚拟硬件被创建</b>。最快的判别方法：在容器里敲 <code>uname -r</code>，看到的是<b>宿主机的内核版本</b>；在虚拟机里敲，看到的是 Guest 自己的内核版本。</p>')
+        + T.note('warn', '⚠️ 反向误解：容器「更安全」', '<p>很多人以为「隔离就等于安全」。方向恰恰相反：<b>虚拟机的隔离强度高于容器</b>。容器里的 root（尤其是带上了 <code>CAP_SYS_ADMIN</code>、或挂载了宿主目录时）离宿主 root 只差一个内核漏洞。这既是云手机厂商的成本考量，也是风控厂商的检测入口 —— 31.12 会专门演练这个战场。</p>'),
+      after: '<p>那容器究竟由哪几块拼成？下一节把它们拆成四根柱子，一根一根装上去。</p>'
+    },
+
+    /* ============ 31.2 ============ */
+    {
+      h: '31.2',
+      title: '容器是由什么拼出来的：四根柱子',
+      html:
+        '<p>Docker 的文档喜欢把容器讲成「镜像 + 运行时」的黑盒。我们换一个讲法：<b>容器 = 四组内核机制同时作用在一个普通进程上</b>。下面这张图把它们拆成四根柱子，逐步点亮，看每一根装上去之后这个世界多了什么。</p>'
+        + '<p>先认识三个必须在术语上分清的东西：' + T.term('namespace', '命名空间：Linux 的资源隔离机制，决定进程「看得见什么」。注意它是视图隔离，不是物理隔离') + '、'
+        + T.term('cgroup', 'control group 控制组：Linux 的资源限制机制，决定进程「能用多少」') + '、'
+        + T.term('veth pair', '虚拟网卡对：成对出现的两块虚拟网卡，像一根网线连接两个网络命名空间') + '。三者加上一个 rootfs，就是你在 <code>docker ps</code> 里看到的那一行。</p>'
+        + T.note('key', '🔑 四根柱子的分工', '<p><b>namespaces 管「看不见」</b>（隔离视图）→ <b>cgroup 管「用不了那么多」</b>（限制资源）→ <b>rootfs 管「文件系统长什么样」</b>（换根）→ <b>veth + capabilities/seccomp 管「怎么连出去、还剩多少权限」</b>。任何号称「容器」的东西，缺了其中任意一根都跑不起来 —— 这也是你自己写容器时的检查清单。</p>'),
+      stage: {
+        title: '容器装配图：四根柱子一根一根装上去',
+        speed: 2000,
+        render:
+          '<div class="flow-row" style="align-items:stretch;gap:12px">' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">① namespaces · 看不见</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="nsp1">CLONE_NEWPID · 进程视图</div>' +
+                '<div class="blk" id="nsp2">CLONE_NEWNET · 网络视图</div>' +
+                '<div class="blk" id="nsp3">CLONE_NEWNS · 挂载视图</div>' +
+                '<div class="blk" id="nsp4">CLONE_NEWUTS · 主机名</div>' +
+                '<div class="blk" id="nsp5">CLONE_NEWIPC · IPC 对象</div>' +
+                '<div class="blk" id="nsp6">CLONE_NEWUSER · UID 映射</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">② cgroup · 用不了那么多</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="cgp1">cpu.max · CPU 配额</div>' +
+                '<div class="blk" id="cgp2">memory.max · 内存上限</div>' +
+                '<div class="blk" id="cgp3">pids.max · 进程数上限</div>' +
+                '<div class="blk" id="cgp4">io.max · 磁盘带宽</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">③ rootfs · 有哪些文件</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="rfp1">/ 换成容器的根目录</div>' +
+                '<div class="blk" id="rfp2">/proc · 重挂 procfs</div>' +
+                '<div class="blk" id="rfp3">/sys · 重挂 sysfs</div>' +
+                '<div class="blk" id="rfp4">/dev · 最小设备集</div>' +
+              '</div>' +
+            '</div>' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">④ 网络与权限 · 怎么连、剩多少权</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="nvp1">eth0 · 容器里的网卡</div>' +
+                '<div class="blk" id="nvp2">vethXXXX · 宿主这端</div>' +
+                '<div class="blk" id="nvp3">docker0 · 虚拟网桥</div>' +
+                '<div class="blk" id="nvp4">capabilities · 能力裁剪</div>' +
+                '<div class="blk" id="nvp5">seccomp · 系统调用过滤</div>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="flow-row" style="margin-top:14px">' +
+            '<span class="blk" id="sum1">PID 1 = 你的程序</span>' +
+            '<span class="arrow">+</span>' +
+            '<span class="blk" id="sum2">限额生效</span>' +
+            '<span class="arrow">+</span>' +
+            '<span class="blk" id="sum3">/ 指向 rootfs</span>' +
+            '<span class="arrow">+</span>' +
+            '<span class="blk" id="sum4">能连出去</span>' +
+            '<span class="arrow">=</span>' +
+            '<span class="blk" id="sum5">这就是「容器」</span>' +
+          '</div>',
+        reset: () => {
+          ['nsp1','nsp2','nsp3','nsp4','nsp5','nsp6','cgp1','cgp2','cgp3','cgp4',
+           'rfp1','rfp2','rfp3','rfp4','nvp1','nvp2','nvp3','nvp4','nvp5',
+           'sum1','sum2','sum3','sum4','sum5'].forEach((k) => S(k, ''));
+        },
+        steps: [
+          { run: () => S('sum1', 'active'),
+            note: '<b>起点：一个再普通不过的进程。</b>你敲下 <code>docker run</code> 时，内核里并没有发生什么「创建机器」的大事 —— containerd 只是准备了一次 <code>clone()</code> 调用。容器的一切特殊性，都是这次 clone 之后才被贴上去的。记住这个起点，后面每一步都只是往这个进程上加约束。' },
+          { run: () => S('nsp1', 'active'),
+            note: '<b>①-A PID namespace（CLONE_NEWPID）。</b>新进程成为新命名空间里的 <b>PID 1</b>。它看不到宿主机上的任何其他进程，宿主机上的 <code>ps</code> 也看不到它。这就解决了「进程互相干扰」的问题 —— 容器 A 里跑什么，容器 B 里完全不知道。' },
+          { run: () => S('nsp2', 'active'),
+            note: '<b>①-B NET namespace（CLONE_NEWNET）。</b>给它一套全新的网卡、路由表、iptables 规则和端口空间。于是两个容器可以同时监听 80 端口而互不冲突 —— 因为「80 端口」在各自的网络命名空间里是两回事。<b>没有这一层，容器网络无从谈起。</b>' },
+          { run: () => { S('nsp3', 'active'); S('nsp4', 'active'); },
+            note: '<b>①-C Mount（CLONE_NEWNS）+ UTS（CLONE_NEWUTS）。</b>挂载命名空间让进程拥有独立的挂载点视图，可以安全地换根；UTS 命名空间隔离主机名与域名，容器里 <code>hostname</code> 改成什么都不会影响宿主机。<span class="mono">注意 flag 叫 NEWNS 而不是 NEWMNT</span> —— 历史遗留命名，考试与文档里经常出现，别写错。' },
+          { run: () => { S('nsp5', 'active'); S('nsp6', 'active'); S('sum1', 'done'); },
+            note: '<b>①-D IPC（CLONE_NEWIPC）+ USER（CLONE_NEWUSER）。</b>IPC 隔离 System V IPC 与 POSIX 消息队列，防止容器间通过共享内存串门；USER 做 UID 映射，让<b>非 root 用户也能创建容器</b> —— 这是 rootless 容器的基础。至此「看不见」这一列完成：<b>它现在活在一个只有自己的世界里</b>。' },
+          { run: () => { ['cgp1','cgp2','cgp3','cgp4'].forEach((k) => S(k, 'active')); S('sum2', 'active'); },
+            note: '<b>② cgroup：从「看不见」到「拿不走」。</b>光隔离不限制，一个容器里的死循环照样能把整台机器吃光。cgroup 就是那道闸门：把进程 PID 写进 <code>cgroup.procs</code>，再往 <code>cpu.max</code>、<code>memory.max</code>、<code>pids.max</code> 里写上限。<b>namespace 管邻居是谁，cgroup 管你能吃多少 —— 两者缺一不可。</b>' },
+          { run: () => { ['rfp1','rfp2','rfp3','rfp4'].forEach((k) => S(k, 'active')); S('sum3', 'active'); },
+            note: '<b>③ rootfs：换掉整个文件系统。</b>用 <code>pivot_root</code>（或 <code>chroot</code>）把进程眼中的 <span class="mono">/</span> 指到容器的根目录。接着必须<b>重新挂载 /proc、/sys、/dev</b> —— 因为换了根以后，旧的 <code>/proc</code> 挂载点已经看不到了，而 <code>ps</code>、<code>free</code>、<code>ifconfig</code> 全都靠它。<b>这一步是新手最常漏的坑</b>：漏了 /proc，容器里连 <code>ps</code> 都跑不起来。' },
+          { run: () => { ['nvp1','nvp2','nvp3'].forEach((k) => S(k, 'active')); S('sum4', 'active'); },
+            note: '<b>④-A 网络：veth pair 把容器接出去。</b>刚创建的网络命名空间里只有一块 down 状态的 <code>lo</code>。运行时创建一对 veth 虚拟网卡，一端丢进容器的命名空间改名 <code>eth0</code>，另一端留在宿主机插到 <code>docker0</code> 网桥上。<b>记住「网卡是成对出现的」</b> —— 这是理解容器网络的钥匙，31.7 会逐跳验证。' },
+          { run: () => { S('nvp4', 'active'); S('nvp5', 'active'); },
+            note: '<b>④-B capabilities + seccomp：把 root 的权限切碎。</b>容器里的 root 默认已经丢掉了大量 capability（不能改内核模块、不能改系统时间、不能直接挂载设备）；seccomp 再从系统调用层面过滤掉危险调用。<b>这一层决定了「容器逃逸有多难」</b> —— 也是风控判断「你是不是在容器里」的重要依据。' },
+          { run: () => { S('sum5', 'hot'); S('sum1', 'cool'); S('sum2', 'cool'); S('sum3', 'cool'); S('sum4', 'cool'); },
+            note: '<b>合体完成。</b>四根柱子都装好了，你现在拥有一个「看起来像一台机器、实际上只是一个被约束的进程」的东西。回头看：<b>没有任何一行代码在模拟硬件，没有任何一个内核被拷贝</b>。Docker 不是魔法，Docker 是这四根柱子的封装器 —— 下一节先跟虚拟机并排比一次，再动手自己造。' }
+        ]
+      },
+      after: T.note('', '📌 这张图的用法', '<p>以后遇到任何容器相关问题，先问自己「是四根柱子里的哪一根出问题了」：看不见对方进程 → PID namespace；端口冲突 → NET namespace；<code>ps</code> 报错 → rootfs 里 /proc 没挂；OOM 被杀 → cgroup 的 <code>memory.max</code>；连不上网 → veth/docker0/NAT。<b>把这张图背下来，排障速度会快一个数量级。</b></p>')
+    },
+    /* ============ 31.3 ============ */
+    {
+      h: '31.3',
+      title: '并排看：共享内核 vs 独立内核',
+      html:
+        '<p>上一节说「容器共享宿主内核」，这句话值得单独画一张图钉死。下面把两者按分层摊开 —— 请重点盯<b>内核层有几份</b>，以及<b>每一层上面压着几个应用</b>。</p>'
+        + '<p>为什么要花一整节讲这个？因为在实战里，「我到底是在容器里还是在虚拟机里」这个问题会反复出现：它决定了你能不能 <code>insmod</code>、能不能改系统时间、能不能看到别人、以及风控会不会把你标出来。<b>分层图是判断这一切的坐标系。</b></p>',
+      stage: {
+        title: '架构对比：容器（共享内核） vs 虚拟机（独立内核）',
+        speed: 2000,
+        render:
+          '<div class="flow-row" style="align-items:stretch;gap:14px">' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">容器 · 一个内核，多个隔离视图</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="ca1">App A（独立 rootfs）</div>' +
+                '<div class="blk" id="ca2">App B（独立 rootfs）</div>' +
+                '<div class="blk" id="cl1">libc / 依赖（各一份）</div>' +
+                '<div class="blk" id="cl2">libc / 依赖（各一份）</div>' +
+                '<div class="blk" id="cr1">namespaces + cgroup 施加的「视图与额度」</div>' +
+                '<div class="blk" id="ck1">宿主内核 · 全程只有这一份</div>' +
+                '<div class="blk" id="ch1">物理硬件</div>' +
+              '</div>' +
+              '<div id="ct1" class="pill">启动：毫秒级</div>' +
+            '</div>' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">虚拟机 · 每个 Guest 一套完整内核</div>' +
+              '<div class="flow-col">' +
+                '<div class="blk" id="va1">App A</div>' +
+                '<div class="blk" id="va2">App B</div>' +
+                '<div class="blk" id="vg1">Guest OS 内核 A（完整 OS 映像）</div>' +
+                '<div class="blk" id="vg2">Guest OS 内核 B（完整 OS 映像）</div>' +
+                '<div class="blk" id="vv1">Hypervisor（VT-x / AMD-V 硬件虚拟化）</div>' +
+                '<div class="blk" id="vh1">物理硬件</div>' +
+              '</div>' +
+              '<div id="ct2" class="pill">启动：秒级</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="flow-row" style="margin-top:14px">' +
+            '<span class="blk" id="k1">隔离强度</span>' +
+            '<span class="blk" id="k2">启动开销</span>' +
+            '<span class="blk" id="k3">单机密度</span>' +
+            '<span class="blk" id="k4">判据 uname -r</span>' +
+            '<span class="blk" id="k5">逃逸难度</span>' +
+          '</div>',
+        reset: () => {
+          ['ca1','ca2','cl1','cl2','cr1','ck1','ch1','va1','va2','vg1','vg2','vv1','vh1',
+           'k1','k2','k3','k4','k5'].forEach((k) => S(k, ''));
+          CLS('ct1', 'pill'); SET('ct1', '启动：毫秒级');
+          CLS('ct2', 'pill'); SET('ct2', '启动：秒级');
+        },
+        steps: [
+          { run: () => { S('ca1', 'active'); S('ca2', 'active'); },
+            note: '<b>先看应用层，两边是一样的。</b>无论容器还是虚拟机，跑的都是普通 Linux 用户态程序。差别不在这里，往下看。' },
+          { run: () => { ['cl1','cl2'].forEach((k) => S(k, 'active')); S('ca1', 'done'); S('ca2', 'done'); },
+            note: '<b>容器：每个应用有自己的依赖库和 rootfs。</b>这正是容器「环境一致性」的来源 —— 把 libc、openssl 这些依赖连同程序一起打包，换台机器照样跑。注意它<b>只打包用户态</b>，内核不打。' },
+          { run: () => { S('cr1', 'active'); S('cl1', 'done'); S('cl2', 'done'); },
+            note: '<b>容器：中间这一层是「约束」而不是「系统」。</b>namespaces 提供隔离视图，cgroup 提供资源额度，capabilities/seccomp 裁掉多余权限。它们全部由<b>宿主内核自己实现</b>，容器里没有任何一份独立的内核代码。' },
+          { run: () => { S('ck1', 'hot'); S('cr1', 'done'); },
+            note: '<b>★ 关键：宿主内核只有一份，所有容器共用。</b>这就是「合租公寓的承重墙」。它带来两个后果 —— 好处是启动极快、内存占用极低（不需要为每个容器加载一份内核）；代价是<b>内核漏洞一旦被利用，影响的是整栋楼</b>。容器的隔离强度天然低于虚拟机，根源就在这一格。' },
+          { run: () => { ['va1','va2','vg1','vg2'].forEach((k) => S(k, 'active')); },
+            note: '<b>虚拟机：每个 Guest 自带一套完整内核</b>（含驱动、调度器、内存管理、网络协议栈）。这就是为什么虚拟机镜像动辄 GB 级，而容器镜像可以只有几 MB —— 容器省掉的那部分，正是整个 OS。' },
+          { run: () => { S('vv1', 'active'); ['va1','va2','vg1','vg2'].forEach((k) => S(k, 'done')); S('ch1', 'cool'); S('vh1', 'cool'); },
+            note: '<b>虚拟机靠 Hypervisor + CPU 硬件虚拟化指令（VT-x / AMD-V）实现隔离。</b>Guest 的每一次特权操作都会被硬件截获并交给 Hypervisor 处理。<b>这是硬件级隔离</b>，与容器的「内核帮忙改个视图」完全不是一个量级 —— 前者是物理隔断，后者是软件约定。' },
+          { run: () => { S('k1', 'cool'); S('k2', 'hot'); },
+            note: '<b>对比一：隔离强度（虚拟机强）与启动开销（容器小）。</b>注意这两个结论<b>方向相反</b> —— 这正是选型时的核心权衡。云手机厂商大量采用容器方案，赌的就是「密度和成本」，而不是「更强隔离」。<span class="pill warn">具体性能数字随硬件、内核、负载差异很大，不要背数字，记住量级关系即可</span>' },
+          { run: () => { S('k2', 'done'); S('k3', 'active'); S('ct1', 'done'); S('ct2', 'done'); },
+            note: '<b>对比二：单机密度。</b>容器只是进程，密度受限于内存和 PID 数量；虚拟机每个都要预留一大块内存和磁盘。同一台 128G 的机器，跑十几个虚拟机就到顶了，跑几十上百个容器是常态 —— <b>这就是云手机能「一台宿主机开几百个安卓实例」的底层原因</b>（第 32 章 Waydroid 会用到这个结论）。' },
+          { run: () => { S('k3', 'done'); S('k4', 'active'); },
+            note: '<b>对比三：一条命令判断你在哪。</b>在容器里 <code>uname -r</code> 返回<b>宿主内核版本</b>；在虚拟机里返回 Guest 自己的。这是最快的判据。<span class="mono">补充判据</span>：<code>systemd-detect-virt</code> 的输出在容器里常为 <code>docker</code>/<code>lxc</code>/<code>podman</code>，在虚拟机里为 <code>kvm</code>/<code>vmware</code>；容器里 <code>cat /proc/1/cgroup</code> 往往能看到容器 ID 的痕迹。' },
+          { run: () => { S('k4', 'done'); S('k5', 'hot'); S('ck1', 'hot'); },
+            note: '<b>★ 对比四：逃逸难度，方向与直觉相反。</b>很多人默认「容器更轻更现代所以更安全」。事实是：<b>容器逃逸通常只需一个内核漏洞，或一次危险 capability 的滥用；虚拟机逃逸要攻破虚拟化层本身，难度高一个档次。</b>记住这句话 —— 它既是安全常识，也是下一节「风控怎么发现你」的伏笔。' }
         ]
       },
       quiz: {
-        id: 'q31-1', chapter: 31, answer: 2,
-        stem: '一位同事总结说：「非对称加密比对称加密安全，因为它密钥更长。」按本章的六类分工，这句话最根本的<b>错</b>在哪？',
+        id: 'q17-1', chapter: 17,
+        answer: 2,
+        stem: '你远程连上一台「云手机」，想确认它的底座到底是容器还是虚拟机。下面哪一组命令的输出，能<b>最直接地</b>证明它跑在容器里？',
         options: [
-          { t: '错在密钥长度：RSA-2048 的密钥其实没有 AES-128 长', why: '长度确实不能直接横比（2048 位的 RSA 模数与 128 位的 AES 密钥不是同一种量），但这只是表面问题，没说到点子上。' },
-          { t: '错在「更安全」：非对称加密慢得多，所以实际系统里只用它来传对称密钥', why: '「慢」是事实，也确实解释了混合加密的动机，但这是性能层面的事实，不是这句话的症结。' },
-          { t: '错在把两类算法当成「同一件事的强弱两档」：它们解决的是不同问题——对称解决「保密」，非对称解决「密钥怎么送到对方手里」和「身份能不能被验证」', why: '正确。六类功能是按「解决什么问题」划分的，不是按「强度」排名的。RSA 的意义在于它能把「保密」拆成「公开的东西 + 只有我有的东西」，从而绕开密钥分发难题；把它当成「更强的 AES」会直接导致你在逆向时判断错方向。' },
-          { t: '错在「密钥更长」：非对称加密的密钥其实更短', why: '事实层面就反了——RSA 的模数动辄 2048 位，比 AES 的 128/256 位长得多。选这个说明还没建立两类算法的长度直觉。' }
+          { t: '<code>uname -m</code> 返回 <code>aarch64</code>', why: '这只说明用户态/内核报告的机器架构是 ARM64，和「容器还是虚拟机」完全无关。真机、模拟器、容器、虚拟机都可能是 aarch64。' },
+          { t: '<code>cat /proc/cpuinfo</code> 里出现了 QEMU 的字样', why: '这指向的是<b>模拟器</b>（QEMU 模拟 CPU），不是容器。容器共享宿主内核、不模拟 CPU，所以这条判据方向整个错了。' },
+          { t: '<code>cat /proc/1/cgroup</code> 里出现形如 <code>/docker/&lt;一长串ID&gt;</code> 的路径', why: '正确。cgroup 路径记录了 1 号进程被放进了哪个 cgroup 层级，容器的 1 号进程是被运行时创建并放进专属 cgroup 的，路径里因此带着容器 ID 或编排系统前缀（kubepods 等）。<b>这是最硬的容器指纹之一。</b>' },
+          { t: '<code>df -h</code> 显示根分区容量很小', why: '容量小只能说明磁盘配得小，真机也可以是小容量分区。虽然容器镜像确实通常很小，但它不是判据 —— 判据要能反映「机制」而不是「习惯」。' }
         ],
-        explain: '<b>这道题考的是「地图是按功能分的，不是按强度分的」。</b>六类功能里，编码解决「能不能塞进文本协议」，摘要解决「有没有被改过」，MAC 解决「有没有被改过<b>且</b>是不是你发的」，对称解决「别人看不懂」，非对称解决「<b>公钥可以公开，也能完成保密或验签</b>」，密钥交换解决「密钥从哪来」。<br>' +
-          '把它们理解成一条从弱到强的阶梯，后果很具体：你会以为「既然它用了 RSA，那一定比 AES 难搞」——而事实往往相反。<b>RSA 的公钥就摆在二进制里或证书里，你甚至可以不「破解」它，只需要照着用它。</b>' +
-          '反过来，AES 的密钥可能压根不出 KeyStore，那才是真的难。' +
-          '<p>顺带把长度的直觉建立起来：<b>摘要</b>的长度固定且很短（16 / 20 / 32 字节）；<b>对称加密</b>的密文长度是块大小（AES 为 16 字节）的整数倍、随明文增长；' +
-          '<b>非对称加密</b>的密文长度等于模长（RSA-2048 恒为 256 字节）、与明文长度无关。这三个长度规律，是你在不知道任何别的东西时最便宜的三把尺子。</p>'
+        explain: '<b>判据必须来自机制本身，而不是经验观察。</b><code>/proc/1/cgroup</code> 之所以可靠，是因为它直接读出了「1 号进程属于哪个 cgroup」这个内核事实 —— 而 Docker/K8s/LXC 都会为容器主进程建立专属的 cgroup 层级，路径名就是证据。<br><br>其他几条佐证（组合起来更硬）：<code>uname -r</code> 返回宿主内核版本、<code>/.dockerenv</code> 文件存在、网卡名带 <code>@ifN</code> 后缀、IP 落在 172.17/172.18 网段、主机名是随机十六进制。<b>注意 <code>/.dockerenv</code> 是「有则可疑，无则不能证明不是」</b> —— 它可以被删掉。<br><br>把能力用在本章上：判断底座决定了你后续能用哪些调试手段（容器里通常没有内核模块权限），所以这应该是接手任何云环境时的<b>第一步</b>。'
       },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">你应该能背出六类的名字，并且知道<b>每一类「在 App 里长什么样」</b>。' +
-        '更重要的是记住那条总纲：<b>只有非对称这一类的公钥是设计上就要公开的</b>——所以逆向 RSA，重点不是找密钥，而是读结构和判方向。</p>')
+      after:
+        T.note('key', '🔑 这对逆向 / 环境伪装有什么用', '<p>① <b>判断自己在哪：</b>拿到一台「云手机」或「云真机」，第一件事就是确定底座是容器还是虚拟机 —— <code>uname -r</code>、<code>/.dockerenv</code>、<code>/proc/1/cgroup</code> 三连就能定性，这决定了你后续能用哪些提权/调试手段。</p>'
+          + '<p>② <b>利用共享内核：</b>容器共享宿主内核意味着<b>宿主上装了什么模块，容器里就可能用得上</b>（取决于权限和 seccomp）——<code>ebpf</code> 抓包、<code>perf</code>、某些内核接口在虚拟机里根本不存在，在容器里却可能可用（第 25 章 eBPF 与这一章合起来看会很有感觉）。</p>'
+          + '<p>③ <b>反检测意识：</b>风控识别模拟器/云手机时，容器特征（挂载表、cgroup 路径、网络握手特征）是重要证据链之一。你要先知道「特征从哪来」，才谈得上伪装。</p>'
+          + '<p>④ <b>能力规划：</b>容器里往往没有完整 <code>/sys</code>、没有内核模块权限，所以依赖内核模块的调试方案（部分内核态 Hook、自定义驱动）在容器化云手机上会直接失效 —— <b>选方案前先确认底座</b>。</p>')
     },
 
-    /* ============================================================ 31.2 */
+    /* ============ 31.4 ============ */
     {
-      h: '31.2', title: '三个可测量的量：长度、字符集、熵',
+      h: '31.4',
+      title: 'namespaces API 实战：三个系统调用，七个标志',
       html:
-        '<p>地图给了你六个格子，但你手上只有一串字节。<b>把字节变成格子，靠的是三个能直接测出来的量。</b>' +
-        '它们之所以重要，是因为这三个量不需要你读懂一行代码、也不需要 Hook 上进程——抓包看到的那一瞬间就能算。</p>' +
-        T.grid(3, [
-          '<div class="card"><div class="card-title">① 长度</div>' +
-          '<p>先量字节数，再问三个问题：<b>是不是固定的？</b>（16/20/32 → 摘要）<b>是不是 16 的整数倍？</b>（AES 分组）' +
-          '<b>是不是等于 128/256/384/512？</b>（RSA 密文）</p>' +
-          '<p>长度是最便宜、也最容易被忽略的量。<span class="hit">很多「算法识别」的僵局，其实是长度没量对</span>——' +
-          '因为你量的可能是 Base64 <b>之后</b>的字符串长度，而不是原始字节数。Base64 会把长度放大到约 4/3 并向上取整到 4 的倍数。</p></div>',
-          '<div class="card"><div class="card-title">② 字符集</div>' +
-          '<p>把字符按类别数一遍：是否只出现 <span class="mono">A-Za-z0-9+/=</span>？是否只出现 <span class="mono">0-9a-f</span>？' +
-          '是否出现 <span class="mono">%</span>？是否有大量不可打印字节？</p>' +
-          '<p><b>只由 64 个可打印字符组成 → 编码。</b>这一点比长度还硬：真加密的输出是随机字节，' +
-          '随机字节里几乎必然出现不可打印字符，所以它必须先编码才能进 URL。<span class="hit">「先编码」这件事会留下痕迹。</span></p></div>',
-          '<div class="card"><div class="card-title">③ 熵（字节级）</div>' +
-          '<p>把每个字节值的出现次数统计出来，算香农熵 <span class="mono">H = -Σ p·log₂p</span>，单位是 bit/字节，上限 8。</p>' +
-          '<p>它是一个<b>真实可算</b>的量：ASCII 文本大约 3～4，随机字节接近 8（样本越长越接近）。' +
-          '它的价值在于<b>区分「看起来像随机」和「真的是随机」</b>：一段 16 字节的 ASCII 密钥（<span class="mono">MyS3cr3tKey2024!</span>）熵只有 3.6 左右，' +
-          '而一段 16 字节的随机密钥接近 4（样本太短，熵本身就上不去）。<span class="pill warn">注意</span>：短样本的熵不可靠，别用它下强结论。</p></div>'
-        ]) +
-        '<h4>量完之后怎么下判断</h4>' +
-        T.tbl(['你量到的', '优先怀疑', '下一步动作'],
-          [
-            ['长度固定 16 / 20 / 32 字节，字符集是十六进制', '<b>摘要</b>（MD5 / SHA-1 / SHA-256）',
-             '拿同样长度去比标准算法的输出；再搜 IV / K 表看有没有魔改（第 8 章 8.3）'],
-            ['长度是 16 的整数倍，随明文增长，两次加密结果不同', '<b>对称加密 + 随机 IV</b>',
-             '找 Key / IV 的构造点；用第 24 章的自吐沙箱思路在 <span class="mono">Cipher.init</span> 处取参数'],
-            ['长度恒为 256 字节，与明文长度无关，每次都不一样', '<b>RSA-2048 公钥加密</b>',
-             '转本章 31.8 的填充判断与 31.10 的公钥提取'],
-            ['长度恒为 256 字节，<b>同一明文每次结果完全相同</b>', '<b>裸 RSA 或固定填充</b>',
-             '这是本章 31.12 的重点甄别项：确定性意味着可被字典攻击'],
-            ['一大段与请求无关、每次都一样的常量', '<b>公钥 / 证书 / 诱饵</b>',
-             '走 31.10 的公钥常量识别器：看长度、看首字节、看 DER 结构是否自洽'],
-            ['长度约为原文的 4/3，字符集是 64 个可打印字符', '<b>Base64 编码（可能换了表）</b>',
-             '先按标准表解一次；解出来是乱码再考虑换表（第 8 章 8.4）']
-          ]) +
-        T.note('key', '🔑 这三个量的正确用法：先排除最便宜的类别',
-          '<p style="margin-bottom:0">不要一上来就假设「它是加密」。<b>先花两分钟量长度、数字符、算熵，把「编码」和「摘要」这两个最便宜的类别排除掉。</b><br>' +
-          '理由很实际：编码的还原成本是几行代码，摘要的还原成本是一次常量比对，而 RSA 的还原成本可能要读 DER、对填充、找方向。' +
-          '<b>按成本从低到高试，是第 8 章就立下的规矩，在地图这一层同样适用。</b></p>'),
-      stage: {
-        title: '三个量构成的分类流水线 · 从一串字节到一个类别',
-        legend: '<span class="pill acc mono">3 道闸门 + 1 个结论</span>',
-        speed: 1600,
-        render:
-          '<div class="flow-col" style="gap:10px">' +
-            '<div class="flow-row"><span class="pill mono">输入</span>' +
-              '<span class="blk" id="in0">一串字节 / 一个参数 / 一段常量</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓ 闸门 1</span>' +
-              '<span class="blk" id="g1">量长度</span>' +
-              '<span class="blk" id="g1r">固定？16 的倍数？等于 256？</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓ 闸门 2</span>' +
-              '<span class="blk" id="g2">数字符集</span>' +
-              '<span class="blk" id="g2r">只有 64 个可打印字符 → 编码</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓ 闸门 3</span>' +
-              '<span class="blk" id="g3">算熵</span>' +
-              '<span class="blk" id="g3r">真随机还是 ASCII？</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="concl">结论：待定</span></div>' +
-            '<div id="plog" style="margin-top:8px;font-family:var(--mono);font-size:12.5px;color:var(--fg-3)">' +
-              '&gt; 等待开始</div>' +
-          '</div>',
-        reset: () => {
-          ['in0', 'g1', 'g1r', 'g2', 'g2r', 'g3', 'g3r'].forEach(i => S(i, ''));
-          S('in0', 'active');
-          CLS('concl', 'pill bad');
-          SET('concl', '结论：待定');
-          SET('plog', '&gt; 等待开始');
-        },
-        steps: [
-          { run: () => { S('in0', 'done'); S('g1', 'hot'); SET('plog', '&gt; 第 1 步：长度是最便宜的量，先量它'); },
-            note: '<b>闸门 1：量长度。</b>注意一个坑——<span class="hit">你量的必须是原始字节数</span>，' +
-                  '而不是 Base64 之后的字符串长度。很多人的「长度对不上」就出在这里：Base64 会把长度放大到约 4/3。' },
-          { run: () => { S('g1', 'done'); S('g1r', 'cool'); SET('plog', '&gt; 长度 32 字节：符合摘要长度，也符合 AES-256 密钥长度 —— 还不够'); },
-            note: '<b>长度只能缩小范围，不能定案。</b>32 字节既可能是 SHA-256 的摘要，也可能是一把 AES-256 密钥，还可能是一段随机数。' +
-                  '<b>所以必须往下走第二道闸门。</b>' },
-          { run: () => { S('g2', 'hot'); SET('plog', '&gt; 第 2 步：数字符集，判断它是不是「只能由可打印字符构成」'); },
-            note: '<b>闸门 2：数字符集。</b>这一步的判据比长度硬：真加密的输出是随机字节，<span class="hit">随机字节里几乎必然出现不可打印字符</span>，' +
-                  '所以它要进 URL / JSON 就必须再编码一次。而编码只由那 64 个字符组成。' },
-          { run: () => { S('g2', 'done'); S('g2r', 'cool'); SET('plog', '&gt; 字符集 = [0-9a-f] 十六进制表示：说明它已经被人为编码过，原始字节要先还原'); },
-            note: '<b>看到十六进制或 Base64，第一件事是「还原成原始字节」</b>，然后重新量长度。' +
-                  '<span class="hit">在编码后的形态上做算法判断，几乎一定会错。</span>' },
-          { run: () => { S('g3', 'hot'); SET('plog', '&gt; 第 3 步：算字节级香农熵，区分「像随机」和「是 ASCII」'); },
-            note: '<b>闸门 3：算熵。</b>熵不是玄学，是一个能真算出来的数：数 256 个桶的频次，代入公式即可。' +
-                  'ASCII 文本 3～4，随机字节接近 8。<b>但短样本不可靠</b>——16 字节的随机密钥熵通常也只有 4 左右，别拿它定案。' },
-          { run: () => { S('g3', 'done'); S('g3r', 'cool'); CLS('concl', 'pill ok'); SET('concl', '结论：高熵 + 定长 32 字节 → 优先怀疑摘要或对称密钥，而不是 RSA'); SET('plog', '&gt; 结论：进入对应的类别分支，按成本由低到高处理'); },
-            note: '<b>三道闸门走完，你得到的是一个「优先怀疑」，不是一个「确定结论」。</b>' +
-                  '这很重要：分类的价值在于<b>决定下一步去哪查</b>，不在于给答案。<br>' +
-                  '注意结论里那句「而不是 RSA」——<span class="hit">RSA 的密文长度等于模长（2048 位即 256 字节），这与 32 字节完全不同。</span>' +
-                  '长度这一个量，就已经把 RSA 排除掉了。' }
-        ]
-      },
+        '<p>namespace 在用户态只有三个入口，把这三个函数记住，你就掌握了容器隔离的全部 API 面。</p>'
+        + T.tbl(['系统调用', '作用', '典型场景'], [
+            ['<code>clone()</code>', '创建一个<b>新进程</b>，并在创建时指定它进入哪些新命名空间', '运行时的入口：容器主进程就是这么来的'],
+            ['<code>unshare()</code>', '让<b>当前进程</b>脱离某个命名空间，进入一个新的', '实验、<code>unshare</code> 命令行工具、rootless 工具链'],
+            ['<code>setns()</code>', '让当前进程<b>加入一个已存在的</b>命名空间', '<code>docker exec</code>、<code>nsenter</code>、调试已运行的容器']
+          ])
+        + '<p>七个标志（<code>clone()</code> / <code>unshare()</code> 共用）对照表 —— 这张表建议直接背下来：</p>'
+        + T.tbl(['标志', '隔离什么', '备注'], [
+            ['<code>CLONE_NEWPID</code>', 'PID 命名空间：容器内进程从 <b>PID 1</b> 开始，看不到宿主机其他进程', '★<b>只对之后 fork 出的子进程生效</b>'],
+            ['<code>CLONE_NEWNET</code>', '网络命名空间：独立网卡、路由表、iptables、端口空间', '新命名空间里默认只有 down 的 <code>lo</code>'],
+            ['<code>CLONE_NEWNS</code>', 'Mount 命名空间：独立挂载点视图', '★<b>叫 NEWNS 不叫 NEWMNT</b>，历史原因，高频考点'],
+            ['<code>CLONE_NEWUTS</code>', '主机名与域名隔离', 'UTS = UNIX Time-sharing System，历史名称'],
+            ['<code>CLONE_NEWIPC</code>', 'System V IPC 与 POSIX 消息队列隔离', '防止容器间通过共享内存「串门」'],
+            ['<code>CLONE_NEWUSER</code>', '用户与用户组 ID 映射', '<b>rootless 容器的基础</b>：非 root 也能造容器'],
+            ['<code>CLONE_NEWCGROUP</code>', 'cgroup 根目录视图隔离', '容器里 <code>cat /proc/self/cgroup</code> 看到的是自己的根']
+          ])
+        + T.note('bad', '❌ 最容易踩的坑：PID 不是立刻就变 1', '<p>调用 <code>unshare(CLONE_NEWPID)</code> 之后，<b>当前进程的 PID 不会改变</b>，它仍然是宿主机命名空间里的那个 PID。原因：PID 命名空间是在<b>进程创建时</b>绑定到进程上的。你必须再 <code>fork()</code> 一次，让子进程成为新命名空间的第一个进程（PID 1），或者干脆用 <code>clone(CLONE_NEWPID)</code> 直接带着标志创建子进程。<b>「unshare 完 PID 没变、以为内核不支持」是新手第一大坑</b>，下一个决策演练就是它。</p>')
+        + T.note('', '🔍 怎么查看当前的命名空间', '<p>每个进程在 <code>/proc/&lt;pid&gt;/ns/</code> 下都有一组软链接指向自己所属的各命名空间：<code>ls -l /proc/self/ns/</code> 会列出 <code>cgroup ipc mnt net pid pid_for_children user uts</code>。括号里的 <code>pid:[4026531836]</code> 这样的编号就是命名空间 inode 号 —— <b>两个进程的这个号相同，就说明它们共享同一个命名空间</b>。命令行工具 <code>lsns</code> 可以一次性列出系统里所有命名空间及其中进程数。<span class="pill warn">不同内核版本的 /proc 视图与 lsns 输出字段略有差异，待核实</span></p>')
+        + T.note('warn', '⚠️ 组合使用的权限讲究', '<p><code>CLONE_NEWUSER</code> 比较特殊：<b>它能让非特权用户创建其他命名空间</b>（先建 user namespace，在里面「成为 root」，再用这份名义上的权限去建 net/pid namespace）。但代价是新 user namespace 里的 root 在宿主机上<b>依然不是真正的 root</b>，只是被映射到某个普通 UID —— 这带来大量后续限制（比如某些挂载类型仍然不允许）。<b>「rootless 容器能跑，但有些事就是做不到」的根源就在这里。</b></p>'),
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境一',
-            scenario: '<b>情境：</b>你抓到一个请求参数 <span class="mono">sign</span>，值是 <b>344 个字符</b>的字符串，' +
-              '只由 <span class="mono">A-Za-z0-9+/</span> 组成，末尾是 <span class="mono">=</span>。' +
-              '同一个接口连发两次，<b>两次的值不同</b>；把请求体里改一个字节，值也全变。<br>' +
-              '你手上没有任何别的情报。第一步做什么？',
+            label: '情境一 · 我以为内核不支持 PID namespace',
+            scenario: '<b>情境：</b>你要亲手验证 PID 隔离。你写了一段 C：先调 <code>unshare(CLONE_NEWPID)</code>，紧接着 <code>printf(&quot;%d&quot;, getpid())</code>，期待看到 <code>1</code>。<br><br>'
+              + '结果打印出来是 <code>18422</code> —— 一个宿主机上的普通 PID。<code>unshare</code> 的返回值是 0，没有报错。<br><br>'
+              + '你接下来怎么做？',
             choices: [
-              { t: '先把末尾的 = 去掉、按 Base64 解码，量出原始字节数，再决定下一步', next: 'n1' },
-              { t: '这是签名，先假设它是 RSA 签名：用抓到的流量猜一段公钥，再尝试验签', next: 'n2' },
-              { t: '直接上 Frida，把 MessageDigest 和 Cipher 全挂一遍，让它自己吐', next: 'n3' },
-              { t: '先去看请求里还有没有别的字段（时间戳、随机数、设备号），把它们按几种常见顺序拼起来算 MD5 试', next: 'n4' }
+              { t: '怀疑内核没开 PID 命名空间支持，去查 config、换台机器或重新编译内核', next: 'n1' },
+              { t: '在 unshare 之后再 fork() 一次，让子进程打印自己的 PID', next: 'n2' },
+              { t: '改用 setns() 加入 /proc/1/ns/pid，把当前进程搬进去', next: 'n3' },
+              { t: '再加上 CLONE_NEWUSER 一起 unshare，这样才有权限让 PID 变成 1', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先花两分钟把「编码」这一层剥掉',
-            result: '<b>这一步的成本是几秒钟，收益却最大。</b>344 个字符按 Base64 解码后是 258 字节左右——' +
-              '<span class="hit">这个数字本身就是情报</span>：它立刻把「32 字节的摘要」排除掉了，' +
-              '同时把「256 字节左右的非对称结果」提到了最前面。<br>' +
-              'Base64 的长度关系是 <span class="mono">ceil(n/3)×4</span>（含填充），所以从 344 反推原始字节数是可算的。' +
-              '量出来之后你才知道自己在跟什么量级的东西打交道。<br>' +
-              '<b>注意这一步不是「解出明文」</b>——解出来大概率是乱码。它的目的是<b>把编码层剥掉，拿到真正的字节数和字节分布</b>。' +
-              '很多人在编码层上做算法判断，结果长度算错、熵算错，后面一路歪。'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：这不是内核支持问题',
+            result: '<b>认知根源：把「机制没生效」直接归因于「功能不存在」。</b><code>unshare</code> 返回 0 就已经说明内核<b>接受</b>了这个请求、命名空间创建成功了 —— 只是<b>当前进程不会因此换 PID</b>。<br><br>'
+              + '真正的原因：PID 命名空间在<b>进程被创建的那一刻</b>绑定到进程结构上，<code>unshare</code> 只是给「之后创建的子进程」准备好了新的命名空间。所以当前进程的 <code>getpid()</code> 当然还是老值。<br><br>'
+              + '<b>正确做法：</b><code>unshare(CLONE_NEWPID)</code> 之后立刻 <code>fork()</code>，子进程就是新命名空间的 PID 1；或者在 <code>fork()</code> 的子进程里做 unshare + 再 fork。用 <code>clone(CLONE_NEWPID)</code> 一次到位也可以。<br><br>'
+              + '<b>迁移经验：</b>凡是「调用了没反应」，先查这个机制的<b>生效时机</b>（创建时？写文件时？下一次系统调用时？），不要急着怀疑内核没编进去。'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'bad',
-            verdictTitle: '方向错了：你在「猜一把公钥」，而公钥通常就在 App 里',
-            result: '<b>认知根源：把「缺情报」当成了「要猜」。</b>RSA 的公钥要么硬编码在 so / dex 里，要么写在一张证书里，' +
-              '要么从服务端下发——<b>它是可获取的，不需要猜。</b><br>' +
-              '去猜公钥既不现实（密钥空间太大），也走错了顺序：你连它是签名还是加密都还没判断。' +
-              '签名和加密用的是<b>不同的密钥对</b>，判断错方向，后面的还原全是错的（本章 31.7 整节就在讲这件事）。<br>' +
-              '<b>正确顺序：先剥编码 → 量长度 → 判断方向 → 再去取证公钥。</b>'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：PID 命名空间只对之后创建的子进程生效',
+            result: '<b>这就是标准答案。</b>改造后的骨架大致是：<code>unshare(CLONE_NEWPID)</code> → <code>pid = fork()</code> → 子进程里 <code>getpid()</code> 得到 <b>1</b>。<br><br>'
+              + '<b>为什么必须这样：</b>PID 命名空间是一棵<b>树</b>，每个命名空间有自己的 PID 编号体系。新命名空间的第一个进程（PID 1）同时承担特殊职责 —— 它是这个命名空间的 init：<b>它挂了，整个命名空间的进程都会被内核杀掉</b>；它还要负责回收孤儿进程。<br><br>'
+              + '<b>顺带记住两个推论：</b>① 容器里 PID 1 必须是能正确处理信号、能回收子进程的程序，否则一 <code>kill</code> 就带崩整个容器，这正是 <code>--init</code> 选项存在的理由；② 新 PID 命名空间会自动挂载一个新的 <code>procfs</code>，你之后必须重新 <code>mount -t proc</code>，否则 <code>/proc</code> 里看到的还是宿主的进程列表。<br><br>'
+              + '<b>验证一下：</b><code>unshare --pid --fork --mount-proc /bin/bash</code>，然后 <code>echo $$</code> 应该得到 1。'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '跳过了最便宜的一步，直接上最贵的手段',
-            result: '<b>认知根源：把「动态 Hook」当成了万能起手式。</b>Hook 本身没错，但它是成本较高的一步：你要有 root 环境、要处理反调试、' +
-              '要面对加固。而你现在连<b>长度</b>都还没量。<br>' +
-              '更现实的问题：如果你还不知道它是<b>哪一类</b>算法，Hook 点就只能全挂——全挂的代价是海量日志，' +
-              '而海量日志里挑出有用那条，比自己算一遍还慢。<br>' +
-              '<b>Hook 应该用在「静态已经缩小了范围，需要确认」的时候，而不是用在「什么都不知道」的时候。</b>' +
-              '这正是第 8 章立的规矩：先用常量与结构把范围缩小，再上动态手段。'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：setns 搬的是「加入已有的」，解决不了你的问题',
+            result: '<b>认知根源：把三个系统调用的职责混为一谈。</b><code>setns()</code> 的语义是「<b>加入一个已经存在的</b>命名空间」，而 <code>/proc/1/ns/pid</code> 恰恰是<b>宿主机自己的</b> PID 命名空间 —— 你搬进去等于原地不动，甚至可能因为权限不足直接失败（<code>setns</code> 到 PID 命名空间需要 <code>CAP_SYS_ADMIN</code>）。<br><br>'
+              + '<b>三者的正确分工：</b><code>clone</code> = 创建进程并进入新命名空间；<code>unshare</code> = 当前进程脱离旧的、进入新的；<code>setns</code> = 加入别人已经建好的。<br><br>'
+              + '<b>setns 真正的用武之地：</b><code>docker exec</code> 要钻进一个正在运行的容器，靠的就是 setns；调试时用 <code>nsenter -t &lt;pid&gt; -n</code> 借一个进程的网络命名空间来抓包，也是它。<b>它的方向永远是「进去」，不是「新建」。</b>'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '先假定结论（它是摘要），再去做实验',
-            result: '<b>认知根源：把「常见」当成了「当前」。</b>「签名字段就是拼串算 MD5」确实是移动端最常见的形态，' +
-              '这条经验值得记；但你现在有更便宜、更硬的证据没用——<b>长度</b>。<br>' +
-              '344 个字符的 Base64 解码后约 258 字节，而 MD5 恒为 16 字节、SHA-256 恒为 32 字节。' +
-              '<span class="hit">如果它真是摘要，那它外面一定还套了别的东西</span>（比如被 RSA 加密过，或者被截断拼接）——' +
-              '这个可能性恰恰是你应该先确认的。<br>' +
-              '实验设计的第一原则是<b>用一个能区分假设的实验</b>。你提的这个实验无法区分「摘要」和「非对称」，' +
-              '因为无论结果如何你都会怀疑自己拼错了串。'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：权限不是这里的原因，而且加错顺序会更糟',
+            result: '<b>认知根源：把「权限不足」当成了万能解释。</b>你的 <code>unshare</code> 明明返回了 0，说明权限<b>没问题</b>（root 拥有 <code>CAP_SYS_ADMIN</code>）。加 <code>CLONE_NEWUSER</code> 不会让当前进程的 PID 变成 1，问题照样存在。<br><br>'
+              + '<b>而且这里有真实的顺序陷阱：</b>同时 unshare user + pid 时，正确的姿势是<b>先建 user namespace、在里面写 uid_map/gid_map 拿到名义权限，再建 pid namespace</b>。顺序写反或忘了写映射文件，会得到一个「里面什么都不敢做」的命名空间，报出各种 <code>EPERM</code>，比原来的问题更难查。<br><br>'
+              + '<b>思维习惯：</b>调用的返回值是判断权限的最直接证据 —— <b>返回 0 就代表内核已经答应了你的请求</b>，此时应该去查「语义/时机」，而不是继续加权限。'
           }
         }
       },
-      quiz: {
-        id: 'q31-2', chapter: 31, answer: 1,
-        stem: '一段 Base64 字符串共 <b>344 个字符</b>（含末尾填充）。把它还原成原始字节后，长度最接近下面哪个？',
-        options: [
-          { t: '约 258 字节', why: '正确。Base64 每 4 个字符表示 3 字节，344 ÷ 4 × 3 = 258。去掉填充后实际字节数在 256～258 之间——这正好落在 RSA-2048 的密文/签名长度（256 字节）附近。' },
-          { t: '约 172 字节', why: '这是把关系算反了（用 344 ÷ 2 = 172）。Base64 的膨胀比是 4/3 而不是 2，用 2 除会把长度低估一半，后面所有长度判断都会跟着错。' },
-          { t: '约 344 字节', why: '这是把「编码后」当成了「原始」。Base64 是膨胀编码，原始字节必然比字符串短——除非字符串里大量是无意义的填充字符。' },
-          { t: '约 512 字节', why: '方向反了。Base64 只会让长度变长到约 4/3，不会让它变成 1.5 倍。选这个说明还没建立 4 字符 = 3 字节这个基本换算。' }
-        ],
-        explain: '<b>Base64 的换算关系要背成条件反射：4 个字符 = 3 字节，所以原始长度 ≈ 字符串长度 × 3/4。</b>' +
-          '344 × 0.75 = 258。更精确地说：344 个字符里有 <span class="mono">ceil(344/4) = 86</span> 组，' +
-          '其中末尾的 <span class="mono">=</span> 表示最后一组少了 1 或 2 字节，所以原始长度是 258、257 或 256。<br>' +
-          '<p><b>为什么这个数字值得单独出一道题：</b>因为它是一个<b>免费的定性工具</b>。' +
-          '256 字节恰好是 RSA-2048 的模长，也就是说密文或签名的长度恒为 256 字节，<b>与明文长度无关</b>。' +
-          '反过来，摘要的长度是固定的 16 / 20 / 32 字节，对称加密的密文长度随明文变化且是 16 的整数倍。<br>' +
-          '所以：<b>只要你算对了原始字节数，你就已经能把「非对称」这一类和「摘要」这一类区分开了。</b>' +
-          '而这一切的前提是——先把编码层剥掉。在 Base64 字符串上做长度判断，是新手最常见的一个系统性错误。</p>'
-      }
+      after: '<p>三个系统调用 + 七个标志 + 一个 fork 时机，这就是容器隔离的全部原料。下一节我们不再用现成工具，<b>自己写一个迷你容器</b> —— 把 rootfs、mount、pivot_root、exec 全部手工串一遍。</p>'
     },
 
-    /* ============================================================ 31.3 */
+    /* ============ 31.4L 动手实验 ============ */
     {
-      h: '31.3', title: '摘要与 MAC：没有密钥的那两类为什么最好认',
+      h: '31.4L', title: '动手实验：为一个需求挑选正确的 namespace 组合',
       html:
-        '<p>这两类是地图上最容易处理的两格，原因很实在：<strong>它们没有需要你去「找」的密钥</strong>（MAC 有密钥，但密钥通常是从别处传进来的，' +
-        '而不是算法自身藏着的常量）。而你已经在第 8 章学过怎么处理它们的常量与结构，所以这里只做两件事：<strong>把判据固定下来</strong>，' +
-        '以及<strong>说清它们和 RSA 的边界在哪</strong>。</p>' +
-        '<h4>摘要：长度就是它的身份证</h4>' +
-        T.tbl(['算法', '输出字节数', '十六进制字符数', '块大小', '识别抓手（第 8 章已讲）'],
-          [
-            ['MD5', '<b>16</b>', '32', '64 字节', 'IV = <span class="mono">67452301 efcdab89 98badcfe 10325476</span>；K 表由 sin 生成'],
-            ['SHA-1', '<b>20</b>', '40', '64 字节', 'IV = MD5 的 IV 再加 <span class="mono">c3d2e1f0</span>'],
-            ['SHA-256', '<b>32</b>', '64', '64 字节', 'IV 前 4 个字 <span class="mono">6a09e667 bb67ae85 3c6ef372 a54ff53a</span>；K 表来自质数立方根'],
-            ['SHA-512', '<b>64</b>', '128', '128 字节', '块大小与上面三个不同，这点在 HMAC 里会咬人']
-          ]) +
-        T.note('key', '🔑 摘要的两个「结构性事实」，比任何常量都好用',
-          '<p><b>① 输出长度恒定。</b>MD5 永远 16 字节，SHA-256 永远 32 字节。' +
-          '所以<b>「长度固定且等于某几个特定值」本身就是摘要的判据</b>——不需要看代码。</p>' +
-          '<p style="margin-bottom:0"><b>② 雪崩效应：改一个比特，输出面目全非。</b>这条性质有一个非常实用的反面用法：' +
-          '如果你怀疑某段输出是摘要，就把输入改一个字节再算一次，<b>如果输出几乎全变（而不是只变几个字节），那它极可能是摘要而不是异或或简单映射</b>。' +
-          '反过来，如果改一个字节只有对应位置变了，那是流密码或异或，不是摘要。</p>') +
-        '<h4>MAC：结构比常量更可靠</h4>' +
-        '<p>HMAC 的识别与常量无关，它靠的是两个结构事实，第 8 章 8.8 已经详细讲过，这里只留一条最短版本的记忆锚：</p>' +
-        T.code(
-          'HMAC(K, m) = H( (K &oplus; opad) || H( (K &oplus; ipad) || m ) )\n' +
-          '<span class="c">ipad = 0x36 重复到块大小；opad = 0x5C 重复到块大小</span>\n' +
-          '<span class="c">于是你会看到：连续 64 个 0x36、连续 64 个 0x5C、同一个哈希被调用两次</span>'
-        ) +
-        T.note('warn', '⚠️ 一个和本章直接相关的陷阱：块大小不同，ipad 的长度就不同',
-          '<p style="margin-bottom:0">HMAC 的填充长度是<b>哈希的块大小</b>，不是输出长度。MD5 / SHA-1 / SHA-256 的块大小都是 64 字节，' +
-          '但 <b>SHA-512 的块大小是 128 字节</b>。<br>' +
-          '所以如果你按「连续 64 个 <span class="mono">0x36</span>」去找 HMAC-SHA512，会找不到——那里是 128 个。' +
-          '这不是魔改，是规范。<span class="pill warn">待核实</span>：具体实现可能对短密钥先做哈希再补零，填充字节的数量依然由块大小决定，但你在内存里看到的形态会变。</p>') +
-        '<h4>它们和 RSA 的边界：为什么「签名」这个词会骗你</h4>' +
-        '<p>中文里「签名」这个词被用得太宽了。<strong>它至少指三种完全不同的东西：</strong></p>' +
-        T.tbl(['你听到的「签名」', '实际是什么', '有没有非对称密钥', '怎么认'],
-          [
-            ['<span class="mono">sign</span> / <span class="mono">_sign</span> / <span class="mono">x-sign</span> 这类请求参数',
-             '通常是 <b>HMAC 或 MD5 加盐</b>，密钥硬编码在客户端',
-             '<b>没有</b>',
-             '长度是 16 / 32 / 64 字节的十六进制；改一个输入字节输出全变'],
-            ['<span class="mono">Signature.getInstance("SHA256withRSA")</span>',
-             '<b>真正的非对称签名</b>，用私钥产生',
-             '<b>有</b>，但客户端拿不到私钥',
-             '输出长度等于模长（RSA-2048 → 256 字节）；调用点能看到 <span class="mono">Signature</span> 类'],
-            ['「验签」<span class="mono">Signature.verify</span>',
-             '<b>非对称验签</b>，用公钥验证',
-             '<b>有</b>，且公钥就在客户端里',
-             '同一段代码里出现公钥常量或证书；<b>这一条是你能静态看到的最有价值的信息</b>']
-          ]) +
-        T.note('bad', '🔥 最要命的一种误判',
-          '<p style="margin-bottom:0">把第一种当成第二种。<br>' +
-          '后果：你会去 so 里疯狂寻找「私钥」，找不到就以为被加固藏起来了；或者反过来，' +
-          '你看到一个 256 字节的常量，就断定「这是 RSA 签名」，于是花几天去抠 DER 结构，<b>结果它其实是服务端下发的随机数</b>。<br>' +
-          '分辨方法只有一条，而且很便宜：<b>量长度 + 找调用点</b>。' +
-          '长度 256 字节 + 调用点有 <span class="mono">Signature</span> / <span class="mono">KeyFactory</span> → 非对称；' +
-          '长度 32 字节 + 调用点有 <span class="mono">MessageDigest</span> / <span class="mono">Mac</span> → 摘要或 MAC。</p>'),
-      quiz: {
-        id: 'q31-3', chapter: 31, answer: 3,
-        stem: '一个参数每次请求都是 <b>32 个十六进制字符</b>（即 16 字节），把请求体里任意一个字符改掉，它<b>完全变化</b>。' +
-          '但你在 so 里搜 MD5 的 IV 常量 <span class="mono">67452301</span>，<b>零命中</b>。最合理的下一步判断是？',
-        options: [
-          { t: '它不是 MD5，所以这是 AES-128 的密文', why: '长度 16 也可能是 AES 的密文，但 AES 密文的长度会随明文增长（16 的整数倍），而这个参数恒为 16 字节、与输入长度无关——这一点更像摘要。而且改一个字符就全变，说明它是对整体做的运算。' },
-          { t: '它是 MD5，但被换成了 SHA-256 的前 16 字节', why: '这是凭空的假设，没有证据。SHA-256 的输出是 32 字节，截断成 16 字节是一种可能性，但没有任何观察支持它——不要用「可能」替代「排查」。' },
-          { t: '搜不到 IV 就说明它一定被魔改了，应该按第 8 章的方法去动态 dump 内存找 IV', why: '动态 dump 确实是第 8 章的正确手段，方向也对，但「零命中 ⇒ 一定魔改」这个推论不成立（见正确项）。先做最便宜的排除，再决定要不要花动态调试的成本。' },
-          { t: '零命中不能推出魔改：常量可能被拆进指令立即数、可能在运行时才解密到内存、也可能是端序导致你搜错了字节串；先按标准 MD5 复算一遍，对上就收工', why: '正确。这正是第 8 章 8.2 的方法论在摘要这一类上的标准应用：先用最便宜的实验（标准实现复算）定性，再决定要不要动用动态手段。「搜不到」只是证据缺失，不是反证。' }
-        ],
-        explain: '<b>这道题是第 8 章方法论在地图上的复用，考的是「不要把证据缺失当成反证」。</b>' +
-          '搜不到 IV 至少有四种解释：① 常量被编译进了指令立即数（用 <span class="mono">MOVZ/MOVK</span> 之类的指令逐段拼出来，而不是以连续数据块存在）；' +
-          '② 常量在运行时才解密到堆上；③ 你搜的字节串因为端序（ARM 小端下 <span class="mono">0x67452301</span> 在内存里是 <span class="mono">01 23 45 67</span>）或拼写错误而根本不对；' +
-          '④ 确实被改了。<br>' +
-          '<p>而四种解释里，<b>验证成本最低的是「按标准实现复算一遍」</b>：把你能还原的输入串拼出来，用标准 MD5 算一次，与抓包的值比对。' +
-          '一致 → 根本没人改它，你当场收工；不一致 → 才需要去 Hook 压缩函数入口看状态。<b>顺序不能反。</b></p>' +
-          '<p>再把长度这一层加进来：<b>16 字节恒定 + 改一字节全变 = 摘要的典型形态</b>；' +
-          '而 RSA 的产物恒为 256 字节（2048 位），AES 的产物随明文增长且为 16 的倍数。' +
-          '长度这一把尺子，往往在你打开 IDA 之前就已经把范围缩小到一两类了。</p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">摘要与 MAC 的处理方法你已经在第 8 章学会了，本节只补了三条地图层面的判断：' +
-        '<b>长度即身份</b>、<b>雪崩效应可以反向利用</b>、<b>「签名」这个词在中文语境里指三种不同的东西</b>。<br>' +
-        '记住第三条——它是你后面判断「要不要去啃非对称」的第一道分流。</p>')
-    },
-    /* ============================================================ 31.4 */
-    {
-      h: '31.4', title: '非对称的分水岭：公钥本来就是公开的',
-      intuition: {
-        tag: '直觉模型 · 只能锁的门，与只能开的钥匙',
-        body:
-          '<p>对称加密像一把普通挂锁：<strong>锁上和打开是同一把钥匙</strong>。这带来一个绕不开的麻烦——你总得把钥匙交给对方。' +
-          '而在网络上，「交给」这个动作本身就可能被人截住。</p>' +
-          '<p>非对称加密换了个思路：造一把<strong>只能锁、不能开</strong>的锁。' +
-          '你可以复制一万把这样的锁，挂在广场上、贴在公告栏里、写进 App 的二进制里——<strong>谁拿到都不构成泄密</strong>，' +
-          '因为拿到锁的人只能做「锁上」这个动作。</p>' +
-          '<p>那「开」怎么办？只有造锁的人手里那把自己留着的钥匙能开。这把钥匙<strong>从不旅行</strong>，所以没有「在路上被截住」这回事。</p>' +
-          '<p>反过来的用法同样成立，而且更常用：造锁的人用自己那把「开锁的钥匙」去盖一个只有他能盖的章（签名），' +
-          '任何人都能用广场上那把「只能锁」的锁去验这个章是不是他盖的。<strong>同一对东西，两种用法，方向相反。</strong>' +
-          '这一节先把「为什么公钥能公开」这件事讲通，31.7 再把两个方向摆清楚。</p>'
-      },
-      html:
-        '<p>把「公开的东西」和「必须保密的东西」摆在一起，你就明白它为什么能成立：</p>' +
-        T.tbl(['', '对称加密（AES 一类）', '非对称加密（RSA 一类）'],
-          [
-            ['<b>需要保密的</b>', '密钥本身。<b>两边各存一份，且必须完全相同</b>', '<b>只有私钥</b>。公钥不需要保密'],
-            ['<b>可以公开的</b>', '没有——公开密钥等于放弃保密', '<b>公钥</b>：它被设计成「谁拿到都无害」'],
-            ['<b>它解决的核心问题</b>', '「别人看不懂」（保密性）', '「密钥怎么安全地到达对方」与「身份能不能被验证」'],
-            ['<b>速度</b>', '快（AES 有硬件加速）', '慢得多（大数模幂运算）'],
-            ['<b>所以现实系统里</b>', '用来加密真正的数据', '用来<b>协商出对称密钥</b>、或者<b>签名验签</b>'],
-            ['<b>逆向时的核心动作</b>', '<b>把密钥找出来</b>（或让它自己吐出来）', '<b>把公钥结构读出来、把方向判断对、把填充对上</b>']
-          ]) +
-        T.note('key', '🔑 最后一行就是本章存在的理由',
-          '<p style="margin-bottom:0">前 30 章里，你练的几乎所有肌肉都是「把密钥找出来」——dump 内存、Hook 构造函数、常量比对、自吐沙箱。<br>' +
-          '<b>而这套肌肉在 RSA 面前会突然失效</b>：因为公钥本来就在那里，你不需要找；而私钥压根不在你的目标里。<br>' +
-          '你会遇到的真正难点是：<b>这一段 256 字节的常量，到底是公钥、密文、签名，还是服务端下发的随机数？它被用来做加密还是验签？它带不带填充？</b>' +
-          '这几个问题没有一个能用「找密钥」解决。</p>') +
-        '<h4>「公钥可以公开」靠的是数学上的一个不对称</h4>' +
-        '<p>公钥密码学的安全性依赖的是：<strong>某些运算正着算很便宜，反着算贵到不现实</strong>。这类运算叫' +
-        T.term('陷门单向函数', '正向计算容易、反向计算在没有额外信息（陷门）时在计算上不可行的函数。RSA 的陷门就是大整数 n 的两个质因数 p 和 q。') + '。</p>' +
-        T.grid(2, [
-          '<div class="card"><div class="card-title">RSA 的不对称</div>' +
-          '<p><b>正向便宜</b>：给定 n、e 和明文 m，算 <span class="mono">m^e mod n</span> 只用几十次模乘（31.5 会详细算）。</p>' +
-          '<p><b>反向昂贵</b>：只知道 n 和 e，想从密文恢复明文，目前已知最快的路线是<b>把 n 分解成 p × q</b>。' +
-          '2048 位的 n 分解在现有公开方法下不可行，这就是 RSA-2048 依然在用的全部理由。</p>' +
-          '<p><span class="hit">注意「目前已知」这四个字</span>——RSA 的安全性不是被证明的，是被「至今没人公开做出来」支撑的。' +
-          '历史上 512 位在 1999 年被公开分解、768 位在 2009 年被公开分解——<b>这就是为什么现在通行的下限是 2048 位</b>。</p></div>',
-          '<div class="card"><div class="card-title">ECC 的不对称</div>' +
-          '<p>椭圆曲线密码（ECC）依赖的是另一类难题（离散对数）。它的卖点是<b>同样的安全强度下密钥短得多</b>——' +
-          '256 位的 ECC 大致对应 3072 位的 RSA。</p>' +
-          '<p>本章不讲椭圆曲线的数学。<b>本章只讲它在逆向里的意义</b>：它几乎总出现在「密钥交换」这个位置上（31.13），' +
-          '而不是用来加密你的业务数据。<span class="hit">看到 ECC，先问「它是不是在协商会话密钥」，而不是「密钥藏哪了」。</span></p></div>'
-        ]) +
-        '<h4>密钥长度与字节数的对应关系（这张表要背）</h4>' +
-        '<p>在逆向现场，你最常做的换算就是「这个长度对应多少位」。RSA 的长度指的是<b>模数 n 的位数</b>，' +
-        '而所有运算都在模 n 下进行，于是<strong>密文和签名的长度恒等于模长</strong>——与明文多长完全无关。</p>' +
-        T.tbl(['密钥长度（n 的位数）', '模长 = 密文/签名长度', '十六进制字符数', 'Base64 字符数（约）'],
-          [
-            ['512 位', '64 字节', '128', '88'],
-            ['1024 位', '128 字节', '256', '172'],
-            ['<b>2048 位</b>（当前主力）', '<b>256 字节</b>', '<b>512</b>', '<b>344</b>'],
-            ['3072 位', '384 字节', '768', '512'],
-            ['4096 位', '512 字节', '1024', '684']
-          ]) +
-        T.note('warn', '⚠️ 这张表里最值得记住的是「2048 位 → 256 字节」，以及一个反直觉的推论',
-          '<p style="margin-bottom:0">明文最多能有多长？对 PKCS#1 v1.5 加密来说，明文上限约是 <b>模长 − 11 字节</b>；' +
-          '对 OAEP 来说还要再减掉两个哈希长度。也就是说 <b>RSA-2048 一次最多只能加密 245 字节左右</b>（具体数值取决于填充方案）。<br>' +
-          '这解释了一个你在现场一定会遇到的现象：<b>没有哪个 App 会真的用 RSA 去加密一大段业务数据</b>——' +
-          '它要么只加密一个 16/32 字节的对称密钥，要么只签一段摘要。<span class="hit">所以当你在密文里看到几百字节的「RSA 密文」，先怀疑它不是 RSA。</span><br>' +
-          '（明文上限的精确值取决于填充方案，不同规范与实现的细节略有差异 <span class="pill warn">待核实</span>：以你目标上实际使用的库文档为准。）</p>'),
-      quiz: {
-        id: 'q31-4', chapter: 31, answer: 0,
-        stem: '你在一段反编译出来的 Java 代码里看到：私钥能从 <span class="mono">assets/private.pem</span> 里读出来，' +
-          '用来解密服务端下发的数据。用本章的六类地图判断，这属于哪种情况？',
-        options: [
-          { t: '这是「非对称加密」这一类，但方向上出问题了：客户端持有私钥这件事本身就等于放弃了非对称加密的全部意义', why: '正确。非对称的分水岭是「公钥公开、私钥保密」。把私钥随 App 分发出去，等于把广场上那把只能锁的锁和造锁者的钥匙一起发给了所有人——任何人都能解密、也都能伪造签名。这属于本章 31.11、31.12 要重点甄别的「假保护」。' },
-          { t: '这属于「对称加密」，因为 PEM 里可能装着 AES 密钥', why: 'PEM 是容器格式，里面既可能是 RSA 密钥也可能是别的。但题目说的是「私钥」，且用它可以解密服务端下发数据——这是非对称解密的典型用法。判断格式之前先看用途。' },
-          { t: '这是「密钥交换」这一类：客户端用私钥协商会话密钥', why: '密钥交换有专门的机制（如 ECDHE），而且它用的是双方各自的临时密钥对，不是把一个长期私钥打包进 App。把它归到这一类会掩盖真正的问题：私钥泄露。' },
-          { t: '这属于「编码」这一类：PEM 只是把密钥做了 Base64', why: 'PEM 确实包含 Base64 编码，但那是外壳。按「它解决什么问题」分类，这里解决的是「服务端发来的密文只有客户端能解」——这是非对称加密的职责，不是编码。' }
-        ],
-        explain: '<b>这道题考的是「按功能分类」这个原则本身。</b>如果你按「它长什么样」分类，PEM 里全是 Base64 字符，看起来确实像编码；' +
-          '但六类地图是按<b>解决的什么问题</b>分的——这里要解决的是保密，用的是非对称密钥对，所以它属于第五类。<br>' +
-          '<p>真正的重点在方向：<b>非对称加密的安全模型要求私钥只有一个持有者。</b>' +
-          '当私钥被随 App 分发出去，模型就崩了：<br>' +
-          '① <b>保密性没了</b>——任何拿到这个 App 的人都能解密服务端下发的数据；<br>' +
-          '② <b>它反而成了一个「硬编码密钥」，只是体积更大</b>——你甚至不需要做任何数学，直接调用同一份代码就能解密，' +
-          '这一点比 AES 硬编码密钥还好处理（因为连「找 16 字节」都省了，直接 <span class="mono">RSA.importKey(open("private.pem").read())</span>）；<br>' +
-          '③ 如果这把私钥还用于<b>签名</b>，那任何人都能伪造出「客户端」的签名。</p>' +
-          '<p><span class="hit">所以在现场看到客户端持有私钥，你的结论不应该是「好难」，而应该是「这里有一个设计缺陷」。</span>' +
-          '31.11 的 CERT Keyfinder 案例就是一个真实的、公开的、被写进工具的这类缺陷。</p>'
-      }
-    },
-
-    /* ============================================================ 31.5 */
-    {
-      h: '31.5', title: 'RSA 的数学最小集：一份够用的笔记',
-      html:
-        '<p>本节只讲逆向时真的会用到的部分。目标是：<strong>看到 n、e、d、c 这四样东西时，你知道它们各自是什么、彼此怎么换算、以及为什么「正向便宜、反向昂贵」。</strong>' +
-        '不讲数论证明，也不讲攻击史。</p>' +
-        '<h4>四个量，两个公式</h4>' +
-        T.code(
-          '<span class="c">① 生成密钥（只在生成的时候做一次）</span>\n' +
-          '选两个大质数  p, q\n' +
-          'n   = p × q                     <span class="c">← 这个 n 就是「模数」，它的位数就是所谓的「密钥长度」</span>\n' +
-          'φ(n) = (p − 1) × (q − 1)        <span class="c">← 欧拉函数。对两个质数乘积，它就是上面这个式子</span>\n' +
-          '选 e，要求 gcd(e, φ(n)) = 1\n' +
-          '求 d，使  e × d ≡ 1 (mod φ(n))  <span class="c">← 模逆元，用扩展欧几里得算法求</span>\n\n' +
-          '<span class="c">② 使用</span>\n' +
-          '公钥 = (n, e)                     <span class="c">← 可以公开</span>\n' +
-          '私钥 = (n, d)                     <span class="c">← 必须保密</span>\n' +
-          '加密： c = m^e mod n\n' +
-          '解密： m = c^d mod n'
-        ) +
-        T.note('key', '🔑 为什么这两个式子是自洽的（一句话版）',
-          '<p style="margin-bottom:0">因为 <span class="mono">e·d ≡ 1 (mod φ(n))</span>，所以 <span class="mono">e·d = 1 + k·φ(n)</span>；' +
-          '而欧拉定理告诉我们 <span class="mono">m^φ(n) ≡ 1 (mod n)</span>（当 m 与 n 互质时）。' +
-          '于是 <span class="mono">(m^e)^d = m^(1+kφ(n)) = m · (m^φ(n))^k ≡ m (mod n)</span>——先加密再解密，回到原点。<br>' +
-          '<b>你不需要会证明它，但你需要知道「d 是由 φ(n) 决定的」，所以知道 φ(n) 的人就能算出 d，而知道 p、q 的人就能算出 φ(n)。' +
-          '这就是为什么「分解 n」等于「拿到私钥」。</b></p>') +
-        '<h4>e 为什么通常是 65537</h4>' +
-        T.tbl(['e 的常见取值', '形态', '为什么用它 / 为什么危险'],
-          [
-            ['<b>65537</b>（= 0x10001）',
-             '二进制 <span class="mono">1 0000 0000 0000 0001</span>，只有两个 1',
-             '<b>事实上的默认值。</b>平方-乘算法里「1 的个数」决定乘法次数，所以 65537 做公钥运算非常快；' +
-             '同时它足够大，避开了小指数的一批已知问题'],
-            ['3',
-             '二进制 <span class="mono">11</span>',
-             '合法（只要 gcd(3, φ(n)) = 1）而且更快，<b>但历史上有配套攻击</b>：如果同一条明文用同一个 e=3 加密给三个不同的人，' +
-             '可以用中国剩余定理直接恢复明文（广播攻击）。<span class="hit">在客户端看到 e = 3，是一条值得记下的风险信号</span>'],
-            ['17 / 65537 之外的值',
-             '各种',
-             '合法但少见。<b>如果你在客户端看到 e 是一个奇怪的值，先确认它不是「公钥被拼接错位」导致的误读</b>（31.10 会给判据）']
-          ]) +
-        T.note('warn', '⚠️ 一个必须说清的边界：这些都是「数学事实」，不是「安全性结论」',
-          '<p style="margin-bottom:0">「e = 3 有风险」这句话只在<b>特定场景</b>下成立（例如同一明文广播给多个接收者、且没有正确填充）。' +
-          '同理，「RSA-2048 安全」也只是「以当前公开的分解能力而言」。<br>' +
-          '本节的用法是：<b>把 e 当成一条情报</b>——它是 65537 说明对方用了标准库的默认值（这很有用，说明它大概率是标准实现）；' +
-          '它是 3 或者别的怪值，就值得多看一眼。<b>不要用它直接下「安全/不安全」的结论。</b></p>') +
-        '<h4>方幂运算怎么写：平方-乘（square-and-multiply）</h4>' +
-        '<p>RSA 里反复出现的运算是<span class="mono">base^exp mod n</span>，而 exp 可能有 2048 位。' +
-        '直接连乘 2048 次是不现实的，实际实现用的是<strong>按指数的二进制位、逐步平方、遇 1 才乘底数</strong>：' +
-        '把 <span class="mono">O(exp)</span> 次乘法降到 <span class="mono">O(log exp)</span> 次。</p>' +
-        '<p>下面用 31.6 那个小例子（<span class="mono">65^17 mod 3233</span>）逐步走一遍。<b>每一步的数值都是真的，你可以拿计算器核对。</b></p>',
-      stepper: {
-        title: '平方-乘逐步推演：65^17 mod 3233（e = 17 = 0b10001）',
-        lines: [
-          { code: 'acc = 1        // 指数从最高位开始处理：1 0 0 0 1',
-            note: '<b>起点。</b>把指数 e 写成二进制并<b>从最高位往最低位</b>处理，是平方-乘的标准写法。' +
-                  '每一步做两件事：先平方，再看这一位是不是 1，是就再乘一次底数。' +
-                  '<br>为什么要从最高位开始？因为这样你不需要预先知道指数的位数——边读边乘即可。',
-            state: { 'acc': '1', '底数 base': '65', '模数 n': '3233', '指数 e': '17 = 0b10001' } },
-          { code: 'acc = acc² mod n = 1² mod 3233 = 1\n// 本位 = 1 → acc = acc × base mod n = 1 × 65 = 65',
-            note: '<b>第 1 位（最高位）是 1。</b>平方之后乘底数，得到 <span class="mono">65</span>。' +
-                  '<br>注意：这一步等价于「acc 已经表示 <span class="mono">65^1</span>」。后面每读一位，指数的幂次相当于「乘 2」；读到 1 再「加 1」。',
-            state: { '本位': '1', '平方后': '1', '乘底数后 acc': '<b>65</b>' } },
-          { code: 'acc = 65² mod 3233 = 4225 mod 3233 = 992\n// 本位 = 0 → 不乘底数，只保留平方结果',
-            note: '<b>第 2 位是 0。</b>只平方、不乘底数。此时 acc 表示 <span class="mono">65^2</span>。' +
-                  '<br><span class="hit">这一位是 0，就省掉了一次乘法</span>——65537 之所以快，正是因为它的二进制里绝大多数位都是 0。',
-            state: { '本位': '0', '平方后 acc': '<b>992</b>', '乘法次数': '1（累计）' } },
-          { code: 'acc = 992² mod 3233 = 984064 mod 3233 = 1232\n// 本位 = 0 → 不乘',
-            note: '第 3 位是 0。acc 表示 <span class="mono">65^4</span>。<br>' +
-                  '顺带看一眼数字规模：<span class="mono">992² = 984064</span>——在真实 RSA 里，这一步是 2048 位数的平方，' +
-                  '所以底层用大数库、而不是 CPU 的原生乘法指令。<b>这也是你会看到 so 里有一整套大数运算代码的原因。</b>',
-            state: { '本位': '0', '平方后 acc': '<b>1232</b>', '当前幂次': '65^4' } },
-          { code: 'acc = 1232² mod 3233 = 1517824 mod 3233 = 1547\n// 本位 = 0 → 不乘',
-            note: '第 4 位是 0。acc 表示 <span class="mono">65^8</span>。<br>' +
-                  '<b>到这里已经能看出这个算法的意义了</b>：指数 17 需要 17 次乘法才能硬算，而现在只用了 4 次。位数翻倍，乘法次数才翻倍——这是指数级的节省。',
-            state: { '本位': '0', '平方后 acc': '<b>1547</b>', '当前幂次': '65^8' } },
-          { code: 'acc = 1547² mod 3233 = 2393209 mod 3233 = 789\n// 本位 = 1 → acc = acc × base mod n = 789 × 65 = 51285 mod 3233 = 2790',
-            note: '<b>最后一位是 1。</b>平方得 789，再乘底数 65 得 51285，取模得 <span class="mono">2790</span>。<br>' +
-                  '<span class="hit">这个 2790 就是密文 c。</span>它就是「用公钥加密 65」的结果，也是 31.6 那个实验里你要亲手复现出来的数字。',
-            state: { '本位': '1', '平方后': '789', '乘底数后 acc': '<b>2790</b>' }, },
-          { code: '// 总计：5 次平方 + 2 次乘法 = 7 次模乘，算出了 65^17 mod 3233',
-            note: '<b>收束。</b>7 次模乘 vs 硬算 17 次，差距看起来不大，但把指数换成 65537：' +
-                  '硬算是 65537 次，平方-乘只需要 <span class="mono">16 次平方 + 1 次乘法 = 17 次</span>。' +
-                  '<br><b>这就是为什么「看到一长串平方和条件乘法」时你要认出它是模幂运算</b>——' +
-                  '它是 RSA 在汇编层最典型的一个签名，比任何常量都更容易认。',
-            state: { '总模乘次数': '7', '输出 c': '<b>2790</b>', '明文 m': '65' } }
-        ]
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">你应该能回答四个问题：<b>n 是什么？φ(n) 怎么算？d 从哪来？为什么 e 常取 65537？</b><br>' +
-        '另外记住一条在汇编层很有用的指纹：<b>平方 + 条件乘法 = 模幂</b>。' +
-        '当你在一个 so 里看到「循环里先是自己乘自己、取模，然后按某个位决定要不要再乘一次」，' +
-        '基本可以断定这是一段大数模幂实现——不管它调用的是 OpenSSL 还是自己手写的。</p>')
-    },
-
-    /* ============================================================ 31.6 */
-    {
-      h: '31.6', title: '动手实验一：小参数 RSA 全流程，自己算出 d',
-      html:
-        '<p>下面这个实验是全章的枢纽。<strong>它不给你 d，也不给你答案——你要自己用扩展欧几里得把 d 解出来，然后填进去，让系统真的用它解密一次。</strong></p>' +
-        '<p>为什么必须自己算一遍？因为「公钥加密、私钥解密」这句话，背下来只要三秒，但<strong>「哪把钥匙做哪个动作」只有亲手走过一遍才会变成肌肉记忆</strong>。' +
-        '后面的 31.7 讲方向、31.8 讲填充、31.12 讲甄别，全都建立在你不把方向搞反的前提上。</p>' +
-        T.note('key', '🔑 手算 d 的路线图（扩展欧几里得）',
-          '<p>以预填参数为例：<span class="mono">p = 61, q = 53, e = 17</span>。</p>' +
-          '<p><b>第一步，算 n 和 φ(n)</b>：<span class="mono">n = 61 × 53 = 3233</span>，' +
-          '<span class="mono">φ(n) = (61−1) × (53−1) = 60 × 52 = 3120</span>。</p>' +
-          '<p><b>第二步，用辗转相除把 1 表示成 3120 和 17 的组合</b>：</p>' +
-          '<p><span class="mono">3120 = 183 × 17 + 9</span>　→　<span class="mono">9 = 3120 − 183 × 17</span><br>' +
-          '<span class="mono">17 = 1 × 9 + 8</span>　→　<span class="mono">8 = 17 − 9</span><br>' +
-          '<span class="mono">9 = 1 × 8 + 1</span>　→　<span class="mono">1 = 9 − 8</span></p>' +
-          '<p><b>第三步，回代</b>：<br>' +
-          '<span class="mono">1 = 9 − 8 = 9 − (17 − 9) = 2 × 9 − 17 = 2 × (3120 − 183 × 17) − 17 = 2 × 3120 − 367 × 17</span></p>' +
-          '<p style="margin-bottom:0"><b>第四步，取模</b>：<span class="mono">d ≡ −367 (mod 3120)</span>，' +
-          '即 <span class="mono">d = 3120 − 367 = 2753</span>。<br>' +
-          '<b>验算：</b><span class="mono">17 × 2753 = 46801 = 15 × 3120 + 1</span> —— 余数确实是 1。' +
-          '<span class="hit">养一个习惯：算出 d 之后一定要验算 d × e mod φ(n) == 1。</span></p>'),
+        '<p>七个 namespace 标志不难记，难的是<b>面对一个具体需求，知道该开哪几个</b>。' +
+        '这个实验给你三个真实场景，你来选。</p>',
       lab: {
-        title: '实验一：小参数 RSA 全流程（自己算 d → 真的解一次）',
-        goal: '目标：亲手走完 n → φ(n) → d → 加密 → 解密',
+        title: '实验：给需求配 namespace',
+        goal: '目标：按需选标志，不多不少',
         intro:
-          '<p>先用默认参数把流程走通，<b>再自己改一组参数重做一遍</b>（比如 p=7, q=11 → n=77, φ=60, 取 e=13）。</p>' +
-          '<p>规则只有一条：<b>d 必须你自己算出来填进去</b>。点「用我的参数真算一遍」时，系统会用你填的 d ' +
-          '去解它刚刚加密出来的密文——<span class="hit">解不回来，就说明你的 d 是错的</span>，而不是「系统算错了」。</p>' +
-          '<p>注意：p、q 必须是质数（否则 φ(n) 的公式不成立），e 必须与 φ(n) 互质，明文 m 必须小于 n。</p>',
+          '<p>下面是一个具体需求：</p>' +
+          '<div class="note key" style="margin:12px 0"><div class="note-h">🎯 需求</div>' +
+          '<p style="margin-bottom:0">你要做一个"进程沙箱"，用来安全地跑一段<b>不可信的第三方代码</b>。要求：<br>' +
+          '① 这段代码<b>看不到宿主机的其他进程</b>（也不能 kill 它们）<br>' +
+          '② 它写文件时<b>不能污染宿主机文件系统</b>，要用一份独立的根目录<br>' +
+          '③ 它<b>不能改主机名</b>，以免影响宿主机上的服务<br>' +
+          '④ 它<b>不能占用宿主机已用的端口</b>（比如 80、443）<br>' +
+          '⑤ 它<b>不能创建超过 100 个进程</b>，防止 fork 炸弹<br>' +
+          '⑥ <b>不需要</b>限制 CPU 和内存（这段代码本身就是短任务）</p></div>' +
+          '<p><b>任务：从七个 namespace 标志里选出需要的，并说明⑤⑥分别属于什么机制。</b></p>',
         inputs: [
-          { key: 'p', label: '质数 p', hint: '默认 61', value: '61' },
-          { key: 'q', label: '质数 q', hint: '默认 53', value: '53' },
-          { key: 'e', label: '公钥指数 e', hint: '必须与 φ(n) 互质', value: '17' },
-          { key: 'm', label: '明文 m（整数）', hint: '必须小于 n；支持 0x 前缀', value: '65' },
-          { key: 'd', label: '★ 你自己算出的私钥指数 d', hint: '用扩展欧几里得解 e·d ≡ 1 (mod φ(n))', ph: '例如 2753', value: '' }
+          { key: 'flags', label: '① 需要哪些 namespace 标志？（可多选，用空格分隔）',
+            hint: '写简称即可，如 PID NET MNT UTS IPC USER CGROUP', ph: '例如 PID MNT UTS' },
+          { key: 'forkbomb', label: '② 需求⑤（限制进程数）靠什么机制实现？',
+            hint: '不是 namespace', ph: 'namespace 还是 cgroup？还是别的？', type: 'textarea', rows: 2 }
         ],
-        runLabel: '🔍 用我的参数真算一遍',
-        run: function (v) {
-          var B = function (s) {
-            var t = String(s == null ? '' : s).trim().replace(/[\s,_]/g, '');
-            if (!t) return null;
-            try { return BigInt(t); } catch (e) { return null; }
+        runLabel: '🔍 校验我的方案',
+        run: (v) => {
+          const need = {
+            PID:  { want: true,  why: '① 隔离进程视图 —— 容器内看不到宿主机进程，也杀不了。注意：CLONE_NEWPID 后需要再 fork 一次，当前进程才会进入新 PID 命名空间。' },
+            MNT:  { want: true,  why: '② 挂载命名空间 —— 独立挂载点视图，配 pivot_root 换根，文件写入落在自己的 rootfs 里。' },
+            UTS:  { want: true,  why: '③ 隔离主机名与域名 —— 容器内改 hostname 不影响宿主机。' },
+            NET:  { want: true,  why: '④ 网络命名空间 —— 独立网卡/IP/端口空间，容器内绑 80 端口不与宿主机冲突。' },
+            IPC:  { want: false, why: '需求里没提 IPC。虽然实践中常一起开（避免共享 System V IPC / 消息队列造成干扰），但不是这个需求的必需项。' },
+            USER: { want: false, why: '需求没要求"非 root 也能创建容器"。USER 命名空间是 rootless 容器的基础，属于额外加分项而非必需。' },
+            CGROUP:{ want: false, why: 'CGROUP 命名空间只是隔离 cgroup 根目录的<b>视图</b>，它本身不提供限制能力。限制要靠 cgroup 控制器。' }
           };
-          var mp = function (b, ex, n) {
-            b %= n; if (b < 0n) b += n;
-            var r = 1n;
-            while (ex > 0n) { if (ex & 1n) r = r * b % n; b = b * b % n; ex >>= 1n; }
-            return r;
-          };
-          var gcd = function (a, b) { while (b) { var t = a % b; a = b; b = t; } return a; };
-          var inv = function (a, m) {
-            var g = m, x = 0n, x1 = 1n, r0 = a % m, r1 = m;
-            while (r1 !== 0n) { var q = r0 / r1, t = r0 - q * r1; r0 = r1; r1 = t; t = x - q * x1; x = x1; x1 = t; }
-            if (r0 !== 1n) return null;
-            return ((x % g) + g) % g;
-          };
-          var isP = function (n) {
-            if (n < 2n) return false;
-            if (n === 2n) return true;
-            if (n % 2n === 0n) return false;
-            if (n > 1000000n) return null;          // 太大就跳过：不在这里做昂贵的素性检验
-            for (var i = 3n; i * i <= n; i += 2n) if (n % i === 0n) return false;
-            return true;
-          };
-          var p = B(v.p), q = B(v.q), e = B(v.e), m = B(v.m), d = B(v.d);
-          if (p === null || q === null || e === null || m === null) {
-            return '<div class="lab-msg warn"><b>参数不完整</b><div class="lab-note">p、q、e、m 都必须是整数（支持 0x 前缀）。</div></div>';
-          }
-          if (p < 2n || q < 2n || e < 2n) {
-            return '<div class="lab-msg warn"><b>取值不合法</b><div class="lab-note">p、q、e 都要大于等于 2。</div></div>';
-          }
-          var n = p * q, phi = (p - 1n) * (q - 1n);
-          var warn = '';
-          var pp = isP(p), qq = isP(q);
-          if (pp === false) warn += '<div class="lab-msg warn"><b>p 不是质数</b><div class="lab-note">φ(n) = (p−1)(q−1) 这个公式只在 p、q 都是质数时成立。换成质数再算。</div></div>';
-          if (qq === false) warn += '<div class="lab-msg warn"><b>q 不是质数</b><div class="lab-note">同上：p、q 必须都是质数。</div></div>';
-          if ((pp === null || qq === null) && !warn) warn += '<div class="lab-msg warn"><b>素性未检验</b><div class="lab-note">p 或 q 太大，本实验不做素性检验（免得卡住浏览器）。请自行确认它们都是质数。</div></div>';
-          if (gcd(e, phi) !== 1n) {
-            return warn + '<div class="lab-msg fail"><b>e 与 φ(n) 不互质</b><div class="lab-note">gcd(' + e + ', ' + phi + ') = ' + gcd(e, phi) +
-              '。<br>此时模逆元 d <b>不存在</b>，RSA 用不起来。换一个与 φ(n) 互质的 e（常见选择：3、17、65537）。</div></div>';
-          }
-          if (m >= n) warn += '<div class="lab-msg warn"><b>明文 m 不小于 n</b><div class="lab-note">RSA 要求 m &lt; n。下面按 m mod n = ' + (m % n) + ' 计算。</div></div>';
-          var mm = m % n;
-          var c = mp(mm, e, n);
-          var dTrue = inv(e, phi);
-          var html = '';
-          html += '<table class="lab-tbl"><thead><tr><th>量</th><th>值</th><th>它是什么</th></tr></thead><tbody>';
-          html += '<tr><td>n = p × q</td><td>' + n + '</td><td>模数。它的位数就是「密钥长度」（这里是 ' + n.toString(2).length + ' 位）</td></tr>';
-          html += '<tr><td>φ(n) = (p−1)(q−1)</td><td>' + phi + '</td><td>欧拉函数。<b>知道它就等于知道私钥</b>，所以它必须保密</td></tr>';
-          html += '<tr><td>公钥 (n, e)</td><td>(' + n + ', ' + e + ')</td><td>这一对可以公开</td></tr>';
-          html += '<tr><td>明文 m mod n</td><td>' + mm + '</td><td>要加密的消息（按整数看）</td></tr>';
-          html += '<tr><td>密文 c = m^e mod n</td><td><b>' + c + '</b></td><td>这就是「加密」的全部结果</td></tr>';
-          html += '</tbody></table>';
-          html += '<div class="lab-note">要解的方程：<span class="mono">' + e + ' × d ≡ 1 (mod ' + phi + ')</span>　' +
-            '（提示：先算 gcd 的线性组合，再取模到 [0, ' + phi + ') 区间）</div>';
-          if (d === null) {
-            html += '<div class="lab-msg model"><b>还没有填 d</b><div class="lab-note">' +
-              '先用扩展欧几里得把 d 解出来，填进上面第 5 个输入框，再点一次本按钮——' +
-              '系统会用它真的解一次密给你看。' +
-              '<br>顺手验算：你算出的 d 乘上 e、再对 φ(n) 取模，结果必须是 1。</div></div>';
-          } else {
-            var back = mp(c, d, n);
-            var ok = back === mm;
-            var de = (e * d) % phi;
-            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>' +
-              (ok ? '✅ 解密成功：你的 d 是对的' : '❌ 解密失败：这个 d 不是正确的私钥指数') + '</b>' +
-              '<div class="lab-note">用你填的 d 解密：<span class="mono">c^d mod n = ' + c + '^' + d + ' mod ' + n + ' = <b>' + back + '</b></span>' +
-              '　（期望值 ' + mm + '）<br>' +
-              '你的 d × e mod φ(n) = ' + de + (de === 1n ? '　✅ 余数正确' : '　❌ 余数必须是 1') + '</div>' +
-              (ok ? '<div class="lab-note">到这里，你已经亲手走完了一个完整的 RSA：<b>选质数 → 算 n → 算 φ(n) → 解 d → 加密 → 解密</b>。' +
-                '<br><span class="hit">请留意方向：加密用的是 (n, e)，解密用的是 (n, d)。</span>下一节就专门讲这两个方向。</div>' : '') +
-              '</div>';
-          }
-          return warn + html;
-        },
-        expected: function (v) {
-          var B = function (s) {
-            var t = String(s == null ? '' : s).trim().replace(/[\s,_]/g, '');
-            if (!t) return null;
-            try { return BigInt(t); } catch (e) { return null; }
-          };
-          var mp = function (b, ex, n) {
-            b %= n; if (b < 0n) b += n;
-            var r = 1n;
-            while (ex > 0n) { if (ex & 1n) r = r * b % n; b = b * b % n; ex >>= 1n; }
-            return r;
-          };
-          var p = B(v.p), q = B(v.q), e = B(v.e), m = B(v.m), d = B(v.d);
-          if (p === null || q === null || e === null || m === null) {
-            return { ok: false, detail: '先把 p、q、e、m 都填成整数（支持 0x 前缀）。' };
-          }
-          if (p < 2n || q < 2n || e < 2n) return { ok: false, detail: 'p、q、e 都要 ≥ 2。检查一下有没有填成 0 或 1。' };
-          if (d === null) {
-            return { ok: false, detail: '还没填 d。用扩展欧几里得解 <span class="mono">e × d ≡ 1 (mod φ(n))</span>，' +
-              '再把结果填进最后一个框。提示：算完之后用 <span class="mono">d × e mod φ(n) == 1</span> 自查。' };
-          }
-          var n = p * q, phi = (p - 1n) * (q - 1n), mm = m % n;
-          var c = mp(mm, e, n);
-          var back = mp(c, d, n);
-          if (back === mm) {
-            return { ok: true, detail: '✅ 正确。用你的 d 解出的明文是 <b>' + back + '</b>，与原始明文一致。' +
-              '<br>密文 c = <span class="mono">' + mm + '^' + e + ' mod ' + n + ' = ' + c + '</span>，' +
-              '解密 <span class="mono">' + c + '^' + d + ' mod ' + n + ' = ' + back + '</span>。' +
-              '你算出的 d 与 φ(n) = ' + phi + ' 是配套的。<br>' +
-              '<span class="hit">换个参数再算一遍</span>——比如 p=7、q=11（n=77, φ=60），取 e=13，明文 m=42，再解一次 d。' };
-          }
-          return { ok: false, detail: '❌ 用 <span class="mono">c^d mod n</span> 解出来是 <b>' + back + '</b>，期望是 <b>' + mm + '</b>。' +
-            '<br>先自查两件事：① 你算的 <span class="mono">d × e mod φ(n)</span> 等于 1 吗？（φ(n) = ' + phi + '）' +
-            '② p、q 都是质数吗？φ(n) 的公式只在质数下成立。' };
-        },
-        showAnswer:
-          '<b>以预填参数 p = 61、q = 53、e = 17、m = 65 为例：</b><br><br>' +
-          'n = 61 × 53 = <b>3233</b><br>' +
-          'φ(n) = (61−1) × (53−1) = 60 × 52 = <b>3120</b><br>' +
-          '解 17 × d ≡ 1 (mod 3120)：<br>' +
-          '　3120 = 183 × 17 + 9　→　9 = 3120 − 183 × 17<br>' +
-          '　17 = 1 × 9 + 8　　　→　8 = 17 − 9<br>' +
-          '　9 = 1 × 8 + 1　　　 →　1 = 9 − 8<br>' +
-          '回代：1 = 9 − 8 = 9 − (17 − 9) = 2 × 9 − 17 = 2 × (3120 − 183 × 17) − 17 = 2 × 3120 − 367 × 17<br>' +
-          '所以 d ≡ −367 ≡ 3120 − 367 = <b>2753</b><br>' +
-          '验算：17 × 2753 = 46801 = 15 × 3120 + 1　✅<br><br>' +
-          '加密：c = 65^17 mod 3233 = <b>2790</b>（31.5 的动画逐步算过）<br>' +
-          '解密：2790^2753 mod 3233 = <b>65</b>　✅ 回到明文',
-        hint:
-          '扩展欧几里得求模逆元的套路只有三步：<br>' +
-          '① 用辗转相除，把 <span class="mono">gcd(e, φ)</span> 一路写下去，直到余数为 1；<br>' +
-          '② 从最后一行往回<b>回代</b>，把 1 写成 <span class="mono">a × φ + b × e</span> 的形式；<br>' +
-          '③ 那个 b 就是 d 的候选值，对它取模到 [0, φ) 区间即可（如果是负数，加上 φ）。<br>' +
-          '自查：<span class="mono">d × e mod φ(n)</span> 必须等于 1。这一条不对，后面全不用看。',
-        after: T.note('ok', '✅ 这个实验真正的收获',
-          '<p style="margin-bottom:0">不是「我会算 RSA 了」，而是这三件事变成了直觉：<br>' +
-          '① <b>加密用 (n, e)，解密用 (n, d)</b>——公钥和私钥做的是不同的动作；<br>' +
-          '② <b>d 是由 φ(n) 决定的，而 φ(n) 由 p、q 决定</b>——所以「分解 n」等于「拿到私钥」；<br>' +
-          '③ <b>模幂可以手算，也可以被机器逐步复算</b>——这意味着只要参数齐全，RSA 的结果永远是<b>可验证</b>的。' +
-          '你在现场复现不出结果时，缺的一定是某个参数或某个约定，而不是「RSA 不可复现」。</p>')
-      }
-    },
 
-    /* ============================================================ 31.7 */
-    {
-      h: '31.7', title: '加密与签名：同一套密钥，方向相反',
-      html:
-        '<p>这一节是本章<strong>最容易被搞反、也最容易因此全盘皆输</strong>的一节。</p>' +
-        '<p>RSA 只有一套密钥、两个动作（用公钥做、用私钥做），但这两个动作组合出<strong>两种完全不同的用法</strong>。' +
-        '它们的方向正好相反：</p>' +
-        T.tbl(['用途', '发送方用什么', '接收方用什么', '它解决什么', '在客户端能不能做'],
-          [
-            ['<b>保密</b>（公钥加密 / 私钥解密）',
-             '<b>公钥</b>加密',
-             '<b>私钥</b>解密',
-             '「这段内容只有持有私钥的人能看懂」',
-             '<b>能</b>——客户端有公钥，可以加密发给服务端；<b>但客户端解不了服务端发来的东西</b>（它没有私钥）'],
-            ['<b>防篡改 + 身份</b>（私钥签名 / 公钥验签）',
-             '<b>私钥</b>签名',
-             '<b>公钥</b>验签',
-             '「这段内容确实出自持有私钥的人，且没被改过」',
-             '<b>验签能</b>（客户端有公钥）；<b>签名不能</b>——客户端没有私钥']
-          ]) +
-        T.note('bad', '🔥 这一节的核心判断：客户端做 RSA 签名，在密码学上是站不住的',
-          '<p>我们把它一步一步推到底：</p>' +
-          '<p><b>第一步</b>：签名这个动作，数学上要求用<b>私钥</b>（<span class="mono">s = H(m)^d mod n</span>）。' +
-          '能产生合法签名的只有私钥持有者。</p>' +
-          '<p><b>第二步</b>：如果签名发生在客户端，那么<b>私钥必须存在于客户端</b>——或者存在于 App 的二进制里，' +
-          '或者存在于它的内存里。</p>' +
-          '<p><b>第三步</b>：而客户端运行在攻击者（也就是你）完全控制的设备上。' +
-          '所以私钥<b>一定拿得到</b>：写死在 so 里就 dump 出来，运行时才解密就用 Frida 在解密之后读，' +
-          '放进 KeyStore 也拦不住——因为调用它的代码同样在这台设备上。</p>' +
-          '<p style="margin-bottom:0"><b>结论</b>：客户端签名提供了<b>零</b>安全性。它唯一还能起的作用是「防懒人」——' +
-          '让随手改包的人过不了服务端校验。真要做防篡改，正确做法是<b>把签名放到服务端</b>，' +
-          '或者用一次一密的会话密钥做 MAC，且密钥由服务端协商下发（31.13 / 31.14）。<br>' +
-          '<span class="hit">对你的逆向工作来说，这条结论是极度有利的：如果签名确实在客户端做，那它一定可复现——' +
-          '你不需要「破解」RSA，你只需要把私钥（或者产生签名的整段逻辑）拿过来照用。</span></p>') +
-        '<p>所以现场的正确判断顺序是：<strong>先看方向，再看密钥类型，最后才看算法细节。</strong>下面这个动画把两个方向摆在一起。</p>',
-      case: {
-        source: 'github',
-        title: 'Day 35: 逆向加密算法（MD5、AES、RSA）',
-        author: 'Evil0ctal',
-        target: 'AndroidReverse101 教学仓库 · 第二阶段「APK 逆向基础」的 Day 35 文档',
-        background:
-          '<p>这是一份公开的、以中文写成的安卓逆向教学文档，出自 GitHub 仓库 <span class="mono">Evil0ctal/AndroidReverse101</span>' +
-          '（<b>仓库创建于 2025-02-22，MIT 许可</b>；我核对时通过 GitHub API 读到 stars 408）。' +
-          '它的定位非常明确：<b>用一天的时间把 MD5、AES、RSA 三种常见算法的「逆向识别」讲一遍</b>，' +
-          '这与本章对应的课时主题（常用算法基础 + RSA 逆向分析）几乎完全重合。</p>' +
-          '<p>把它作为案例，价值不在「它讲得多深」，而在<b>它是一份典型的、被广泛模仿的入门材料</b>——' +
-          '而它示范的那套动作里，恰恰藏着本章要纠正的那个方向错误。<b>这是一份「公共样本」，不是一个具体 App 的实战记录</b>，' +
-          '这一点我先说明，免得读者误以为它是一次完整的逆向战役。</p>',
-        points: [
-          '学习目标写的是：「掌握常见加密算法（MD5、AES、RSA）的基本原理」「掌握 Frida Hook 方法，拦截 <span class="mono">encrypt()</span> 和 <span class="mono">decrypt()</span> 方法，直接获取加密/解密数据」。',
-          '静态路线：<span class="mono">jadx -d output/ app.apk</span> 反编译，然后 <span class="mono">grep -r "MD5" / "AES" / "RSA" output/</span> 找关键字。',
-          '动态路线：Hook <span class="mono">java.security.MessageDigest.getInstance</span> 与 <span class="mono">MessageDigest.digest</span> 看摘要算法；Hook <span class="mono">javax.crypto.Cipher.doFinal.overload("[B")</span> 看对称加密的明密文。',
-          'RSA 那一段的示例代码是 <span class="mono">Cipher.getInstance("RSA/ECB/PKCS1Padding")</span> + <span class="mono">init(Cipher.ENCRYPT_MODE, pubKey)</span> + <span class="mono">doFinal(data.getBytes())</span>。',
-          '<b>关键观察</b>：文档给 AES 和给 RSA 的 Hook 代码<b>逐字相同</b>——都是同一个 <span class="mono">Cipher.doFinal.overload("[B")</span>，打印一句日志然后原样返回。',
-          'Python 侧的解密示例用的是 <b>私钥</b>：<span class="mono">RSA.importKey(open("private.pem").read())</span> 配 <span class="mono">PKCS1_v1_5.new(private_key).decrypt(...)</span>，但没有交代这把 <span class="mono">private.pem</span> 是从哪来的。'
-        ],
-        method: [
-          '先反编译 APK（<span class="mono">jadx -d output/ app.apk</span>），把「用了哪些算法」这件事用关键字搜出来。',
-          '对每个命中的算法，挂上对应的 Frida Hook：摘要走 <span class="mono">MessageDigest</span>，对称/非对称都走 <span class="mono">Cipher.doFinal</span>。',
-          '在 Hook 里打印算法名与数据，把「App 调了什么、输入输出是什么」抄出来。',
-          '拿到参数之后，用 Python 的 pycryptodome 在本地复算一遍，与服务端交互验证。',
-          'RSA 这一段给出的复算路径是：用 <span class="mono">PKCS1_v1_5</span> 加一把 PEM 私钥去解密抓到的密文。'
-        ],
-        result:
-          '<p>文档给出的是一套可操作的入门流程：<b>搜关键字 → 挂 Hook → 抄参数 → 本地复算</b>，' +
-          '并用一段 Python 代码演示了「用私钥解 RSA 密文」的收尾方式。</p>' +
-          '<p>从教学效率看，这套流程对 MD5 和 AES 是成立的——因为这两种算法的复现要素就是「算法名 + 密钥（+ IV）」，' +
-          '而 Hook 正好能把它们抄出来。<b>但对 RSA，这一步就断了</b>：下一节的分析会具体指出断在哪里。</p>',
-        terms: ['jadx', 'Frida Hook', 'MessageDigest', 'Cipher.doFinal', 'RSA/ECB/PKCS1Padding', 'PKCS1_v1_5', 'pycryptodome', 'PEM'],
-        limits:
-          '<p>作者没有在这份文档里自述局限，所以这里只能记录我核对到的客观情况，不做代替作者下结论的事：</p>' +
-          '<p>① 该文档是<b>操作清单式</b>的短文（我读到的 raw markdown 约 6.1 KB），主体是代码片段 + 一到两句说明，' +
-          '既没有失败路径，也没有边界条件（比如「Hook 到了却复现不出来」该怎么办）。</p>' +
-          '<p>② 文档里 <span class="mono">console.log("[*] Intercepted ...: " + data)</span> 这种写法，' +
-          '能不能直接打印出可用的字节内容，取决于所用 Frida 版本对 Java <span class="mono">byte[]</span> 的字符串化行为——' +
-          '这一点需要在你自己的环境上实测 <span class="pill warn">待核实</span>。文档没有说明如何把它转成十六进制来比对。</p>' +
-          '<p>③ 我引用的是 main 分支上我读到的那一版；仓库仍在更新，内容可能已经变化 <span class="pill warn">待核实</span>。</p>',
-        analysis:
-          '<p><b>这个案例的价值，在于它把本章要纠正的那个错误示范得非常干净。</b>它的动作是「给每个算法挂一个 Hook」，' +
-          '而 RSA 那一段的 Hook 代码与 AES <b>一字不差</b>——<b>这正是「把非对称当成更强的对称」这个误区的代码化版本</b>（31.1 的测验就是打这个的）。</p>' +
-          '<p><b>第一，Hook <span class="mono">doFinal</span> 对 RSA 来说抓不到关键信息。</b>' +
-          '对 AES，<span class="mono">doFinal</span> 的输入输出加上此前 <span class="mono">init</span> 的密钥，要素就齐了；' +
-          '但对 RSA，<b>决定成败的三样东西都不在 <span class="mono">doFinal</span> 这一层</b>：' +
-          '① <span class="mono">init</span> 时传进去的 Key 是<b>公钥还是私钥</b>（这一条直接决定方向）；' +
-          '② 变换串里的<b>填充方案</b>（PKCS#1 v1.5 还是 OAEP）；' +
-          '③ 这段数据到底是<b>被加密</b>还是<b>被签名</b>。' +
-          '<span class="hit">对 RSA，你要 Hook 的第一个点是 <span class="mono">Cipher.init</span> 与 <span class="mono">Signature.initSign/initVerify</span>，而不是 <span class="mono">doFinal</span>。</span></p>' +
-          '<p><b>第二，文档里那个 <span class="mono">private.pem</span> 是整段示例的命门。</b>' +
-          'Python 那段代码能跑通的前提是「你手里有一把与服务端配对的私钥」。' +
-          '在服务端加密、客户端解密的场景里这确实可能存在——<b>但那恰恰就是 31.4 测验里那个设计缺陷</b>：' +
-          '私钥随 App 分发，等于没有保护。而在「客户端加密、服务端解密」的正常场景里，客户端只有公钥，' +
-          '这把私钥<b>根本不存在于你的目标里</b>，那段 Python 代码一步都跑不动。<br>' +
-          '<b>所以复现 RSA 的第一步不是写代码，是先回答「我手里这把钥匙是公钥还是私钥」。</b></p>' +
-          '<p><b>第三，把它的方法与本章地图接起来。</b>文档的路线本质上是「枚举算法名」，' +
-          '这在六类地图里对应的是<b>第 1～4 类（编码 / 摘要 / MAC / 对称）</b>——对这四类，' +
-          '「拿到算法名 + 密钥」确实就结束了。而第 5 类（非对称）的复现要素是' +
-          '<b>「方向 + 填充 + 公钥结构」</b>，与前面四类不是一套东西。<br>' +
-          '<span class="hit">这也解释了为什么很多人「全挂上 Hook 也复现不出来」：不是 Hook 不够全，是问题问错了层。</span></p>',
-        link: 'https://github.com/Evil0ctal/AndroidReverse101/blob/main/AndroidReverse101/%E7%AC%AC%E4%BA%8C%E9%98%B6%E6%AE%B5_APK%E9%80%86%E5%90%91%E5%9F%BA%E7%A1%80/Day_35_%E9%80%86%E5%90%91%E5%8A%A0%E5%AF%86%E7%AE%97%E6%B3%95_MD5_AES_RSA.md',
-        linkNote: 'GitHub 上的教学文档原文（Markdown）。正文可读性已通过同一路径的 raw 端点核对：本次核对时抓到 6133 字节的完整 Markdown',
-      },
-      stage: {
-        title: '两个方向：公钥加密 / 私钥解密 与 私钥签名 / 公钥验签',
-        legend: '<span class="pill ok mono">客户端有</span> <span class="pill bad mono">客户端没有</span>',
-        speed: 1700,
-        render:
-          '<div class="flow-col" style="gap:10px">' +
-            '<div class="flow-row"><span class="pill mono">客户端手里有</span>' +
-              '<span class="blk" id="cpub">公钥 (n, e) —— 公开，随便拿</span>' +
-              '<span class="blk" id="cpriv">私钥 d —— 不在 App 里</span></div>' +
-            '<div class="flow-row" style="margin-top:8px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill acc mono">用法 A · 保密</span>' +
-              '<span class="blk" id="a1">明文 m</span><span class="arrow">→</span>' +
-              '<span class="blk" id="a2">c = m^e mod n（用公钥）</span><span class="arrow">→</span>' +
-              '<span class="blk" id="a3">m = c^d mod n（用私钥）</span></div>' +
-            '<div class="flow-row">' +
-              '<span class="pill acc mono">用法 B · 防篡改</span>' +
-              '<span class="blk" id="b1">摘要 H(m)</span><span class="arrow">→</span>' +
-              '<span class="blk" id="b2">s = H(m)^d mod n（用私钥）</span><span class="arrow">→</span>' +
-              '<span class="blk" id="b3">H(m) =? s^e mod n（用公钥）</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="mark">结论：两个方向正好相反</span></div>' +
-            '<div id="alog" style="margin-top:8px;font-family:var(--mono);font-size:12.5px;color:var(--fg-3)">' +
-              '&gt; 等待开始</div>' +
-          '</div>',
-        reset: () => {
-          ['cpub', 'cpriv', 'a1', 'a2', 'a3', 'b1', 'b2', 'b3'].forEach(i => S(i, ''));
-          S('cpub', 'cool');
-          S('cpriv', 'bad');
-          CLS('mark', 'pill bad');
-          SET('mark', '结论：两个方向正好相反');
-          SET('alog', '&gt; 等待开始');
-        },
-        steps: [
-          { run: () => { S('a1', 'active'); SET('alog', '&gt; 用法 A 第 1 步：要保密的内容（通常很短，比如一把对称密钥）'); },
-            note: '<b>用法 A：保密。</b>要保护的内容通常很短——RSA 一次只能加密到「模长 − 填充开销」那么多字节（31.4 提过）。' +
-                  '所以现实里它加密的往往就是一把 16 字节的对称密钥。' },
-          { run: () => { S('a1', 'done'); S('a2', 'hot'); SET('alog', '&gt; 用公钥加密：这一步任何拿到公钥的人都能做，包括你'); },
-            note: '<b>★ 用公钥加密。</b>注意这里：<span class="hit">加密这个动作不需要保密能力</span>——公钥就在 App 里、在证书里、在服务端下发的接口里。' +
-                  '所以「App 能加密」这件事一点都不神秘；<b>它甚至可能根本不是保护措施，只是流程要求</b>。' },
-          { run: () => { S('a2', 'done'); S('a3', 'hot'); SET('alog', '&gt; 用私钥解密：这一步只有私钥持有者能做 —— 而私钥不在客户端'); },
-            note: '<b>★ 用私钥解密。</b>这一步是<b>客户端做不到</b>的。所以如果你发现目标 App 能解密服务端下发的数据，' +
-                  '那么结论只有一个：<b>它手里有私钥</b>（或者那把「私钥」其实是服务端用公钥加密时的另一套关系）。<br>' +
-                  '这个观察是 31.11 案例的入口，也是 31.12 甄别清单里的第一条硬伤。' },
-          { run: () => { S('b1', 'active'); SET('alog', '&gt; 用法 B 第 1 步：先对消息取摘要（为什么要先取摘要？见下一步）'); },
-            note: '<b>用法 B：防篡改。</b>签名的对象通常不是原文，而是原文的<b>摘要</b>。两个原因：' +
-                  '① RSA 一次能处理的数据量很小，摘要把任意长度的消息压成定长；' +
-                  '② 签名验证的是「内容有没有被改」，摘要已经足够表达这件事。' },
-          { run: () => { S('b1', 'done'); S('b2', 'hot'); SET('alog', '&gt; ★ 用私钥签名：这一步只有私钥持有者能做 —— 所以「客户端在签名」等于「客户端有私钥」'); },
-            note: '<b>★ 用私钥签名——这一格是整个第 31.7 节的命门。</b>' +
-                  '<span class="hit">签名是「用私钥做」的动作。</span>于是只要你观察到客户端在做签名，' +
-                  '就必然推出「私钥可以在客户端被拿到」这个结论。<br>' +
-                  '而对你的工作来说，这是一条<b>好消息</b>：它意味着这个签名一定可复现——你不用破解 RSA，' +
-                  '只需要把私钥或产生签名的整段逻辑搬过来。' },
-          { run: () => { S('b2', 'done'); S('b3', 'hot'); SET('alog', '&gt; 用公钥验签：这一步谁都能做 —— 所以验签逻辑可以放在客户端'); },
-            note: '<b>★ 用公钥验签。</b>这一格也解释了另一件事：<b>为什么很多 App 会在客户端做「验签」</b>——' +
-                  '比如校验服务端下发的配置、校验某个授权文件的真实性。因为验签只需要公钥，而公钥可以公开。' +
-                  '<br><span class="hit">在客户端看到验签逻辑，你通常不需要「破解」它——把公钥拿出来，自己签一个合法数据就行。' +
-                  '但注意：如果签名用的私钥也在这个 App 里（那就回到了用法 B 的上一格），你连签都不用，直接调用它的签名函数。</span>' },
-          { run: () => { S('a3', 'done'); S('b3', 'done'); CLS('mark', 'pill ok');
-              SET('mark', '✅ 记住这一句：加密和签名用同一套密钥，但方向相反'); SET('alog', '&gt; 收束：判断方向的三个证据 —— init 的 Key 类型、调用的类（Cipher 还是 Signature）、以及数据长度'); },
-            note: '<b>收束：怎么在现场判断方向？</b>三个便宜的证据：<br>' +
-                  '① <b>看调用的类</b>：<span class="mono">Cipher</span> → 加密；<span class="mono">Signature</span> → 签名/验签；' +
-                  '<span class="mono">Mac</span> → HMAC（第 8 章那一类）。<br>' +
-                  '② <b>看 init 时传的 Key 是公钥还是私钥</b>：<span class="mono">PublicKey</span> / <span class="mono">PrivateKey</span>，' +
-                  '以及 <span class="mono">Signature.initSign</span>（私钥）还是 <span class="mono">initVerify</span>（公钥）。<br>' +
-                  '③ <b>看数据长度</b>：密文/签名恒为模长（2048 位 → 256 字节）；谁「变长」谁就是被处理过的对象。<br>' +
-                  '<span class="hit">这三条都不需要你读懂一行大数运算代码。</span>' }
-        ]
-      },
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境二',
-            scenario: '<b>情境：</b>静态分析确认：这个 App 会用 <span class="mono">Signature.getInstance("SHA256withRSA")</span> ' +
-              '对请求体产生一个 256 字节的 <span class="mono">sign</span> 字段。而你在整个 APK 与所有 so 里，' +
-              '<b>只找到一段 2048 位的公钥</b>（以 SPKI 形式硬编码），没有任何私钥。<br>' +
-              '组长问你：「客户端在签名，但私钥不在客户端——这怎么可能？我们还能不能复现这个签名？」<br>你怎么回答、怎么做？',
-            choices: [
-              { t: '先把这个矛盾本身当成最重要的线索：去确认它到底调用的是 initSign 还是 initVerify，以及那段公钥是不是被当私钥用了', next: 'n1' },
-              { t: '私钥一定被加固藏起来了，先上脱壳 + 内存 dump，把整个进程内存搜一遍找私钥', next: 'n2' },
-              { t: '不可能复现。既然私钥拿不到，这条路就断了，直接放弃签名、改用重放请求', next: 'n3' },
-              { t: '绕过签名：既然服务端认签名，我们就 hook 掉客户端的签名函数，让它返回固定值试试', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：矛盾就是线索，先去核对「谁在做哪个动作」',
-            result: '<b>「客户端在签名」与「私钥不在客户端」这两句里，至少有一句是错的</b>——而找出哪一句错了，成本极低。' +
-              '三种常见情况，覆盖了绝大多数现场：<br>' +
-              '<b>① 它其实在验签，不是签名。</b><span class="mono">Signature.getInstance("SHA256withRSA")</span> ' +
-              '既用于签名也用于验签，区别在 <span class="mono">initSign(私钥)</span> 还是 <span class="mono">initVerify(公钥)</span>。' +
-              '看到 <span class="mono">getInstance</span> 就断定「在签名」，是现场最常见的误判。<br>' +
-              '<b>② 那个 <span class="mono">sign</span> 字段根本不是 RSA 签名。</b>它可能是 HMAC（32/64 字节），' +
-              '而你在别处看到 256 字节就以为它是签名。<b>量长度</b>就能分开（31.3）。<br>' +
-              '<b>③ 私钥确实在客户端，但被拆散/加密藏得很深。</b>这时才轮到脱壳与内存工作——但因为你有更便宜的两步，' +
-              '不该一开始就上它。<br>' +
-              '<span class="hit">注意这一选的思维动作：把「矛盾」当成待验证的假设，而不是当成需要蛮力突破的障碍。</span>'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'bad',
-            verdictTitle: '用最贵的手段去验证一个还没成立的假设',
-            result: '<b>认知根源：把「找不到」直接解释成了「藏得深」。</b>找不到私钥有两种可能：藏得深，或者<b>根本不在这里</b>。' +
-              '而这两种可能需要的手段完全不同——你现在的选择只覆盖了第一种。<br>' +
-              '更具体的代价：脱壳 + 全内存 dump + 搜索，是一条数小时到数天的路径，而且它<b>没有回答「它到底在签名还是在验签」</b>这个问题。' +
-              '如果答案是「它在验签」，那你这一整趟全是白做。<br>' +
-              '<b>正确的成本排序：先花十分钟核对动作方向（看 initSign / initVerify、看 SymmetricKey / PublicKey 类型），' +
-              '再决定要不要为「私钥藏得深」这个假设付大代价。</b>'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '把一个还没验证的前提，当成了放弃的理由',
-            result: '<b>认知根源：把「私钥不在客户端」当成了既定事实，然后据此宣布无解。</b>' +
-              '但你自己也说了，前提是「只找到公钥」——<b>这只说明你没找到私钥，不说明它不存在</b>。' +
-              '这和第 8 章「搜不到 IV 就说没用 MD5」是同一类逻辑错误。<br>' +
-              '另外「改用重放」这个退路也不像听起来那么安全：签名通常带时间戳与随机数，' +
-              '重放窗口可能只有几十秒；而且重放会让你的分析停留在黑盒层面，对后续所有接口都无效。<br>' +
-              '<b>放弃是最后一步，不是第二步。</b>在放弃之前，你至少应该先确认方向、确认长度、确认它是不是真的 RSA。'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '把「客户端能改」误当成「服务端会认」',
-            result: '<b>认知根源：把攻击面理解成了客户端单方面的事。</b>签名是<b>服务端拿去验证</b>的东西。' +
-              '你在客户端让函数返回固定值，只是让客户端发出去一个固定的字符串——服务端用它手里的<b>公钥</b>一验，' +
-              '立刻就知道这个签名不合法，请求被拒。<br>' +
-              '这条路的唯一价值是「探测服务端有没有真的验签」（如果服务端偷懒不验，那你确实绕过了——但那时你连 RSA 都不用管）。' +
-              '<b>把它当成验证假设的实验可以，当成解法不行。</b><br>' +
-              '<span class="hit">顺便记住这个区分：能在客户端改的，只有「客户端发出的字节」；服务端认不认，取决于服务端的校验逻辑，' +
-              '而那不在你的控制范围内。</span>'
+          const picked = String(v.flags || '').toUpperCase()
+            .split(/[\s,，、]+/).filter(Boolean)
+            .map(s => ({ 'PIDNS': 'PID', 'MNTNS': 'MNT', 'MOUNT': 'MNT', 'NS': '', 'CLONE_NEWPID': 'PID',
+                         'CLONE_NEWNET': 'NET', 'CLONE_NEWNS': 'MNT', 'CLONE_NEWUTS': 'UTS',
+                         'CLONE_NEWIPC': 'IPC', 'CLONE_NEWUSER': 'USER', 'CLONE_NEWCGROUP': 'CGROUP' }[s] || s))
+            .filter(Boolean);
+
+          let html = '<table class="lab-tbl"><tr><th>标志</th><th>需求是否需要</th><th>你的选择</th><th>说明</th></tr>';
+          let correct = 0, total = 0;
+          for (const [f, info] of Object.entries(need)) {
+            const has = picked.includes(f);
+            const ok = has === info.want;
+            if (ok) correct++;
+            total++;
+            html += '<tr class="' + (ok ? 'same' : 'diff') + '">'
+              + '<td><code>' + f + '</code></td>'
+              + '<td>' + (info.want ? '<b>需要</b>' : '非必需') + '</td>'
+              + '<td>' + (has ? '选了' : '没选') + ' ' + (ok ? '✅' : '❌') + '</td>'
+              + '<td style="font-size:12px">' + info.why + '</td></tr>';
           }
-        }
-      },
-      quiz: {
-        id: 'q31-5', chapter: 31, answer: 1,
-        stem: '你在一个 App 里看到它用 <span class="mono">Signature.getInstance("SHA256withRSA")</span> 处理某个字段，' +
-          '并且这段代码位于<b>上传请求之前</b>。关于「这是签名还是验签」，下面哪个判断方法<b>最可靠</b>？',
-        options: [
-          { t: '看 <span class="mono">getInstance</span> 后面跟的是不是什么 withRSA：带 withRSA 就是签名', why: 'getInstance 的参数只说明「用哪个算法做散列 + 用哪个算法做非对称运算」，它同时用于签名和验签两条路径，区分不了方向。' },
-          { t: '看它调的是 <span class="mono">initSign</span> 还是 <span class="mono">initVerify</span>，以及传进去的是 PrivateKey 还是 PublicKey', why: '正确。方向完全由 init 决定：initSign 要求私钥（产生签名），initVerify 要求公钥（验证签名）。这两个方法名本身就是规范定义的语义，是可靠、便宜且无法混淆的判据。' },
-          { t: '看输出长度：256 字节就是签名，128 字节就是验签', why: '长度只反映模长（2048 位 → 256 字节），签名与验签的输出/输入长度是一样的，区分不了方向。' },
-          { t: '看它写在哪个类里：写在网络工具类里就是签名', why: '代码位置是弱证据。同一个工具类里既有签名函数也有验签函数是常态，靠位置判断属于猜测。' }
-        ],
-        explain: '<b>方向由 init 决定，不由类名或算法名决定。</b>这是 JCE 里一条非常干净的规则：' +
-          '<span class="mono">Signature.initSign(PrivateKey)</span> 进入「产生签名」状态，' +
-          '<span class="mono">Signature.initVerify(PublicKey)</span> 进入「验证签名」状态。' +
-          '两个方法对密钥类型的要求是硬性的——传错了会直接抛异常，所以你只要看到调用点就能确定方向。<br>' +
-          '<p>为什么这条判据值得单独出一道题：因为它把 31.7 那个看起来很抽象的原则（<b>公钥做什么、私钥做什么</b>）' +
-          '落到了一个具体的 API 上。<b>在客户端的语境里，方向不是学术问题，而是可行性问题</b>：' +
-          '如果它在 initSign，那私钥必然可获取（否则代码跑不起来），你的任务是找到它；' +
-          '如果它在 initVerify，那它根本不是在「产生」签名，你去找私钥就是白费力气，' +
-          '真正该做的是把公钥拿出来、自己造一段合法数据。<br>' +
-          '<span class="hit">同一个 getInstance 字符串，两种 init，通向两条完全不同的分析路线——这就是「方向判断错，后面全错」的具体含义。</span></p>'
-      }
-    },
-    /* ============================================================ 31.8 */
-    {
-      h: '31.8', title: '填充：看到 RSA 却复现不出的头号原因',
-      html:
-        '<p>如果你只记住本章的一句话，记住这句：<strong>「裸 RSA」是一个数学家写出来的玩具，不是一个工程师会用的东西。</strong></p>' +
-        '<p>教科书上的 <span class="mono">c = m^e mod n</span> 有一个致命特征——它是<strong>确定性</strong>的：同一个明文、同一个公钥，' +
-        '算出来永远是同一个密文。而真实世界的 RSA 实现，在加密之前会先往明文里塞一段<strong>填充</strong>（padding），' +
-        '让每一次的结果都不一样。</p>' +
-        T.note('bad', '🔥 这就是「hook 到了、参数也对、但结果就是不一样」的头号原因',
-          '<p style="margin-bottom:0">你把明文、公钥、算法全搞对了，用 Python 算出来的密文和服务端/抓包里的对不上——' +
-          '十次里有七次是<b>填充没对上</b>。<br>' +
-          '而且它有两个变种：<b>方案选错</b>（PKCS#1 v1.5 还是 OAEP）和<b>参数不对</b>（OAEP 用哪个哈希、MGF 用哪个）。' +
-          '再叠加一层「随机填充每次都不一样」，于是你连「算对一次」都很难验证。<br>' +
-          '<span class="hit">正确的排查顺序是：先确认填充方案，再确认「这个场景到底能不能用密文比对来验证」。</span></p>') +
-        '<h4>两种主流方案：PKCS#1 v1.5 与 OAEP</h4>' +
-        T.tbl(['', 'PKCS#1 v1.5（老，但最常见）', 'OAEP（新，推荐）'],
-          [
-            ['<b>加密前怎么构造</b>',
-             '<span class="mono">00 02 || PS || 00 || M</span><br>PS 是至少 8 字节的<b>非零随机</b>字节',
-             '<span class="mono">00 || maskedSeed || maskedDB</span><br>用哈希与掩码生成函数（MGF）把种子和数据混合'],
-            ['<b>结果是确定的还是随机的</b>',
-             '<b>随机</b>（因为 PS 随机）',
-             '<b>随机</b>（因为种子随机）'],
-            ['<b>能不能用密文比对来验证</b>',
-             '不能直接比——<b>但可以用私钥解出来看结构</b>（开头两个字节是不是 <span class="mono">00 02</span>）',
-             '同样不能直接比；解出来看开头是不是 <span class="mono">00</span>，以及后续的哈希是否自洽'],
-            ['<b>变换串长什么样</b>',
-             '<span class="mono">RSA/ECB/PKCS1Padding</span>（Android / SunJCE 的常见写法）',
-             '<span class="mono">RSA/ECB/OAEPWithSHA-1AndMGF1Padding</span> 或 <span class="mono">RSA/ECB/OAEPPadding</span>'],
-            ['<b>逆向时的难点</b>',
-             'PS 随机，所以密文每次都不同；<b>但结构简单、肉眼可验</b>',
-             '哈希与 MGF 的具体取值可能随库与版本不同，<b>参数对不上就永远算不出来</b>']
-          ]) +
-        T.note('warn', '⚠️ 三处必须标「待核实」的细节',
-          '<p><b>① 不带模式与填充的写法到底默认成什么。</b>你经常看到 <span class="mono">Cipher.getInstance("RSA")</span>——' +
-          '只给算法名。规范要求 Provider 提供默认值，而<b>不同 Provider、不同 Android 版本的默认值不保证完全一致</b>。' +
-          '业界普遍认为 Android / SunJCE 的历史默认是 <span class="mono">RSA/ECB/PKCS1Padding</span>，' +
-          '但这需要在你自己的目标上实测 <span class="pill warn">待核实</span>。</p>' +
-          '<p><b>② OAEP 的默认哈希与 MGF。</b><span class="mono">OAEPPadding</span> 与 <span class="mono">OAEPWithSHA-1AndMGF1Padding</span> ' +
-          '在默认参数上可能不同；历史上 SHA-1 是默认选择，但新版本与不同库可能改 <span class="pill warn">待核实</span>。' +
-          '<b>这一条的实操结论：不要猜，去把完整的变换串字符串打出来。</b></p>' +
-          '<p style="margin-bottom:0"><b>③ 签名的填充。</b>PKCS#1 v1.5 签名不是简单地对消息做模幂，而是先拼一个 ' +
-          '<span class="mono">DigestInfo</span> 结构（<span class="mono">算法 OID + 摘要</span>）。' +
-          '这意味着<b>你自己实现的「对摘要做模幂」会少一层固定前缀，结果必然对不上</b>。' +
-          '常见的前缀在规范里有明确定义（SHA-1 是 <span class="mono">30 21 30 09 06 05 2B 0E 03 02 1A 05 00 04 14</span>，' +
-          'SHA-256 是 <span class="mono">30 31 30 0D 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20</span>），' +
-          '具体以你所用标准的附录为准 <span class="pill warn">待核实</span>。</p>') +
-        '<h4>为什么裸 RSA 不安全：两个必须理解的后果</h4>' +
-        T.grid(2, [
-          '<div class="card"><div class="card-title">后果一：确定性 → 字典攻击</div>' +
-          '<p>如果 <span class="mono">c = m^e mod n</span> 没有任何随机成分，那么<b>同一个明文永远产出同一个密文</b>。</p>' +
-          '<p>于是攻击者不需要解密：他只要把候选明文（比如 <span class="mono">"0"</span>、<span class="mono">"1"</span>、' +
-          '<span class="mono">"true"</span>、一批常见口令）逐个加密，看哪个密文与你抓到的一致即可。</p>' +
-          '<p><span class="hit">这条性质在逆向现场的第一个用途是「判断有没有填充」：同一明文、同一公钥，两次密文完全相同 → 没有随机填充。</span></p></div>',
-          '<div class="card"><div class="card-title">后果二：可乘性 → 攻击者能在不解密的情况下「加工」密文</div>' +
-          '<p>因为 <span class="mono">(m₁^e)·(m₂^e) = (m₁·m₂)^e</span>，所以在模 n 下有：</p>' +
-          '<p><span class="mono">c(m₁) × c(m₂) mod n = c(m₁ × m₂ mod n)</span></p>' +
-          '<p>这意味着<b>攻击者可以把两个密文乘起来，得到一个「两数乘积的密文」，而他完全不知道明文是什么</b>。' +
-          '这是选择密文攻击（CCA）的基石之一。</p>' +
-          '<p>下面这个实验会让你亲手算出这个等式成立——<b>用真的数字，不是示意</b>。</p></div>'
-        ]) +
-        '<p>还有第三个后果值得一提：当明文很短、<span class="mono">m^e &lt; n</span> 时，取模根本没发生，' +
-        '密文就是 <span class="mono">m^e</span> 本身——此时直接对密文开 e 次方就能得到明文，' +
-        '连分解 n 都不用。<strong>这是 e 取值很小时最直接的风险</strong>（31.5 提过）。</p>',
-      lab: {
-        title: '实验三：填充识别器 —— 两条密文背后有没有随机填充',
-        goal: '目标：用真的模幂判定填充，并亲手验证裸 RSA 的可乘性',
-        intro:
-          '<p>场景：同一个明文、同一把公钥，你抓到了<b>两条不同的密文</b>。</p>' +
-          '<p>下面是<i>教学用的</i>一把 256 位 RSA 密钥（模数只有 32 字节，方便你看清每个字节），' +
-          '私钥也一并给你——因为<b>这个实验的目的就是让你真的解一次、亲眼看到填充结构</b>。' +
-          '真实场景里你没有私钥，那时的判据是「两条密文是否相同」+「长度」。</p>' +
-          '<p><b>任务：① 判断这两条密文有没有填充、是哪种；② 说明为什么裸 RSA 一定不会有「两条不同」的现象。' +
-          '把结论写在第 7 个输入框里。</b></p>',
-        inputs: [
-          { key: 'n', label: '模数 n（十六进制）', hint: '教学用 256 位模数', type: 'textarea', rows: 3,
-            value: 'b4a6cec41e21c6592fd8c00045bbea46d03ce689aaea46fbd3b744fba8a82377' },
-          { key: 'e', label: '公钥指数 e', hint: '十进制或 0x 前缀', value: '65537' },
-          { key: 'd', label: '私钥指数 d（十六进制，本实验给你）', hint: '真实场景里你不会有它', type: 'textarea', rows: 3,
-            value: '45f9df59e47a1cc4eb5dc071da9141dbe961fa51e8185ef542fda9246747e161' },
-          { key: 'm', label: '明文（按 UTF-8 文本）', hint: '两条密文对应的同一个明文', value: 'ping=1234' },
-          { key: 'c1', label: '密文 c1（十六进制）', type: 'textarea', rows: 3,
-            value: '456c8858443a8b6718094da6a4bb7dc9e8a641b26640281067cc416da1869d2d' },
-          { key: 'c2', label: '密文 c2（十六进制，同一明文的另一次结果）', type: 'textarea', rows: 3,
-            value: '1d4c9cb7a44633aa440641bc8d27666351f9e809262de7df72cf925064bae60b' },
-          { key: 'verdict', label: '你的判断', hint: '例：有没有填充？是哪种？为什么两次密文不同？', type: 'textarea', rows: 3, value: '' }
-        ],
-        runLabel: '🔍 真算一遍（含可乘性验证）',
-        run: function (v) {
-          var HX = function (s) { return String(s == null ? '' : s).replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '').toLowerCase(); };
-          var B = function (s) {
-            var t = String(s == null ? '' : s).trim().replace(/[\s,_]/g, '');
-            if (!t) return null;
-            try { return BigInt(/^0x/i.test(t) ? t : '0x' + HX(t).replace(/^$/, '0')); } catch (e) { return null; }
-          };
-          var Dec = function (s) {
-            var t = String(s == null ? '' : s).trim();
-            if (!t) return null;
-            try { return /^0x/i.test(t) ? BigInt(t) : BigInt(t); } catch (e) { return null; }
-          };
-          var mp = function (b, ex, n) {
-            b %= n; if (b < 0n) b += n;
-            var r = 1n;
-            while (ex > 0n) { if (ex & 1n) r = r * b % n; b = b * b % n; ex >>= 1n; }
-            return r;
-          };
-          var n = B(v.n), e = Dec(v.e), d = B(v.d), c1 = B(v.c1), c2 = B(v.c2);
-          var msg = String(v.m == null ? '' : v.m);
-          if (n === null || e === null || d === null || c1 === null || c2 === null || !msg) {
-            return '<div class="lab-msg warn"><b>参数不完整</b><div class="lab-note">n、e、d、m、c1、c2 都要填（n/d/c1/c2 是十六进制，e 可十进制）。</div></div>';
+          html += '</table>';
+
+          // 未知项
+          const unknown = picked.filter(p => !(p in need));
+          if (unknown.length) {
+            html += '<div class="lab-msg warn"><b>⚠️ 有无法识别的项</b>'
+              + '<div class="lab-note">' + unknown.join('、') + ' —— 请用 PID / NET / MNT / UTS / IPC / USER / CGROUP 这些简称。</div></div>';
           }
-          var k = Math.ceil(n.toString(2).length / 8);
-          var pad = function (x) { var h = x.toString(16); if (h.length % 2) h = '0' + h; return h.padStart(k * 2, '0'); };
-          var bytesOf = function (h) { var a = []; for (var i = 0; i < h.length; i += 2) a.push(parseInt(h.substr(i, 2), 16)); return a; };
-          var mHex = '';
-          for (var i = 0; i < msg.length; i++) { var cc = msg.charCodeAt(i); if (cc < 128) mHex += cc.toString(16).padStart(2, '0'); else mHex += '3f'; }
-          var mInt = BigInt('0x' + mHex);
-          if (mInt >= n) return '<div class="lab-msg fail"><b>明文比模数还长</b><div class="lab-note">这个教学模数只有 ' + k +
-            ' 字节，装不下 ' + msg.length + ' 字节的明文。把明文改短一点再试。</div></div>';
-          var cRaw = mp(mInt, e, n);
-          var em1 = pad(mp(c1, d, n)), em2 = pad(mp(c2, d, n));
-          var mTail = pad(mInt).slice(-mHex.length);
-          var rows = '';
-          var row = function (a, b, c) { return '<tr><td>' + a + '</td><td>' + b + '</td><td>' + c + '</td></tr>'; };
-          rows += row('模长 k = ⌈位数/8⌉', k + ' 字节', 'RSA 的密文长度恒等于模长，与明文多长无关');
-          rows += row('c1 == c2 ？', (c1 === c2 ? '<b>相同</b>' : '<b>不同</b>'),
-            c1 === c2 ? '确定性 —— 两次结果一样，说明密文里没有任何随机成分' : '有随机成分 —— 填充（或随机 IV 之类的机制）在起作用');
-          rows += row('c1 与「裸 RSA 复算值」比较', (c1 === cRaw ? '<b>相同</b>' : '<b>不同</b>'),
-            '裸 RSA 复算：c = m^e mod n，其中 m 是明文的整数值');
-          rows += row('c2 与「裸 RSA 复算值」比较', (c2 === cRaw ? '<b>相同</b>' : '<b>不同</b>'), '同上');
-          rows += row('裸 RSA 复算值 c = m^e mod n（十六进制）', pad(cRaw), '把 c1、c2 都换成这个值再跑一次，就能亲眼看到「无填充 ⇒ 两次密文完全相同」');
-          rows += row('用私钥解 c1 得到的 EM 前 4 字节', em1.slice(0, 8), '解密不是「直接得到明文」，中间先得到填充块 EM');
-          rows += row('用私钥解 c2 得到的 EM 前 4 字节', em2.slice(0, 8), '两条 EM 的头部相同、随机段不同');
-          rows += row('两条 EM 是否相同', (em1 === em2 ? '相同' : '<b>不同</b>'), '不同点集中在填充段，而不是消息段');
-          rows += row('两条 EM 的尾部是不是同一个消息', (em1.slice(-mHex.length) === mTail && em2.slice(-mHex.length) === mTail ? '<b>是</b>' : '否'),
-            '两条密文解出来的明文一致，差别只在填充字节');
-          var emB1 = bytesOf(em1);
-          var psz = emB1.slice(2, k - 1 - msg.length);
-          var hdrOK = em1.slice(0, 4) === '0002' && em2.slice(0, 4) === '0002';
-          var psOK = psz.length > 0 && psz.every(function (b) { return b !== 0; });
-          var sepOK = emB1[k - 1 - msg.length] === 0;
-          rows += row('EM 结构判读', '首两字节 ' + em1.slice(0, 4) + '；填充段全非零？' + (psOK ? '是' : '否') +
-            '；消息前有分隔的 00？' + (sepOK ? '是' : '否'),
-            hdrOK
-              ? '<span class="mono">00 02 || 非零随机 PS || 00 || M</span> —— 这正是 PKCS#1 v1.5 <b>加密</b>填充的结构'
-              : 'EM 开头不是 <span class="mono">00 02</span>，<b>不符合 PKCS#1 v1.5</b>。如果开头是 <span class="mono">00 00</span>，' +
-                '说明这次<b>没有做填充</b>——解出来的 EM 就是明文整数本身（这也是「裸 RSA」的直接证据）');
-          var html = '<table class="lab-tbl"><thead><tr><th>观察项</th><th>结果</th><th>它意味着什么</th></tr></thead><tbody>' +
-            rows + '</tbody></table>';
-          html += '<div class="lab-msg ' + (c1 !== c2 ? 'pass' : 'warn') + '"><b>' +
-            (c1 !== c2 ? '→ 两次密文不同，说明密文里有随机成分：存在随机填充' : '→ 两次密文完全相同：不存在随机填充（确定性）') + '</b>' +
-            '<div class="lab-note">把这个现象和第 7 个输入框的判断对上：<b>两次不同 ⇒ 有随机填充</b>；' +
-            '<b>两次相同 ⇒ 裸 RSA 或固定填充</b>（后者同样危险，因为它是确定的）。</div></div>';
-          var m1 = mInt, m2 = mInt + 1n;
-          var cm1 = mp(m1, e, n), cm2 = mp(m2, e, n);
-          var prod = (cm1 * cm2) % n;
-          var cprod = mp((m1 * m2) % n, e, n);
-          html += '<div class="lab-msg model"><b>附带验证：裸 RSA 的可乘性（用你填的 n 与 e 真算）</b>' +
-            '<div class="lab-note">取 m₁ = 明文的整数值 = <span class="mono">' + m1 + '</span>，m₂ = m₁ + 1 = <span class="mono">' + m2 + '</span>：<br>' +
-            'c(m₁) = <span class="mono">' + cm1 + '</span><br>' +
-            'c(m₂) = <span class="mono">' + cm2 + '</span><br>' +
-            'c(m₁) × c(m₂) mod n = <span class="mono">' + prod + '</span><br>' +
-            'c(m₁ × m₂ mod n)　　 = <span class="mono">' + cprod + '</span><br>' +
-            '<b>' + (prod === cprod ? '✅ 两者完全相等' : '❌ 不等') + '</b> —— ' +
-            '攻击者把两个密文相乘，就得到了「两数乘积的密文」，而他从头到尾不知道明文是什么。' +
-            '<b>这就是裸 RSA 不能用的第二个理由。</b></div></div>';
-          html += '<div class="lab-note">想亲眼看「无填充 ⇒ 两次密文相同」的现象？把 c1 和 c2 都换成上表中' +
-            '「裸 RSA 复算值」那一行的十六进制值，再点一次本按钮即可。</div>';
+
+          const score = unknown.length ? 0 : correct;
+          html += '<div class="lab-msg ' + (score === total ? 'pass' : score >= 4 ? 'warn' : 'fail') + '">'
+            + '<b>' + (score === total ? '✅ 完全正确' : score >= 4 ? '🟡 大体对了，有偏差' : '❌ 偏差较大')
+            + '（' + score + '/' + total + '）</b>'
+            + '<div class="lab-note">正确答案：<b>PID + MNT + UTS + NET</b> 四个。<br>'
+            + '口诀：<b>① 看得见什么（PID）② 写在哪儿（MNT）③ 叫什么名字（UTS）④ 网络怎么走（NET）</b>——' +
+            '前四个需求正好一一对应这四个标志。</div></div>';
+
+          // 第②问
+          const fb = String(v.forkbomb || '').trim();
+          if (fb) {
+            const hitCg = window.AKKC_hasConcept(fb, ['cgroup', '控制组', 'pids.max', 'pids', '资源限制']);
+            const hitNs = window.AKKC_hasConcept(fb, ['namespace', '命名空间']);
+            html += '<div class="lab-msg ' + (hitCg && !hitNs ? 'pass' : 'warn') + '">'
+              + '<b>' + (hitCg && !hitNs ? '✅ 正确：靠 cgroup 的 pids 控制器' : '🟡 再想想') + '</b>'
+              + '<div class="lab-note">'
+              + '限制进程数属于<b>资源限制</b>，是 <b>cgroup</b> 的职责，不是 namespace 的。<br>'
+              + '具体用 <code>pids</code> 控制器：写 <code>pids.max = 100</code>，' +
+              '再把进程加入对应的 <code>cgroup.procs</code>。<br><br>'
+              + '<b>关键区分（本章最重要的那句话）：</b><br>'
+              + '<b>namespace 管"看不看得见"（隔离），cgroup 管"能⽤多少"（限制）。</b><br>'
+              + '它们解决的是两类完全不同的问题，容器 = 两者 + rootfs + capabilities。'
+              + '</div></div>';
+          }
           return html;
         },
-        expected: function (v) {
-          var hv = String(v.verdict == null ? '' : v.verdict);
-          var H = window.AKKC_hasConcept;
-          var g = [
-            { n: '指出了「有填充」', any: ['填充', 'padding', 'pkcs', 'v1.5', 'pkcs1', 'pkcs#1', '00 02'] },
-            { n: '用「两次密文不同」推断出存在随机成分', any: ['两次不同', '不同', '不一样', '随机', 'random', '每次都变', '每次不同', '不确定'] },
-            { n: '说清了裸 RSA 是确定的（两次会相同）', any: ['相同', '一样', '确定', '确定性', '固定', '裸', '无填充', '没有填充'] }
-          ];
-          var hits = g.map(function (x) { return H(hv, x.any); });
-          var ok = hits[0] && (hits[1] || hits[2]);
-          var list = g.map(function (x, i) { return (hits[i] ? '<span class="hit">✔</span> ' : '<span class="miss">?</span> ') + x.n; }).join('<br>');
-          if (!hv.trim()) return { ok: false, detail: '还没写判断。先跑一次上面的计算，把「有没有填充」和「为什么两次不同」说清楚。' };
+        expected: (v) => {
+          const want = ['PID', 'MNT', 'UTS', 'NET'];
+          const picked = String(v.flags || '').toUpperCase()
+            .split(/[\s,，、]+/).filter(Boolean)
+            .map(s => ({ 'CLONE_NEWPID': 'PID', 'CLONE_NEWNET': 'NET', 'CLONE_NEWNS': 'MNT',
+                         'CLONE_NEWUTS': 'UTS', 'CLONE_NEWIPC': 'IPC', 'CLONE_NEWUSER': 'USER',
+                         'CLONE_NEWCGROUP': 'CGROUP' }[s] || s));
+          const extra = picked.filter(p => !want.includes(p));
+          const miss = want.filter(w => !picked.includes(w));
+          const ok = extra.length === 0 && miss.length === 0;
           return {
-            ok: ok,
-            detail: (ok ? '✅ 判断到位。' : '❌ 还差一点：至少要点明<b>有填充</b>，并且解释<b>两次密文不同</b>背后的原因。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">再追问自己一句：如果没有填充，密文会变成什么样？</span>答案见下一段的解析。' : '')
+            ok,
+            detail: ok
+              ? '<b>完全正确：PID + MNT + UTS + NET。</b><br>' +
+                '前四个需求恰好一一对应这四个标志 —— 这不是巧合，' +
+                '而是因为<b>每个 namespace 都对应一类"共享资源"</b>：进程表、挂载表、主机名、网络栈。<br>' +
+                '需求⑤（进程数）不属于隔离而是<b>限制</b>，归 cgroup 的 <code>pids</code> 控制器。'
+              : (miss.length ? '<b>漏了：' + miss.join('、') + '</b><br>' : '')
+                + (extra.length ? '<b>多选了：' + extra.join('、') + '</b>（不是错，但按"最小必要"原则可以不选）<br>' : '')
+                + '正确答案是 <b>PID + MNT + UTS + NET</b>。<br>' +
+                '对照需求：① 看不到别的进程→PID；② 不污染文件系统→MNT；③ 不改主机名→UTS；④ 不占端口→NET。'
           };
         },
         showAnswer:
-          '<b>这两条密文都有填充，方案是 PKCS#1 v1.5（加密用）。</b><br><br>' +
-          '证据链：<br>' +
-          '① <b>c1 ≠ c2</b>，而它们对应的明文完全相同——说明密文里有随机成分，而裸 RSA 是确定的，所以一定有随机填充。<br>' +
-          '② 用私钥解出来，EM 的开头是 <span class="mono">00 02</span>（本实验里 c1 是 <span class="mono">00 02 11 11 …</span>，' +
-          'c2 是 <span class="mono">00 02 6D 52 …</span>）——这正是 PKCS#1 v1.5 <b>加密</b>填充的固定开头。<br>' +
-          '③ 两条 EM 的<b>结尾都是同一个消息</b>（<span class="mono">00</span> 分隔符 + <span class="mono">ping=1234</span>），' +
-          '差别只在中间那段随机字节 PS。<br>' +
-          '④ 两条 EM 都不等于「明文的整数值」，也就是说它们都不是裸 RSA 的输入。<br><br>' +
-          '<b>为什么裸 RSA 一定不会出现「两次不同」：</b>因为 <span class="mono">c = m^e mod n</span> 是一个确定的函数，' +
-          '输入相同、输出必然相同。一旦你看到两次密文不同，就说明在模幂之前还插入了别的东西。<br><br>' +
-          '<b>顺带记住签名侧的区别：</b>签名也有填充，但 PKCS#1 v1.5 的签名填充里塞的是 ' +
-          '<span class="mono">DigestInfo</span>（算法 OID + 摘要），结构与加密填充完全不同——' +
-          '所以「用加密的方式去复现签名」一定会对不上。',
+          '【① 需要的 namespace】PID + MNT + UTS + NET 四个\n\n' +
+          '  需求① 看不到宿主机进程     → CLONE_NEWPID\n' +
+          '  需求② 独立根目录、不污染   → CLONE_NEWNS（Mount）\n' +
+          '  需求③ 不改主机名           → CLONE_NEWUTS\n' +
+          '  需求④ 不占用宿主端口       → CLONE_NEWNET\n\n' +
+          '  IPC / USER / CGROUP 非必需：\n' +
+          '    IPC   — 需求没提共享内存/消息队列\n' +
+          '    USER  — 需求没要求非 root 也能创建容器（那是 rootless 场景）\n' +
+          '    CGROUP— 只隔离 cgroup 根目录的"视图"，本身不提供限制能力\n\n' +
+          '【② 限制进程数靠什么】cgroup 的 pids 控制器（不是 namespace）\n\n' +
+          '  写 cgroup v2: /sys/fs/cgroup/<组>/pids.max = 100\n' +
+          '  再把进程 pid 写入 cgroup.procs\n\n' +
+          '【核心区分】\n' +
+          '  namespace = 隔离"看不看得见"（进程表/挂载表/主机名/网络栈…）\n' +
+          '  cgroup    = 限制"能用多少"（CPU/内存/进程数/IO）\n' +
+          '  容器 = namespaces + cgroup + rootfs + capabilities/seccomp',
         hint:
-          '三步走：<br>' +
-          '① 先比 c1 和 c2：<b>不同</b>还是相同？这一步只要肉眼比对字符串。<br>' +
-          '② 再用给你的私钥把两条密文各解一次，看解出来的 32 字节（EM）开头是什么、结尾是什么。' +
-          '注意：<b>解密得到的不是明文，而是「填充块 + 明文」</b>。<br>' +
-          '③ 拿明文按裸 RSA 复算一次（<span class="mono">m^e mod n</span>），看它落在 c1 还是 c2 上。' +
-          '如果两个都不是，就说明有填充在起作用。',
-        after: T.note('ok', '✅ 这个实验真正的收获',
-          '<p style="margin-bottom:0">你亲手验证了两件事：<br>' +
-          '① <b>填充是真实存在的、可观测的</b>——它就在解密出来的 EM 开头那两三个字节里；<br>' +
-          '② <b>裸 RSA 的两个致命性质都是可计算的</b>——确定性（两次相同）与可乘性（密文相乘 = 乘积的密文）。<br>' +
-          '以后遇到「RSA 复现结果对不上」，你的第一反应应该是：<b>我是不是把填充漏了？我用的是加密填充还是签名填充？</b></p>')
-      },
-      decision: {
-        start: 'n0',
-        nodes: {
-          n0: {
-            label: '情境三',
-            scenario: '<b>情境：</b>你已经完全确定了算法：<span class="mono">RSA/ECB/PKCS1Padding</span>，公钥（2048 位）也提取出来了，' +
-              '明文（一段 24 字节的 JSON）也确认了。但你在本地复算出来的密文，和抓包里那个 256 字节的 <span class="mono">enc</span> 字段<b>永远对不上</b>。<br>' +
-              '你先怀疑哪一头？',
-            choices: [
-              { t: '先怀疑填充与数据形态：我把明文的字节形态搞对了吗（原始字节 / 十六进制字符串 / UTF-8 / Base64 解码后）？编码错了，填充算得再对也没用', next: 'n1' },
-              { t: '先怀疑算法：肯定是它被魔改了，去把 so 里的大数库 dump 出来对比标准实现', next: 'n2' },
-              { t: '先怀疑密钥：一定是拿错了公钥，去搜 APK 里所有的 256 字节常量', next: 'n3' },
-              { t: '先怀疑随机填充：既然是随机 PS，那本地永远算不出同一个密文，这个验证方法本身就不成立', next: 'n4' }
-            ]
-          },
-          n1: {
-            label: '选A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先用最便宜的方式把「数据形态」这条排除掉',
-            result: '<b>「明文是什么」这件事，比你想象得更容易搞错，而且排查成本最低。</b>具体要确认三件事：<br>' +
-              '① <b>原始字节是什么</b>：你要加密的是 <span class="mono">{...}</span> 这段 JSON 的 UTF-8 字节，' +
-              '还是它的十六进制字符串、还是它的 Base64 编码后字节？<b>这三种长度都不同，密文必然不同。</b><br>' +
-              '② <b>有没有拼接</b>：现场很常见的做法是 <span class="mono">时间戳 + 随机数 + body</span> 拼起来再加密。' +
-              '你只加密了 body，当然对不上。<br>' +
-              '③ <b>填充之后能不能比对</b>：PKCS#1 v1.5 的 PS 是随机的，所以<b>密文比对根本不是一个合法的验证方法</b>。' +
-              '正确做法是对着「同一份输入」比对<b>解密结果</b>或者让服务端验一次——而不是比密文字符串。<br>' +
-              '<span class="hit">注意选 A 同时覆盖了「数据形态」和「验证方法」两件事，这正是它比另外三个选项更值钱的地方。</span>'
-          },
-          n2: {
-            label: '选B', terminal: true, verdict: 'bad',
-            verdictTitle: '在成本最高的方向上，验证一个还没有证据的假设',
-            result: '<b>认知根源：把「对不上」直接归因成「被魔改了」。</b>「对不上」是一个现象，不是证据——' +
-              '它有一堆更常见、更便宜的解释（数据形态、拼接方式、填充方案、验证方法本身不成立）。<br>' +
-              '而「dump 大数库对比标准实现」是一条数天的路径，且它<b>不会告诉你数据形态对不对</b>。' +
-              '更糟的是：如果最后发现是对面在明文前面拼了一个你不知道的字段，那你这一趟反汇编一无所获。<br>' +
-              '<b>正确顺序：先用五分钟核对输入与验证方法，再考虑「实现被改了」这个假设。</b>' +
-              'RSA 的大数运算被魔改的概率，远低于「你在明文上少拼了一个字段」的概率。'
-          },
-          n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '你已经在做第 31.10 的实验了，但顺序放错了',
-            result: '<b>认知根源：把「公钥可能不对」排在「我的输入可能不对」前面。</b>' +
-              '公钥确实值得核对（尤其是你可能是从一大段拼接常量里抠出来的），' +
-              '但它是<b>可验证的</b>：用私钥解一次服务端的响应、或者拿公钥去验一段已知签名，就能确认它是不是真的。<br>' +
-              '而「搜 APK 里所有 256 字节常量」这种扫法有个现实问题：<b>你会搜到一堆 256 字节的东西</b>（随机数、哈希、别的密钥），' +
-              '而你没有判据去区分它们——判据正是 31.10 那个实验要建立的。<br>' +
-              '<b>先建立判据，再去做搜索。</b>否则搜索只会给你一堆候选。'
-          },
-          n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '结论对了一半，但用它取消了整条验证链',
-            result: '<b>「PKCS#1 v1.5 有随机 PS，所以本地算不出同一个密文」——这句话本身是对的。</b>' +
-              '这是很多人踩的坑：拿「我的密文 ≠ 抓包的密文」当作失败判据，结果怎么查都查不出问题，' +
-              '因为<b>这个判据从一开始就是错的</b>。<br>' +
-              '但「所以验证方法不成立」这个推论只对了一半：<b>验证方法失效的是「比密文」这一种，不是全部。</b>可以替代的有：' +
-              '① 用私钥解抓包的密文，看能不能得到你预期的明文（这一步最强）；' +
-              '② 让服务端替你验（发一个你算出来的密文，看它能不能正常处理）；' +
-              '③ 如果对方同时提供了签名，用公钥验签（签名也是可验证的）。<br>' +
-              '<span class="hit">「这个验证方法不成立」和「这件事无法验证」是两回事。前者是排查的起点，后者是放弃的理由——' +
-              '不要把前者直接升级成后者。</span>'
-          }
-        }
+          '把六个需求逐条翻译成"要隔离什么资源"：<br>' +
+          '① 进程表　② 挂载表　③ 主机名　④ 网络栈<br>' +
+          '每一个都对应一个 namespace。<br><br>' +
+          '第⑤条要小心：<b>"限制数量"和"隔离视图"是两回事</b>——' +
+          'namespace 让你看不见别人，但不能阻止你自己创建 10000 个进程。那该由谁来管？',
+        after:
+          T.note('ok', '✅ 实验的收获',
+            '<p style="margin-bottom:0">你现在有了一个可复用的判断方法：' +
+            '<b>把需求翻译成"要隔离哪类共享资源"，再去找对应的 namespace。</b><br>' +
+            '七个标志记不住也没关系——记住它们的<b>语义分类</b>就够了：<br>' +
+            '• 进程相关：PID、IPC<br>• 文件系统相关：MNT、CGROUP<br>' +
+            '• 身份与网络：UTS、USER、NET<br><br>' +
+            '<span class="hit">另外记住那条分界线：namespace 管"看不看得见"，cgroup 管"能用多少"。' +
+            '分不清这两者，是新手设计容器方案时最常见的错误。</span></p>')
       }
     },
 
-    /* ============================================================ 31.9 */
+    /* ============ 31.4C 实战案例 ============ */
     {
-      h: '31.9', title: 'RSA 在 App 里的真实形态：常量、PEM/DER、SPKI',
-      html:
-        '<p>讲完了数学，回到现场。RSA 在 App 里出现的方式<strong>非常固定</strong>，来来回回就是下面这几种。' +
-        '认出形态，你就知道该去哪里把它抠出来。</p>' +
-        T.tbl(['你在 App 里看到什么', '它是什么格式', '怎么读出来'],
-          [
-            ['<b>一段硬编码的十六进制字符串</b>（dex 里的 <span class="mono">String</span>，或 so 里的字节数组）',
-             '最常见的是 <b>PEM 正文</b>（去掉了 <span class="mono">-----BEGIN-----</span> 头尾的 Base64），' +
-             '也可能是裸的 modulus',
-             '先按 Base64 解一次：解出来是 <span class="mono">30 82</span> 开头 → DER，走 31.10 的解析流程；' +
-             '解出来是 256 字节的原始大数 → 裸 modulus'],
-            ['<b><span class="mono">assets/xxx.pem</span> / <span class="mono">res/raw/xxx</span></b>',
-             'PEM 文件（Base64 + 头尾标记），里面可能是公钥、私钥、证书',
-             '看头尾标记：<span class="mono">PUBLIC KEY</span> / <span class="mono">RSA PUBLIC KEY</span> / ' +
-             '<span class="mono">PRIVATE KEY</span> / <span class="mono">CERTIFICATE</span>——<b>这四个词直接决定方向</b>'],
-            ['<b>一张 X.509 证书</b>（.cer / .crt / 内嵌在代码里）',
-             'DER 或 PEM 编码的证书；公钥在里面的 <span class="mono">SubjectPublicKeyInfo</span> 字段',
-             '证书是一层套一层的 DER：先在证书里找到 SPKI，再从 SPKI 里取出 modulus 与 exponent'],
-            ['<b><span class="mono">KeyFactory.getInstance("RSA")</span></b> + <span class="mono">X509EncodedKeySpec</span>',
-             '<b>这是一个非常强的信号</b>：说明被喂进来的是 DER 编码的公钥（SPKI）',
-             '<span class="mono">X509EncodedKeySpec</span> 只吃公钥的 DER，' +
-             '<span class="mono">PKCS8EncodedKeySpec</span> 吃私钥的 DER——<b>看用的是哪个 Spec，就知道方向</b>'],
-            ['<b><span class="mono">KeyPairGenerator.getInstance("RSA")</span></b>',
-             '现场生成一对密钥（常见于设备指纹、密钥协商的临时密钥）',
-             '这类密钥<b>不硬编码</b>，你只能在运行时观察；生成后通常会进 KeyStore（31.14）'],
-            ['<b><span class="mono">Cipher.getInstance("RSA/...")</span></b>',
-             '变换串——<b>它把模式与填充方案直接写在参数里</b>',
-             '<b>零成本情报。</b>和第 24 章自吐沙箱里 <span class="mono">getInstance</span> 的第一行日志是同一个信息源']
-          ]) +
-        T.note('key', '🔑 变换串是免费的答案，一定要把它读全',
-          '<p style="margin-bottom:0">Java 的 <span class="mono">getInstance</span> 参数格式是 <span class="mono">算法/模式/填充</span>。' +
-          '对 AES，这三个字段都有实际含义；<b>对 RSA，「模式」那一格是个历史遗留的占位符</b>——' +
-          'RSA 不是分组密码，所以你会看到 <span class="mono">RSA/ECB/PKCS1Padding</span> 这种写法，' +
-          '其中的 <span class="mono">ECB</span> 对 RSA 本身没有分组模式的意义，只是 JCE 命名习惯。<br>' +
-          '真正要看的是<b>第三格（填充）</b>：<span class="mono">PKCS1Padding</span>（PKCS#1 v1.5）、' +
-          '<span class="mono">OAEPWithSHA-1AndMGF1Padding</span>（OAEP）、<span class="mono">NoPadding</span>（裸 RSA，危险）。' +
-          '这一格决定了你能不能复现。</p>') +
-        T.tbl(['变换串 / 调用点', '含义', '对你的影响'],
-          [
-            ['<span class="mono">Cipher.getInstance("RSA")</span>', '只给算法名，模式与填充由 Provider 的默认值决定',
-             '<b>不要猜默认值</b> <span class="pill warn">待核实</span>：不同 Provider / 版本可能不同，去把实际生效的串打出来'],
-            ['<span class="mono">.../PKCS1Padding</span>', 'PKCS#1 v1.5', '经典方案，结构简单；但 PS 随机，密文每次都不同'],
-            ['<span class="mono">.../OAEPWithSHA-1AndMGF1Padding</span>', 'OAEP，哈希 SHA-1，MGF1',
-             '参数必须完全一致才能复现 <span class="pill warn">待核实</span>：换库换版本时默认值可能变'],
-            ['<span class="mono">.../OAEPPadding</span>', 'OAEP，具体参数用 Provider 的默认',
-             '<b>最需要警惕的一种写法</b>：你去查完整参数，而不是接受默认值'],
-            ['<span class="mono">.../NoPadding</span>', '<b>裸 RSA</b>',
-             '<b>危险信号。</b>而且它意味着密文是确定的——这反而让你更容易复现（也更容易被攻击）'],
-            ['<span class="mono">Signature.getInstance("SHA256withRSA")</span>', 'PKCS#1 v1.5 签名（先摘要再签）',
-             '注意它的填充是 <span class="mono">DigestInfo</span> 结构，与加密填充不同'],
-            ['<span class="mono">Signature.getInstance("SHA256withRSA/PSS")</span>', 'PSS 签名（概率性）',
-             '每次签名结果都不同 <span class="pill warn">待核实</span>：各 Provider 对 PSS 参数（盐长）的默认值可能不同']
-          ]) +
-        '<p>下面把一段真实的 <strong>294 字节 SPKI 公钥</strong>逐层剥开。' +
-        '这段常量是真的：它是一个 2048 位的 RSA 公钥，我从 CERT/CC 的 Keyfinder 项目 README 里那份证书输出中取出 modulus，' +
-        '再按 SPKI 的语法重新编码成 DER。<strong>每一层的偏移与长度你都可以自己数出来核对。</strong></p>',
-      stage: {
-        title: 'DER 逐层剥离：从 294 字节常量到 n 与 e',
-        legend: '<span class="pill acc mono">SEQUENCE → 算法标识 → BIT STRING → INTEGER(n) → INTEGER(e)</span>',
-        speed: 1500,
-        render:
-          '<div class="flow-col" style="gap:8px">' +
-            '<div class="flow-row"><span class="pill mono">输入</span>' +
-              '<span class="blk" id="d0">294 字节的十六进制常量</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l1">30 82 01 22 ：SEQUENCE，内容 290 字节</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l2">30 0D ：内层 SEQUENCE，13 字节（算法标识）</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l3">06 09 2A 86 48 86 F7 0D 01 01 01 ：OID = rsaEncryption</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l4">03 82 01 0F ：BIT STRING，271 字节（首字节 00 = 未用位数）</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l5">30 82 01 0A ：内层 SEQUENCE，266 字节</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l6">02 82 01 01 00 … ：INTEGER，257 字节 → 这是 modulus n</span></div>' +
-            '<div class="flow-row"><span class="arrow">↓</span>' +
-              '<span class="blk" id="l7">02 03 01 00 01 ：INTEGER e = 65537</span></div>' +
-            '<div class="flow-row" style="margin-top:6px;padding-top:10px;border-top:1px dashed var(--line)">' +
-              '<span class="pill bad" id="mark9">结论：待剥完</span></div>' +
-            '<div id="derlog" style="margin-top:8px;font-family:var(--mono);font-size:12.5px;color:var(--fg-3)">' +
-              '&gt; 等待开始</div>' +
-          '</div>',
-        reset: () => {
-          ['d0', 'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7'].forEach(i => S(i, ''));
-          S('d0', 'active');
-          CLS('mark9', 'pill bad');
-          SET('mark9', '结论：待剥完');
-          SET('derlog', '&gt; 等待开始');
-        },
-        steps: [
-          { run: () => { S('d0', 'done'); S('l1', 'hot'); SET('derlog', '&gt; 第 1 层：第一个字节是 30，说明这是一整个 SEQUENCE'); },
-            note: '<b>第 1 层：<span class="mono">30</span> = SEQUENCE。</b>DER 里所有「结构」都以 <span class="mono">30</span> 开头。' +
-                  '看到常量第一个字节是 <span class="mono">30</span>，基本可以断定它是 ASN.1 DER 编码——' +
-                  '<span class="hit">这是比长度更硬的判据。</span>' },
-          { run: () => { S('l1', 'done'); S('l2', 'hot'); SET('derlog', '&gt; 长度字段 82 01 22 = 290，加 4 字节头正好 294 字节，结构自洽'); },
-            note: '<b>长度字段：<span class="mono">82 01 22</span>。</b>首字节 <span class="mono">0x82</span> 的最高位是 1，' +
-                  '表示「长度本身占 2 个字节」，于是长度 = <span class="mono">0x0122 = 290</span>。<br>' +
-                  '<b>自洽性检验</b>：4 字节头 + 290 字节内容 = 294，正好等于常量总长。' +
-                  '<span class="hit">这个「长度字段与总长对得上」的检验，是区分「真 DER」和「随机数据碰巧以 30 开头」的关键。</span>' },
-          { run: () => { S('l2', 'done'); S('l3', 'hot'); SET('derlog', '&gt; 算法标识：OID 2A 86 48 86 F7 0D 01 01 01 = 1.2.840.113549.1.1.1 = rsaEncryption'); },
-            note: '<b>第 3 层：OID。</b><span class="mono">2A 86 48 86 F7 0D 01 01 01</span> 解码出来是 ' +
-                  '<span class="mono">1.2.840.113549.1.1.1</span>，即 <b>rsaEncryption</b>。<br>' +
-                  '<span class="hit">这一串九个字节，就是「这段常量是 RSA 公钥」的铁证。</span>' +
-                  '它出现在常量的前 32 个字节内，你可以用一个简单的字节搜索确认。' },
-          { run: () => { S('l3', 'done'); S('l4', 'hot'); SET('derlog', '&gt; BIT STRING：03 82 01 0F，内容 271 字节，第一个内容字节 00 表示未用位数'); },
-            note: '<b>第 4 层：<span class="mono">03</span> = BIT STRING。</b>公钥的密钥数据装在位串里。' +
-                  '长度 <span class="mono">0x010F = 271</span>，其中第 1 个字节 <span class="mono">00</span> 是「未用位数」，' +
-                  '表示后面 270 字节都是有效数据。<br>为什么中间要套一层 BIT STRING？因为 SPKI 的设计要兼容各种算法，' +
-                  '位串是最通用的容器。<b>你只要照着数偏移就行，不需要理解设计动机。</b>' },
-          { run: () => { S('l4', 'done'); S('l5', 'hot'); SET('derlog', '&gt; 内层 SEQUENCE：30 82 01 0A，266 字节 —— 从这里开始是纯 RSA 参数'); },
-            note: '<b>第 5 层：又一个 <span class="mono">30</span>。</b>这里装的是 PKCS#1 定义的 RSA 公钥结构：' +
-                  '<span class="mono">SEQUENCE &#123; INTEGER n, INTEGER e &#125;</span>。<br>' +
-                  '<b>到这里位置已经固定了</b>：内层 SEQUENCE 的内容总是「n 的 INTEGER 跟着 e 的 INTEGER」，顺序不会变。' },
-          { run: () => { S('l5', 'done'); S('l6', 'hot'); SET('derlog', '&gt; INTEGER n：02 82 01 01，257 字节，首字节 00 是符号位补齐；真正的 n 是后面 256 字节'); },
-            note: '<b>★ 第 6 层：modulus。</b><span class="mono">02</span> 是 INTEGER 标签，长度 <span class="mono">0x0101 = 257</span>。' +
-                  '<br><span class="hit">为什么是 257 而不是 256？因为 DER 的 INTEGER 是有符号的：' +
-                  'n 的首字节是 <span class="mono">0xB0</span>，最高位为 1，如果不补一个 <span class="mono">00</span>，' +
-                  '它会被解释成负数。</span>所以规范要求补一个前导零字节。<br>' +
-                  '<b>记住这条：前导 00 是编码需要，不是密钥的一部分。真正的 n 是后面那 256 字节 = 2048 位。</b>' },
-          { run: () => { S('l6', 'done'); S('l7', 'hot'); SET('derlog', '&gt; INTEGER e：02 03 01 00 01 = 65537'); },
-            note: '<b>第 7 层：公钥指数 e。</b><span class="mono">02 03 01 00 01</span> —— 标签 02、长度 3、值 ' +
-                  '<span class="mono">0x010001 = 65537</span>。<br>' +
-                  '看到这五个字节收尾，几乎可以确定这就是一个标准的 RSA 公钥（而不是别的 DER 结构）。' },
-          { run: () => { S('l7', 'done'); CLS('mark9', 'pill ok'); SET('mark9', '✅ 拿到了 (n, e)：这就是完整的公钥'); SET('derlog', '&gt; 收束：n 与 e 各一个整数。剩下的第 31.10 节会教你怎么判断「一段陌生常量」是不是这个东西'); },
-            note: '<b>收束。</b>整个过程你只做了三件事：<b>读标签、读长度、跳过对应的字节数</b>。' +
-                  '没有任何密码学运算——DER 是一个纯粹的长度前缀格式。<br>' +
-                  '<span class="hit">所以「手工解析 DER」这件事的门槛，比大多数人想象得低得多：' +
-                  '它更像读一个带长度字段的二进制协议，而不是解一道数学题。</span>' }
-        ]
-      },
-      quiz: {
-        id: 'q31-6', chapter: 31, answer: 2,
-        stem: '目标 App 里写的是 <span class="mono">Cipher.getInstance("RSA")</span>——<b>只给了算法名，没有写模式和填充</b>。' +
-          '关于这个写法，下面哪个判断最准确？',
-        options: [
-          { t: '这说明它用的是裸 RSA，所以密文是确定的', why: '不带填充的写法是 NoPadding，而它是显式写出来的。只给算法名时由 Provider 提供默认值，业界普遍认为默认是带填充的——但这一点必须实测，不能反推成「没写就等于没有」。' },
-          { t: '这说明填充无关紧要，因为 RSA 本身没有模式', why: '「RSA 不是分组密码，所以没有模式」这半句是对的（ECB 那一格对 RSA 没有分组含义），但「填充无关紧要」是错的——填充恰恰是决定你能不能复现的关键，也是这一节反复强调的。' },
-          { t: '模式与填充由 Provider 的默认值决定，不能靠猜；正确做法是把实际生效的完整变换串打出来再判断', why: '正确。规范要求 Provider 提供默认值，但不同实现与不同版本不保证一致；现场可靠的做法是运行时把完整的变换串字符串打印出来（例如把 getInstance 的入参记下来，或观察 Provider 实际使用的实现类），而不是凭经验假设默认值。' },
-          { t: '这说明它是签名而不是加密，因为签名不需要写填充', why: '签名走的是 Signature 类而不是 Cipher，两者是完全不同的 API 路径。而且签名同样有填充（PKCS#1 v1.5 的 DigestInfo 或 PSS），只是不写在 Cipher 的变换串里。' }
-        ],
-        explain: '<b>这道题考的是「变换串是零成本情报，但省写的那部分不是情报」。</b>' +
-          'Java 的 <span class="mono">getInstance</span> 参数格式是 <span class="mono">算法/模式/填充</span>，' +
-          '省写时由 Provider 补默认值。对 AES，这三个字段都有实际含义；' +
-          '对 RSA，「模式」那一格是 JCE 命名习惯留下的占位符——RSA 不是分组密码，' +
-          '所以 <span class="mono">RSA/ECB/PKCS1Padding</span> 里的 <span class="mono">ECB</span> 没有任何分组模式的意义。<br>' +
-          '<p>真正要看的是第三格：<span class="mono">PKCS1Padding</span>（PKCS#1 v1.5）、' +
-          '<span class="mono">OAEPWithSHA-1AndMGF1Padding</span>（OAEP）、<span class="mono">NoPadding</span>（裸 RSA）。' +
-          '<b>而省写的时候你什么都看不到</b>——这才是不写填充最麻烦的地方：不是「没有填充」，而是「你不知道是哪种」。</p>' +
-          '<p>所以正确的动作是<b>去把实际生效的串打出来</b>。方法有两条，都很便宜：' +
-          '① 在 <span class="mono">Cipher.getInstance</span> 的入参处记录（这正是第 24 章自吐沙箱第一行日志能给你的东西）；' +
-          '② 观察实际的 SPI 实现类（<span class="mono">getProvider()</span> / 实现类名），再对照该 Provider 的文档确认默认值。' +
-          '<span class="hit">和第 31.8 节的态度一致：凡是「默认值」这种东西，能实测就不要猜——' +
-          '它恰恰是「RSA 复现对不上」的常见来源之一。</span></p>'
-      }
-    },
-
-    /* ============================================================ 31.10 */
-    {
-      h: '31.10', title: '动手实验二：公钥常量识别器（长度 + 结构 + 熵）',
-      html:
-        '<p>现场最常见的僵局是：你 dump 出一大堆常量，<strong>分不清哪个是公钥、哪个是密钥、哪个是摘要、哪个只是随机数</strong>。' +
-        '本节给你四条<strong>可验证的判据</strong>，然后让你自己动手判一遍。</p>' +
-        '<h4>四条判据（按可靠性从高到低）</h4>' +
-        T.grid(2, [
-          '<div class="card"><div class="card-title">判据 1：DER 结构自洽（最硬）</div>' +
-          '<p>第一个字节是 <span class="mono">0x30</span>（SEQUENCE），<b>并且</b>紧随其后的长度字段算出来的总长，' +
-          '正好等于这段常量的实际长度。</p>' +
-          '<p>这两条同时满足，几乎不可能是巧合——随机数据碰巧以 <span class="mono">30</span> 开头是 1/256 的概率，' +
-          '但<b>长度字段还能对上</b>，概率就低到可以忽略了。</p></div>',
-          '<div class="card"><div class="card-title">判据 2：OID 出现（最直接）</div>' +
-          '<p>在常量开头的几十个字节内搜字节串 <span class="mono">2A 86 48 86 F7 0D 01 01 01</span>。' +
-          '它是 <span class="mono">rsaEncryption</span> 的 OID 编码。</p>' +
-          '<p><b>找到它 = 确定是 RSA。</b>这一条不需要任何推理。</p></div>',
-          '<div class="card"><div class="card-title">判据 3：长度 + 首字节（最廉价）</div>' +
-          '<p><b>256 字节</b>（2048 位）是当前主力；<span class="mono">0x00</span> 开头 + 次字节 ≥ <span class="mono">0x80</span>，' +
-          '是「DER INTEGER 里的正整数补齐」的典型形态——换句话说，<b>它前面那个 00 在告诉你「这是一个被当成有符号整数编码的大数」</b>。</p>' +
-          '<p>反过来：如果一段 256 字节常量的<b>首字节是 0x00、次字节小于 0x80</b>，那个 00 就不是符号位补齐，' +
-          '更可能是别的结构（或者是填充）。<span class="pill warn">注意</span>：单看这一条不足以定案，要配合判据 1。</p></div>',
-          '<div class="card"><div class="card-title">判据 4：熵（用来排除，不用来确认）</div>' +
-          '<p>modulus 是高熵的（接近 8 bit/字节），所以熵能帮你排除「低熵的文本 / 编码 / 配置」，' +
-          '<b>但它区分不了「modulus」和「一段随机数」</b>——两者都是高熵。</p>' +
-          '<p><span class="hit">熵的正确用法是：低熵 ⇒ 一定不是密钥；高熵 ⇒ 什么都还不能说。</span>' +
-          '很多人指望用熵「识别出密钥」，那是对这个量的误解。</p></div>'
-        ]) +
-        T.note('key', '🔑 一条实战组合拳：先找结构，再找 OID，最后才看长度和熵',
-          '<p style="margin-bottom:0">在几百个候选常量里，最有效的顺序是：<br>' +
-          '<b>① 秒筛长度</b>（只看 256 / 384 / 512 字节的，其余全丢）；<br>' +
-          '<b>② 看首字节</b>（<span class="mono">0x30</span> 开头的一堆，其余基本可以排除）；<br>' +
-          '<b>③ 搜 OID</b>（在前 32 字节里找那九个字节）；<br>' +
-          '<b>④ 算结构自洽</b>（长度字段对不对得上）。<br>' +
-          '走完这三四步，剩下的候选通常只剩一两个，而且你有<b>确定的证据</b>而不是「感觉像」。</p>'),
-      stepper: {
-        title: '手工解析 DER：每一步落在哪个偏移上（用 31.9 那段 294 字节的公钥）',
-        lines: [
-          { code: 'bytes[0x00] = 0x30            // SEQUENCE 标签',
-            note: '<b>第一步：读标签。</b>DER 的第一个字节永远是标签。' +
-                  '<span class="mono">0x30</span> = SEQUENCE（构造类型 + 序列）。' +
-                  '<br>常见标签：<span class="mono">0x02</span> INTEGER、<span class="mono">0x03</span> BIT STRING、' +
-                  '<span class="mono">0x05</span> NULL、<span class="mono">0x06</span> OID、<span class="mono">0x30</span> SEQUENCE。' +
-                  '<b>这五个值值得背下来。</b>',
-            state: { '偏移': '0x00', '标签': '0x30 = SEQUENCE', '剩余长度': '293 字节' } },
-          { code: 'bytes[0x01..0x03] = 0x82 0x01 0x22   // 长度字段：3 字节\n// 0x82 的最高位为 1 → 接下来 2 字节是长度 → 0x0122 = 290\n// 校验：4（头）+ 290（内容）= 294 = 常量总长度 ✓',
-            note: '<b>第二步：读长度。</b>DER 的长度字段有两种形态：短格式（1 字节，值 &lt; 0x80）和长格式（首字节 &ge; 0x80，' +
-                  '低 7 位表示「后面有几个字节是长度」）。' +
-                  '<br><span class="hit">这一步的「总长对得上」是整个识别流程里最有价值的一次校验。</span>' +
-                  '它把「碰巧以 30 开头」这种巧合排除掉了。',
-            state: { '偏移': '0x01', '首字节': '0x82 → 长格式，长度占 2 字节', '长度': '0x0122 = 290', '自洽': '✅ 4 + 290 = 294' } },
-          { code: 'bytes[0x04..0x05] = 0x30 0x0D    // 内层 SEQUENCE，内容 13 字节\n// 内容 = OID(11 字节) + NULL(2 字节) = AlgorithmIdentifier',
-            note: '<b>第三步：进第一层。</b>这个 13 字节的小结构叫 <span class="mono">AlgorithmIdentifier</span>，' +
-                  '作用是声明「后面那把钥匙属于哪个算法」。<b>几乎每个 SPKI 的第一个孩子都是它。</b>',
-            state: { '偏移': '0x04', '标签': 'SEQUENCE', '内容长度': '13 字节' } },
-          { code: 'bytes[0x06..0x10] = 0x06 0x09 2A 86 48 86 F7 0D 01 01 01\n// 0x06 = OID 标签，长度 9，值是 1.2.840.113549.1.1.1 = rsaEncryption',
-            note: '<b>第四步：读 OID —— 这一步直接给答案。</b>' +
-                  '<span class="mono">2A 86 48 86 F7 0D 01 01 01</span> 解码后是 <span class="mono">1.2.840.113549.1.1.1</span>。' +
-                  '<br><b>在逆向现场，你不需要真的去解码 OID——直接搜这九个字节就够了。</b>' +
-                  '搜到它，等于拿到了「这段常量是 RSA 公钥」的书面证明。',
-            state: { '偏移': '0x06', '标签': '0x06 = OID', '值': '1.2.840.113549.1.1.1（rsaEncryption）' } },
-          { code: 'bytes[0x11..0x12] = 0x05 0x00    // NULL（算法参数为空）\nbytes[0x13..0x16] = 0x03 0x82 0x01 0x0F   // BIT STRING，内容 271 字节\nbytes[0x17] = 0x00                  // 未用位数 = 0',
-            note: '<b>第五步：跳过 NULL，进入 BIT STRING。</b>这一层的作用是「装密钥数据」。' +
-                  '<span class="mono">0x00</span> 表示位串里没有未使用的位——记住这一个字节的存在，' +
-                  '<b>因为你的偏移计算要从它之后开始</b>。',
-            state: { '偏移': '0x13', '标签': '0x03 = BIT STRING', '内容长度': '271 字节', '首位': '0x00（未用位数）' } },
-          { code: 'bytes[0x18..0x1B] = 0x30 0x82 0x01 0x0A   // 内层 SEQUENCE，266 字节\n// 内容 = INTEGER n(261 字节) + INTEGER e(5 字节) = 266 ✓',
-            note: '<b>第六步：进到 PKCS#1 的 RSA 公钥结构。</b>' +
-                  '<span class="mono">SEQUENCE &#123; INTEGER n, INTEGER e &#125;</span>——只有两个整数，顺序固定。' +
-                  '<br>顺手做一次自洽校验：261 + 5 = 266，与长度字段一致。' +
-                  '<span class="hit">这种「每一步都验证长度」的习惯，能让你在解析变长结构时不迷路。</span>',
-            state: { '偏移': '0x18', '标签': 'SEQUENCE', '内容长度': '266 字节', '自洽': '✅ 261 + 5 = 266' } },
-          { code: 'bytes[0x1C..0x1F] = 0x02 0x82 0x01 0x01   // INTEGER，257 字节\nbytes[0x20] = 0x00              // 符号位补齐（不是密钥的一部分！）\nbytes[0x21..0x120] = n          // 真正的 modulus，256 字节 = 2048 bit',
-            note: '<b>第七步：拿到 n。</b>标签 <span class="mono">0x02</span>、长度 <span class="mono">257</span>、' +
-                  '首字节 <span class="mono">0x00</span> 是符号位补齐。<br>' +
-                  '<span class="hit">这是现场最容易出错的地方：把那个 00 也算进 modulus，导出的公钥就会错一个字节，' +
-                  '而且报错信息通常很难指向这里。</span>判断方法很简单——<b>补零只发生在「次字节 ≥ 0x80」的时候</b>。',
-            state: { '偏移': '0x1C', '标签': 'INTEGER', 'DER 长度': '257 字节', 'n 实际长度': '256 字节 = 2048 bit' } },
-          { code: 'bytes[0x121..0x125] = 0x02 0x03 0x01 0x00 0x01   // INTEGER e = 0x010001 = 65537',
-            note: '<b>第八步：拿到 e，解析结束。</b>偏移 <span class="mono">0x121 = 289</span>，长度 5 字节。' +
-                  '<br>收束：整个过程<b>没有任何密码学</b>，只有「读标签 → 读长度 → 跳到下一个偏移」这一个循环。' +
-                  '<span class="hit">DER 不是一个难格式，它是一个<b>啰嗦但极其规矩</b>的长度前缀格式。</span>',
-            state: { '偏移': '0x121', 'e': '65537 (0x10001)', '总长度': '294 字节（校验通过）' } }
-        ]
-      },
-      lab: {
-        title: '实验二：公钥常量识别器（长度 + 结构 + 熵，全部真算）',
-        goal: '目标：给 7 段陌生常量定性，并说出依据',
-        intro:
-          '<p>下面两个框里一共有 <b>7 段常量</b>（十六进制框 5 段、Base64 框 2 段），' +
-          '它们混在一起：<b>一个真的 RSA-2048 公钥（DER/SPKI 形式）、一个裸的 2048 位 modulus、一把 AES-128 密钥、' +
-          '一个 SHA-256 摘要、一段随机字节、一段 Base64 编码的 JSON、一段更短的随机字节</b>。</p>' +
-          '<p>点「测一测这 7 段」会输出<b>每段的真实测量值</b>：字节数、首字节、字节级香农熵、可打印比例、' +
-          'DER 长度字段是否自洽、开头有没有出现 rsaEncryption 的 OID、结尾有没有 <span class="mono">02 03 01 00 01</span>。</p>' +
-          '<p><b>任务：按 A～G 的顺序，在最后一个框里写下每一段是什么，并给出你的判据。</b>' +
-          '（写「A=DER 编码的 RSA 公钥，因为 30 开头且长度自洽、含 OID」这样一句就够。）</p>',
-        inputs: [
-          { key: 'hex', label: '十六进制常量（每行一段，A～E）', hint: 'A 段很长，会自动换行显示',
-            type: 'textarea', rows: 10,
-            value:
-              '30820122300d06092a864886f70d01010105000382010f003082010a0282010100b091bef6cc625ffdaf9e481eb9c559ca36f002a7e562485c261b78c13a74020faf85740cd7245f854ccee09b2f3f0a85ba8f363ebc4b3b3c13d88fb9463842699cb27e51faccabfc57954989455ca217b96cfca3f60cdf509e3628711e43d2e7130aec25e15d27a5695d4875f24c443fb6cd33a2db49d3974d4f2c60aca04f4a961952d94db9ce7049e62deb99c6cb458c5bdf790a105344acc2a36cfd7da30493735e2ed2d9b9c9f25dada0686eb943312e2b31b58d2b09047b631e795a0bcc02167e6c7e0b04d007d63bf96df880e4b5e23673eec26aa2b3ad20ac42002461adffed8d3de79f36ed51a191cf1360b4401ce482294ed50543362d04b237c5cb0203010001\n' +
-              'b091bef6cc625ffdaf9e481eb9c559ca36f002a7e562485c261b78c13a74020faf85740cd7245f854ccee09b2f3f0a85ba8f363ebc4b3b3c13d88fb9463842699cb27e51faccabfc57954989455ca217b96cfca3f60cdf509e3628711e43d2e7130aec25e15d27a5695d4875f24c443fb6cd33a2db49d3974d4f2c60aca04f4a961952d94db9ce7049e62deb99c6cb458c5bdf790a105344acc2a36cfd7da30493735e2ed2d9b9c9f25dada0686eb943312e2b31b58d2b09047b631e795a0bcc02167e6c7e0b04d007d63bf96df880e4b5e23673eec26aa2b3ad20ac42002461adffed8d3de79f36ed51a191cf1360b4401ce482294ed50543362d04b237c5cb\n' +
-              '4d795333637233744b65793230323421\n' +
-              'a8dd942d589f7c0063339e760c3ef5aa70d6481ddc2f537aba837f5b20af5b79\n' +
-              'de634e36d27f134dc810bd253bcbb28b435753065fe53132a9e4f79ac2737f14f820a9eece9dcd43a95a6c5f49d5676c6913277dbd7a31a7b8ff520a4abdc12061523245e2b39e9350c9dad881fbaacc9e39b6d5395c46c142762718bea0c414' },
-          { key: 'b64', label: 'Base64 常量（每行一段，F～G）', hint: '注意：这两段长度不同',
-            type: 'textarea', rows: 4,
-            value: 'eyJ1aWQiOiIxMDA4NiIsInYiOiIyLjMuMSIsInRzIjoxNzM1Njg5NjAwfQ==\n' +
-                   'CYqUcjWiUPrNDv6f4S7wnGfarMODa2aQ9IBWS7GuIzWr2d4NPk1MIPHODUxzfmwQ' },
-          { key: 'verdict', label: '你的判断（A～G，逐条写：是什么 + 依据）',
-            hint: '例：A=DER 编码的 RSA 公钥；依据 = 30 开头、长度字段自洽、含 rsaEncryption OID、结尾是 02 03 01 00 01',
-            type: 'textarea', rows: 6, value: '' }
-        ],
-        runLabel: '🔍 测一测这 7 段',
-        run: function (v) {
-          var hexToB = function (s) {
-            var t = String(s == null ? '' : s).replace(/0x/gi, '').replace(/[^0-9a-fA-F]/g, '').toLowerCase();
-            var a = [];
-            for (var i = 0; i + 1 < t.length; i += 2) a.push(parseInt(t.substr(i, 2), 16));
-            return a;
-          };
-          var B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-          var b64ToB = function (s) {
-            var t = String(s == null ? '' : s).replace(/[^A-Za-z0-9+/=]/g, '');
-            var out = [], buf = 0, bits = 0;
-            for (var i = 0; i < t.length; i++) {
-              var c = t.charAt(i);
-              if (c === '=') break;
-              var x = B64T.indexOf(c);
-              if (x < 0) continue;
-              buf = (buf << 6) | x; bits += 6;
-              if (bits >= 8) { bits -= 8; out.push((buf >> bits) & 0xff); }
-            }
-            return out;
-          };
-          var entropy = function (b) {
-            if (!b.length) return 0;
-            var f = new Array(256).fill(0), i;
-            for (i = 0; i < b.length; i++) f[b[i]]++;
-            var h = 0;
-            for (i = 0; i < 256; i++) if (f[i]) { var p = f[i] / b.length; h -= p * Math.log(p) / Math.LN2; }
-            return h;
-          };
-          var printable = function (b) {
-            if (!b.length) return 0;
-            var c = 0;
-            for (var i = 0; i < b.length; i++) if (b[i] >= 0x20 && b[i] <= 0x7e) c++;
-            return c / b.length;
-          };
-          var derLen = function (b) {
-            if (!b.length || b[0] !== 0x30) return { isSeq: false };
-            if (b.length < 2) return { isSeq: true, ok: false, why: '长度不足' };
-            var i = 1, L = b[1], hdr = 2;
-            if (L & 0x80) {
-              var n2 = L & 0x7f;
-              if (n2 === 0 || n2 > 4 || b.length < 2 + n2) return { isSeq: true, ok: false, why: '长度格式异常' };
-              L = 0;
-              for (var j = 0; j < n2; j++) L = L * 256 + b[2 + j];
-              hdr = 2 + n2;
-            }
-            return { isSeq: true, ok: hdr + L === b.length, len: L, hdr: hdr, total: hdr + L };
-          };
-          var findOid = function (b) {
-            var pat = [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
-            for (var i = 0; i + pat.length <= b.length && i < 40; i++) {
-              var hit = true;
-              for (var j = 0; j < pat.length; j++) if (b[i + j] !== pat[j]) { hit = false; break; }
-              if (hit) return i;
-            }
-            return -1;
-          };
-          var tail65537 = function (b) {
-            if (b.length < 5) return false;
-            var t = b.slice(-5);
-            return t[0] === 0x02 && t[1] === 0x03 && t[2] === 0x01 && t[3] === 0x00 && t[4] === 0x01;
-          };
-          var hexLines = String(v.hex || '').split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
-          var b64Lines = String(v.b64 || '').split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean);
-          if (!hexLines.length && !b64Lines.length) {
-            return '<div class="lab-msg warn"><b>没有输入</b><div class="lab-note">把常量粘进上面两个框（每行一段）。</div></div>';
-          }
-          var items = [];
-          hexLines.forEach(function (s, i) { items.push({ id: String.fromCharCode(65 + i), enc: 'hex', bytes: hexToB(s) }); });
-          b64Lines.forEach(function (s, i) { items.push({ id: String.fromCharCode(65 + hexLines.length + i), enc: 'base64', bytes: b64ToB(s) }); });
-          var rows = '';
-          items.forEach(function (it) {
-            var b = it.bytes;
-            if (!b.length) { rows += '<tr><td>' + it.id + '</td><td colspan="6" class="lab-no">解析不出字节（检查是否是合法的十六进制 / Base64）</td></tr>'; return; }
-            var d = derLen(b);
-            var first = '0x' + b[0].toString(16).padStart(2, '0');
-            var head2 = b.length > 1 ? '0x' + b[1].toString(16).padStart(2, '0') : '—';
-            var oidOff = findOid(b);
-            rows += '<tr>' +
-              '<td><b>' + it.id + '</b></td>' +
-              '<td>' + it.enc + '</td>' +
-              '<td>' + b.length + ' 字节' + (b.length === 64 ? '（512 bit）' : (b.length === 128 ? '（1024 bit）' : (b.length === 256 ? '（2048 bit）' : ''))) + '</td>' +
-              '<td>' + first + ' / ' + head2 + '</td>' +
-              '<td>' + entropy(b).toFixed(3) + '</td>' +
-              '<td>' + (printable(b) * 100).toFixed(0) + '%</td>' +
-              '<td>' + (d.isSeq
-                ? ('30 开头；长度字段算出 ' + d.total + ' 字节，实际 ' + b.length + ' 字节 → ' + (d.ok ? '<b>自洽</b>' : '不自洽'))
-                : '不是 30 开头') +
-                (oidOff >= 0 ? '；<b>偏移 ' + oidOff + ' 处有 rsaEncryption OID</b>' : '') +
-                (tail65537(b) ? '；<b>结尾是 02 03 01 00 01</b>' : '') + '</td>' +
-              '</tr>';
-          });
-          var html = '<table class="lab-tbl"><thead><tr><th>#</th><th>编码</th><th>字节数</th><th>首字节 / 次字节</th>' +
-            '<th>熵(bit/B)</th><th>可打印</th><th>结构特征</th></tr></thead><tbody>' + rows + '</tbody></table>';
-          html += '<div class="lab-msg model"><b>怎么用这张表</b><div class="lab-note">' +
-            '① <b>先看「结构特征」列</b>：出现「长度自洽 / rsaEncryption OID / 结尾 02 03 01 00 01」的，几乎锁定是 DER 公钥；<br>' +
-            '② <b>再按字节数分组</b>：16 字节、32 字节、48 字节、96 字节、256 字节、294 字节——长度本身就把它们分成了几堆；<br>' +
-            '③ <b>最后用熵和可打印比例收口</b>：熵低 + 可打印比例高 ⇒ 大概率是文本或编码后的文本；' +
-            '熵高 + 可打印比例低 ⇒ 二进制数据（但<b>无法区分密钥、摘要和随机数</b>）。<br>' +
-            '<span class="hit">注意：表格里刻意没有「这是什么」这一列——定性是你的工作。</span></div></div>';
-          return html;
-        },
-        expected: function (v) {
-          var t = String(v.verdict == null ? '' : v.verdict);
-          var H = window.AKKC_hasConcept;
-          var groups = [
-            { n: 'A 是 DER 编码的 RSA 公钥（SPKI）', any: ['der', '公钥', 'spki', 'x509', 'x.509', '证书结构', 'asn.1', 'asn1'] },
-            { n: 'B 是裸 modulus（2048 位大数）', any: ['modulus', '模数', '2048', '大数', 'rsa 的 n', '裸'] },
-            { n: 'C 是 16 字节的对称密钥（AES 密钥）', any: ['aes', '对称', '密钥', '16 字节', '16字节'] },
-            { n: 'D 是 32 字节的摘要（SHA-256）', any: ['sha', 'sha256', 'sha-256', '摘要', '哈希', '散列', 'digest'] },
-            { n: 'E 是随机字节（无结构）', any: ['随机', 'random', '噪声', '无结构', '没有结构'] },
-            { n: 'F 是 Base64 编码的 JSON 文本（可读）', any: ['json', '明文', '可读', '文本', '配置'] }
-          ];
-          if (!t.trim()) return { ok: false, detail: '还没写判断。先跑一次上面的测量，再按 A～G 逐条写「是什么 + 依据」。' };
-          var hits = groups.map(function (g) { return H(t, g.any); });
-          var cnt = hits.filter(Boolean).length;
-          var ok = cnt >= 5;
-          var list = groups.map(function (g, i) { return (hits[i] ? '<span class="hit">✔</span> ' : '<span class="miss">?</span> ') + g.n; }).join('<br>');
-          return {
-            ok: ok,
-            detail: (ok ? '✅ 说到 ' + cnt + '/6 组，判断到位。' : '❌ 只说到 ' + cnt + '/6 组，还差一些。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">最关键的一条依据是「DER 长度自洽 + 含 rsaEncryption OID」——它把 A 和 E（同样 256 字节、同样高熵）区分开了。</span>'
-                  : '<br>提示：<b>A 和 E 字节数接近、熵都高，靠熵分不开</b>，必须用结构（30 开头 + 长度自洽 + OID）区分。')
-          };
-        },
-        showAnswer:
-          '<b>A = DER 编码的 RSA-2048 公钥（SPKI，294 字节）</b><br>' +
-          '依据：<span class="mono">30</span> 开头；长度字段 <span class="mono">82 01 22</span> 算出 290，4 + 290 = 294 = 实际长度（自洽）；' +
-          '偏移 8 处有 <span class="mono">2A 86 48 86 F7 0D 01 01 01</span>（rsaEncryption OID）；结尾是 <span class="mono">02 03 01 00 01</span>。' +
-          '四条判据同时命中，不可能是巧合。<br><br>' +
-          '<b>B = 裸 modulus（256 字节 = 2048 bit）</b><br>' +
-          '依据：正好 256 字节、高熵、首字节 <span class="mono">0xb0</span> ≥ 0x80，但<b>不以 30 开头、没有 OID、结尾也不是 e</b>——' +
-          '所以它是一段裸的大数，而不是完整的公钥。它就是 A 里面那 256 字节（去掉了前导 00）。<br><br>' +
-          '<b>C = 16 字节的对称密钥（这里是一把 ASCII 写成的 AES-128 密钥）</b><br>' +
-          '依据：16 字节；可打印比例 100%；熵只有 3.6 左右。' +
-          '<b>注意：熵低是因为它把密钥写成 ASCII 了，不是因为「它一定是密钥」</b>——判据是长度 = 块大小/密钥长度 + 高可打印。' +
-          '真实项目里如果看到 16 字节全可打印，几乎一定是手写的密钥。<br><br>' +
-          '<b>D = 32 字节的摘要（SHA-256）</b><br>' +
-          '依据：32 字节、高熵、可打印比例 0（十六进制只是<b>你看到的形式</b>，还原成字节后是二进制）。' +
-          '这一条和「32 字节随机数」在熵上是分不开的——要区分只能靠上下文（调用点、是否有 IV 常量）。<br><br>' +
-          '<b>E = 96 字节随机数据</b><br>' +
-          '依据：既不是固定长度（不是 16/20/32/64 这些摘要长度），也不是模长（128/256/384/512），' +
-          '没有 DER 结构、没有 OID。<b>结论是「无结构的高熵数据」——它可能是随机数、盐、IV 的组合，也可能是加密后的数据。</b>' +
-          '<span class="hit">像 E 这种量，光靠静态统计是定不了性的，必须去看它的使用点。</span><br><br>' +
-          '<b>F = Base64 编码的 JSON 文本</b><br>' +
-          '依据：Base64 解码后是 43 字节、熵只有约 3.9、可打印比例 100%，内容是 ' +
-          '<span class="mono">{"uid":"10086","v":"2.3.1","ts":1735689600}</span>。' +
-          '这是一个典型的「看起来像密文，其实是明文」的例子——<b>先解一次编码，能省掉后面一大堆工作。</b><br><br>' +
-          '<b>G = 48 字节随机数据（Base64 形式）</b><br>' +
-          '依据：Base64 解码后 48 字节、高熵、无结构、可打印比例低。<br><br>' +
-          '<b>这一题真正的知识点：熵只能「排除」，不能「确认」。</b>' +
-          'A（公钥）、D（摘要）、E（随机）、G（随机）全都是高熵的二进制数据，' +
-          '把它们的熵摆在一起几乎一样。<b>区分它们的是长度和结构，不是熵。</b>',
-        hint:
-          '按这个顺序读表格：<br>' +
-          '① <b>结构特征列</b>：谁出现了「长度自洽」「rsaEncryption OID」「结尾 02 03 01 00 01」？这三条任意一条命中，都强烈指向 DER 公钥。' +
-          'A 三条全中，B 一条都不中——<b>这就是「完整公钥」和「裸 modulus」的分界</b>。<br>' +
-          '② <b>字节数列</b>：16（对称密钥长度）、32（SHA-256 摘要长度）、48/96（不是任何标准长度 → 更像随机数据或数据块）、' +
-          '256（模长 / 也可能只是随机）、294（DER 公钥总长）。<br>' +
-          '③ <b>可打印比例列</b>：接近 100% 的，先怀疑是文本或 ASCII 密钥；接近 0% 的是二进制。' +
-          '别忘了 Base64 那两段要<b>先解码再看</b>——F 解码后是可读 JSON，G 解码后是随机字节。<br>' +
-          '④ <b>熵列只用来排除</b>：熵很低的一定不是密钥，熵很高什么都说明不了。',
-        after: T.note('ok', '✅ 这个实验真正的收获',
-          '<p style="margin-bottom:0">你现在有了一套<b>可复用、可验证</b>的判据，而不是「看感觉」。<br>' +
-          '请特别记住那个对比：<b>A 与 E 都是两百多字节的高熵二进制，熵几乎一样</b>，' +
-          '而区分它们靠的是「以 30 开头 + 长度字段自洽 + 含 rsaEncryption OID + 结尾是 e」。<br>' +
-          '<span class="hit">下次你在一堆常量里找公钥时，先跑一遍这个流程，比逐个肉眼比对快得多，而且结论是可辩护的。</span></p>')
-      },
-      quiz: {
-        id: 'q31-7', chapter: 31, answer: 1,
-        stem: '你在 so 的数据段里找到一段 <b>257 字节</b>的常量：首字节 <span class="mono">0x00</span>，次字节 <span class="mono">0xB0</span>，' +
-          '整段以 <span class="mono">0x30</span> 开头、长度字段自洽，并在开头 20 字节内包含九个字节 <span class="mono">2A 86 48 86 F7 0D 01 01 01</span>。最合理的判断是？',
-        options: [
-          { t: '这是一段被填充到 257 字节的随机数，首字节的 00 是填充', why: '随机填充不会同时满足「0x30 开头 + 长度字段自洽 + 含 rsaEncryption OID」这三条。长度自洽这一条尤其排除巧合——随机数据碰巧能以 30 开头，但要让它后面的长度字段正好等于剩余字节数，概率可以忽略。' },
-          { t: '这是一个 DER 编码的 RSA 公钥（SPKI）；那个前导 0x00 是 DER INTEGER 的符号位补齐，不属于密钥本身', why: '正确。0x30 是 SEQUENCE 标签；长度字段自洽说明它是一段完整的 DER；rsaEncryption 的 OID 直接证明它是 RSA 公钥；257 = 1 字节符号位补齐 + 256 字节 modulus，次字节 0xB0 ≥ 0x80 正是需要补齐的情形。' },
-          { t: '这是一段 257 字节的 RSA 密文，因为 257 字节只比 256 多一个字节', why: 'RSA 密文长度恒等于模长，2048 位就是 256 字节，不会出现 257。而且密文是随机字节，不可能稳定地以 0x30 开头、更不可能包含一个固定的 OID。' },
-          { t: '这是私钥：因为出现了 257 字节和 0x00 开头', why: 'PKCS#8 私钥的 DER 里同样有 OID 与长度字段，但它包含的标签远不止两个 INTEGER（还会有版本号、算法参数、可选的属性等）。更可靠的判据是：这段结构里只有「INTEGER n + INTEGER e」两个成员，那是公钥的形态。' }
-        ],
-        explain: '<b>这道题把 31.10 的四条判据全部用了一遍——而且刻意选了一个「长度不像」的例子（257 而不是 256）来考你。</b><br>' +
-          '<p><b>判据一：DER 结构自洽。</b>以 <span class="mono">0x30</span>（SEQUENCE）开头，且长度字段算出的总长正好等于这段常量的长度。' +
-          '单看「以 30 开头」不算证据，但加上长度自洽，巧合的概率就低到可以忽略。<br>' +
-          '<b>判据二：OID。</b>开头 20 字节内出现 <span class="mono">2A 86 48 86 F7 0D 01 01 01</span>，' +
-          '它是 <span class="mono">1.2.840.113549.1.1.1</span>（rsaEncryption）。<b>这一条直接给出答案，不需要推理。</b><br>' +
-          '<b>判据三：长度与首字节。</b>257 = 1 + 256。<span class="mono">0x00</span> 开头、次字节 <span class="mono">0xB0</span> ≥ 0x80——' +
-          '这正是 DER INTEGER 的符号位补齐规则：大数首字节的最高位是 1 时，必须补一个 <span class="mono">0x00</span>，否则会被解释成负数。' +
-          '<b>所以真正的 modulus 是后面那 256 字节 = 2048 位。</b><br>' +
-          '<span class="hit">这一条在现场最容易踩坑：把那个 00 也算进 modulus，导出的公钥就多一个字节，' +
-          '而且报错信息通常不会指向这里——你只会看到「解密失败」或者「公钥格式错误」。</span><br>' +
-          '<b>判据四：熵。</b>本题没有用到它，但你要知道它在这里帮不上忙——modulus 和随机数都是高熵的。</p>' +
-          '<p>顺带记住这个「257」的来历：<b>2048 位 ≈ 256 字节，但在 DER 里往往以 257 字节出现</b>。' +
-          '如果你在常量里按「256 字节」去搜 modulus，很可能会漏掉它；按「256 或 257」一起搜才稳。</p>'
-      }
-    },
-    /* ============================================================ 31.11 */
-    {
-      h: '31.11', title: '实战案例：CERT Keyfinder —— 从 APK 里把私钥捞出来',
-      html:
-        '<p>前面几节讲的是「怎么把公钥读出来」。这一节的案例走的是另一个方向：<strong>怎么在 APK 里把本来不该出现在客户端的私钥找出来</strong>。</p>' +
-        '<p>它的来源是 CERT/CC（美国卡内基梅隆大学软件工程研究所下的 CERT 协调中心）维护的一个开源工具，' +
-        'README 明确写着它的开发由美国国土安全部（DHS）资助，并且<strong>它一开始就是为了做「在 Android 应用里寻找私钥」这个实验而写的</strong>。' +
-        '这让它成为本章最贴切的一个案例：<b>它处理的正是 31.9 那张「形态表」里的每一项，只不过目标是私钥那一侧。</b></p>',
+      h: '31.4C', title: '实战案例：把 Android 装进 Docker —— redroid 与 adb 认证改造',
       case: {
-        source: 'github',
-        title: 'CERTCC/keyfinder',
-        author: 'CERTCC（CERT Coordination Center）',
-        target: 'Keyfinder 工具，以及 README 中用作示例的多个真实 APK 样本（com.shopgate.android.app21760.apk、ireland.numt.aplykey.apk、tntapp.trinitymember.apk）',
+        source: 'kanxue',
+        title: '[原创]redroid 镜像编译及预埋 adb_key 认证',
+        date: '2025-6-6',
+        author: 'CCTV果冻爽',
+        target: 'redroid（Android-in-Docker 容器方案）跑在香橙派 5 Max（ARM64 板卡）',
         background:
-          '<p>Keyfinder 是一个用来<b>在文件系统里、以及 Android APK 内部查找并分析密钥文件</b>的工具。' +
-          '（我核对时通过 GitHub API 读到：仓库创建于 <b>2018-07-16</b>，最后一次提交在 <b>2022-11-07</b>，' +
-          '核对时 stars 278，API 返回的 license 字段为 null——<b>仓库未声明许可证</b>，引用时请注意这一点。）</p>' +
-          '<p>README 里有一句非常关键的自述：这个工具<b>「诞生于一次在 Android 应用里寻找私钥的实验」</b>，' +
-          '所以它一开始就带着「APK 里可能躺着不该躺的密钥」这个假设。' +
-          '而它给出的实证也确实如此：<b>有的应用把自己的签名私钥（也就是用来给这个 APK 签名的钥匙）直接打包进了资源目录。</b></p>' +
-          '<p>它的安装依赖很能说明它的工作方式：Python 3（<span class="mono">androguard</span>、' +
-          '<span class="mono">python-magic</span>、<span class="mono">PyOpenSSL</span>）、<span class="mono">apktool</span>、' +
-          '<span class="mono">grep</span>、<span class="mono">OpenSSL</span>、<span class="mono">Java</span>。' +
-          '<b>没有一项是密码学攻击工具</b>——它做的是格式识别、反编译与引用追踪。</p>',
+          '<p>第 31 章讲的容器化原理（namespaces + cgroup + rootfs），在真实项目里长什么样？' +
+          'redroid 就是那个把 Android 系统整套塞进 Docker 容器的方案——你不再需要一台手机或一台虚拟机，' +
+          '在 ARM64 板卡（甚至服务器）上就能跑起一个完整的 Android。</p>' +
+          '<p>但装进去只是第一步。真正麻烦的是<b>装进去之后怎么管</b>。这个案例讲的正是第二件事：' +
+          '作者要在 Android <b>12 user 版</b>（注意是 user 版，不是 userdebug）上实现<b>免配对的 adb 认证</b>——' +
+          '即预埋公钥，让 adb 连进来时不用点确认框。</p>' +
+          '<p>为什么需求这么具体？因为容器的价值在于<b>自动化批量管理</b>。' +
+          '如果每次连接都要人工点一下"允许 USB 调试"，那 100 个容器就是 100 次手工操作，容器化就失去意义了。</p>',
         points: [
-          '扫描目标目录或 APK，按<b>文件扩展名 + 文件 magic</b> 判断是不是密钥文件；默认只报告<b>私钥和/或受口令保护的</b>密钥文件。',
-          '输出里对每个文件给出结构化字段：<span class="mono">keyfile</span> / <span class="mono">private</span> / ' +
-          '<span class="mono">protected</span> / <span class="mono">iskey</span> / <span class="mono">iscert</span> / ' +
-          '<span class="mono">encoding</span>（如 pem）/ <span class="mono">type</span>（如 pkcs12、pkcs8、certificate、DH）/ ' +
-          '<span class="mono">certhash</span> / <span class="mono">keyhash</span>。',
-          'APK 场景的真实输出示例 1：<span class="mono">com.shopgate.android.app21760.apk distributes its signing key as: res/raw/keystore.jks</span>，' +
-          '并判定它 <span class="mono">includes private,protected key</span>（Java KeyStore），另有一个 BouncyCastle Keystore V1 文件。',
-          '<b>关于「受口令保护」的一个重要观察</b>：README 指出 Java KeyStore 文件本身<b>并不隐藏里面装了什么</b>——它只是用口令保护。' +
-          '于是工具的做法是：<b>先改掉 KeyStore 的口令，再用 JDK 自带的 <span class="mono">keytool</span> 解析内容</b>。',
-          'APK 场景的真实输出示例 2（<span class="mono">-u</span> 选项）：' +
-          '<span class="mono">assets/sample-keys/server.key</span> 被判定为私钥（pkcs5），' +
-          '并且该公钥指纹在 <b>crt.sh</b>（证书透明度日志查询站）里被查到，' +
-          '点进去能看到它对应的证书是签发给某个真实域名的。',
-          '<b>crt.sh 检查的原理</b>：工具把「含私钥的 keystore 里那张证书的哈希」或「从私钥导出的公钥哈希」拿去查 crt.sh。' +
-          'README 的推理很直接：<b>如果一个私钥对应的证书出现在公开的证书透明度日志里，那这个私钥本来就不该是公开可得的——' +
-          '而它却躺在一个人人可下载的 APK 里。</b>',
-          '<b>引用点追踪（<span class="mono">-u</span>）</b>：用 apktool 反编译 APK，再找「哪段代码引用了这个密钥文件」。' +
-          '实例输出：<span class="mono">res/raw/sm_private is referenced by ... R$raw.smali</span> 与 ' +
-          '<span class="mono">res/values/public.xml</span>；顺着资源 ID <span class="mono">0x7f060001</span> 追下去，' +
-          '落在 <span class="mono">smali/tntapp/trinitymember/model/RSA.smali</span>。',
-          '<b>最关键的一段反编译代码</b>：那个类里有一个方法 ' +
-          '<span class="mono">public static byte[] decryptRSA(Context, String)</span>，' +
-          '它先 <span class="mono">Base64.decode(...)</span> 处理入参，再用 ' +
-          '<span class="mono">getResources().openRawResource(0x7F060001)</span> 打开那个密钥文件并逐行读进来——' +
-          '<b>也就是说，客户端在用一把打包进 APK 的私钥做 RSA 解密。</b>'
+          '<code>device/redroid/AndroidProducts.mk</code> 新增 <code>redroid_arm64-user</code> 产品，增加 <b>user 模式</b>编译目标',
+          '新增 <code>adb_keys</code>（存放 adb 认证公钥）与 <code>preinstall.sh</code>（首次开机把 adb_keys 拷到 <code>data/system</code>）',
+          '改 <code>build/target/product/base_product.mk</code>，打包时把 <code>adb_keys</code> / <code>preinstall</code> 相关文件拷进镜像',
+          '改 <code>system/core/rootdir/init.rc</code>，在 <code>on boot</code> 末尾新增执行 <code>preinstall.sh</code>',
+          '<b>SELinux 五处改动</b>：<code>sepolicy/private/file_contexts</code>、' +
+            '<code>prebuilts/api/31.0/private/file_contexts</code>、新增 <code>preinstall.te</code>（两份）、' +
+            '以及 <code>init.te</code>（两份）',
+          '改 <code>frameworks/native/libs/adbd_auth/adbd_auth.cpp</code>，在认证路径中新增 <code>/data/system/adb_keys</code>',
+          '改 <code>frameworks/base/services/core/java/com/android/server/adb/AdbDebuggingManager.java</code>',
+          '开机启动 adb 服务：改 <code>AdbService.java</code> + <code>system/core/rootdir/init.usb.rc</code>',
+          '延长 adb 连接过期时间：改 <code>frameworks/base/core/java/android/provider/Settings.java</code>',
+          '<b>保持 adb root</b>：改 <code>packages/modules/adb/daemon/main.cpp</code>，' +
+            '令 <code>should_drop_privileges()</code> <b>返回 false</b>'
         ],
         method: [
-          '先扫：把 APK 当成一个文件系统扫一遍，按扩展名与 magic 找出所有「像密钥」的文件，只留下私钥与受保护的那些。',
-          '再判定：给每个候选打上结构标签（pkcs12 / pkcs8 / pkcs5 / certificate / DH…），这一步决定了「这是钥匙」还是「这只是证书」。',
-          '对受口令保护的 keystore：<b>不去爆破口令，而是改口令</b>——因为 Keystore 文件的内容本身没有被隐藏，改完口令用 <span class="mono">keytool</span> 就能读。',
-          '对外查：把私钥 / 证书的哈希拿去 crt.sh 查询，判断这把钥匙是否曾经在公网出现过（这一步把「本地文件」提升成了「有影响面的泄露」）。',
-          '追引用：用 <span class="mono">-u</span> 反编译 APK，从资源 ID 出发找引用点，定位到真正使用这把钥匙的代码。',
-          '看用途：读反编译后的方法（例子里是 <span class="mono">decryptRSA</span>），确认这把钥匙是用来解密、签名还是别的。'
+          '<b>拉 Android 12 源码</b>，在 <code>AndroidProducts.mk</code> 里加一个 user 模式的 redroid 产品',
+          '<b>准备免配对材料</b>：放好 <code>adb_keys</code> 与首次开机会自动执行的 <code>preinstall.sh</code>',
+          '<b>打通打包链路</b>：改 <code>base_product.mk</code> 让这两个文件进镜像',
+          '<b>打通执行时机</b>：改 <code>init.rc</code>，在 <code>on boot</code> 末尾触发 preinstall.sh',
+          '<b>放开 SELinux 限制</b>：新增 <code>preinstall.te</code> 并改 <code>file_contexts</code> 与 <code>init.te</code>，' +
+            '否则 init 无权执行脚本、无全新文件的安全上下文',
+          '<b>改 adbd 认证路径</b>：让 <code>adbd_auth.cpp</code> 认 <code>/data/system/adb_keys</code>，再改 ' +
+            '<code>AdbDebuggingManager.java</code> 配合',
+          '<b>编译刷板验证</b>：烧进香橙派 5 Max，确认 adb 免配对直连且保持 root'
         ],
         result:
-          '<p>工具给出的是一份<b>可核查的清单</b>：哪个文件是私钥、是什么格式、是否受保护、它的指纹有没有在证书透明度日志里出现过，' +
-          '以及<b>它是被哪一段代码引用的</b>。</p>' +
-          '<p>对本章来说最重要的结论有两条：<br>' +
-          '① <b>RSA 在客户端的形态确实是「文件」，而不是「16 字节的密钥常量」</b>——案例里出现的关键词全是 ' +
-          '<span class="mono">jks / bks / pkcs5 / pkcs12 / pem / certificate</span>；<br>' +
-          '② 这些 App 里出现了<b>客户端持有私钥</b>这一设计缺陷（其中一例甚至是这个 APK 自己的签名私钥），' +
-          '也就是 31.4 与 31.7 反复强调的那个「密码学上站不住」的模式——<b>而 CERT/CC 在 README 里的措辞是明确的批评</b>：' +
-          'Android 官方文档把「妥善保管签名密钥」列为发布流程的关键一环，而这个应用却把它公开分发了。</p>',
-        terms: ['Java KeyStore (jks)', 'BouncyCastle Keystore (bks)', 'pkcs5', 'pkcs12', 'PKCS#8', 'PEM', 'SPKI', 'crt.sh / 证书透明度', 'apktool', '资源 ID 引用点'],
+          '<p>Android 12 <b>user 版</b>的 redroid 实现了两项改造：</p>' +
+          '<p>① <b>免配对 adb 认证</b>——通过预埋 <code>/data/system/adb_keys</code>，adb 连接无需人工确认；</p>' +
+          '<p>② <b>保持 adb root</b>——<code>should_drop_privileges()</code> 返回 false 让 adbd 不降权。</p>' +
+          '<p>这两项合起来，才让"在板卡上批量跑 Android 容器"具备了自动化管理的前提。</p>',
+        terms: ['redroid', 'Android-in-Docker', 'init.rc', 'SELinux file_contexts', 'adbd_auth', 'user 构建变体', 'preinstall', 'AdbDebuggingManager'],
         limits:
-          '<p>这里记录我能核实的客观情况，不代作者下结论：</p>' +
-          '<p>① <b>作者把最后一步留给了读者。</b>README 在展示完 <span class="mono">decryptRSA</span> 那段反编译代码之后，' +
-          '原话是「继续往应用代码里追下去，可以更好地了解这把私钥被用来做什么，但<b>我们把它留作读者的练习</b>」——' +
-          '所以「这把钥匙具体保护了什么业务」在 README 里是没有答案的。</p>' +
-          '<p>② <b>README 没有给出依赖的版本号</b>（<span class="mono">androguard</span>、<span class="mono">apktool</span> 等只列了包名），' +
-          '而这两者对 APK 的解析行为都随版本变化。项目最后一次提交在 <b>2022-11-07</b>，' +
-          '此后 Android 的 keystore 形态与 apktool 行为是否会影响它的判定，<b>我没有实测</b> <span class="pill warn">待核实</span>。</p>' +
-          '<p style="margin-bottom:0">③ <b>仓库未声明许可证</b>（我通过 GitHub API 读到的 license 字段为 null），' +
-          '示例 APK 也来自第三方。若要复用它的代码或样本，请自行确认授权情况。</p>',
+          '<p><b>⚠️ 这个案例的步骤不可完整复现</b>——作者自己写道：' +
+          '「编译时如果还有其他 selinux 问题，自行看提示解决。<b>因为我也忘了还修改了哪些</b>」，' +
+          '且"9）其它可能需要修改"一节<b>内容为空</b>。</p>' +
+          '<p>更关键的是：正文的多个命令与配置以 <b>webp 截图</b>呈现（至少 6 处：板卡实物图、' +
+          '<code>adb_keys</code> 与 preinstall 目录结构图、<code>preinstall.sh</code> 内容图、' +
+          '<code>base_product.mk</code> 改动图、<code>init.rc</code> 改动图、SELinux 各文件内容图），' +
+          '<b>这些截图无法读取</b>，因此具体的 shell 内容、mk 语法、te 规则文本均缺失。</p>' +
+          '<p>结论：本文适合作为<b>"改哪些文件"的索引</b>，但<b>不能当作可照抄的教程</b>。' +
+          '另外正文末尾的「回复或点赞可查看完整内容」经核验仅为 CSS 遮罩，其后确实没有更多文字。</p>',
         analysis:
-          '<p><b>这个案例几乎逐条印证了本章的判据，而且是在「文件粒度」上印证。</b></p>' +
-          '<p><b>第一，它验证了 31.9 的「形态表」。</b>本章说「RSA 在 App 里以常量、PEM、证书、keystore 的形式出现」，' +
-          '而这个工具的输出字段就是那张表的逆向版本：<span class="mono">type: pkcs12 / pkcs8 / certificate</span>。' +
-          '<span class="hit">注意它<b>没有</b>去找任何 16 字节的对称密钥常量——因为非对称这一类的问题本来就不在那个维度上。</span></p>' +
-          '<p><b>第二，它把 31.7 那条「客户端持有私钥站不住」的判断落到了一个真实文件上。</b>' +
-          '本章从数学推出「私钥在客户端 = 没有保护」，而这个案例给出的是实证：' +
-          '一个 APK 把 <b>自己的签名私钥</b>放进了 <span class="mono">res/raw/</span>。' +
-          'README 还补了一刀：<b>「受口令保护」不等于「内容被隐藏」</b>——Java KeyStore 的口令只保护访问，不隐藏结构，' +
-          '所以改口令 + <span class="mono">keytool</span> 就能读。<br>' +
-          '<span class="hit">这条结论可以直接搬进你的工作流：遇到 keystore 文件时，「受保护」这个观察不等于「拿不到里面是什么」。</span></p>' +
-          '<p><b>第三，它示范了本章主张的「成本排序」。</b>整个工具没有做任何密码学运算：' +
-          '<b>格式识别（扩展名 + magic）→ 结构判定 → 引用点追踪 → 一条外部数据库查询</b>。' +
-          '而最后的引用点追踪（<span class="mono">-u</span>）恰好回答了本章 31.14 那个核心问题——<b>「密钥从哪来、被谁用」</b>：' +
-          '它不是靠猜，而是从资源 ID 一路追到 <span class="mono">R$raw.smali</span>、再追到 ' +
-          '<span class="mono">model/RSA.smali</span>。<br>' +
-          '<span class="hit">这正是「硬编码密钥」这一类来源的标准分析路线：静态搜索之后，一定要追引用点，' +
-          '否则你只知道「那里有一把钥匙」，不知道「它能干什么」。</span></p>' +
-          '<p><b>第四，它也提醒了一件事：这个案例里没有「破解」。</b>' +
-          '发现的私钥可以直接用——你不需要分解任何模数、也不需要绕过任何防护。' +
-          '这和本章开头那句判断一致：<b>非对称这一类的战场不在「算出密钥」，而在「认出结构、判断方向、找到来源」。</b></p>',
-        link: 'https://github.com/CERTCC/keyfinder',
-        linkNote: 'README 的「APK Parsing」与「crt.sh Checking」两节是本案例的主要来源。正文可读性已通过 raw README 核对：本次核对时抓到 26512 字节',
+          '<p><b>本课第 31 章讲的核心是"容器 = namespaces + cgroup + rootfs + capabilities/seccomp"。</b>' +
+          '这个案例正好把其中的 <b>rootfs</b> 那一块落到了实处——' +
+          '而且它揭示了一个课本上不会写、但工程上绕不开的事实：' +
+          '<b>把 Android 塞进容器之后，你会立刻撞上 SELinux。</b></p>' +
+          '<p><b>① 为什么改一个 adb 认证要动这么多地方？</b>' +
+          '看作者的改动清单：打包（<code>base_product.mk</code>）→ 触发（<code>init.rc</code>）→ ' +
+          '权限（<code>file_contexts</code> + <code>preinstall.te</code> + <code>init.te</code>）→ ' +
+          '认证逻辑（<code>adbd_auth.cpp</code> + <code>AdbDebuggingManager.java</code>）。' +
+          '<span class="hit">这是 Android 的典型特征：一个功能的实现被拆到构建系统、启动脚本、' +
+          '安全策略、框架代码四个层面。缺任何一层都不工作。</span>' +
+          '其中 <b>init.rc 的执行时机</b>和 <b>SELinux 上下文</b>是最容易漏的两环——' +
+          '文件放进镜像了 ≠ 开机会被执行 ≠ 执行时有权限。</p>' +
+          '<p><b>② user 版这个细节很关键。</b>作者特意新增 <code>redroid_arm64-user</code> 产品去编译 <b>user</b> 模式，' +
+          '而不是图省事用 userdebug。为什么？<b>因为 user 版才是真实设备的形态</b>——' +
+          'adb root 默认关闭、SELinux 强制、调试接口收紧。' +
+          '在 userdebug 上跑通的方案，搬到 user 版上大概率失败；' +
+          '反过来先在 user 版上走通，方案的可靠性才站得住。' +
+          '这跟第 29 章"伪装要经得起交叉验证"是同一种思路：<b>在更严格的条件下验证，结论才可信。</b></p>' +
+          '<p><b>③ 最该学的其实是作者的诚实。</b>' +
+          '他直接写"我也忘了还修改了哪些"，并且把关键配置留成截图而不是文本。' +
+          '这提醒我们：<b>社区案例的价值往往在"改哪些文件"这个索引上，' +
+          '而不在"照抄就能用"</b>。真正要复现时，还是得对着目标版本的 AOSP 源码自己走一遍——' +
+          '这正是本课反复强调的"护城河在原理，不在步骤"。</p>',
+        link: 'https://bbs.kanxue.com/thread-287127.htm',
+        linkNote: '看雪论坛原创帖（关键配置为截图，步骤不可完整复现）'
+      }
+    },
+
+    /* ============ 31.5 ============ */
+    {
+      h: '31.5',
+      title: '命令行实现 Docker：手写一个迷你容器',
+      html:
+        '<p>前面讲了原理，现在动手。下面这段 C 大约 40 行，<b>它就是一个可用的容器运行时</b> —— 没有 containerd、没有 runc、没有镜像分层，只有内核 API 本身。把它读懂、跑通，你对 Docker 的敬畏就会变成掌控。</p>'
+        + '<p>先看它的整体骨架，一共七件事，缺一不可：' + T.term('clone', '创建新进程并按标志进入新命名空间，容器运行时的真正入口') + ' → '
+        + T.term('MS_PRIVATE', '把挂载事件设为私有，防止容器里的挂载传播回宿主机') + ' → '
+        + T.term('MS_BIND', '绑定挂载，让目录本身成为一个挂载点（pivot_root 的前置条件）') + ' → '
+        + T.term('pivot_root', '真正交换根文件系统的系统调用，容器的标准做法') + ' → '
+        + T.term('procfs 重挂', '换根后必须重新挂载 /proc，否则 ps 等工具全废') + ' → '
+        + T.term('sethostname', '在 UTS 命名空间里改主机名，不影响宿主机') + ' → '
+        + T.term('execv', '用目标程序替换当前进程映像，成为容器里的 PID 1') + '。</p>'
+        + T.note('warn', '⚠️ 先准备 rootfs，否则跑不起来', '<p>这段代码假设当前目录下有一个名为 <code>rootfs</code> 的目录，里面是一套可用的最小文件系统。<b>没有它就只能等到 chroot 之后 exec 失败。</b>怎么造？两条路：① 用 busybox 手工搭（<code>busybox --install -s ./rootfs/bin</code>，最省事）；② 用 <code>debootstrap</code> 拉一套 Debian/Ubuntu（31.11 详细讲）。<b>注意：宿主和 rootfs 的架构必须一致</b>（除非你按 31.10 配好了 binfmt + QEMU 跨架构执行）。</p>'),
+      stepper: {
+        title: 'mini-container.c —— 逐行拆解一个容器运行时',
+        lines: [
+          {
+            code: '<span class="k">int</span> flags = <span class="t">CLONE_NEWPID</span> | <span class="t">CLONE_NEWNS</span> | <span class="t">CLONE_NEWUTS</span> | <span class="t">CLONE_NEWIPC</span>;',
+            note: '<b>第 1 件事：决定要几根柱子。</b>PID（进程视图）、NS（挂载视图）、UTS（主机名）、IPC（进程间通信）四个。<b>故意没写 CLONE_NEWNET</b> —— 网络命名空间的网卡需要在<b>宿主机侧</b>创建 veth 再塞进去，所以通常由运行时在外面配好，而不是在这里开空网络（开了也只有一个 down 的 lo）。',
+            state: { '当前命名空间': '宿主 init 命名空间', '根文件系统': '/ （宿主机）', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">mount</span>(<span class="n">NULL</span>, <span class="s">&quot;/&quot;</span>, <span class="n">NULL</span>, <span class="t">MS_REC</span> | <span class="t">MS_PRIVATE</span>, <span class="n">NULL</span>);',
+            note: '<b>第 2 件事：把挂载传播切断。</b>这是<b>新手最常漏、后果最严重</b>的一步。默认情况下挂载事件是 shared 的，容器里的挂载会「传播」回宿主机 —— 你在容器里挂了个 tmpfs，宿主机的挂载表里居然也出现了。<code>MS_REC | MS_PRIVATE</code> 让这棵挂载树变成私有的，容器里的操作就出不去了。<b>这是隔离的一部分，不是可选项。</b>',
+            state: { '当前命名空间': '宿主 init 命名空间', '根文件系统': '/ （宿主）· 挂载已私有化', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">mount</span>(<span class="s">&quot;./rootfs&quot;</span>, <span class="s">&quot;./rootfs&quot;</span>, <span class="n">NULL</span>, <span class="t">MS_BIND</span> | <span class="t">MS_REC</span>, <span class="n">NULL</span>);',
+            note: '<b>第 3 件事：把 rootfs 变成「挂载点」。</b>这行看起来莫名其妙 —— 把一个目录挂到它自己身上有什么意义？意义在于 <code>pivot_root</code> 有一条硬性要求：<b>new_root 必须已经是一个挂载点</b>。普通目录不是挂载点，直接调 pivot_root 会拿到 <code>EINVAL</code>。绑定挂载就是为了满足这个前置条件。',
+            state: { '当前命名空间': '宿主 init 命名空间', '根文件系统': '/ （宿主）', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">chdir</span>(<span class="s">&quot;./rootfs&quot;</span>); <span class="k">mkdir</span>(<span class="s">&quot;oldroot&quot;</span>, <span class="n">0755</span>);',
+            note: '<b>第 4 件事：摆好新旧根的位置。</b><code>pivot_root</code> 的第二个参数（put_old）必须是<b>新根目录下的一个子目录</b>，用来临时安置旧根。所以要先进到新根里，再建一个 <code>oldroot</code> 目录。这一步纯粹是准备现场，没有任何魔法。',
+            state: { '当前命名空间': '宿主 init 命名空间', '根文件系统': '/ （宿主）· 已进入 ./rootfs', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">pivot_root</span>(<span class="s">&quot;.&quot;</span>, <span class="s">&quot;oldroot&quot;</span>);',
+            note: '<b>第 5 件事：真正换根。</b>这一行的效果是：当前进程的根目录从宿主 <code>/</code> 变成 <code>./rootfs</code>，而原来的宿主根被挪到了 <code>/oldroot</code> 下面。<b>注意它和 chroot 的本质区别</b> —— pivot_root 是在<b>挂载树层面做交换</b>，旧根成了一个可被卸载的普通挂载点；chroot 只是改了一个指针，旧根依然静静躺在那里，随时可能被绕回去。',
+            state: { '当前命名空间': '宿主 init 命名空间（挂载视图已独立）', '根文件系统': '<b>rootfs</b>（旧根在 /oldroot）', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">umount2</span>(<span class="s">&quot;/oldroot&quot;</span>, <span class="t">MNT_DETACH</span>); <span class="k">rmdir</span>(<span class="s">&quot;/oldroot&quot;</span>);',
+            note: '<b>第 6 件事：把旧根彻底摘掉。</b>少了这一步，容器里就能通过 <code>/oldroot</code> 一路走回宿主机的完整文件系统 —— <b>等于没隔离</b>。<code>MNT_DETACH</code> 是「惰性卸载」：立刻从挂载树里摘除，等没人再引用它时才真正释放。因为此时当前进程的工作目录还挂在旧根上，普通 <code>umount</code> 会报 <code>EBUSY</code>，必须用惰性卸载。<b>这一步做完，「逃回宿主」的路径才真正断掉。</b>',
+            state: { '当前命名空间': '宿主 init 命名空间（挂载视图独立）', '根文件系统': '<b>rootfs</b>（旧根已摘除）', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">mount</span>(<span class="s">&quot;proc&quot;</span>, <span class="s">&quot;/proc&quot;</span>, <span class="s">&quot;proc&quot;</span>, <span class="n">0</span>, <span class="n">NULL</span>);',
+            note: '<b>第 7 件事：重新挂 /proc。</b>换根之后，原来的 <code>/proc</code> 挂载点已经不在视野里了，而新 rootfs 里通常是<b>一个空目录</b>。不重挂的后果非常直观：<code>ps</code> 报错、<code>free</code> 读不到内存、<code>top</code> 一片空白、很多程序启动时读取 <code>/proc/self/...</code> 直接崩。<b>因为挂着新的 PID 命名空间，这里的 /proc 会天然只显示本命名空间的进程</b> —— 隔离是免费获得的。',
+            state: { '当前命名空间': '宿主 init ns · <b>PID 视图已隔离</b>', '根文件系统': 'rootfs · /proc 已重挂', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">mount</span>(<span class="s">&quot;sysfs&quot;</span>, <span class="s">&quot;/sys&quot;</span>, <span class="s">&quot;sysfs&quot;</span>, <span class="n">0</span>, <span class="n">NULL</span>);',
+            note: '<b>第 8 件事：挂 /sys。</b>同理。<code>/sys</code> 暴露的是内核对象（设备、驱动、cgroup 视图）。<b>注意一个坑</b>：容器里挂载 <code>sysfs</code> 通常需要网络命名空间已就绪，否则网卡相关的 sysfs 子树会是空的。至于 <code>/dev</code>，最省事的做法是从宿主机<b>绑定挂载</b>需要的设备节点（如 <code>/dev/null</code>、<code>/dev/zero</code>、<code>/dev/random</code>），或者挂一个 tmpfs 再用 <code>mknod</code> 造节点（需要 <code>CAP_MKNOD</code>）。<b>设备节点的权限控制，正是容器逃逸的经典入口之一。</b>',
+            state: { '当前命名空间': '宿主 init ns · PID 视图隔离', '根文件系统': 'rootfs · /proc /sys 已挂', 'cgroup 限额': '无' }
+          },
+          {
+            code: '<span class="k">sethostname</span>(<span class="s">&quot;mini-container&quot;</span>, <span class="n">14</span>);',
+            note: '<b>第 9 件事：改主机名。</b>因为带了 <code>CLONE_NEWUTS</code>，这次改名只作用于本命名空间。宿主机上跑 <code>hostname</code> 依然纹丝不动。<b>顺带说一个实战细节</b>：很多程序（尤其是授权类、上报类）会把主机名当作指纹的一部分 —— 容器里主机名是一串随机 ID，这本身就是「我在容器里」的强特征，31.11 会回到这一点。',
+            state: { '当前命名空间': 'PID/MNT/UTS/IPC 均已隔离', '根文件系统': 'rootfs', 'cgroup 限额': '无', '主机名': 'mini-container' }
+          },
+          {
+            code: '<span class="k">char</span> *argv[] = { <span class="s">&quot;/bin/sh&quot;</span>, <span class="n">NULL</span> }; <span class="k">execv</span>(<span class="s">&quot;/bin/sh&quot;</span>, argv);',
+            note: '<b>第 10 件事：exec，成为 PID 1。</b><code>execv</code> 用目标程序<b>替换当前进程映像</b>，进程号不变 —— 所以这个 shell 就是容器里的 <b>PID 1</b>。回想 31.4 的知识点：PID 1 一旦退出，整个命名空间的所有进程都会被内核清理掉。这就是「容器里不要随便 kill 1 号进程」的原因，也是 <code>--init</code> 参数的意义（插一个真正的 init 来回收僵尸进程）。<b>真实运行时在这一步之前，还会先设置 cgroup、丢 capabilities、装 seccomp 过滤器、切 uid/gid，最后才 exec。</b>',
+            state: { '当前命名空间': 'PID 1 = /bin/sh（隔离生效）', '根文件系统': 'rootfs', 'cgroup 限额': '无', '主机名': 'mini-container' }
+          },
+          {
+            code: '<span class="c">/* 宿主机侧，另一个终端：给容器套上额度 */</span>\n<span class="k">echo</span> $PID &gt; /sys/fs/cgroup/mini/cgroup.procs\n<span class="k">echo</span> <span class="s">&quot;50000 100000&quot;</span> &gt; /sys/fs/cgroup/mini/cpu.max\n<span class="k">echo</span> <span class="s">&quot;268435456&quot;</span> &gt; /sys/fs/cgroup/mini/memory.max',
+            note: '<b>第 11 件事：补上 cgroup 这一根柱子。</b>注意这步<b>不在容器内部做，而是在宿主机侧做</b>（容器里通常没有权限写 cgroup 文件）。先把容器主进程的 PID 写进 <code>cgroup.procs</code>，它和它的所有子进程就自动归属这个 cgroup；再写 <code>cpu.max</code>（<code>50000 100000</code> 表示每 100ms 周期最多用 50ms CPU，即半个核）和 <code>memory.max</code>（这里 256MB）。<b>没有这一步，你的「容器」只是隔离了视图，却随时能把宿主机吃穿 —— 隔离和限额是两回事。</b>',
+            state: { '当前命名空间': '已隔离', '根文件系统': 'rootfs', 'cgroup 限额': '<b>cpu 0.5 核 · mem 256MB</b>' }
+          },
+          {
+            code: '<span class="k">int</span> pid = <span class="k">clone</span>(child, stack + <span class="k">sizeof</span>(stack), flags | <span class="t">SIGCHLD</span>, <span class="n">NULL</span>);\n<span class="k">waitpid</span>(pid, <span class="n">NULL</span>, <span class="n">0</span>);',
+            note: '<b>回到入口：一切从这里开始。</b><code>clone()</code> 带着四个 <code>CLONE_NEW*</code> 标志创建子进程 —— <b>这一个调用就是「创建容器」的全部内核动作</b>。<code>stack</code> 是给子进程准备的栈空间（glibc 的 clone 封装要求调用者自己提供）。<code>SIGCHLD</code> 标志不能少，否则父进程 <code>waitpid</code> 会一直等不到子进程退出。<br><br><b>回头看：整个「容器」就是这一次 clone + 换根 + 挂 proc + 写 cgroup。</b>Docker 在它上面加的是镜像分层、网络编排、卷管理、日志、健康检查、重启策略 —— <b>全是工程封装，没有新的内核魔法</b>。这就是本章最想让你带走的一句话。',
+            state: { '当前命名空间': '<b>新容器已创建</b>', '根文件系统': 'rootfs', 'cgroup 限额': 'cpu 0.5 核 · mem 256MB' }
+          }
+        ]
       },
+      after: T.note('ok', '✅ 编译与运行', '<p><code>gcc -o mini-container mini-container.c &amp;&amp; sudo ./mini-container</code>（<code>_GNU_SOURCE</code> 宏、<code>sched.h</code> 等头文件按你的 glibc 版本自行补全）。进去以后依次验证：<code>echo $$</code> 应为 <b>1</b>；<code>ps aux</code> 只应看到自己的进程；<code>hostname</code> 应是 mini-container；<code>ls /</code> 应是 rootfs 的内容。<b>四条全部对上，说明四根柱子都装好了。</b><span class="pill warn">待核实</span>：不同发行版/内核上 sysfs 挂载是否需要在网络命名空间就绪后进行，表现不一，遇到挂载失败请先看 <code>dmesg</code>。</p>')
+    },
+
+    /* ============ 31.6 ============ */
+    {
+      h: '31.6',
+      title: 'pivot_root 与 chroot：为什么容器不用 chroot',
+      html:
+        '<p>很多人第一次写容器用的是 <code>chroot</code> —— 因为它简单、耳熟能详、一条命令就能把根目录换掉。它能跑，但它<b>不是安全边界</b>。这一节把两者的差异彻底讲清。</p>'
+        + T.tbl(['对比项', '<code>chroot</code>', '<code>pivot_root</code>'], [
+            ['做了什么', '只修改进程的根目录指针（fs_struct 里的 root）', '<b>在挂载树层面交换</b>新旧根'],
+            ['旧根还在吗', '<b>还在</b>，仍挂在系统上，只要能被引用到就能回去', '变成 <code>/oldroot</code> 下的普通挂载点，<b>可以彻底卸载</b>'],
+            ['需要挂载命名空间', '不需要', '<b>需要</b>（否则会动到宿主机的挂载树）'],
+            ['前置条件', '无', 'new_root <b>必须已是挂载点</b>（先 bind mount）'],
+            ['安全强度', '弱 —— 经典逃逸手法可绕过', '强 —— 旧根被摘除后无路可回'],
+            ['容器里的地位', '早期方案 / 简易场景', '<b>事实标准</b>（runc 等都用它）']
+          ])
+        + T.note('bad', '❌ chroot 的两个经典逃逸路径', '<p><b>① 持有外部 fd：</b>进程在 chroot <b>之前</b>打开了一个宿主机目录的 fd（或用 <code>openat</code> 拿到目录 fd），chroot 之后用 <code>fchdir(fd)</code> 切过去，再 <code>chdir(&quot;..&quot;)</code> 逐级上爬 —— <b>根目录的限制只作用于路径解析，不作用于已经打开的 fd</b>。<br><br>'
+          + '<b>② 保留 CAP_SYS_CHROOT 时的嵌套逃逸：</b>在新根里再建一层目录、chroot 进去、然后 <code>chdir(&quot;..&quot;)</code>，就能跳到新根之外。这个手法在内核历史上被反复修补，现代内核已有防护，<b>但只要进程还能再调一次 chroot 并且能构造出目录层级，就始终是隐患</b>。<span class="pill warn">具体行为随内核版本变化，待核实</span><br><br>'
+          + '<b>共同点：</b>根因都是「chroot 只是改了个名字，没有改变挂载事实」。<code>pivot_root</code> 从挂载树上真正换掉，这两条路同时被封死。</p>')
+        + T.note('key', '🔑 记住这条判断准则', '<p><b>chroot 是「改路径」，pivot_root 是「换挂载树」。</b>凡是需要把它当安全边界的地方，就必须用 pivot_root（或者现代内核提供的新接口 <code>open_tree</code> + <code>move_mount</code>，那是 pivot_root 的继任者）。<span class="pill warn">新接口的可用性依赖内核版本，待核实</span></p>'),
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境四',
-            scenario: '<b>情境：</b>你在一次<b>已获授权的</b>安全评估中，用类似 Keyfinder 的思路在一个 App 的 ' +
-              '<span class="mono">res/raw/</span> 里发现了一个 keystore 文件，里面有一把 RSA 私钥，' +
-              '而且它被业务代码用来解密服务端下发的数据。<br>' +
-              '客户问你：「这个发现有多严重？我们该怎么处理？」你应该先做什么？',
+            label: '情境二 · 被一个 fd 掀翻的「容器」',
+            scenario: '<b>情境：</b>你用 <code>chroot ./rootfs /bin/sh</code> 做了一套「容器」，一直用得好好的。某天同事问了一个问题：<br><br>'
+              + '「如果一个进程在 chroot <b>之前</b>就打开了一个宿主机目录的 fd，chroot 之后它还能访问那个目录吗？」<br><br>'
+              + '你做了个实验：<code>fd = open(&quot;/&quot;, O_RDONLY|O_DIRECTORY)</code> → <code>chroot(&quot;./rootfs&quot;)</code> → <code>fchdir(fd)</code> → <code>chdir(&quot;..&quot;)</code>。'
+              + '<b>结果：它一路走回了宿主机的根目录。</b><br><br>你的「容器」整个被打穿了。现在你怎么处理？',
             choices: [
-              { t: '先确认这把私钥的用途与影响面：它是只用来解密「服务端用公钥加密的下发数据」，还是也用于签名/身份认证；再去找这把钥匙有没有在公网出现过', next: 'n1' },
-              { t: '直接用这把私钥去解密生产环境的流量，把明文抓出来作为「影响证明」', next: 'n2' },
-              { t: '这是个硬编码密钥问题，和我们已知的 AES 硬编码是同一类，按同一优先级报给客户就行', next: 'n3' },
-              { t: '先不提，等把整个 App 的加密链路完整还原之后再一起汇报', next: 'n4' }
+              { t: '给进程去掉不必要的 capability、用非 root 用户跑，让它在容器里也拿不到什么权限就行', next: 'n1' },
+              { t: '改用 pivot_root 换根，并把 MS_PRIVATE 和卸载旧根两步补齐，从挂载树上真正切断回宿主的路径', next: 'n2' },
+              { t: '在 chroot 之后立刻 chdir(&quot;/&quot;)，并把工作目录重置，让进程找不到向上爬的起点', next: 'n3' },
+              { t: '用 seccomp 过滤掉 chdir 和 openat 系统调用，让它没法往上走', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：先确定「用途 + 影响面」，再谈严重性',
-            result: '<b>同一把私钥，「只能解密自己账号的下发数据」和「能伪造任意用户身份」是两个量级的风险</b>，' +
-              '而区分它们只需要读几段代码。要查的三件事：<br>' +
-              '① <b>用途</b>：只解密（保密）？还是也做签名（身份）？<b>签名用途的泄露严重得多</b>——' +
-              '前者泄露的是「别人发来的内容」，后者泄露的是「冒充的能力」。<br>' +
-              '② <b>算法与密钥长度</b>：如果 n 只有 512 位或 1024 位，那这把密钥本身的强度就要单独评估——' +
-              '512 位已被公开分解，1024 位在业界也已不再被认为足够（具体合规要求以你所在的标准为准 ' +
-              '<span class="pill warn">待核实</span>）。这会改变整个评估的结论。<br>' +
-              '③ <b>有没有在公网出现过</b>：Keyfinder 的做法值得照搬——<b>把公钥指纹拿去做一次证书透明度日志查询</b>。' +
-              '如果这把钥匙曾被用于某个真实域名的 HTTPS 服务，那影响面就从「这个 App」扩散到了「那台服务器」。<br>' +
-              '<span class="hit">注意这一选的动作特征：先取证、先界定范围，而不是先动手利用。这在授权评估里既是专业要求，也是对客户负责。</span>'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '缓解而非修复：权限最小化是对的，但边界仍然漏着',
+            result: '<b>先肯定：最小权限原则本身完全正确</b>，去 capability、非 root 运行应该做。但它<b>没有修掉这个洞</b>。<br><br>'
+              + '<b>认知根源：把「降低后果」当成了「消除边界」。</b>只要进程还持有那个外部 fd，<b>它就依然能读写宿主机的文件</b> —— 而这些操作是用它自己已有的权限做的，跟去掉 CAP_SYS_ADMIN 没关系。一个非 root 进程能读到宿主机的 <code>/etc/passwd</code>、能读到别的应用的数据目录，这已经足够造成信息泄露了。<br><br>'
+              + '<b>更要命的是：如果 chroot 之前的那个 fd 是在特权阶段拿到的</b>，你连「它到底能摸到什么」都说不清。<br><br>'
+              + '<b>正确顺序：</b>先修边界（pivot_root + 私有挂载 + 卸载旧根），再谈权限收缩。两者是<b>叠加</b>关系，不是替代关系。安全上有句老话：<b>你无法通过限制权限来修补一个根本不存在隔离的边界</b>。'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'bad',
-            verdictTitle: '越过了授权边界，而且用最危险的方式去证明一件已经能证明的事',
-            result: '<b>认知根源：把「技术上能做到」当成了「现在就该做」。</b>' +
-              '授权评估的范围通常是「这个 App 本身」，而不是「用它去解密生产环境的真实用户数据」。' +
-              '拿私钥去解生产流量，很可能已经越出授权范围，并制造了新的数据泄露事件。<br>' +
-              '更关键的是：<b>你根本不需要这么做就能证明影响面。</b>' +
-              '「客户端里存在一把服务端配对的私钥」这件事本身就是结论——它的含义是<b>任何拿到这个 App 的人都能解密</b>，' +
-              '这是从代码结构就能推出的，不需要真的去解一条真实流量。<br>' +
-              '<span class="hit">一个可以替代的做法：用测试账号、测试环境的一条数据做最小验证，' +
-              '并把这个验证写进报告的方法学里。</span>这样既有证据，也不越界。'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：从挂载树上真正切断，而不是只改路径',
+            result: '<b>这就是正解，而且必须是三件事一起做，缺一不可</b>（对照 31.5 的 stepper）：<br><br>'
+              + '① <code>mount(NULL, &quot;/&quot;, NULL, MS_REC|MS_PRIVATE, NULL)</code> —— 先让挂载树私有，否则下一步会动到宿主机的挂载表；<br>'
+              + '② <code>pivot_root(&quot;.&quot;, &quot;oldroot&quot;)</code> —— 在新挂载命名空间里交换根；<br>'
+              + '③ <code>umount2(&quot;/oldroot&quot;, MNT_DETACH)</code> —— <b>把旧根卸载掉</b>。<br><br>'
+              + '<b>第 ③ 步是很多人漏掉的关键：</b>只做 pivot_root 不做卸载，旧根就静静躺在 <code>/oldroot</code>，容器里 <code>ls /oldroot</code> 就能看到整个宿主机文件系统 —— <b>和 chroot 一样漏</b>。因为此时工作目录还在旧根上，普通 umount 会 EBUSY，所以要用 <code>MNT_DETACH</code> 惰性卸载。<br><br>'
+              + '<b>为什么这能同时封死两条逃逸路径：</b>挂载命名空间独立后，容器里的挂载变动不影响宿主；旧根被卸载后，即使手里有 fd 也指不到任何还挂着的宿主机目录树 —— <b>路径解析和 fd 引用两条路一起断了</b>。这正是 runc 等真实运行时的做法。'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '把它归到了错误的类比里，会低估它',
-            result: '<b>认知根源：按「硬编码」这个表面特征归类，忽略了密钥类型带来的语义差别。</b>' +
-              'AES 硬编码密钥泄露的是「一段数据的机密性」；而 RSA <b>私钥</b>泄露还额外包含' +
-              '<b>身份能力</b>（能伪造签名）与<b>信任链风险</b>（如果它同时是证书私钥，或者被用于 TLS）。<br>' +
-              '而且这里还有一个 31.4 讲过的问题：<b>对称密钥泄露通常是「一把钥匙被多个端共用」的架构问题，' +
-              '而私钥泄露是「非对称的信任模型被直接推翻」。</b>前者的整改方案是「换密钥 + 改架构」，' +
-              '后者往往意味着「必须立刻吊销证书 / 更换密钥对 / 重做设备身份体系」。<br>' +
-              '<b>严重性评估要按「泄露了什么能力」来分，不是按「是不是硬编码」来分。</b>'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '没打到点上：chdir 治不了已经打开的 fd',
+            result: '<b>认知根源：以为「路径逃逸靠的是相对路径」，忽略了 fd 这条完全独立的通道。</b><br><br>'
+              + '<code>fchdir(fd)</code> 的作用就是<b>把工作目录直接切到 fd 指向的地方</b>，它根本不走路径解析 —— 你之前 chdir 到哪儿都无所谓。攻击者只要手里握着那个 fd，随便什么时候都能切回去。<br><br>'
+              + '<b>反过来想：</b>如果「重置工作目录」能解决 chroot 逃逸，那 chroot 早就是一个合格的安全边界了，也不会有人费力去发明 pivot_root。<br><br>'
+              + '<b>真正的判断方法：</b>问自己「<b>这个限制作用在什么层面</b>」。chroot 限制的是<b>路径解析</b>；而 fd 是内核对象引用，<b>绕过路径解析的直接引用</b>。凡是「限制一层、另一层还能直接引用」的设计，都不能当边界用 —— 这个思路在做沙箱对抗时同样适用。'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '把「报得完整」排在了「报得及时」前面',
-            result: '<b>认知根源：追求报告的完整性，牺牲了风险的时间窗口。</b>' +
-              '完整还原链路确实有价值，但<b>一条已经确认的高危发现（私钥随包分发）需要立即上报</b>：' +
-              '客户可能要立刻启动吊销/轮换流程，这些动作有前置时间。<br>' +
-              '正确做法是<b>分两段交付</b>：把「已确认的事实 + 影响面判断 + 建议动作」先发一条即时通告，' +
-              '再在最终报告里补完整的链路还原与整改方案。<br>' +
-              '<span class="hit">分寸感也是技术能力的一部分：把「还在分析」当成「先不说」的理由，' +
-              '在真实项目里是要付出代价的。</span>'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：seccomp 挡不住已存在的能力，还会误伤正常程序',
+            result: '<b>认知根源：把 seccomp 当成万能拦截器，忽略了「时机」和「精度」。</b><br><br>'
+              + '<b>时机问题：</b>fd 是在 seccomp 生效<b>之前</b>就拿到的（甚至是父进程传递给子进程的）。seccomp 只能拦「之后的系统调用」，<b>不能回收已经存在的 fd</b>。攻击者只需要在装过滤器之前把 fd 准备好就行。<br><br>'
+              + '<b>精度问题：</b>直接禁掉 <code>chdir</code>／<code>openat</code> 会让 shell、包管理器、几乎所有正常程序立刻罢工 —— 这两个调用太基础了。真实运行时的 seccomp 配置是<b>白名单</b>式的（只放行需要的调用，并带参数级过滤），不是这样粗暴地拉黑。<br><br>'
+              + '<b>seccomp 的正确定位：</b>它是四根柱子里的<b>第四层加固</b>，用来缩小内核攻击面 —— 在边界已经正确的前提下再加一道锁。<b>它的作用是「减少可被利用的入口」，不是「修补一个漏的边界」。</b>边界问题必须在挂载树层面解决。'
           }
         }
-      }
-    },
-
-    /* ============================================================ 31.12 */
-    {
-      h: '31.12', title: '「假 RSA」甄别清单：十种一眼可疑的形态',
-      html:
-        '<p>这一节是本章最实用的部分。下面每一条都是现场高频出现的形态，' +
-        '<strong>每一条都配一个「一句话判据」——你不需要读代码、不需要 Hook，就能先做一次分流。</strong></p>' +
-        T.tbl(['你看到的', '大概率是什么', '一句话判据', '该怎么办'],
-          [
-            ['叫 <span class="mono">rsa</span> / <span class="mono">RSACrypt</span> / <span class="mono">RSAUtil</span> 的方法，' +
-             '输出却是一段可读文本或短的 Base64',
-             '<b>假 RSA</b>：其实只做了 Base64 或 Hex',
-             '把输出<b>解码一次</b>看看是不是明文/JSON；再看长度是不是模长',
-             '当编码处理，走第 8 章 8.4；别去搜密钥'],
-            ['一段 256 字节的常量，<b>每次请求都一模一样</b>',
-             '<b>它是公钥/证书常量，不是密文</b>；或者是一个固定填充的假加密',
-             '密文是随机的（有填充时）或确定的（裸 RSA 时），但<b>绝不会是一段长期不变的常量</b>',
-             '走 31.10 的公钥常量识别器，判断它是不是 SPKI'],
-            ['<span class="mono">Cipher.getInstance("RSA/ECB/NoPadding")</span>',
-             '<b>裸 RSA</b>',
-             '变换串第三格写的是 NoPadding',
-             '<b>记录为高危设计。</b>同时它意味着密文是确定的，复现反而更容易'],
-            ['公钥指数 e = 3',
-             '小指数，可能配了裸 RSA 或未校验的填充',
-             '解析 SPKI 的最后 5 个字节：<span class="mono">02 03 01 00 01</span> 是 65537，其它值就要留意',
-             '记为风险信号，写进报告；不直接等于「能破解」'],
-            ['密文长度<b>等于明文长度</b>，而且改一个字节只对应位置变',
-             '<b>异或 / 流密码</b>，与 RSA 无关（把公钥当固定串做 XOR 也属于这一类）',
-             'RSA 的密文长度恒等于模长，<b>永远不会等于明文长度</b>',
-             '回到地图第 4 类；去 so 里找异或常量（第 8 章 8.6）'],
-            ['客户端里找到 <span class="mono">PRIVATE KEY</span> 开头的 PEM，或 <span class="mono">.jks</span> / <span class="mono">.p12</span> 文件',
-             '<b>客户端持有私钥——设计缺陷</b>',
-             'PEM 头是 <span class="mono">PRIVATE KEY</span> / <span class="mono">RSA PRIVATE KEY</span>',
-             '这等于把密钥硬编码了：直接用它。走 31.11 那个案例的思路，并追引用点'],
-            ['客户端在调 <span class="mono">Signature.initSign</span>',
-             '<b>客户端签名</b>：密码学上站不住（31.7）',
-             '方法名是 <span class="mono">initSign</span>（不是 <span class="mono">initVerify</span>）',
-             '<b>好消息</b>：它一定可复现。去找那把私钥或直接调用它的签名逻辑'],
-            ['一个「RSA 加密」的字段长度有<b>好几千字节</b>',
-             '它其实是 AES（或分段 RSA，或 RSA+AES 混合）',
-             'RSA-2048 一次最多加密两百多字节；更长的数据必然走了别的路',
-             '去找同一段代码里的对称加密调用，RSA 很可能只负责包住那把对称密钥'],
-            ['一个请求参数是 <b>32 个十六进制字符</b>，但代码里出现了 <span class="mono">PublicKey</span>',
-             '公钥被当成了<b>盐</b>或固定串，用来拼 MD5',
-             '长度 32 个字符 = 16 字节 = MD5 的长度，不是任何 RSA 产物',
-             '按摘要处理：去确认公钥字符串是以什么形态（hex / Base64 / DER）被拼进输入的'],
-            ['代码里读了一张证书，但只用它做 SSL Pinning',
-             '<b>与业务加密无关</b>',
-             '证书的用途是校验服务端身份（第 23 章），不参与业务参数的计算',
-             '别把分析精力耗在它身上；先确认业务参数用的是哪条路径']
-          ]) +
-        T.note('key', '🔑 这张清单的用法：三十秒分流',
-          '<p style="margin-bottom:0">拿到一个可疑字段，按这个顺序扫一眼：<br>' +
-          '<b>① 它是一段长期不变的常量吗？</b>是 → 公钥/证书/诱饵，不是密文。<br>' +
-          '<b>② 它的长度对得上哪一类？</b>16 的倍数 → 对称；16/20/32 恒定 → 摘要；等于模长 → 非对称；等于明文长度 → 异或。<br>' +
-          '<b>③ 解码一次是明文吗？</b>是 → 编码，收工。<br>' +
-          '<b>④ 代码里是 initSign 还是 initVerify？</b>方向错了，后面全错。<br>' +
-          '这四问做完，你已经把「假 RSA」全部排除了——而且一行汇编都没读。</p>'),
-      quiz: {
-        id: 'q31-8', chapter: 31, answer: 2,
-        stem: '一个参数叫 <span class="mono">rsaData</span>，值是 32 个十六进制字符。同一请求重复十次，值每次都一样；' +
-          '把请求体里一个字段改掉，它就完全变化。代码里能看到 <span class="mono">getInstance("RSA")</span>。最合理的判断是？',
-        options: [
-          { t: '这是 RSA 加密的结果，只是密钥长度很短（256 位）', why: '256 位的 RSA 确实会产生 32 字节的密文，但那样短的 RSA 早已不安全，且不会出现在正常业务里。更关键的是：它「改一个字段就完全变化」更符合摘要的雪崩效应。' },
-          { t: '这是 RSA 签名，长度为 32 字节', why: '签名长度等于模长，2048 位对应 256 字节而不是 32 字节。32 字节不是任何常见 RSA 签名长度。' },
-          { t: '这更可能是 16 字节的摘要（MD5），而非 RSA 的产物；名字里的 rsa 是误导，应该去确认这段代码里 RSA 到底用在哪一步', why: '正确。32 个十六进制字符 = 16 字节 = MD5 的输出长度；「改一字节全变」是摘要的雪崩效应。函数名或变量名带 rsa 不代表这个字段就是 RSA 产物——现场大量存在「名字是 rsa，实际拼了个 MD5」的写法。' },
-          { t: '这是 Base64 编码的数据，先解码再说', why: '32 个十六进制字符里只含 0-9a-f，当然也能按 Base64 解，但那不是最可能的解释。判断编码类型要先看字符集：只有 0-9a-f 时优先按十六进制看。' }
-        ],
-        explain: '<b>这道题把 31.12 清单里的两条串起来考：名字会骗你，长度不会。</b><br>' +
-          '① <b>长度</b>：32 个十六进制字符 = 16 字节 = MD5 的输出长度。RSA-2048 的产物是 256 字节，' +
-          '差了一个数量级。<b>用长度做第一道筛子，能挡掉绝大多数误判。</b><br>' +
-          '② <b>行为</b>：「改一个字节输入，输出完全变化」是摘要的雪崩效应。' +
-          '而裸 RSA 是确定的（两次相同）、带填充的 RSA 是随机的（两次不同）——' +
-          '「输入改一点、输出全变、但同一输入永远同一输出」这一组行为，指向的是摘要。' +
-          '<p>那代码里的 <span class="mono">getInstance("RSA")</span> 算什么？<b>它说明这个 App 确实用了 RSA，但用在哪一步还不知道。</b>' +
-          '现实里最常见的组合是「先用 MD5/HMAC 得到摘要或签名，再用 RSA 加密或再签一次」——' +
-          '两个算法在同一个方法里前后脚出现，你看到的这个字段只是链条中的一环。' +
-          '<span class="hit">所以「在代码里看到 RSA」和「这个字段是 RSA 的产物」是两句不同的话，不要混。' +
-          '正确的动作是顺着这段代码往前后各看一步：RSA 的输入是什么、输出又去了哪里。</span></p>'
-      }
-    },
-
-    /* ============================================================ 31.13 */
-    {
-      h: '31.13', title: '非对称的另一半：ECDHE 与会话密钥为什么不在客户端',
-      intuition: {
-        tag: '直觉模型 · 两个人各出一半的密码',
-        body:
-          '<p>假设你和对方要约定一个只有你们知道的数字，但你们之间所有的对话都被旁听。听起来不可能——除非你们用<strong>各出一半</strong>的办法。</p>' +
-          '<p>你挑一个只有你知道的秘密 a，算出 A 发给他；他挑一个只有他知道的秘密 b，算出 B 发给你。' +
-          '然后你用自己的 a 和他的 B 算出一个数，他用自己的 b 和你的 A 算出同一个数——' +
-          '<strong>旁听者拿到了 A 和 B，却算不出那个数</strong>，因为他不知道 a 或 b。</p>' +
-          '<p>关键在于：<strong>这个最终的数从来没有在网络上出现过，也从来没有在任何一端「存」过很久</strong>。' +
-          '它是双方各自在本地算出来的，用完就丢。所以——</p>' +
-          '<p style="margin-bottom:0"><b>「抓包抓不到会话密钥」不是你没找到，而是它压根没有以「一把钥匙」的形式旅行过。</b></p>'
       },
-      html:
-        '<p>这一类在六类地图里是第 6 格：<strong>密钥交换 / 派生</strong>。它与前面五类最大的不同是：' +
-        '<strong>没有一把「常驻的密钥」可供你寻找</strong>——密钥是算出来的。</p>' +
-        '<p>第 23 章已经讲过 TLS 握手与证书链，这里只补<strong>它对逆向的三条意义</strong>：</p>' +
-        T.grid(3, [
-          '<div class="card"><div class="card-title">① 会话密钥是「协商」出来的</div>' +
-          '<p>现代 TLS（1.3 起全面使用临时 ECDHE；1.2 也在逐步淘汰 RSA 密钥交换）里，' +
-          '会话密钥由双方各自的<b>临时</b>密钥对协商产生。</p>' +
-          '<p>后果：<b>它不在客户端的任何静态常量里，也不在任何一段长期存在的内存里</b>。' +
-          '你翻遍 APK、dump 进程内存都找不到——<span class="hit">因为它的「存在形式」就是一次运算的结果，而不是一份数据。</span></p></div>',
-          '<div class="card"><div class="card-title">② 服务端私钥也解不了历史流量</div>' +
-          '<p>这是「前向安全」（forward secrecy）的含义：每次会话的密钥是独立的、用完即弃。' +
-          '所以即使你拿到了服务端的长期私钥，也<b>解不开过去录下来的流量</b>。</p>' +
-          '<p>这条在 TLS 1.3 里是硬性的——RSA 密钥交换被移除了，服务端私钥只用于<b>签名</b>（证明身份），' +
-          '不再参与密钥的产生。</p></div>',
-          '<div class="card"><div class="card-title">③ 所以观测点必须搬进进程内</div>' +
-          '<p>既然密钥不在路上、也不在磁盘上，那它只在一个地方「出现过」——<b>进程内存里，算出来的那一刻</b>。</p>' +
-          '<p>这就是为什么第 21 章的 r0capture 选择在 <b>SSL 读写函数的出口抄明文</b>，' +
-          '而第 24 章的自吐沙箱选择在进程内插桩：<span class="hit">它们都在把观测点往「密钥/明文一定出现过的那个瞬间」推。</span></p></div>'
-        ]) +
-        T.note('key', '🔑 把这条结论推广到业务层：自研 DH 也一样',
-          '<p>不是只有 TLS 会用密钥交换。很多 App 会在应用层自己做一套：' +
-          '客户端生成一对临时密钥，与服务端交换后 <span class="mono">KeyAgreement.generateSecret()</span> 得到共享密钥，' +
-          '再拿它去 AES 加密业务参数。</p>' +
-          '<p>遇到这种实现，你的分析动作应该是：<br>' +
-          '① <b>不要在静态里搜密钥</b>——它不存在于静态数据里；<br>' +
-          '② <b>Hook <span class="mono">generateSecret</span> 的返回值</b>（或者它派生出的 AES 密钥的构造点），' +
-          '这是最直接的观测点；<br>' +
-          '③ <b>记住每会话一变</b>：抓到的密钥只对那一次会话有效，别拿 A 会话的密钥去解 B 会话的密文' +
-          '（这个错误的现象是「偶尔能解对、大部分时候是乱码」，很容易被误判成算法找错了）。</p>' +
-          '<p style="margin-bottom:0">第 23 章讲过「密钥交换」，第 24 章讲过「在进程内拿密钥」，' +
-          '本章只在这里给它们之间的连接点：<b>「密钥从哪来」这个问题，答案决定了观测点该放在哪里。</b></p>'),
-      quiz: {
-        id: 'q31-9', chapter: 31, answer: 3,
-        stem: '你录下了一段 HTTPS 流量，也拿到了服务端的私钥（通过合法授权渠道）。但你把私钥丢进 Wireshark 之后，' +
-          '<b>解不开这段流量</b>。最合理的解释是？',
-        options: [
-          { t: '私钥拿错了版本，或者密钥格式不对', why: '格式问题会给出明确的报错（无法解析、密钥不匹配），而不是「解不开但没报错」。而且这是可以先用 openssl 验证的次要怀疑项。' },
-          { t: 'Wireshark 版本太老，不支持这种密钥类型', why: '工具版本确实值得确认，但即便版本最新，用服务端长期私钥去解 ECDHE 协商出来的会话密钥在数学上就是不可行的——这不是工具能力问题。' },
-          { t: '流量被 App 二次加密了，所以需要先把业务层的加密解开', why: '这只在「应用层还有一层自研加密」时才成立，那是另一个层次的问题。而且这个解释绕开了 TLS 本身为什么解不开。' },
-          { t: '这次会话的密钥是用 ECDHE 协商出来的临时密钥：服务端长期私钥不参与会话密钥的产生，只用于签名证明身份，所以它解不开这段流量', why: '正确。这是前向安全的直接后果，也是 TLS 1.3 移除 RSA 密钥交换后的常态。要解开这类流量，你需要的是那次会话的密钥本身（例如客户端导出的 SSLKEYLOGFILE），而不是服务端私钥。' }
-        ],
-        explain: '<b>这道题是「密钥从哪来」这个问题的分水岭。</b>' +
-          '在 TLS 1.2 及更早的版本里，确实存在「用服务端公钥直接加密预主密钥」的密钥交换方式，' +
-          '那种情况下拿到服务端私钥就能解密历史流量。但这种模式<b>没有前向安全</b>：' +
-          '一旦私钥泄露，所有历史流量全部失守。<br>' +
-          '<p>现代实践已经转向临时 ECDHE：会话密钥由双方各自生成的临时密钥对协商而来，' +
-          '<b>服务端长期私钥只用于签名（证明「我确实是证书的持有者」）</b>，不参与密钥的产生。' +
-          '所以「拿到私钥」这件事，对这段流量的解密能力是<b>零</b>。' +
-          'TLS 1.3 更是把 RSA 密钥交换直接删掉了，让这一点变成协议层面的硬性要求。</p>' +
-          '<p><b>把它翻译成逆向现场的三句话：</b><br>' +
-          '① <b>「找不到会话密钥」不是失败，是设计。</b>它没有以数据的形式存在于任何你能静态读取的地方；<br>' +
-          '② <b>要拿明文，就把观测点搬进进程内</b>——SSL 读写函数的出口（第 21 章），或者在密钥派生的出口下钩子（第 24 章）；<br>' +
-          '③ <b>或者让客户端自己把密钥吐给你</b>——很多 TLS 库支持导出会话密钥日志（环境变量方式），这是浏览器生态里成熟的做法，' +
-          '在移动端不一定可用 <span class="pill warn">待核实</span>：取决于目标 App 用的是哪套 TLS 实现、以及是否读取了该环境变量。</p>' +
-          '<p><span class="hit">判断「该不该继续在原方向上找」的标准，就是这一节的内容：' +
-          '如果密钥的来源是「协商」，那它就不会以文件或常量的形式存在——你再怎么 dump 内存也只能捞到某一瞬间的那一份，' +
-          '而且只对那一次会话有效。</span></p>'
-      },
-      after: T.note('ok', '✅ 这一节的收获',
-        '<p style="margin-bottom:0">你应该能把「密钥从哪来」和「去观测哪里」连起来：<br>' +
-        '<b>硬编码</b> → 静态搜索；<b>派生</b> → 找派生的输入；<b>协商</b> → 进程内观测那一刻；' +
-        '<b>服务端下发</b> → 抓包关联会话；<b>KeyStore</b> → 只能拿到句柄；<b>白盒</b> → 走另一套数学。<br>' +
-        '下一节把这张表补全。</p>')
+      after: '<p>根换好了，进程也跑起来了 —— 但这个容器<b>连不上网</b>。下一节我们回到宿主机侧，看 docker0 网桥上到底发生了什么。</p>'
     },
-
-    /* ============================================================ 31.14 */
+    /* ============ 31.7 ============ */
     {
-      h: '31.14', title: '密钥从哪来：把地图收口',
+      h: '31.7',
+      title: 'docker0 网桥与 veth pair：一个包的旅行',
       html:
-        '<p>看到这里，你应该已经发现：<strong>「用了什么算法」这个问题，从来不是最难的</strong>。' +
-        '真正决定你能不能复现的，是另一句话——<strong>「那把密钥是从哪来的」</strong>。</p>' +
-        '<p>这句话可以把整张地图收成一个口。密钥的来源只有六种，每一种对应一条完全不同的分析路线：</p>' +
-        T.tbl(['密钥来源', '典型现象', '分析路线', '谁讲过'],
-          [
-            ['<b>① 硬编码</b>',
-             'so / dex 里有 16 字节常量、一段 Base64、一个 PEM 块、一个 keystore 文件',
-             '<b>静态搜索 + 格式识别</b>：按长度筛、按结构判（本章 31.10）',
-             '第 8 / 9 章讲算法，<b>本章 31.9～31.12 讲非对称的形态与甄别</b>'],
-            ['<b>② 运行时派生</b>',
-             '没有明显的密钥常量，但每台设备算出来的密文不同',
-             '<b>找派生的输入</b>：设备号、时间戳、安装 ID、常量表；' +
-             '<b>在密钥构造点插桩</b>（<span class="mono">SecretKeySpec</span> 构造）',
-             '<b>第 24 章</b>（自吐沙箱的插桩点就是干这个的）'],
-            ['<b>③ 协商</b>',
-             'TLS 握手；Java 层的 <span class="mono">KeyAgreement</span>；自研 DH 交换',
-             '<b>不要去静态找</b>。在 <span class="mono">generateSecret</span> 出口或 SSL 读写出口观测',
-             '<b>第 23 章</b>讲协议，<b>本章 31.13</b> 讲它对逆向的意义'],
-            ['<b>④ 服务端下发</b>',
-             '登录响应里带一个字段，后续请求用它参与加密',
-             '<b>抓包 + 关联会话</b>：把响应字段与后续请求的参数对应起来',
-             '第 23 章；第 24 章可从「谁把这段字节交给了密钥构造函数」反查'],
-            ['<b>⑤ KeyStore / 硬件密钥库</b>',
-             '<span class="mono">AndroidKeyStore</span>、StrongBox；' +
-             '<span class="mono">Cipher.init</span> 收到的 Key 参数是一个句柄而不是 <span class="mono">SecretKeySpec</span>',
-             '<b>拿不到密钥字节</b>。能做的是：观测使用点、或者绕过上层校验',
-             '<b>第 24 章 24.8</b> 明确把它列为自吐的天然边界；第 15 章讲过 attestation'],
-            ['<b>⑥ 白盒内嵌</b>',
-             '翻遍内存也找不到那 16 个字节，但算法明明在跑',
-             '<b>数学路线</b>：把实现看成表格，用 DFA 之类的差分方法把密钥还原出来',
-             '<b>第 25 章</b>（白盒 AES 与 DFA）']
-          ]) +
-        T.note('key', '🔑 三条最容易被忽略的推论',
-          '<p><b>① 第 24 章的自吐沙箱，覆盖面是 ①②④（以及 ③ 的使用点），但不覆盖 ⑤ 和 ⑥。</b>' +
-          '所以当你发现「探针一条都没命中」时，先别怀疑沙箱写错了——' +
-          '<b>去看 Key 参数的类型</b>：如果它是一个 Key 句柄而非字节数组，那说明密钥压根没经过 Java 堆。</p>' +
-          '<p><b>② 第 25 章的白盒是唯一「算法没变、但你找不到密钥」的情形。</b>' +
-          '它和「密钥藏得深」有本质区别：前者是密钥<b>不以完整形态存在</b>，后者是<b>存在但你还没找到</b>。' +
-          '<span class="hit">判断方法：在密钥被使用的那个瞬间下断点，看内存里有没有那 16 个字节。有 → ②；没有 → ⑥。</span></p>' +
-          '<p style="margin-bottom:0"><b>③ 大部分「复现不出来」的问题，答案在「来源」上，而不在「算法」上。</b>' +
-          '你花三天研究算法是不是被魔改了，结果发现真正的输入里少拼了一个服务端下发的 nonce——' +
-          '这类事情在现场发生得极其频繁。<b>先把来源理清，再谈算法细节。</b></p>'),
-      term: {
-        title: '按「现象」反查「来源」：六问六答',
-        lines: [
-          { t: 'o', s: '现象：密文在同一台设备上稳定复现，换设备就变。', note: '来源大概率是 <b>② 运行时派生</b>：输入里含设备相关量。去找派生函数的输入，而不是找密钥常量。' },
-          { t: 'o', s: '现象：同一个请求，两次抓包的密文不同。', note: '要么是<b>随机 IV / 随机填充</b>（算法层面），要么是密钥里含<b>时间戳或随机数</b>（来源层面）。先看长度：长度不变而内容变 → 随机量在算法内部。' },
-          { t: 'w', s: '现象：登录前后同一个接口的密文规则不一样。', note: '来源可能是 <b>④ 服务端下发</b>：登录响应里给了一把会话密钥。去把响应字段与后续请求做关联。' },
-          { t: 'w', s: '现象：抓包工具能解密，但静态找不到任何密钥常量。', note: '这就是 <b>③ 协商</b> 的典型形态。<b>抓包工具能解密，是因为它在中间人位置重新协商了两次，而不是因为它找到了你的密钥。</b>' },
-          { t: 'd', s: '现象：<span class="mono">Cipher.init</span> 收到的 Key 不是 <span class="mono">SecretKeySpec</span>，而是一个来路不明的 Key 对象。', note: '高度怀疑 <b>⑤ KeyStore</b>。此时任何「把密钥 dump 出来」的努力都是白费——转向观测使用点。' },
-          { t: 'd', s: '现象：内存里翻不到明文密钥，但 AES 明明在正常运行。', note: '那就是 <b>⑥ 白盒</b>。回到第 25 章，用 DFA 之类的差分方法做数学还原；本章的形态识别在这里已经到边界了。' }
+        '<p>上一节做出来的容器，<code>ping</code> 一下外网会发现完全不通 —— 因为网络命名空间里只有一块 down 状态的 <code>lo</code>。<b>网络是最需要动手、也最容易讲糊涂的一块</b>，所以这一节我们跟踪一个数据包，把每一跳都点亮。</p>'
+        + '<p>先记住两个关键角色。' + T.term('docker0', 'Docker 默认创建的虚拟网桥，本质上是一个二层交换机，接在宿主机的网络栈里') + '负责转发，'
+        + T.term('veth pair', '虚拟网卡对：两端相连，从一端进去的帧会从另一端出来，像一根网线连接两个网络命名空间') + '负责连接。</p>'
+        + T.note('key', '🔑 一句话理解容器网络', '<p>容器网络不需要任何硬件。<b>veth pair 就是一根「虚拟网线」</b>：一头插在容器的网络命名空间里（在容器里看叫 <code>eth0</code>），另一头插在宿主机的 <code>docker0</code> 网桥上（在宿主上叫 <code>vethXXXX</code>）。<b>网卡一定是成对出现的</b> —— 在容器里 <code>ip link</code> 和宿主上 <code>ip link</code> 各看到一半，两端合起来才是一根完整的线。<b>这个「成对」的心智模型，是看懂一切容器网络的钥匙。</b></p>'),
+      stage: {
+        title: 'bridge 模式：一个数据包从容器到外网的每一跳',
+        speed: 1800,
+        render:
+          '<div class="card">' +
+            '<div class="card-title">bridge 模式 · 出向路径</div>' +
+            '<div class="flow-col">' +
+              '<div class="blk" id="b1">① 容器内进程发包 · 源 172.17.0.2 → 目标 8.8.8.8</div>' +
+              '<div class="blk" id="b2">② 容器内 eth0 发出（它是 veth pair 的一端）</div>' +
+              '<div class="blk" id="b3">③ 从「另一端的 vethXXXX」出现在宿主机网络栈里</div>' +
+              '<div class="blk" id="b4">④ docker0 网桥收到帧 · 查转发表决定去向</div>' +
+              '<div class="blk" id="b5">⑤ 进 IP 层 → 路由判断：目标不是本地网段</div>' +
+              '<div class="blk" id="b6">⑥ ★ SNAT / MASQUERADE：源地址 172.17.0.2 改写成宿主机 IP</div>' +
+              '<div class="blk" id="b7">⑦ 宿主机物理网卡 ethX 真正发出去</div>' +
+              '<div class="blk" id="b8">⑧ 到达外网 · 回包靠 conntrack 表原路还原</div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="flow-row" style="margin-top:14px;align-items:stretch;gap:12px">' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">host 模式 · 无隔离</div>' +
+              '<div class="flow-col"><div class="blk" id="h1">直接使用宿主机网络栈</div><div class="blk" id="h2">没有 veth、没有 docker0、没有 NAT</div></div>' +
+            '</div>' +
+            '<div class="card" style="flex:1">' +
+              '<div class="card-title">none 模式 · 完全无网</div>' +
+              '<div class="flow-col"><div class="blk" id="h3">只有一块 lo</div><div class="blk" id="h4">连不上任何东西，除了自己</div></div>' +
+            '</div>' +
+          '</div>' +
+          '<div class="flow-row" style="margin-top:14px">' +
+            '<span class="blk" id="z1">端口映射 -p 8080:80</span>' +
+            '<span class="blk" id="z2">DNAT：宿主 8080 → 容器 80</span>' +
+            '<span class="blk" id="z3">iptables DOCKER 链</span>' +
+          '</div>',
+        reset: () => {
+          ['b1','b2','b3','b4','b5','b6','b7','b8','h1','h2','h3','h4','z1','z2','z3']
+            .forEach((k) => S(k, ''));
+        },
+        steps: [
+          { run: () => S('b1', 'active'),
+            note: '<b>起点：容器里的进程发起连接。</b>它眼里的世界非常简单 —— 自己有一块网卡 <code>eth0</code>，IP 是 <code>172.17.0.2</code>，默认网关是 <code>172.17.0.1</code>（也就是 docker0 的地址）。<b>它对 veth、网桥、NAT 一无所知</b>，就像你在家里上网时不知道运营商做了什么。' },
+          { run: () => { S('b1', 'done'); S('b2', 'active'); },
+            note: '<b>第一跳：包进了容器的 eth0。</b>关键点在这里 —— 这块 <code>eth0</code> <b>不是真实网卡</b>，它是一个 veth pair 的一端。在容器里敲 <code>ip link</code> 只能看到它，看不到另一端，因为另一端在另一个网络命名空间里。<b>「看不到另一半」是正常的，不是配置出错。</b>' },
+          { run: () => { S('b2', 'done'); S('b3', 'active'); },
+            note: '<b>第二跳：包从「另一端」冒了出来。</b>veth pair 的行为就是一进一出：从容器侧写入的帧，会从宿主侧那块 <code>vethXXXX</code> 上出现，仿佛瞬间穿过了一根网线。<b>在宿主机上 <code>ip link</code> 会看到一堆 veth 开头的网卡，每个对应一个运行中的容器</b> —— 数一数就知道宿主机上跑了几个容器，这也是容器环境检测的一个小线索。' },
+          { run: () => { S('b3', 'done'); S('b4', 'active'); },
+            note: '<b>第三跳：docker0 网桥接手。</b><code>docker0</code> 本质是一个<b>二层虚拟交换机</b>，所有容器的 veth 宿主端都插在它上面。它维护一张转发表（哪个 MAC 在哪个端口后面），决定这个帧该从哪个口转发出去。<b>容器之间能互 ping，靠的就是网桥在同一网段内直接转发，根本不经过 NAT。</b>' },
+          { run: () => { S('b4', 'done'); S('b5', 'active'); },
+            note: '<b>第四跳：上升到自己人管不了的地方 —— IP 路由。</b>网桥只管同网段的二层转发；目标是 <code>8.8.8.8</code>，不在 <code>172.17.0.0/16</code> 里，所以帧要交给宿主机的 IP 层处理。宿主机查路由表，发现要走默认网关，也就是物理网卡那条路。' },
+          { run: () => { S('b5', 'done'); S('b6', 'hot'); },
+            note: '<b>★ 第五跳：NAT —— 整条链路最容易被忽略、也最关键的一步。</b>如果不做任何处理，包源地址是 <code>172.17.0.2</code>（一个私有地址），外网回包时根本不知道往哪送，连接必然失败。<br><br>所以宿主机在这块网卡的出口上做了一次 <b>SNAT / MASQUERADE（源地址伪装）</b>：把源地址改写成宿主机的公网/出口 IP，同时在内核的 <code>conntrack</code>（连接跟踪表）里记一笔「这个连接是我转发的」。<b>回包回来后，内核查 conntrack 表把目标地址还原成 172.17.0.2，再沿原路送回容器。</b>对容器里的进程来说，整个过程不可见 —— 这正是 NAT 的设计目的。' },
+          { run: () => { S('b6', 'done'); S('b7', 'active'); },
+            note: '<b>第六跳：真正的物理网卡发出。</b>到了这一步，包的外观已经和宿主机自己发起的连接<b>完全一样</b>了 —— 外网看到的源 IP 就是宿主机 IP。<b>推论很重要：从外部无法直接连进容器</b>，因为容器 IP 在公网上不存在。这就是「容器默认只能出不能进」的原因。' },
+          { run: () => { S('b7', 'done'); S('b8', 'active'); },
+            note: '<b>第七跳：到达外网，回程靠 conntrack 还原。</b>应答包回到宿主机后，内核查连接跟踪表，把目标地址从宿主机 IP 改回 <code>172.17.0.2</code>，再从 docker0 转回对应的 veth，最终回到容器。<b>整条路径的验证方法</b>：容器里 <code>ip addr</code> / <code>ip route</code> 看自己的视图；宿主上 <code>ip link show master docker0</code> 看插了哪些 veth；<code>iptables -t nat -L -n</code> 看 SNAT 规则；<code>conntrack -L</code> 看连接跟踪表。<b>四张表对着看，网络问题基本无处可藏。</b>' },
+          { run: () => { ['b8'].forEach((k) => S(k, 'done')); S('z1', 'active'); S('z2', 'active'); S('z3', 'active'); },
+            note: '<b>反过来：外界怎么访问容器？靠端口映射。</b><code>docker run -p 8080:80</code> 会在宿主机上装一条 <b>DNAT</b> 规则：凡是发往宿主机 <code>8080</code> 的连接，目标地址改写为 <code>172.17.0.2:80</code>。这就是「出向用 SNAT 伪装源，入向用 DNAT 改目标」的对称设计。<span class="pill warn">具体 iptables 链名与规则条数随 Docker 版本变化，待核实</span>' },
+          { run: () => { ['z1','z2','z3'].forEach((k) => S(k, 'done')); S('h1', 'active'); S('h2', 'active'); },
+            note: '<b>对比 host 模式：整条链路全部消失。</b><code>--network host</code> 让容器<b>直接共享宿主机的网络命名空间</b> —— 没有 veth、没有 docker0、没有 NAT，容器里的 <code>ip addr</code> 看到的就是宿主机的网卡。<br><br><b>收益：</b>没有虚拟化开销，网络性能最好，延迟最低。<b>代价：</b>容器与宿主<b>抢端口</b>（容器监听 80，宿主机就不能再监听 80），而且<b>网络隔离完全消失</b> —— 容器里 <code>iptables</code> 一改，宿主机的防火墙规则就变了。' },
+          { run: () => { S('h1', 'done'); S('h2', 'done'); S('h3', 'active'); S('h4', 'active'); },
+            note: '<b>对比 none 模式：另一个极端。</b><code>--network none</code> 只给容器一块 down 的 <code>lo</code>，连宿主都碰不到。听起来没用，实际上很有用 —— <b>纯离线计算、密钥生成、以及「我要自己手工配网络」的场景</b>都会用它当起点。三种模式连起来看就是一条光谱：<b>none（无网）→ bridge（NAT 隔离，默认）→ host（共享栈，无隔离）</b>，隔离性与性能此消彼长。<span class="mono">另有 container:（复用另一容器的网络命名空间）、overlay（跨主机，Swarm）、macvlan（给容器分配物理网段 IP）等模式，按需了解</span>' }
         ]
       },
+      quiz: {
+        id: 'q17-2', chapter: 17,
+        answer: [0, 3],
+        stem: '<b>多选题。</b>你在宿主机上执行 <code>docker exec c-bridge cat /sys/class/net/eth0/iflink</code>，得到 <code>7</code>。这个数字意味着什么？下面哪些说法是<b>正确</b>的？',
+        options: [
+          { t: '它是容器里 eth0 这块网卡的<b>对端接口索引</b>，也就是宿主机上那块 veth 的 index', why: '正确。<code>iflink</code> 记录的就是 veth pair 对端的接口索引 —— 拿这个数字回宿主机 <code>ip link</code> 里找 index 为 7 的接口，就是配对的那块 vethXXXX。<b>这一步做完，「网卡成对出现」就从抽象变成可验证的事实。</b>' },
+          { t: '它说明容器里有 7 块网卡', why: '错。这个数字是接口索引（index），不是数量，也不是编号顺序 —— 接口索引在整个网络命名空间体系里分配，跳号、从大数开始都很正常。' },
+          { t: '它可以直接当成宿主机的 veth 网卡名（veth7）使用', why: '错。接口索引和接口名是两回事。<code>veth7</code> 这种命名只是恰好可能出现，不能假设两者对应，必须真的去 <code>ip link</code> 输出里按 index 查。' },
+          { t: '这个 <code>@if</code> / iflink 机制的存在本身，也让「我是虚拟网卡对的一端」成为可被外部观察到的特征', why: '正确。真实物理网卡不会有对端接口索引，而 veth 一定有 —— <b>这正是容器网络检测的一条线索</b>，也是 31.11 那张特征清单里的一项。' }
+        ],
+        explain: '<b>核心概念：veth pair 是「成对」的，两端各有一个接口索引，<code>iflink</code> 指向的就是对端。</b>验证流程是：容器里读 <code>/sys/class/net/eth0/iflink</code> 拿到对端 index → 在宿主机上 <code>ip link</code> 找同 index 的接口（会是 <code>vethXXXX@ifN</code> 的形式）→ <code>ip link show master docker0</code> 还能确认它确实插在 docker0 上。<br><br>顺带记住两个同源的现象：宿主上 <code>ip link</code> 看到的每一块 <code>vethXXXX</code> 都对应一个运行中的容器，数一数就知道密度；而容器里 <code>ip addr</code> 看到的 <code>eth0@if7</code>，那个后缀就是对端索引。<b>「看不见另一半」是正常的 —— 因为另一半在另一个网络命名空间里。</b><br><br>这条机制在实战里的意义是双向的：抓包时你要想清楚在哪个命名空间抓（容器内只能看到自己的流量，全貌要在 docker0 上或 <code>nsenter -t &lt;pid&gt; -n</code> 进去抓）；做环境检测时，网卡名形态本身就是证据。'
+      },
+      after: T.note('key', '🔑 这对逆向 / 环境伪装有什么用', '<p>① <b>容器网络的指纹很硬。</b>容器里的 IP 常落在 <code>172.17.0.0/16</code>、<code>172.18.0.0/16</code> 这类网段，网关是 <code>x.x.0.1</code>，网卡名是 <code>eth0@if&lt;N&gt;</code>（<b>那个 <code>@if</code> 后缀本身就暴露了它是 veth 的一端</b>）。风控拿到这些信息，判断「这是不是一台真机」就有了依据。</p>'
+          + '<p>② <b>NAT 之后的可见性有限。</b>容器出网时源 IP 是宿主机 IP，外网看不到真实容器 —— <b>但这恰恰意味着「一台宿主 IP 上突然出现几百个不同设备指纹」会成为异常特征</b>。很多云手机的封号不是因为单个实例被识破，而是因为<b>同 IP 高密度</b>。</p>'
+          + '<p>③ <b>抓包位置要想清楚。</b>在容器里 tcpdump 只能看到容器命名空间内的流量；要抓全貌得在宿主机的 <code>docker0</code> 上抓，或者用 <code>nsenter -t &lt;pid&gt; -n</code> 借命名空间进去抓。<b>「在哪一层抓包」这件事，本质就是命名空间问题。</b></p>'
+          + '<p>④ <b>host 模式是双刃剑。</b>做环境伪装时，某些方案故意用 host 模式来消除 veth 特征；但代价是端口冲突与隔离丧失，而且宿主机上的网络配置痕迹依然存在。<b>没有免费的伪装。</b></p>')
+    },
+
+    /* ============ 31.8 ============ */
+    {
+      h: '31.8',
+      title: 'Docker 三种网络模式实操',
+      html:
+        '<p>原理讲完，落到命令上。<b>三种模式各建一个容器，用同一组命令对比它们的网络视图</b> —— 这张对比表是排障时最有用的东西。</p>'
+        + T.tbl(['模式', '启动命令', '<code>ip addr</code> 看到什么', '隔离性', '典型用途'], [
+            ['bridge（默认）', '<code>docker run -d --name c1 nginx</code>', '<code>eth0</code> + <code>lo</code>，IP 在 172.17.x.x', '网络命名空间独立 + NAT', '绝大多数服务'],
+            ['host', '<code>docker run -d --network host nginx</code>', '<b>宿主机的全部网卡</b>', '<b>无</b>（共享宿主网络栈）', '性能敏感、需要监听宿主端口'],
+            ['none', '<code>docker run -d --network none nginx</code>', '只有 <code>lo</code>', '最强（完全没有网）', '离线计算、手工配网']
+          ])
+        + T.note('', '🔍 自己动手验证的三个动作', '<p>① <code>docker network ls</code> 看有哪些网络（默认会有 bridge / host / none 三个）；<code>docker network inspect bridge</code> 能看到网段、网关和<b>已接入的容器列表</b>。</p>'
+          + '<p>② 进容器里对比：<code>docker exec -it c1 ip addr</code> 与 <code>docker exec -it c1 ip route</code> —— bridge 模式会看到默认路由指向 <code>172.17.0.1</code>，host 模式看到的和你在宿主机上敲一模一样。</p>'
+          + '<p>③ 在宿主机上对账：<code>ip link show master docker0</code> 列出所有插在网桥上的 veth；<code>docker exec c1 cat /sys/class/net/eth0/iflink</code> 拿到容器侧的对端接口索引，再回宿主 <code>ip link</code> 里找同号的那块 veth —— <b>这一步做完，「成对」就不再是抽象概念了</b>。</p>'),
+      term: {
+        title: '三种网络模式的实操命令',
+        lines: [
+          { t: 'p', s: 'docker network ls', note: '<b>先看 Docker 自建了哪些网络。</b>安装完 Docker 后默认就有 bridge / host / none 三个，<code>docker0</code> 网桥也是安装时自动建的。' },
+          { t: 'o', s: 'NETWORK ID     NAME      DRIVER    SCOPE' },
+          { t: 'o', s: 'a1b2c3d4e5f6   bridge    bridge    local' },
+          { t: 'o', s: 'f6e5d4c3b2a1   host      host      local' },
+          { t: 'o', s: '0f1e2d3c4b5a   none      null      local' },
+          { t: 'p', s: 'docker network inspect bridge', note: '<b>看默认网桥的细节。</b>重点看 <code>Subnet</code>（网段）、<code>Gateway</code>（就是 docker0 的地址）、以及 <code>Containers</code> 里已经接进来的容器。<b>容器 IP 是从这个网段自动分配的。</b>' },
+          { t: 'p', s: 'docker run -d --name c-bridge nginx', note: '<b>模式一：bridge（默认）。</b>不写 <code>--network</code> 就是这个模式：建 veth pair、接 docker0、配 NAT。' },
+          { t: 'p', s: 'docker exec -it c-bridge ip addr', note: '<b>进容器看网卡。</b>会看到 <code>eth0@if123</code> —— <b>注意那个 <code>@if123</code></b>：数字是<b>对端接口的索引</b>，也就是宿主侧那块 veth 的编号。这个后缀本身就是「我是 veth 的一端」的自白。' },
+          { t: 'p', s: 'docker exec -it c-bridge ip route', note: '<b>看路由表。</b>默认路由指向 <code>172.17.0.1</code>，那正是 docker0 的地址。容器不需要知道外面有什么，它只知道「不知道往哪送就交给网关」。' },
+          { t: 'p', s: 'docker run -d --name c-host --network host nginx', note: '<b>模式二：host。</b>容器共享宿主机网络命名空间，<b>不再创建 veth、不接网桥、不做 NAT</b>。' },
+          { t: 'p', s: 'docker exec -it c-host ip addr', note: '<b>对比一下：这里看到的网卡和你在宿主机上敲 <code>ip addr</code> 的结果完全一致。</b>隔离为零，性能最好。<span class="mono">注意端口冲突问题：宿主机上已占用 80 的话，这个 nginx 会直接启动失败。</span>' },
+          { t: 'p', s: 'docker run -d --name c-none --network none nginx', note: '<b>模式三：none。</b>只给一块 down 的 lo，连宿主都碰不到。' },
+          { t: 'p', s: 'docker exec -it c-none ip addr', note: '<b>确认：只有 lo。</b>适合离线任务；也可以把它当「白纸」，后续手动把 veth 塞进去自己配网 —— <b>这就是你自己实现 bridge 模式的过程</b>。' },
+          { t: 'p', s: 'ip link show master docker0', note: '<b>回到宿主机侧对账。</b>这条命令列出所有「从属于 docker0」的接口，也就是所有 bridge 模式容器的 veth 宿主端。<b>数一数有几个，就知道有几个容器在用 bridge 网络。</b>' },
+          { t: 'o', s: '7: veth1a2b3c@if6: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 master docker0' },
+          { t: 'o', s: '9: veth4d5e6f@if8: &lt;BROADCAST,MULTICAST,UP,LOWER_UP&gt; mtu 1500 master docker0' },
+          { t: 'p', s: 'docker exec c-bridge cat /sys/class/net/eth0/iflink', note: '<b>★ 关键对账动作：拿到容器侧的「对端索引」。</b>得到比如 <code>7</code>，回到宿主机 <code>ip link</code> 里找 index 为 7 的那块，就是 <code>veth1a2b3c</code>。<b>两端对上了，veth pair 的「成对」就从抽象变成了可验证的事实。</b>' },
+          { t: 'o', s: '7' },
+          { t: 'p', s: 'iptables -t nat -L POSTROUTING -n | grep -i masq', note: '<b>看 NAT 规则。</b>能看到 MASQUERADE 规则 —— 这就是 31.7 里那一跳的实体。<span class="pill warn">规则条数与链名随 Docker 版本和 iptables/nftables 后端不同，待核实</span>' },
+          { t: 'w', s: '# 排障顺序：容器 ip addr → 容器 ip route → 宿主 ip link master docker0 → iptables -t nat -L' },
+          { t: 'd', s: '# 四张表依次看下来，网络问题基本能定位到具体哪一跳' }
+        ]
+      },
+      after: '<p>三种模式没有「哪个更好」，只有「哪个更合适」。下一节把选型做成决策演练。</p>'
+    },
+
+    /* ============ 31.9 ============ */
+    {
+      h: '31.9',
+      title: '网络模式选型演练',
       decision: {
         start: 'n0',
         nodes: {
           n0: {
-            label: '情境五',
-            scenario: '<b>情境：</b>你把一个 App 的加密链路追到了 <span class="mono">Cipher.init(Cipher.ENCRYPT_MODE, key)</span> 这一行。' +
-              'Hook 之后你发现：<b><span class="mono">key</span> 是一个 <span class="mono">Key</span> 对象，但它的实现类是 ' +
-              '<span class="mono">AndroidKeyStoreRSAPrivateKey</span> 之类的句柄，不是 <span class="mono">SecretKeySpec</span></b>；' +
-              '你也确认了它<b>不是</b>从任何 Java 层的字节数组构造出来的。<br>' +
-              '你的目标是复现这个请求的加密结果。下一步最合理的选择是？',
+            label: '情境三 · 容器里的服务，外网连不上',
+            scenario: '<b>情境：</b>你把一个内部服务打包成镜像，用默认的 bridge 模式起容器：<code>docker run -d --name api myapi:latest</code>。容器内监听 <code>0.0.0.0:8080</code>。<br><br>'
+              + '在宿主机上 <code>curl http://172.17.0.2:8080</code> —— <b>通</b>。<br>'
+              + '在你自己笔记本上 <code>curl http://&lt;服务器公网IP&gt;:8080</code> —— <b>不通</b>。<br><br>'
+              + '同事建议了四种做法，你选哪个？',
             choices: [
-              { t: '承认密钥字节拿不到，改从「使用点」入手：观测它的输入输出，用已知明文/密文对反推能不能绕过，或者直接调用它的加密能力', next: 'n1' },
-              { t: '继续往底层挖：hook AndroidKeyStore 的 native 实现，想办法把密钥字节抠出来', next: 'n2' },
-              { t: '换条路：把这个 App 装到一台 root 设备上，直接 dump 整个进程内存搜索密钥', next: 'n3' },
-              { t: '既然拿不到密钥，就改用重放：录下请求，重复发送就行', next: 'n4' }
+              { t: '改用 --network host 起容器，这样容器直接听宿主机的 8080，外网就能连上了', next: 'n1' },
+              { t: '保留 bridge 模式，加上 -p 8080:8080 做端口映射', next: 'n2' },
+              { t: '在宿主机上写一条 iptables DNAT 规则，把公网 8080 转发到 172.17.0.2:8080', next: 'n3' },
+              { t: '给容器手动配一个和宿主机同网段的 IP（macvlan 思路），让它像一台独立机器一样出现在局域网里', next: 'n4' }
             ]
           },
           n1: {
-            label: '选A', terminal: true, verdict: 'good',
-            verdictTitle: '正确：把问题从「拿密钥」改成「用能力」',
-            result: '<b>这是本章 31.14 那张表里第 ⑤ 行的正确读法：<span class="mono">KeyStore</span> 这一类，目标不是提取密钥，而是使用它。</b><br>' +
-              '具体三条路线，按成本排序：<br>' +
-              '① <b>直接调用它的加密能力</b>——如果密钥的权限允许（例如只允许在本应用内使用、且不加用户认证），' +
-              '你可以在应用进程内调用同一段代码路径，把「加密」这个动作交给它自己做。' +
-              '这时你不需要密钥字节，你只需要<b>让系统替你算</b>。<br>' +
-              '② <b>观测输入输出</b>——把明文和密文对全部记下来（第 24 章自吐沙箱的思路），' +
-              '在足够多的样本面前，很多「复现」需求可以被「查表 + 参数化」替代。<br>' +
-              '③ <b>看清它保护的是什么</b>——KeyStore 的密钥通常用于<b>身份</b>（证明「我是这台设备上的这个 App」）' +
-              '而不是「保密一段业务数据」。如果是这样，那么「复现加密结果」这个目标本身可能就不成立——' +
-              '因为服务端要的正是「只有这台设备能产生的东西」。<br>' +
-              '<span class="hit">注意这一选的动作：它把目标从「提取一个数据」改成了「获得一种能力」。' +
-              '在密钥不可提取的场景下，这是唯一可行的方向。</span>'
+            label: '选 A', terminal: true, verdict: 'bad',
+            verdictTitle: '能跑通，但代价被忽略了',
+            result: '<b>先说清楚：这样做确实能连上</b> —— host 模式下容器共享宿主网络栈，外网访问宿主 8080 就是访问容器 8080。<b>但这不是「解决了问题」，而是「把隔离拆了」。</b><br><br>'
+              + '<b>认知根源：把「网络隔离」当成了可有可无的装饰。</b>host 模式的实际代价：① <b>端口空间被独占</b>，宿主上其他服务再想用 8080 就冲突了，多实例部署直接不可能；② <b>容器与宿主网络配置互相影响</b>，容器里改 iptables / 路由会影响整台机器；③ <b>失去了容器网络的可编排性</b>（网络别名、服务发现、容器间隔离统统失效）。<br><br>'
+              + '<b>什么时候 host 才是对的：</b>性能极致敏感（如高频网络转发）、需要监听大量动态端口、或者容器本身就是「宿主的一个组件」。<b>「为了省一条 -p」不是理由。</b>'
           },
           n2: {
-            label: '选B', terminal: true, verdict: 'bad',
-            verdictTitle: '方向对了，但代价与收益完全不成比例',
-            result: '<b>认知根源：把「技术上或许可行」当成了「现在就该做」。</b>' +
-              '理论上，密钥确实是硬件/系统服务在某个时刻用过的，所以「挖到」不是绝对不可能——' +
-              '但那通常意味着你要在<b>系统服务或内核层</b>动手，成本高、风险大，' +
-              '而且一旦密钥被硬件密钥库保护（StrongBox 一类），可能<b>根本没有以明文形式经过任何可读内存</b>。' +
-              '<span class="pill warn">待核实</span>：具体行为随设备、Android 版本、密钥的 attestation 要求而变。<br>' +
-              '更实际的问题是：<b>你要密钥做什么？</b>如果只是为了「让请求能被服务端接受」，' +
-              '直接调用它的加密能力（选 A）就够了。花几天去抠字节，很可能是在为一个不存在的需求付代价。'
+            label: '选 B', terminal: true, verdict: 'good',
+            verdictTitle: '正确：这正是端口映射存在的意义',
+            result: '<b>标准答案。</b><code>-p 8080:8080</code> 的意思是「宿主 8080 ←→ 容器 8080」，Docker 会在宿主机上装一条 <b>DNAT</b> 规则：发往宿主 8080 的连接，目标地址被改写为 <code>172.17.0.2:8080</code>。<br><br>'
+              + '<b>为什么这样是对的（对照 31.7 的路径图）：</b>出向靠 SNAT 把容器源地址伪装成宿主 IP，入向靠 DNAT 把宿主端口改写到容器 —— <b>两者是同一套 NAT 机制的对称使用</b>，容器网络的全部「既隔离又能通信」就建立在这一点上。<br><br>'
+              + '<b>几个必须知道的细节：</b>① 默认绑 <code>0.0.0.0</code>（对外全开），只想本机访问要写 <code>-p 127.0.0.1:8080:8080</code>，<b>这是很常见的安全疏漏</b>；② 一次可以映射多个端口，也可以只写 <code>-p 8080</code> 让 Docker 随机分配宿主端口（用 <code>docker port</code> 查）；③ 容器内程序必须监听 <code>0.0.0.0</code>，只监听 <code>127.0.0.1</code> 的话连 DNAT 也救不了 —— <b>这是「映射了但还是不通」的第一大原因</b>。'
           },
           n3: {
-            label: '选C', terminal: true, verdict: 'bad',
-            verdictTitle: '用最粗暴的方式，验证一个你已经知道答案的假设',
-            result: '<b>认知根源：把「内存 dump」当成了万能钥匙。</b>' +
-              '而这一题的前提恰恰是：<b>密钥从来没有以字节数组的形式存在于 Java 堆上</b>——' +
-              '你已经在 Hook 里确认过它的类型了。那么「dump 内存搜密钥」能搜到什么呢？' +
-              '大概率什么都搜不到，因为那串字节可能压根不在进程的可读内存里（由系统服务或硬件代管）。<br>' +
-              '这条路的另一个问题：它把一个<b>已经确定的事实</b>（密钥不可提取）当成<b>待验证的假设</b>去重做一遍。' +
-              '<span class="hit">在很多场景里，dump 内存确实很有效——但它的前提是「密钥以完整形态在内存里出现过」。' +
-              '第 25 章开头讲白盒时，第一个要问的就是这个问题。</span>'
+            label: '选 C', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：手工造轮子，而且是最脆的那种',
+            result: '<b>认知根源：跳过抽象层直接操作底层机制。</b>手写 DNAT 规则确实能达到同样效果（Docker 内部也是这么干的），但你会失去 Docker 帮你维护的一切：<br><br>'
+              + '① <b>容器重建后 IP 会变</b> —— 规则还指着旧 IP，连接就断了，而 Docker 的 <code>-p</code> 会自动跟随容器的生命周期重新下发；② <b>规则散落在宿主机上无人管理</b>，<code>docker rm</code> 不会清理你的手写规则，日积月累变成谁也看不懂的遗留配置；③ <b>与 Docker 自己的 iptables 链相互干扰</b>，规则顺序稍有出入就会静默失效；④ 换台机器部署时，这些手工步骤完全没有记录。<br><br>'
+              + '<b>但这条选项有一个成立的场景：</b>当你需要<b>绕过 Docker 做自定义转发</b>（例如把流量先引到审计代理、或者做四层负载均衡），此时确实要自己写 iptables —— 但那时你是在<b>补充</b>容器网络，而不是替它做端口映射。'
           },
           n4: {
-            label: '选D', terminal: true, verdict: 'bad',
-            verdictTitle: '把一条临时退路当成了解决方案',
-            result: '<b>认知根源：用「能跑通」替代了「搞懂了」。</b>重放确实能让你短时间内「拿到正确结果」，' +
-              '但它有三个硬限制：<br>' +
-              '① <b>时效</b>——请求通常带时间戳与随机数，重放窗口可能只有几十秒；<br>' +
-              '② <b>不可参数化</b>——你没法改任何一个字段，因为一改就要重算加密结果；' +
-              '这意味着你后续所有的接口分析都做不下去；<br>' +
-              '③ <b>它没有回答任何问题</b>——你依然不知道密钥从哪来、保护了什么，' +
-              '而这恰恰是授权评估或加固评审需要回答的东西。<br>' +
-              '<b>重放适合作为「先确认链路是通的」的第一步验证，不适合作为终点。</b>'
+            label: '选 D', terminal: true, verdict: 'bad',
+            verdictTitle: '方向错了：动机不对，macvlan 是为别的需求准备的',
+            result: '<b>认知根源：把「让容器看起来像独立主机」这个进阶需求，当成了解决基础连通性的手段。</b><br><br>'
+              + '<b>macvlan 是什么：</b>给容器分配一个<b>和宿主机同网段的真实 IP</b>，容器直接出现在物理局域网里，像是插在同一台交换机上的一台独立机器。它确实很优雅，但用在这里是杀鸡用牛刀，而且带着真实的代价：<br><br>'
+              + '① <b>需要网络环境配合</b>（网卡要支持混杂模式、交换机/云平台往往限制同网段多 MAC，<b>云服务器上经常直接用不了</b>）；② <b>宿主机通常无法直接访问自己网卡上的 macvlan 容器</b>，这是个经典的坑；③ <b>容器直接暴露在局域网</b>，安全边界与 bridge 完全不同，需要重新评估；④ 每次加容器都要消耗一个同网段 IP，地址管理成为负担。<br><br>'
+              + '<b>macvlan 该用在哪：</b>需要低延迟直连、需要被局域网其他设备直接发现（如 IoT 设备仿真、需要「真机 IP」的场景）时才值得。<b>先用最简单的手段满足需求，是工程判断力的体现。</b>'
           }
         }
       },
-      quiz: {
-        id: 'q31-10', chapter: 31, answer: 1,
-        stem: '按本章「密钥从哪来」的六种来源判断：下面哪一种情况，<b>第 24 章的自吐沙箱（在 MessageDigest / Cipher / Mac 等 Java 层插桩）最可能一条都命中不了</b>？',
-        options: [
-          { t: '密钥由设备信息拼出来，在 Java 层用 SecretKeySpec 构造', why: '这种反而最容易命中：SecretKeySpec 的构造函数就是自吐沙箱最廉价的插桩点，密钥字节会直接出现在参数里。' },
-          { t: '密钥存在 AndroidKeyStore 里，Cipher.init 收到的是一个 Key 句柄而非字节数组', why: '正确。密钥字节从未经过 Java 堆，插桩点只能看到一个句柄；第 24 章把这一类明确列为自吐沙箱的天然边界。' },
-          { t: '密钥是服务端登录后下发的，客户端把它存进 SharedPreferences', why: '这种能被命中：下发的密钥最终仍要在 Java 层被构造成 Key 对象或字节数组，只要经过 Cipher.init 或 SecretKeySpec 就会被记录。' },
-          { t: '密钥在 TLS 握手中协商得到，随后用于业务层加密', why: '这种情况确实难，但第 24 章的思路仍然有效——协商出来的密钥最终要交给某个加密函数的入口，可以在那里观测。相比之下，KeyStore 的句柄是类型层面的阻断，命中不了是结构性的。' }
-        ],
-        explain: '<b>这道题考的是「自吐沙箱的边界在哪」。</b>它的有效性建立在一个前提上：' +
-          '<b>密钥在某一刻以「一段字节」或「一个可读的 Key 对象」的形式经过了 Java 层。</b>' +
-          '只要满足这个前提，无论在它之前绕了多少弯（设备信息拼装、服务端下发、协商派生），' +
-          '最终都要落到 <span class="mono">SecretKeySpec</span> 的构造或 <span class="mono">Cipher.init</span> 的入参上——' +
-          '而那就是插桩点。<br>' +
-          '<p>KeyStore 打破的正是这个前提：<b>Cipher.init 收到的 Key 参数是一个句柄，它的实现类指向系统服务，' +
-          '密钥字节由系统（可能还有硬件）代管，从不进入应用进程的 Java 堆。</b>' +
-          '所以插桩点能看到「有人用了一把钥匙」，但看不到「钥匙长什么样」。' +
-          '第 24 章把这一条单独列出来当边界，正是因为它属于<b>结构层面的阻断</b>，而不是「你还没找到正确的插桩点」。</p>' +
-          '<p><span class="hit">把这个判断带回本章的六种来源表：自吐沙箱覆盖 ①②④ 以及 ③ 的使用点，' +
-          '不覆盖 ⑤（KeyStore）和 ⑥（白盒）。而这两者需要的是完全不同的手段——' +
-          '前者转向「使用能力」，后者转向「数学还原」。</span></p>'
-      }
+      after: '<p>到这里，网络这一块你已经能自己解释并排障了。下面几节换战场：<b>怎么在 x86_64 上跑起一套 arm64 的根文件系统</b>。</p>'
     },
-
-    /* ============================================================ 31.15 */
+    /* ============ 31.10 ============ */
     {
-      h: '31.15', title: '收口：三种东西拿到手，分别先做什么',
+      h: '31.10',
+      title: 'x86_64 上跑 arm64：binfmt_misc + QEMU',
       html:
-        '<p>本章最后，把一切压成一个可以直接照着做的流程。你在现场会拿到的无非是三种东西——' +
-        '它们的处置步骤完全不同，<strong>而最贵的错误就是拿第一种的做法去处理第三种</strong>。</p>',
+        '<p>为什么要把这一节放进容器章？因为<b>服务器绝大多数是 x86_64，而安卓生态以 ARM 为主</b>。当你需要在一台 x86 云主机上准备一份 arm64 的 rootfs（拉包、跑构建脚本、装依赖）时，就绕不开跨架构执行。这也是第 32 章用容器跑安卓的前置能力。</p>'
+        + '<p>核心机制是内核提供的 <b>binfmt_misc</b>：一个让内核<b>识别任意二进制格式并交给指定解释器执行</b>的功能。配上 QEMU 的 user-mode 模拟器，x86_64 机器就能直接运行 ARM64 的 ELF。整个过程由内核自动完成，对用户完全透明。</p>'
+        + T.note('key', '🔑 两种 QEMU 模式，别搞混', '<p><b>QEMU user-mode（<code>qemu-aarch64-static</code>）：</b>只模拟 CPU 指令 + 把系统调用<b>转发给宿主内核</b>。它跑的是<b>单个程序</b>，不需要模拟硬件。轻量、快、启动几乎无感 —— <b>本章和 debootstrap 用的就是它</b>。</p>'
+          + '<p><b>QEMU system-mode（<code>qemu-system-aarch64</code>）：</b>模拟<b>整个系统</b> —— CPU、内存、中断控制器、磁盘、网卡全都虚拟出来，能启动一个完整的 Guest 内核和 OS。重、慢、但它能跑真正的内核。</p>'
+          + '<p><b>一句话分辨：</b>你要跑的是「一个程序」还是「一个系统」？前者 user-mode 就够（快十倍以上），后者才需要 system-mode。<b>容器场景永远是 user-mode</b>，因为容器共享宿主内核 —— 而 system-mode 恰恰是虚拟机路线（第 30 章模拟器那一路）。</p>')
+        + T.note('bad', '❌ 最大的坑：qemu-aarch64-static 必须复制进 rootfs', '<p>这是「x86_64 下运行 arm64 rootfs」<b>最容易踩、也最难自查</b>的坑。</p>'
+          + '<p>binfmt_misc 的工作原理是：内核发现一个 ARM64 二进制 → 查找注册好的解释器路径 → 执行它。<b>问题在于这个解释器路径是在「当前根文件系统」里解析的</b>。当你 <code>chroot ./rootfs</code> 之后，内核眼里的 <code>/usr/bin/qemu-aarch64-static</code> 已经变成了 <b>rootfs 里面的</b>那个路径 —— 而 rootfs 里通常根本没有这个文件。</p>'
+          + '<p><b>症状：</b><code>chroot ./rootfs /bin/bash</code> 报 <code>Exec format error</code> 或者 <code>No such file or directory</code>（哪怕 <code>/bin/bash</code> 明明存在）。<b>很多人会去怀疑 debootstrap 拉错了架构、或者内核没开 binfmt</b>，其实只是少复制了一个文件。</p>'
+          + '<p><b>解法：</b><code>sudo cp /usr/bin/qemu-aarch64-static ./rootfs/usr/bin/</code> —— 一次性动作，但必须做。<b>记住这条因果链：chroot 改变了解释器的解析基准。</b></p>'),
       term: {
-        title: '三条处置路线（照顺序做，不要跳）',
+        title: 'x86_64 上构建并运行 arm64 rootfs',
         lines: [
-          { t: 'd', s: '# 情况一：一段 32 字节的十六进制串（64 个十六进制字符）', note: '<b>先量长度、再算熵、最后找调用点。</b>32 字节 = 256 bit，横跨「摘要（SHA-256）」「对称密钥（AES-256）」「随机数」三种可能。' },
-          { t: 'o', s: '① 量长度：32 字节 → 排除 MD5（16）与 SHA-1（20），锁定 SHA-256 / AES-256 / 随机数', note: '长度是最便宜的筛子。<b>先量字节数，再谈其它</b>——注意要在解码之后量。' },
-          { t: 'o', s: '② 算熵与可打印比例：高熵 + 低可打印 → 二进制数据；可打印 100% → 大概率是 ASCII 密钥或文本', note: '熵只能用来排除低熵项，不能确认。' },
-          { t: 'w', s: '③ 找调用点：它出现在 MessageDigest/Mac 的输入输出里，还是 Key 的构造里？', note: '<b>这一步才是定性。</b>长度和熵给的是候选集合，调用点给的是答案。' },
-          { t: 'w', s: '④ 别忘了先做一次编码尝试：它是不是某段文本的 Base64 或 Hex？先解一次，几分钟的事', note: '第 31.10 的实验里 F 段就是这种情况：<b>看起来像密文，解一次是 JSON</b>。' },
-          { t: 'd', s: '# 情况二：一段 256 字节的 Base64（约 344 字符）', note: '<b>这是最需要小心的一种</b>：长度落在 RSA 的模长上，所以你会本能地往 RSA 想——但 344 字符也可能是 258 字节的随机数据。' },
-          { t: 'o', s: '① 先解码，把字符换成字节：确认它到底是 256、257 还是 258 字节', note: 'Base64 的填充字符会让「解码前 344」对应「解码后 256～258」。<b>这一个字节的差别，决定了它是不是 RSA 产物。</b>' },
-          { t: 'o', s: '② 看首字节：是 0x30 吗？', note: '0x30 = DER SEQUENCE。<b>是 → 它是「公钥/证书」这一类，几乎肯定不是密文</b>（密文是随机字节，不可能每次都从 0x30 开始）。' },
-          { t: 'w', s: '③ 是 0x30 就走公钥路线：校验长度字段是否自洽 → 搜 rsaEncryption OID → 剥出 n 与 e（31.9 / 31.10）', note: '这一条路径全程不需要任何密码学运算。' },
-          { t: 'w', s: '④ 不是 0x30 就走密文/签名路线：它每次都一样吗？', note: '<b>每次都一样 → 它更可能是常量（公钥、诱饵、哈希）；每次都不同 → 才是「某个输入产生的输出」，去顺藤摸瓜找产生它的调用点。</b>' },
-          { t: 'd', s: '⑤ 如果确认是 RSA 输出：先定方向（加密还是签名），再定填充（PKCS#1 v1.5 还是 OAEP）', note: '顺序不能反。方向错了，填充对上了也没用；填充错了，方向对了也复现不出来。' },
-          { t: 'd', s: '# 情况三：一个 PEM 块（-----BEGIN ... -----）', note: '<b>这是三种里最容易的一种</b>：PEM 自己就写着「这是什么」。' },
-          { t: 'o', s: '① 先读头尾那四个英文词：PUBLIC KEY / RSA PUBLIC KEY / PRIVATE KEY / CERTIFICATE', note: '<b>这四个词直接决定方向</b>。看到 PRIVATE KEY，你要立刻意识到：这是一个设计缺陷（31.4 / 31.7 / 31.11）。' },
-          { t: 'o', s: '② 去掉头尾标记与换行，把中间的 Base64 解成 DER', note: '解出来应该是 30 82 开头。<b>不是 30 开头 → 说明这段 PEM 被改造过或者是别的格式。</b>' },
-          { t: 'w', s: '③ 用 openssl 直接验证一次，别手工猜', note: '例如把 DER 交给 openssl 让它打印出 modulus 与 exponent，再和你手工解析的结果对一遍。<b>手工解析是理解，openssl 是校对。</b>' },
-          { t: 'd', s: '④ 如果它是证书：先找 SubjectPublicKeyInfo，再看 SAN / 有效期 / 签发者', note: '证书里的公钥是「这条信任链的终点」；<b>但如果这个证书只用于 SSL Pinning（第 23 章），它与业务加密无关</b>（31.12 清单最后一条）。' }
+          { t: 'd', s: '# 目标：在 x86_64 主机上做出一个能跑起来的 arm64 Ubuntu 根文件系统' },
+          { t: 'p', s: 'sudo apt install qemu-user-static binfmt-support debootstrap', note: '<b>三个包各司其职：</b><code>qemu-user-static</code> 提供静态链接的 qemu-aarch64-static；<code>binfmt-support</code> 负责向内核注册 binfmt_misc 规则；<code>debootstrap</code> 是拉取并搭建根文件系统的工具。<span class="pill warn">包名与是否已默认启用 binfmt 注册，随发行版与版本变化，待核实</span>' },
+          { t: 'p', s: 'ls /proc/sys/fs/binfmt_misc/', note: '<b>第一步验证：binfmt_misc 挂上了没有。</b>正常情况下这里应该有 <code>register</code>、<code>status</code>，以及注册后的 <code>qemu-aarch64</code> 条目。<b>如果这个目录不存在或为空，后面所有事都不会成功</b> —— 先解决它再说。' },
+          { t: 'o', s: 'qemu-aarch64  qemu-arm  register  status' },
+          { t: 'p', s: 'cat /proc/sys/fs/binfmt_misc/qemu-aarch64', note: '<b>第二步验证：看注册的具体内容。</b>重点看 <code>interpreter</code> 这一行指向哪个路径 —— <b>这个路径就是后面必须复制进 rootfs 的那个文件</b>，也解释了为什么少了它就会报 Exec format error。' },
+          { t: 'o', s: 'enabled' },
+          { t: 'o', s: 'interpreter /usr/bin/qemu-aarch64-static' },
+          { t: 'o', s: 'flags: OCF' },
+          { t: 'o', s: 'magic 7f454c460201010000000000000000000200b700' },
+          { t: 'p', s: 'sudo debootstrap --arch=arm64 --foreign jammy ./rootfs http://ports.ubuntu.com/ubuntu-ports/', note: '<b>第三步：拉取 arm64 的根文件系统。</b>逐段拆解：<code>--arch=arm64</code> 指定目标架构；<code>jammy</code> 是发行版代号（<span class="pill warn">代号与仓库 URL 随版本变化，待核实，请以你要用的发行版官方文档为准</span>）；<code>--foreign</code> 表示<b>只做前半段</b>（下载 + 解包）不做配置 —— 因为主机跑不了 arm64 的脚本，必须分两段；最后那个 URL 是 <b>Ubuntu 的 ARM 移植仓库</b>，<b>ARM 架构必须用 ports.ubuntu.com/ubuntu-ports/，不能用普通的 archive.ubuntu.com</b>，否则会找不到包。<span class="pill warn">Debian 对应的是 deb.debian.org/debian 加 <code>--arch=arm64</code>，具体路径待核实</span>' },
+          { t: 'p', s: 'sudo cp /usr/bin/qemu-aarch64-static ./rootfs/usr/bin/', note: '<b>★ 第四步：把 QEMU 复制进 rootfs —— 全章最关键的一行。</b>少了它，第五步的 chroot 必然失败。原因见上面的红色提示框：<b>chroot 之后，内核解析解释器路径的基准变成了 rootfs 自己</b>，宿主机上那个 qemu-aarch64-static 已经不在视野里了。<br><br><span class="mono">顺便注意</span>：<code>qemu-user-static</code> 这个名字里的 <b>static</b> 也是必需的 —— 动态链接版的 QEMU 还需要 rootfs 里有对应的 arm64 动态库，鸡生蛋问题，静态链接版才自包含。' },
+          { t: 'p', s: 'sudo chroot ./rootfs /debootstrap/debootstrap --second-stage', note: '<b>第五步：在 chroot 里跑第二段配置。</b>这一步会执行大量 arm64 的程序（apt 配置、包安装后脚本）—— <b>它们之所以能在 x86_64 上跑起来，全靠 binfmt + QEMU 在背后透明地做指令翻译</b>。你看到的输出和在一台真 ARM 机器上几乎没有区别。' },
+          { t: 'o', s: 'I: Base system installed successfully.' },
+          { t: 'p', s: 'sudo chroot ./rootfs /bin/bash', note: '<b>第六步：进容器。</b>现在你就在一套 arm64 的根文件系统里了。<b>注意这不是虚拟机、也不是模拟器</b> —— 你只是换了个根目录，跑的却是 ARM64 的二进制。' },
+          { t: 'p', s: 'uname -m', note: '<b>验证 1：内核架构。</b>这里会返回 <code>x86_64</code> —— <b>因为内核是宿主的，从未变过</b>。这正是 31.3 那句「容器共享宿主内核」最直白的证据。' },
+          { t: 'o', s: 'x86_64' },
+          { t: 'p', s: 'dpkg --print-architecture', note: '<b>验证 2：用户态架构。</b>返回 <code>arm64</code> —— <b>用户态变了，内核没变</b>。这两条命令的输出差异，就是「跨架构容器」的全部秘密。' },
+          { t: 'o', s: 'arm64' },
+          { t: 'p', s: 'echo hello-arm64 > /tmp/t && chmod +x /tmp/t', note: '<b>验证 3：直接跑一个「未注册」的 arm64 二进制。</b>脚本由 shell 解释，和 binfmt 无关。<b>想真正验证 binfmt，要去跑一个 arm64 的 ELF 可执行文件</b>（比如 rootfs 里现成的 <code>/bin/ls</code>）—— 它跑得起来，就说明透明翻译生效了。' },
+          { t: 'p', s: '/bin/ls -l /usr/bin/qemu-aarch64-static', note: '<b>验证 4：回头看那个复制进来的解释器。</b>它就在这里，静静地待着 —— <b>没有它，这个 rootfs 里任何一个 ELF 都跑不起来</b>。这是本章最值得记住的一个「不起眼但致命」的细节。' },
+          { t: 'p', s: 'sudo chroot ./rootfs apt update && sudo chroot ./rootfs apt install -y python3', note: '<b>实际用途：在 x86 上给 arm64 环境装包。</b>这是跨架构 rootfs 最常见的用法 —— 构建 ARM 镜像、准备测试环境、给 ARM 设备做离线包。' },
+          { t: 'w', s: '# 常见报错对照：Exec format error → qemu 没复制进 rootfs；No such file or directory → 同上（容易被误判成文件不存在）' },
+          { t: 'w', s: '# Cannot mount /proc → 忘了在 chroot 前挂载 proc/sys/dev' },
+          { t: 'd', s: '# 结论：kernel 认架构靠 binfmt，用户态认架构靠 rootfs —— 两者解耦，才有了跨架构容器' }
         ]
       },
       quiz: {
-        id: 'q31-11', chapter: 31, answer: 0,
-        stem: '你从 <span class="mono">assets/pub.pem</span> 里读到一个 PEM 块，头尾标记是 <span class="mono">-----BEGIN PUBLIC KEY-----</span>。' +
-          '下一步最合理的第一动作是？',
+        id: 'q17-3', chapter: 17,
+        answer: 1,
+        stem: '你在 x86_64 主机上用 debootstrap 做好了 arm64 的 rootfs，注册了 binfmt_misc，<code>qemu-aarch64-static</code> 也装好了。但执行 <code>chroot ./rootfs /bin/bash</code> 时，报出 <code>Exec format error</code>（有些系统上表现为 <code>No such file or directory</code>），而 <code>/bin/bash</code> 明明存在。<b>最可能的原因是什么？</b>',
         options: [
-          { t: '去掉头尾标记与换行，把中间的 Base64 解成 DER，然后校验它是否以 30 82 开头、长度字段是否自洽', why: '正确。PEM 只是 Base64 外壳，真正的结构在 DER 里。先剥外壳再校验结构，是成本最低、信息量最大的一步——长度自洽与否直接决定这段数据是不是一个完整的公钥。' },
-          { t: '直接把这个 PEM 丢给 RSA 解密函数，看看能不能解出东西', why: '公钥不能解密。这一步在任何情况下都不会成功，而且它连「这个 PEM 是不是完整的」都没有回答。' },
-          { t: '先去搜索 APK 里所有和它长度接近的常量，看有没有配对的私钥', why: '「找配对的私钥」是一个假设，而不是第一步。而且公钥存在本身是完全正常的（31.4），没有任何理由假设一定有私钥在同一个包里。' },
-          { t: '直接假设它是 PKCS#1 v1.5 填充，按标准实现算一遍', why: '填充判断要在「确认它是加密用的公钥、且知道它用在哪一步」之后做。现在连它是加密还是验签都还不知道，先定填充属于顺序颠倒。' }
+          { t: 'debootstrap 拉错了架构，rootfs 里其实是 x86_64 的二进制', why: '可能性很低。如果真是拉错架构，你会得到一份能正常运行的 rootfs（只是架构不对），而不是 Exec format error。而且 <code>dpkg --print-architecture</code> 一查就知道，不必靠猜。' },
+          { t: '<code>qemu-aarch64-static</code> 没有复制进 rootfs，导致 chroot 之后找不到 binfmt 注册的解释器', why: '正确。binfmt_misc 注册的 interpreter 路径是 <code>/usr/bin/qemu-aarch64-static</code>；<b>一旦 chroot，这个路径就在 rootfs 内解析</b>，而宿主机上那个文件已经不在视野里了。内核找不到解释器，于是 ELF 无法被识别执行。' },
+          { t: '内核没有编译 binfmt_misc 支持，需要重新编译内核', why: '如果内核不支持，那么 <code>/proc/sys/fs/binfmt_misc/</code> 目录根本不会出现，你在准备阶段就能发现。而且报错形态和这里不同 —— 先做检查再下结论，不要直接跳到「重编内核」这种重手段。' },
+          { t: '缺少 <code>--foreign</code> 参数，导致第二段配置没跑', why: '顺序搞反了：<code>--foreign</code> 是<b>第一段</b>用的（只下载解包），少了它反而会提前尝试执行 arm64 脚本并失败。而且它导致的是 debootstrap 阶段报错，不是 chroot 时报 Exec format error。' }
         ],
-        explain: '<b>PEM 的三层结构要一次说清：头尾标记（文本）→ Base64（编码）→ DER（结构）。</b>' +
-          '头尾标记告诉你「这是什么类型」，Base64 只是为了让二进制能存成文本，真正的结构在 DER 里。' +
-          '所以处置顺序是：<b>读标记 → 剥 Base64 → 校验 DER 结构 → 提取 n 与 e</b>。<br>' +
-          '<p>为什么第一步是「校验结构自洽」而不是直接提取？因为结构自洽是一个<b>能证伪的判据</b>：' +
-          '如果长度字段算出来的总长与常量长度不符，那这段数据要么被截断过、要么被改造过——' +
-          '在这个前提下你做任何后续提取都是在错误的地基上盖楼。' +
-          '<span class="hit">先证伪、再提取，这是在处理任何带长度字段的二进制格式时都适用的习惯（第 28 章讲文件格式时也是同一条原则）。</span></p>' +
-          '<p><b>顺带把另外三个选项的教训收在一起：</b>公钥不能解密（方向问题，31.7）；' +
-          '不该凭「有公钥」就假设「有私钥」（这是 31.11 那个案例的教训——私钥存在是<b>异常</b>，要单独确认）；' +
-          '填充判断要放在方向和调用点都确认之后（31.8）。<b>三条都属于「顺序错了」而不是「知识错了」——' +
-          '而在真实工作里，顺序错误造成的返工远比知识缺口多。</b></p>'
+        explain: '<b>根因链要背下来：chroot 改变了解释器路径的解析基准。</b>binfmt_misc 的工作方式是「内核识别 ELF 头 → 查找注册的解释器路径 → 执行它」。这个路径在<b>当前根文件系统</b>中解析。你没有 chroot 时，<code>/usr/bin/qemu-aarch64-static</code> 是宿主机的；chroot 之后，同一个路径字符串指向的是 rootfs 里的位置 —— 那里什么都没有。<br><br><b>解法就一行：</b><code>sudo cp /usr/bin/qemu-aarch64-static ./rootfs/usr/bin/</code>。<br><br>两个容易忽略的细节：① 必须是 <b>static</b> 版本 —— 动态链接版的 QEMU 还需要 rootfs 里有对应的 arm64 动态库，鸡生蛋问题；② <code>No such file or directory</code> 这个报错极具迷惑性（文件明明在），它的真实含义是「<b>解释器</b>找不到」，不是「目标文件找不到」。<b>记住这个报错语义，能省下几个小时。</b><br><br>顺带验证一下这个机制：chroot 进去后 <code>uname -m</code> 返回 <code>x86_64</code>（宿主内核），而 <code>dpkg --print-architecture</code> 返回 <code>arm64</code>（用户态）—— <b>内核架构与用户态架构解耦，这正是跨架构容器的全部秘密。</b>'
       },
-      after: T.note('ok', '✅ 全章收束',
-        '<p><b>这一章给了你两样东西：一张地图、和一条路线。</b></p>' +
-        '<p><b>地图</b>是六类功能——编码、摘要、MAC、对称、非对称、密钥交换。它的用法是「先归类，再深挖」：' +
-        '而归类只需要三个可测量的量（长度、字符集、熵），不需要读一行代码。</p>' +
-        '<p><b>路线</b>是非对称这一类的处置顺序——<b>读结构 → 判方向 → 对填充 → 查来源</b>。' +
-        '这四步里没有一步是「把密钥算出来」，因为公钥本来就是公开的。</p>' +
-        '<p style="margin-bottom:0">最后留一句判断：<b>当你发现自己在为「找不到某把密钥」而焦虑时，先回到 31.14 那张表，问一句「它的来源是六种里的哪一种」。</b>' +
-        '这一问，往往比再翻一遍汇编有用得多。</p>')
+      after: T.note('', '📌 别忘了 cgroup 也有命名空间', '<p>回顾 31.2 的第四根柱子：容器里 <code>cat /proc/self/cgroup</code> 看到的是自己命名空间的根，而不是宿主机的完整 cgroup 树 —— 这靠的是 <code>CLONE_NEWCGROUP</code>。<b>如果容器里能直接看到宿主机 cgroup 的全貌，风控一眼就能认出「我在容器里」。</b>这个视角在下一节会立刻派上用场。</p>')
     },
-  ],
 
-  glossary: [
-    { t: '算法地图（六类功能）', d: '按「解决什么问题」把密码学功能分成六类：编码、摘要、MAC、对称加密、非对称加密、密钥交换/派生。它是一张分流表，不是一张强度排行榜——分类决定你下一步去哪查。' },
-    { t: '编码（Encoding）', d: 'Base64 / Hex / URL 编码一类，没有密钥，只改变表示形式，任何人都能还原。App 里表现为一长串可打印字符或百分号转义。逆向时先剥掉这一层，再去谈算法。' },
-    { t: '摘要（Digest / Hash）', d: 'MD5 / SHA 系列，没有密钥，把任意长度输入压成定长输出（16 / 20 / 32 / 64 字节）。性质是单向与雪崩效应：改一个比特，输出面目全非。' },
-    { t: 'MAC', d: '消息认证码。带密钥的摘要，最常见的是 HMAC：H((K⊕opad) || H((K⊕ipad) || m))，ipad=0x36、opad=0x5C 各填充到哈希的块大小。识别靠「固定填充 + 两次哈希调用」这个结构，而非常量。' },
-    { t: '对称加密', d: 'DES / 3DES / AES，加解密同一把密钥。密文长度是块大小（AES 为 16 字节）的整数倍并随明文增长。逆向的核心动作是把密钥找出来，或者让它自己吐出来。' },
-    { t: '非对称加密', d: 'RSA / ECC。一对密钥：公钥可公开、私钥必须独占。它解决的是「密钥怎么安全到达对方」与「身份能否被验证」。逆向的核心动作是读结构、判方向、对填充，而不是找密钥。' },
-    { t: '密钥交换 / KDF', d: 'ECDHE、PBKDF2、HKDF 一类：决定「密钥从哪来」。密钥不是被找到的，而是算出来或协商出来的，因此它可能从不在任何一端常驻。' },
-    { t: '模幂运算', d: 'base^exp mod n。RSA 的全部运算都是它。实现上用平方-乘（square-and-multiply）按指数二进制位逐步平方、遇 1 才乘底数，把 O(exp) 次乘法降到 O(log exp) 次。' },
-    { t: 'φ(n) 欧拉函数', d: '当 n = p × q（p、q 为质数）时，φ(n) = (p−1)(q−1)。它决定私钥指数 d，所以「知道 φ(n)」等价于「拿到私钥」——这就是为什么必须分解 n 才能攻破 RSA。' },
-    { t: '公钥指数 e', d: '公钥是 (n, e)，私钥是 (n, d)。e 通常取 65537（0x10001，二进制只有两个 1，模幂最快）或 3；也可以取其它与 φ(n) 互质的值。看到陌生 e 值先怀疑是公钥被拼接错位导致误读。' },
-    { t: '陷门单向函数', d: '正向计算容易、反向在没有额外信息时不可行的函数。RSA 的陷门就是 n 的两个质因数 p、q；ECC 的陷门是另一类离散对数难题。这是「公钥可以公开」的数学依据。' },
-    { t: '填充（Padding）', d: '在模幂之前往明文里插入的结构化字节，目的是引入随机性、绑定长度。PKCS#1 v1.5 与 OAEP 是两大方案。「看到 RSA 却复现不出结果」的头号原因就是填充方案或参数对不上。' },
-    { t: 'PKCS#1 v1.5', d: '一种填充方案。加密填充结构为 00 02 || PS（≥8 字节非零随机）|| 00 || M；签名填充里装的是 DigestInfo（算法 OID + 摘要），与加密填充完全不同。变换串常写作 RSA/ECB/PKCS1Padding。' },
-    { t: 'OAEP', d: '较新的 RSA 填充方案，用哈希与掩码生成函数（MGF）把随机种子与数据混合。变换串如 RSA/ECB/OAEPWithSHA-1AndMGF1Padding。哈希与 MGF 的具体取值随库与版本可能不同，必须实测确认。' },
-    { t: '裸 RSA', d: '不做任何填充、直接对明文做模幂的实现（变换串里写作 NoPadding）。它是确定性的（同明文同密文，可被字典攻击），且具有可乘性（两个密文相乘等于两数乘积的密文），因此不安全。' },
-    { t: '可乘性', d: '裸 RSA 的性质：c(m₁)·c(m₂) mod n = c(m₁·m₂ mod n)。攻击者可以在不知道明文的情况下「加工」密文，这是选择密文攻击的基石之一，也是填充存在的第二个理由。' },
-    { t: 'DER / ASN.1', d: '一种二进制编码规则，全部由「标签 + 长度 + 内容」构成。常见标签：0x30 SEQUENCE、0x02 INTEGER、0x03 BIT STRING、0x05 NULL、0x06 OID。长度首字节 ≥ 0x80 表示长格式。解析它不需要密码学，只需要按长度跳偏移。' },
-    { t: 'SPKI', d: 'SubjectPublicKeyInfo，公钥的标准容器结构：SEQUENCE { AlgorithmIdentifier, BIT STRING { SEQUENCE { INTEGER n, INTEGER e } } }。rsaEncryption 的 OID 编码是 2A 86 48 86 F7 0D 01 01 01，可以在常量里直接搜这九个字节。' },
-    { t: 'DER INTEGER 的符号位补齐', d: 'DER 的 INTEGER 是有符号的。当大数首字节 ≥ 0x80 时，必须在前面补一个 0x00 才不会被视为负数。所以 2048 位 modulus 在 DER 里是 257 字节——那个 00 不属于密钥本身。' },
-    { t: 'PEM', d: '把 DER 用 Base64 编码、再加头尾标记（如 -----BEGIN PUBLIC KEY-----）的文本格式。头尾那四个英文词直接告诉你它是公钥、私钥还是证书，是判断方向的最快入口。' },
-    { t: '会话密钥 / 前向安全', d: 'TLS 等协议中由双方临时协商出来的对称密钥，用完即弃。前向安全指：即使长期私钥泄露，也解不开历史流量——这正是「拿到服务端私钥也解不了录下来的流量」的原因。' },
-    { t: '字节级香农熵', d: '统计 256 个字节值的出现频次，算 H = −Σ p·log₂p，单位 bit/字节，上限 8。它只能用来「排除低熵数据」，不能用来「确认某段是高熵密钥」——modulus、摘要、随机数的熵几乎一样。' },
-    { t: '白盒实现', d: '把标准算法用查找表 + 编码重新表达出来的实现，密钥被溶进表项里，从不以完整形态出现。第 25 章讲它的识别与 DFA 攻击；本章只负责在「密钥来源」表里给它定位。' }
-  ],
+    /* ============ 31.11 ============ */
+    {
+      h: '31.11',
+      title: 'cgroup：容器资源限制的实体与检测线索',
+      html:
+        '<p>namespaces 决定「看得见什么」，cgroup 决定「能用多少」。这一节把 cgroup 落到文件系统上 —— 因为<b>它既能限制你的容器，也能暴露你的容器</b>。</p>'
+        + T.tbl(['版本', '结构', '挂载点', '现状'], [
+            ['<b>cgroup v1</b>', '各控制器（cpu / memory / blkio / pids …）<b>各自独立挂载，层次结构混乱</b>', '<code>/sys/fs/cgroup/&lt;controller&gt;/</code> 多套目录', '老系统；同一进程在不同控制器里的分组可能不一致'],
+            ['<b>cgroup v2</b>', '<b>统一层次结构（unified hierarchy）</b>，单一挂载点，所有控制器协同', '通常 <code>/sys/fs/cgroup</code> 一个', '<b>现代发行版默认</b>']
+          ])
+        + '<p>v2 的主要控制器与对应文件：</p>'
+        + T.tbl(['控制器', '核心文件', '作用'], [
+            ['<code>cpu</code>', '<code>cpu.max</code>', 'CPU 带宽上限。格式 <code>&quot;配额 周期&quot;</code>，如 <code>50000 100000</code> = 每 100ms 最多用 50ms（半个核）'],
+            ['<code>memory</code>', '<code>memory.max</code>', '内存上限（字节）。超过会被 OOM killer 干掉'],
+            ['<code>pids</code>', '<code>pids.max</code>', '进程/线程数上限。<b>防 fork 炸弹</b>'],
+            ['<code>io</code>', '<code>io.max</code>', '块设备读写带宽 / IOPS 上限']
+          ])
+        + '<p>两个必须认识的文件：<b><code>cgroup.controllers</code></b> 列出当前 cgroup <b>可用</b>的控制器；<b><code>cgroup.procs</code></b> 是<b>加入这个 cgroup 的进程列表</b> —— 把 PID 写进去，进程就归它管。</p>'
+        + T.note('ok', '✅ 动手：亲手给一个进程套上限额', '<p>① <code>sudo mkdir /sys/fs/cgroup/demo</code>（在 cgroup v2 里，<b>创建目录就等于创建 cgroup</b>）；② <code>cat /sys/fs/cgroup/demo/cgroup.controllers</code> 看有哪些控制器可用；③ 如果控制器没启用，往父级的 <code>cgroup.subtree_control</code> 写 <code>+cpu +memory</code> 启用；④ <code>echo &lt;PID&gt; | sudo tee /sys/fs/cgroup/demo/cgroup.procs</code> 把进程放进去（<b>它和它的所有子进程一起生效</b>）；⑤ <code>echo &quot;50000 100000&quot; | sudo tee /sys/fs/cgroup/demo/cpu.max</code> 限成半个核；⑥ <code>echo 268435456 | sudo tee /sys/fs/cgroup/demo/memory.max</code> 限成 256MB。<b>做完以后跑个死循环看 CPU 占用，你会亲眼看到它被压在 50% 上下</b> —— 那一刻 cgroup 就从名词变成了实体。<span class="pill warn">subtree_control 的写法与是否需要多级委派随内核版本而异，待核实</span></p>')
+        + T.note('warn', '⚠️ 容器里最经典的 OOM 迷思', '<p>「容器里 <code>free</code> 显示还剩很多内存，进程却被 OOM killer 杀了」—— 因为 <b><code>free</code> 读的是宿主机内存，而杀你的是 cgroup 的 <code>memory.max</code></b>。容器看到的内存数字和它真正能用的额度是两回事。<b>排查方向：</b>看 <code>/sys/fs/cgroup/.../memory.max</code>（额度）与 <code>memory.current</code>（当前用量）、<code>memory.events</code>（有没有触发 oom/oom_kill 计数）。<b>推论到实战：</b>性能压测、批量任务在容器里跑时，「加内存」要加的是 cgroup 额度，不是宿主机内存条。</p>')
+        + T.note('key', '🔑 这对逆向 / 环境伪装有什么用', '<p><b>cgroup 是容器检测最硬的证据之一</b>，因为它不太容易被「伪装」而不留痕迹：</p>'
+          + '<p>① <code>cat /proc/1/cgroup</code> —— 在容器里往往会看到 <code>/docker/&lt;64位容器ID&gt;</code>、<code>/kubepods/...</code>、<code>/lxc/...</code> 这类路径；在真机上通常只有 <code>/</code> 或一条很短的路径。<b>这一条几乎是最常见的容器指纹。</b></p>'
+          + '<p>② <code>cat /proc/self/cgroup</code> —— 同理，暴露自己是哪一层下的进程。</p>'
+          + '<p>③ <code>ls -la /.dockerenv</code> —— Docker 会在容器根目录创建一个空的 <code>/.dockerenv</code> 文件作为标记。存在的架构差异使它成为一个「有则可疑」的信号（<b>不存在不能证明不是容器</b>，因为可以删、别的运行时也不建）。</p>'
+          + '<p>④ <code>ls /sys/fs/cgroup/</code> —— 在容器里看到的内容和真机差别很大；如果连 cgroup 的层次结构都只剩极少几项，基本可以确定被裁剪过。</p>'
+          + '<p>⑤ 综合判断 —— <b>主机名是一串随机十六进制</b>、<b>网卡名带 <code>@if</code> 后缀</b>、<b>IP 在 172.17/172.18 网段</b>、<b>挂载表里出现 overlay / tmpfs 的异常组合</b>。风控不会只看一条，而是<b>打分</b>；同理，做环境伪装的人也不能只改一条 —— <b>删掉 /.dockerenv 却留着 /proc/1/cgroup 里的容器 ID，等于没改</b>。<span class="pill warn">具体检测项与各云手机方案的实现差异很大，需按目标逐个验证，待核实</span></p>'),
+      quiz: {
+        id: 'q17-4', chapter: 17,
+        answer: 0,
+        stem: '一个容器被限制了 <code>memory.max = 256MB</code>。容器里的程序申请了约 400MB 内存后被 OOM killer 杀掉。但运维在容器里执行 <code>free -m</code>，看到宿主机<b>还剩好几个 GB</b>。<br><br>关于这个现象，下面哪个说法是<b>正确</b>的？',
+        options: [
+          { t: '<code>free</code> 读的是宿主机内存，而限制容器的是 cgroup 的 <code>memory.max</code> —— 两者是不同层面的数字，容器的真实额度要看它所在 cgroup 目录下的 <code>memory.max</code> / <code>memory.current</code>', why: '正确。容器共享宿主内核，<code>free</code> 从宿主内核拿全局内存统计，它<b>不知道也不关心</b> cgroup 额度。杀进程的是 cgroup 控制器按 <code>memory.max</code> 触发的 OOM。' },
+          { t: '说明宿主机的内存统计被容器篡改了，应该重启 Docker 服务', why: '把机制差异误判成了故障。数字没有错，只是它回答的不是你想问的问题 —— <b>容器视角和宿主视角本来就看到不同的内存统计</b>。' },
+          { t: '应该删掉 cgroup 的 <code>memory.max</code> 限制，让容器直接用宿主机内存', why: '这是「用拆掉护栏的方式解决问题」。去掉限额确实不会被杀了，但你也失去了隔离保护 —— 一个容器就能把整台宿主机拖垮。<b>正确做法是调大额度，不是取消额度。</b>' },
+          { t: '在容器里执行 <code>free</code> 的结果不可信，容器里无法获取内存信息', why: '过度怀疑。<code>free</code> 的输出本身是准确的（就是宿主内存），只是它的<b>语义</b>不是「你能用多少」。真正的容器内存额度要读 cgroup 文件。' }
+        ],
+        explain: '<b>核心认知：容器里看到的很多「系统信息」其实是宿主机的，而限制你的那套规则活在另一个地方。</b><code>free</code>、<code>nproc</code>、部分 <code>/proc/meminfo</code> 字段反映的都是宿主全局状态 —— 因为它们读的是共享内核的全局统计。而 cgroup 的额度是「挂在这个进程组上的规则」，不会改变全局统计的数字。<br><br><b>正确的排查姿势：</b>① 先找到容器所属的 cgroup 目录（<code>cat /proc/self/cgroup</code> 或 <code>cat /proc/1/cgroup</code>）；② 读 <code>memory.max</code>（额度上限）、<code>memory.current</code>（当前用量）、<code>memory.events</code>（<code>oom</code> / <code>oom_kill</code> 计数，能确认是不是 cgroup 层面杀的）；③ 如果是 K8s 环境，还要看 Pod 的 resources.limits。<br><br><b>这条知识在实战里的两个用法：</b>一是给容器里的服务做容量规划时，「加内存」加的是 cgroup 额度而不是物理内存条；二是反过来 —— <b>容器里 <code>free</code> 显示的就是宿主内存，这本身就泄露了宿主机信息</b>，是环境检测可以利用（或被利用）的一个点。'
+      }
+    },
+
+    /* ============ 31.12 ============ */
+    {
+      h: '31.12',
+      title: '为什么逆向要关心容器化：四个战场',
+      html:
+        '<p>这一节回答本章的收尾问题：<b>我一个做逆向的，学容器干什么？</b>四个理由，每一个都会在后续章节反复出现。</p>'
+        + T.card('① 云手机的运行底座 —— 你调试的东西可能就是一个容器',
+          '<p>很多云手机 / 云真机方案用<b>容器而不是虚拟机</b>来做多实例：开销小、启动快、单机密度高（回想 31.3 的分层图：共享内核省掉的就是整个 OS 的内存和启动时间）。</p>'
+          + '<p><b>对你的直接影响：</b>当你远程连上一台「云手机」时，需要先判断它的底座是什么 —— 是<b>容器里跑安卓</b>（第 32 章 Waydroid 那一类）、是<b>虚拟机里跑安卓</b>、还是<b>真机托管</b>。判断方法就是 31.3 和 31.11 给的那几条：<code>uname -r</code>、<code>/proc/1/cgroup</code>、<code>/.dockerenv</code>、网卡名。<b>底座决定了你的调试手段清单</b> —— 容器里通常没有内核模块权限，依赖 insmod 的方案直接出局。</p>')
+        + T.card('② 环境伪装与检测 —— 容器特征是风控的重要证据链',
+          '<p>容器环境有一整套<b>独特的、难以完全抹除的</b>特征：<code>/.dockerenv</code> 文件、cgroup 路径里的容器 ID、被裁剪的挂载表、<code>eth0@ifN</code> 形式的网卡、172.17 网段、随机主机名、以及特殊的 <code>/proc</code>、<code>/sys</code> 视图。</p>'
+          + '<p><b>攻防两侧都需要这一章：</b>检测方把这些特征做成打分项（单条不可靠，组合起来就很硬）；伪装方则需要知道<b>每一条特征的来源</b>才能对症下药 —— 而特征的来源，正是前面十一节讲的 namespace / cgroup / veth。<b>本章最大的实用价值之一，就是让你拿到一份「容器特征清单 + 每条特征的内核出处」。</b></p>'
+          + '<p>更进一步：<b>风控也会检测「反检测行为」本身</b> —— 比如 <code>/.dockerenv</code> 被删除、cgroup 路径被改写成 <code>/</code>，这类「过于干净」的环境反而会触发另一套规则。<b>伪装的目标是「像真的」，不是「像空的」。</b></p>')
+        + T.card('③ 安卓容器化的前提 —— 第 32 章全靠这一章',
+          '<p>第 32 章的 Waydroid 本质就是<b>「用容器跑安卓」</b>：用 Linux namespace 给 Android 用户态一个隔离视图，用 cgroup 限制它，用 binder / ashmem 之类的内核支持让安卓框架跑起来。<b>没有 namespace 和 cgroup 这两块地基，Waydroid 一行都跑不起来。</b></p>'
+          + '<p>届时你会遇到的所有问题 —— 为什么安卓容器里看不到宿主的某些设备、为什么网络要走特殊配置、为什么某些 App 一启动就闪退 —— <b>答案都在这一章的四根柱子里</b>。学完本章再去看 Waydroid 的启动脚本，你会发现它做的就是把 31.5 的迷你容器流程（换根、挂 /proc、配 cgroup、exec）包装了一遍，只是多了安卓特有的挂载点和设备节点。</p>')
+        + T.card('④ 跨架构是刚需 —— 服务器 x86，生态 ARM',
+          '<p>现实是错位的：<b>服务器以 x86_64 为主，而安卓应用生态以 ARM 为主</b>。所以「在一台 x86 云主机上准备、运行、调试 ARM 环境」是每天都在发生的事。</p>'
+          + '<p>31.10 的那条链路（binfmt_misc + qemu-user-static + debootstrap）就是标准解法。理解它之后，你才能回答一些很实际的问题：为什么这个方案快（user-mode 只翻译指令、系统调用直接转发给宿主内核）、什么时候会失效（涉及大量 <code>ioctl</code>、自修改代码、或依赖特定 CPU 特性时会翻译出错）、以及为什么它<b>不能代替真机</b>（模拟器检测 —— 见第 30 章）。</p>'
+          + '<p><b>一句话总结这一章：容器不神秘，它是内核给一个普通进程套上的四层约束。</b>你越是能亲手把它拼出来，就越能在「云手机到底是什么」这个问题上拥有判断力 —— 而这正是后面所有环境对抗工作的起点。</p>'),
+      after: T.note('ok', '✅ 本章带走五句话', '<p>① <b>容器不是虚拟机</b>：共享宿主内核，软件隔离，弱于硬件隔离，但启动开销和资源占用低一个数量级。</p>'
+        + '<p>② <b>容器 = namespaces + cgroup + rootfs + capabilities/seccomp</b>，四根柱子缺一不可；<code>docker run</code> 的内核本质是一次带 <code>CLONE_NEW*</code> 标志的 <code>clone()</code>。</p>'
+        + '<p>③ <b>namespaces 管「看不见」，cgroup 管「用不了那么多」</b>；三个系统调用 <code>clone</code> / <code>unshare</code> / <code>setns</code>，<code>CLONE_NEWNS</code> 不叫 NEWMNT，PID 隔离要再 fork 一次才生效。</p>'
+        + '<p>④ <b>容器网络靠 veth pair 成对出现</b>：一端在容器里叫 eth0，一端在宿主上挂在 docker0；出向 SNAT、入向 DNAT，host 模式无隔离、none 模式只有 lo。</p>'
+        + '<p>⑤ <b>容器特征是可检测的</b>（/.dockerenv、/proc/1/cgroup、cgroup 路径、网卡名、网段）—— 每条特征的源头都能在本章找到，这就是你在环境对抗里的地图。</p>')
+    }
+     ],
+     glossary: [
+       { t: 'namespace（命名空间）', d: 'Linux 的<b>资源隔离机制</b>，决定进程「看得见什么」。通过 clone / unshare / setns 创建与加入，标志形如 CLONE_NEW*。注意它是<b>视图隔离</b>，不是物理隔离 —— 进程仍共享同一个内核。' },
+       { t: 'cgroup（控制组）', d: 'Linux 的<b>资源限制机制</b>，决定进程「能用多少」。v2 采用<b>统一层次结构</b>，单一挂载点通常为 /sys/fs/cgroup；主要控制器有 cpu（cpu.max）、memory（memory.max）、pids（pids.max）、io（io.max）。' },
+       { t: 'CLONE_NEWNS', d: '<b>Mount 命名空间</b>标志。名字里的 NS 指 mount namespace，<b>不叫 NEWMNT</b> —— 这是历史原因造成的命名，属于高频考点。提供独立的挂载点视图。' },
+       { t: 'CLONE_NEWPID', d: 'PID 命名空间标志。容器内进程从 <b>PID 1</b> 开始编码，看不到宿主机其他进程。<b>关键时机：只对之后 fork 出的子进程生效</b>，unshare 之后必须再 fork 一次当前进程的 PID 才会变。' },
+       { t: 'CLONE_NEWUSER', d: '用户命名空间标志，做用户与用户组 ID 映射。<b>rootless 容器的基础</b> —— 让非 root 用户也能创建容器。但里面的「root」在宿主机上只是被映射的普通 UID，能力有限。' },
+       { t: 'pivot_root', d: '真正<b>交换根文件系统</b>的系统调用：new_root 必须已是挂载点（先 bind mount），旧根被挪到 put_old 目录后可被卸载。<b>比 chroot 安全，是容器的标准做法</b>。' },
+       { t: 'chroot', d: '只<b>修改进程的根目录指针</b>，不改变挂载事实。旧根依然挂在系统上，持有外部 fd 可经典逃逸。<b>不是安全边界</b>，容器场景应改用 pivot_root。' },
+       { t: 'veth pair', d: '虚拟网卡<b>对</b>：两端相连，从一端进去的帧从另一端出来，像一根网线连接两个网络命名空间。容器侧叫 eth0，宿主侧叫 vethXXXX 并挂在 docker0 上。<b>「成对出现」是理解容器网络的关键。</b>' },
+       { t: 'docker0', d: 'Docker 安装时自动创建的<b>虚拟网桥</b>，本质是一个二层交换机，接在宿主机的网络栈里。所有 bridge 模式容器的 veth 宿主端都插在它上面，同网段容器互通靠它直接转发，出网则交给 NAT。' },
+       { t: 'binfmt_misc', d: 'Linux 内核功能：让内核<b>识别任意二进制格式并交给指定解释器执行</b>。配合 QEMU user-mode 可在 x86_64 上透明运行 ARM64 程序。<b>坑：解释器路径经 chroot 后会在 rootfs 内解析，所以 qemu-aarch64-static 必须复制进 rootfs。</b>' },
+       { t: 'QEMU user-mode / system-mode', d: '<b>user-mode</b>（qemu-aarch64-static）只模拟 CPU 并把系统调用转发给宿主内核，跑单个程序、轻量快速；<b>system-mode</b>（qemu-system-aarch64）模拟整个系统（CPU + 设备 + 内存），能跑完整 OS，重。容器场景用 user-mode。' },
+       { t: 'debootstrap', d: 'Debian/Ubuntu 的引导工具，可在指定目录构建最小根文件系统。<code>--arch=arm64</code> 指定架构，<code>--foreign</code> 只做下载解包、配置留给 chroot 内的 second-stage。<b>ARM 架构要用 ports.ubuntu.com/ubuntu-ports/，不是 archive.ubuntu.com。</b>' }
+     ],
 
   teacher: {
-    id: 't31', chapter: 31,
+    id: 'ch17', chapter: 17,
     name: '追问老师 · 第 31 章',
-    sub: '「我凭什么这么判断」说不清，我不会放你走',
-    intro: '<p style="margin:0">这一章我不考你 RSA 的公式推导，<b>我盯着你的判据问</b>。' +
-      '答「我感觉它是 RSA」是过不了关的，我要听到<b>长度、首字节、结构、方向、填充、来源</b>这些词。' +
-      '三次答不上来我会给出完整答案，但那时候你已经浪费了一次练习机会。</p>',
+    sub: '拷问五件事：容器与虚拟机的分界、命名空间的生效时机、pivot_root 的完整姿势、容器网络的数据流、以及容器特征从哪来',
+    intro: '<p style="margin:0">这一章的知识点不多，但<b>每一条都容易被「差不多懂了」蒙混过去</b>。我会追问机制背后的因果：为什么 PID 没变成 1、为什么只调 pivot_root 还会漏、为什么容器里删了 <code>/.dockerenv</code> 照样被识破。<b>答不上来不要紧，但请不要用「Docker 帮我做了」当答案 —— 那正是这一章要拆掉的东西。</b></p>',
     questions: [
       {
-        id: 'c31q1', depth: 1, threshold: 0.7,
-        q: '请把本章六类功能按「<b>密钥</b>」这个维度分成两组，各说明分组的依据；并且指出<b>哪一类是唯一「密钥可以公开」的</b>，为什么这一条会彻底改变它的逆向方法。',
+        id: 'c17q1', depth: 1, threshold: 0.7,
+        q: '请说清楚：<b>容器和虚拟机最本质的区别是什么？</b>并且给出<b>至少两种在实战中判断「我当前是在容器里还是在虚拟机里」的具体方法</b>，说明每个方法的原理。',
         concepts: [
-          { label: '无密钥组：编码与摘要（以及密钥交换这一类里没有常驻密钥的情形）',
-            hint: '哪两类的还原完全不需要密钥？',
-            any: ['编码', 'base64', 'hex', 'url 编码', '摘要', '哈希', '散列', 'md5', 'sha', '没有密钥', '无密钥', '不需要密钥', '不用密钥'] },
-          { label: '有密钥组：MAC、对称加密、非对称加密',
-            hint: '哪三类的安全性依赖某把密钥不泄露？',
-            any: ['mac', 'hmac', '对称', 'aes', 'des', '非对称', 'rsa', 'ecc', '有密钥', '带密钥', '密钥是核心'] },
-          { label: '唯一「公钥可公开」的是非对称加密',
-            hint: '哪一类的设计目标就是让全世界都拿到它的一半？',
-            any: ['非对称', 'rsa', '公钥', '公钥可以公开', '公钥是公开的', '可以公开', 'public key', '唯一'] },
-          { label: '因此逆向动作从「找密钥」变成「读结构、判方向、对填充、查来源」',
-            hint: '既然公钥本来就在那里，你还找它干什么？那你该干什么？',
-            any: ['读结构', '结构', '判方向', '方向', '填充', 'padding', '查来源', '来源', 'der', 'spki', '不需要找密钥', '不用找密钥'] },
-          { label: '分类依据是三个可测量的量：长度、字符集、熵',
-            hint: '你在不知道任何代码的情况下，凭什么把它归到某一类？',
-            any: ['长度', '字节数', '字符集', '可打印', '熵', '香农熵', '统计'] }
+          { label: '容器共享宿主内核，虚拟机有独立内核',
+            hint: '想想两者分别有几份内核？容器省掉的是什么？',
+            any: ['共享内核', '共享宿主内核', '共用一个内核', '同一个内核', '独立内核', '自己的内核', 'guest os', '客户机内核', '不用引导内核', '不启动内核', 'shared kernel', 'own kernel', '没有独立内核'] },
+          { label: '容器是软件隔离（namespace），虚拟机是硬件隔离（VT-x/AMD-V）',
+            hint: '两者隔离的手段分别是什么层面的？',
+            any: ['软件隔离', '命名空间隔离', 'namespace', '硬件隔离', '硬件虚拟化', '虚拟化指令', 'vt-x', 'vtx', 'amd-v', 'amd v', 'hypervisor', '虚拟化层', 'intel vt', '硬件辅助'] },
+          { label: '判据 uname -r：容器返回宿主内核版本',
+            hint: '哪条命令能一次性看出内核是谁的？',
+            any: ['uname -r', 'uname -a', 'uname', '内核版本', '宿主内核版本', '内核号'] },
+          { label: '判据 /proc/1/cgroup 或 /.dockerenv 等容器痕迹',
+            hint: '容器运行时会在文件系统里留下什么标记？cgroup 路径长什么样？',
+            any: ['/proc/1/cgroup', 'proc/1/cgroup', 'cgroup', '/.dockerenv', 'dockerenv', 'docker 文件', 'systemd-detect-virt', 'detect-virt', 'lsns', '/proc/self/cgroup', '容器id', '容器 id'] }
         ],
         hints: [
-          '先把六类名字列出来，再逐一问自己：这一类要还原，必须知道某把密钥吗？',
-          '第四问的关键是：如果你的目标是「复现服务端能接受的请求」，而公钥本来就在 App 里，那你还缺什么？'
+          '先问自己一个问题：容器里 <code>uname -r</code> 显示的是谁的内核版本？为什么？',
+          '再想想隔离手段：一个是在内核里改「视图」，一个是用 CPU 硬件指令做「隔断」—— 强度能一样吗？'
         ],
         probes: [
-          'MAC 明明有密钥，为什么你在现场往往不需要「破解」它？',
-          '如果一段 32 字节的常量既可能是 SHA-256 摘要、也可能是 AES-256 密钥，你用什么顺序把它们分开？'
+          '那为什么大家都说容器「更轻」？轻在哪里？具体省掉了哪些开销？',
+          '如果我说「容器比虚拟机更安全」，你怎么反驳我？'
         ],
-        model: '<b>按「还原时需不需要一把保密的密钥」分，六类干净地分成两组。</b><br>' +
-          '<b>无密钥组：编码与摘要。</b>编码只是换表示形式，任何人都能还原；摘要是一次单向压缩，你只需要知道算法与输入就够。' +
-          '另外「密钥交换 / 派生」虽然涉及密钥，但它没有<b>常驻的</b>密钥常量可供寻找——密钥是算出来或协商出来的，这一点让它的处理方式更接近前一组。<br>' +
-          '<b>有密钥组：MAC、对称加密、非对称加密。</b>MAC 的密钥通常是从别处传进来的（不是算法自带的常量），所以它是「有密钥但不难」的那一档；' +
-          '对称加密的密钥是核心，AES 的安全性完全押在它身上；非对称加密也有密钥，但它的公钥是公开的。<br>' +
-          '<b>唯一「密钥可以公开」的是非对称加密，而且这一条改变了一切。</b>因为公钥的设计目标就是公开，所以：<br>' +
-          '① <b>「找密钥」这个动作失去意义</b>——它就在那里，可能还写在证书里等着你去下载；<br>' +
-          '② <b>难点转移到了别处</b>：这段常量是公钥还是密文？它被用来加密还是验签？带的是哪种填充？它的来源是硬编码还是服务端下发？<br>' +
-          '③ <b>真正稀缺的东西变成了私钥</b>，而私钥通常在服务端——所以你会反复遇到「客户端持有私钥」这种设计缺陷（那反而让你的工作变简单）。<br>' +
-          '<b>分组的依据不是「难度」，而是「解决什么问题」。</b>把它当难度排行榜会让你在错误的方向上用力。' +
-          '至于怎么在现场把一段字节归到某一类，靠的是三个可测量的量：<b>长度</b>（16/20/32 恒定 → 摘要；16 的倍数 → 对称；等于模长 → 非对称）、' +
-          '<b>字符集</b>（只有 64 个可打印字符 → 编码）、<b>熵</b>（只能用来排除低熵项，不能用来确认）。',
-        after: '<p>补一句：这三条判据的顺序很重要。<b>先剥编码、再量长度、最后才谈其它</b>——在 Base64 字符串上量长度是最常见的系统性错误。</p>'
+        model: '最本质的区别只有一条：<b>容器共享宿主内核，虚拟机拥有自己的内核。</b>容器里的所有进程和宿主机上的进程，跑的是同一份内核代码、同一套调度器和内存管理；虚拟机的 Guest OS 则自带完整内核，通过 Hypervisor 和 CPU 的硬件虚拟化指令（Intel VT-x / AMD-V）与宿主隔开。<br><br>由这一条推出其余全部差异。隔离手段上：容器靠 <b>namespace</b> 做软件层的视图隔离（改的是「看得见什么」），虚拟机靠<b>硬件虚拟化</b>做真正的隔断 —— 前者的隔离强度<b>弱于</b>后者，一个内核漏洞就可能让容器里的 root 摸到宿主；后者要逃逸得先攻破虚拟化层本身。开销上：容器不需要引导内核、不需要加载驱动、不需要为每个实例准备一份 OS 镜像，所以启动是毫秒级、内存占用是 MB 级；虚拟机要引导完整 OS，秒级启动、GB 级内存。<b>注意这两个结论方向是相反的：容器更轻但更弱，虚拟机更重但更强</b> —— 这就是选型的核心权衡，也是云手机厂商选容器方案时真正赌的东西（密度和成本，而不是隔离强度）。<br><br>实战判据有四个，原理各不相同：① <code>uname -r</code> —— 容器返回<b>宿主内核版本</b>，虚拟机返回 Guest 自己的，这是最直接的证据；② <code>cat /proc/1/cgroup</code> —— 容器里常能看到 <code>/docker/&lt;容器ID&gt;</code>、<code>/kubepods/...</code> 之类的路径，真机上通常只有 <code>/</code>；③ <code>ls -la /.dockerenv</code> —— Docker 会在容器根目录建这个标记文件（<b>有则可疑，无则不能证明不是</b>）；④ <code>systemd-detect-virt</code> —— 容器里常输出 docker/lxc/podman，虚拟机里输出 kvm/vmware。<br><br>补充一条更细的：容器里 <code>/proc/self/ns/</code> 下的命名空间 inode 号与宿主机 init 不同，<code>lsns</code> 能直接列出系统里的命名空间及进程数。'
       },
       {
-        id: 'c31q2', depth: 1, threshold: 0.7,
-        q: '把 <span class="mono">n</span>、<span class="mono">φ(n)</span>、<span class="mono">e</span>、<span class="mono">d</span> 四个量的关系讲清楚，' +
-          '并回答：<b>为什么公钥 (n, e) 可以公开，而私钥 d 一旦泄露就等于全盘失守？</b>另外说明 <b>e 为什么常取 65537</b>。',
+        id: 'c17q2', depth: 2, threshold: 0.7,
+        q: '你写了这段代码想验证 PID 隔离：<code>unshare(CLONE_NEWPID)</code> 之后立刻 <code>printf(&quot;%d&quot;, getpid())</code>。<b>结果打印出的是一个普通的宿主机 PID，而 unshare 返回了 0。</b>请解释原因，并给出正确的写法；再说说为什么这个设计是<b>必须的</b>，而不是内核的缺陷。',
         concepts: [
-          { label: 'n = p × q，n 的位数就是所谓的「密钥长度」',
-            hint: '模数是怎么来的？「2048 位密钥」指的是谁的长度？',
-            any: ['n = p', 'p × q', '两个质数', '质数相乘', '乘积', '模数', '2048', '位数', '密钥长度'] },
-          { label: 'φ(n) = (p−1)(q−1)，它由 p、q 决定',
-            hint: '欧拉函数在这个特殊情况下等于什么？',
-            any: ['φ', 'phi', '欧拉', 'p-1', '(p-1)(q-1)', 'p−1', '减一'] },
-          { label: 'd 是 e 关于 φ(n) 的模逆元：e·d ≡ 1 (mod φ(n))，用扩展欧几里得求',
-            hint: '私钥指数是怎么解出来的？用什么算法？',
-            any: ['模逆', '逆元', '扩展欧几里得', 'exgcd', 'e·d', 'ed ≡ 1', '互质', 'gcd'] },
-          { label: '所以「知道 φ(n)」等于「能算出 d」，而知道 p、q 就能算出 φ(n)——分解 n 就是拿到私钥',
-            hint: '攻破 RSA 的那条路，最后一步落在哪个量上？',
-            any: ['分解', '因式分解', 'factor', '算出 d', '推导', '知道 phi', '知道φ', '拿到私钥', '等于'] },
-          { label: '公钥能公开，是因为反向（从 n、e 恢复明文）目前唯一已知的可行路线是分解 n，而这在大数上不可行',
-            hint: '「陷门」这个词在这里指的是什么？',
-            any: ['陷门', '不可行', '算不出来', '困难', '大数分解', '计算上不可行', '没有已知', '反向'] },
-          { label: 'e 取 65537 是因为它的二进制只有两个 1，平方-乘时乘法次数最少；同时它足够大',
-            hint: '去看 e 的二进制：它有几个 1？这和模幂的速度有什么关系？',
-            any: ['65537', '0x10001', '两个 1', '二进制', '平方-乘', 'square', '乘法次数', '快', '够大'] }
+          { label: 'PID 命名空间在进程创建时绑定，只对之后创建的子进程生效',
+            hint: '命名空间是在哪个时刻被「贴」到进程上的？',
+            any: ['创建时', '进程创建', 'fork 时', 'fork时', '创建进程时', '只对子进程', '对子进程生效', '之后创建', '下一个进程', '新创建的进程', '不影响当前进程', '当前进程不变', 'clone 时', 'clone时'] },
+          { label: '正确写法：unshare 之后再 fork 一次（或用 clone 带标志）',
+            hint: '让谁成为新命名空间的第一个进程？',
+            any: ['再 fork', '再fork', 'fork 一次', 'fork()', '调用 fork', 'clone', 'clone(', 'clone 带', '带上标志', 'unshare --fork', '--fork', 'unshare -f', 'fork 出子进程'] },
+          { label: '子进程成为新命名空间的 PID 1，并承担 init 职责',
+            hint: '新命名空间里的第一个进程编号是多少？它有什么特殊责任？',
+            any: ['pid 1', 'pid1', '1 号进程', '一号进程', 'init', '第一个进程', '回收', '僵尸', '孤儿进程', 'reap', '子进程退出', '整个命名空间被杀', '命名空间被清理'] }
         ],
         hints: [
-          '把四个量写成两条式子：n 和 φ(n) 是「怎么来的」，e 和 d 是「怎么配对的」。',
-          'e 的取值要同时满足两个要求：与 φ(n) 互质，以及做模幂时快。65537 恰好两个都满足。'
+          '<code>unshare</code> 返回 0 说明内核<b>已经答应了</b>。那么没变的到底是什么？换个角度：当前这个进程是什么时候被创建的？',
+          '想想「命名空间」是挂在进程结构的哪个字段上的，以及这个字段是在生命周期的哪一刻被确定的。'
         ],
         probes: [
-          '如果 e 取 3，除了「快」以外还有什么后果？',
-          '为什么 d 泄露比 n 泄露严重得多？（提示：n 是公钥的一部分）'
+          '那新 PID 命名空间里，<code>/proc</code> 需要做处理吗？不做会怎样？',
+          '容器里 PID 1 挂了会发生什么？这解释了 Docker 的哪个命令行选项？'
         ],
-        model: '<b>四个量分成两组看最清楚：一组是「结构」，一组是「配对」。</b><br>' +
-          '<b>结构组：n 与 φ(n)。</b>选两个大质数 p、q，<span class="mono">n = p × q</span>，这个 n 就是模数，' +
-          '它的位数（2048、3072…）就是通常说的「密钥长度」。对两个质数的乘积，欧拉函数有闭式：' +
-          '<span class="mono">φ(n) = (p−1)(q−1)</span>。<br>' +
-          '<b>配对组：e 与 d。</b>选一个与 φ(n) 互质的 e 当公钥指数，再求它关于 φ(n) 的模逆元 d：' +
-          '<span class="mono">e·d ≡ 1 (mod φ(n))</span>，用扩展欧几里得算法解出来。于是公钥是 (n, e)，私钥是 (n, d)。<br>' +
-          '<b>为什么公钥能公开？</b>因为加密是 <span class="mono">c = m^e mod n</span>——正向运算只需要几十次模乘。' +
-          '而要从 c 恢复 m，目前已知的可行路线是<b>先把 n 分解成 p × q</b>，有了 p、q 就能算 φ(n)、进而算出 d。' +
-          '2048 位的 n 分解在现有公开方法下不可行，这就是全部的理由。这就是「陷门单向函数」的含义：' +
-          '正向便宜、反向昂贵，而陷门（p、q）只有生成者知道。<br>' +
-          '<b>为什么 d 泄露等于全盘失守？</b>因为 RSA 的两种用法都靠 d 提供不可伪造性：' +
-          '解密要用 d，签名要用 d。<b>d 一泄露，攻击者既能解开所有密文，也能伪造这个身份的签名</b>——' +
-          '而 n 与 e 本来就是公开的，泄露它们等于什么都没泄露。<br>' +
-          '<b>e 为什么是 65537？</b>它的十六进制是 <span class="mono">0x10001</span>，二进制是 ' +
-          '<span class="mono">1 0000 0000 0000 0001</span>——<b>只有两个 1</b>。' +
-          '平方-乘算法的乘法次数由指数中 1 的个数决定，所以 65537 做公钥运算几乎是最省的；' +
-          '同时它足够大，避开了 e=3 一类小指数在特定场景下的已知问题。' +
-          '<span class="hit">在现场，e=65537 通常意味着「对方用了标准库的默认值」——这本身就是一条情报：' +
-          '既然用的是标准实现，那你复现的重点就应该放在填充与输入串上，而不是怀疑算法被改了。</span>',
-        after: '<p>顺手记一条现场判据：解析 SPKI 时，结尾五个字节 <span class="mono">02 03 01 00 01</span> 就是 e=65537。' +
-          '看到它，基本可以确定这是一个标准生成的 RSA 公钥。</p>'
+        model: '原因在于 <b>PID 命名空间是在进程被创建的那一刻绑定到进程上的</b>。当你调用 <code>unshare(CLONE_NEWPID)</code> 时，内核为<b>之后创建的子进程</b>准备好了一个新的 PID 命名空间，但当前进程早就创建完了 —— 它的 PID 命名空间字段不可能在此时被改写，否则进程在宿主机上的身份会瞬间变化，所有引用它的地方（信号、wait、/proc 条目、父进程记录）都会错乱。<b>所以 unshare 返回 0 是诚实的：命名空间确实创建了，只是还没人住进去。</b><br><br>正确写法有两条路：① <code>unshare(CLONE_NEWPID)</code> 之后立刻 <code>fork()</code>，子进程就是新命名空间的 <b>PID 1</b>；② 直接用 <code>clone(child_func, stack, CLONE_NEWPID | SIGCHLD, NULL)</code>，一步到位，子进程出生就在新命名空间里。命令行等价物是 <code>unshare --pid --fork --mount-proc /bin/bash</code>，进去后 <code>echo $$</code> 得到 1。<br><br>这个设计不是缺陷，而是<b>必须的</b>。PID 命名空间是一棵<b>树</b>，每个命名空间有自己的号码体系：同一个进程在宿主机上是 18422，在容器里是 1，两者同时成立。这要求「进程 → 它属于哪个 PID 命名空间」的映射在进程诞生时就固定下来，才能保证信号投递、父子关系、进程回收在每一层都自洽。如果允许运行中的进程中途换命名空间，内核就必须在每一处引用 PID 的地方做动态重解析，成本和复杂度不可接受。<br><br>顺着 PID 1 的特殊地位还有两个实战推论：① PID 1 退出时，<b>内核会杀死该命名空间内的所有进程</b> —— 所以容器里不能随便 kill 1 号进程，这也是 <code>docker run --init</code> 存在的理由（插一个真正的 init 来回收孤儿进程、正确转发信号）；② 换了 PID 命名空间后，<b>必须重新挂载 procfs</b>（<code>mount -t proc proc /proc</code>），否则 <code>/proc</code> 里显示的仍是宿主机的进程列表 —— 这正是 31.5 的 stepper 里那一步。'
       },
       {
-        id: 'c31q3', depth: 2, threshold: 0.7,
-        q: '请论证：<b>「客户端用 RSA 私钥做签名」这件事，在密码学上是站不住的。</b>' +
-          '你的论证要能让一个只会写代码、不懂密码学的人听懂；最后再说明<b>这个结论给逆向工作带来了什么后果</b>。',
+        id: 'c17q3', depth: 2, threshold: 0.7,
+        q: '在写迷你容器时，为什么标准做法用 <b>pivot_root</b> 而不是 <b>chroot</b>？请说出 chroot 的至少一条<b>经典逃逸路径</b>，以及完整的、<b>不能省略任何一步</b>的换根流程。',
         concepts: [
-          { label: '签名这个动作在数学上必须使用私钥',
-            hint: '签名用哪把钥匙产生？验签用哪把？',
-            any: ['私钥', 'private key', 'd', '用私钥签名', '签名用私钥', '私钥产生签名'] },
-          { label: '因此客户端能做签名，就意味着私钥必然存在于客户端',
-            hint: '如果代码能跑起来，那把钥匙在哪？',
-            any: ['私钥在客户端', '客户端有私钥', '必然在', '一定在', '必须存在', '存在于客户端', '那它就在'] },
-          { label: '而客户端运行在攻击者完全控制的设备上，所以私钥一定拿得到（dump / hook / 内存读取）',
-            hint: '你手里的设备是谁的地盘？',
-            any: ['攻击者控制', '不可信', '不受控', '一定能拿到', 'dump', 'hook', '内存', '读出来', '提取', '拿到'] },
-          { label: '所以客户端签名提供的安全性是零，最多只能挡住「懒得改包的人」',
-            hint: '那它还有什么用？',
-            any: ['没有安全', '零', '不提供', '等于没有', '无效', '形同虚设', '挡懒人', '防懒人', '只能挡'] },
-          { label: '对逆向的后果：这个签名一定可复现——不需要「破解」RSA，只要拿到私钥或直接调用它的签名逻辑',
-            hint: '既然私钥一定在手里，你还需要去分解模数吗？',
-            any: ['可复现', '复现', '直接调用', '拿来用', '照用', '不用破解', '不需要破解', '搬过来', '调用它的签名'] }
+          { label: 'chroot 只改根目录指针，不改变挂载事实，旧根仍可被引用',
+            hint: 'chroot 修改的到底是什么？旧根去哪了？',
+            any: ['只改根目录', '改根目录指针', '只是改路径', '只改路径', '路径解析', '旧根还在', '旧根仍然', '没改变挂载', '不改变挂载', '不是安全边界', '指针', 'fs_struct', 'root 指针'] },
+          { label: '经典逃逸：持有外部 fd 用 fchdir 逃出；或保留 CAP_SYS_CHROOT 做嵌套逃逸',
+            hint: '在 chroot 之前打开的 fd 会怎样？还能用吗？',
+            any: ['fd', '文件描述符', 'fchdir', 'chdir', '已打开的', '外部 fd', '目录 fd', 'dirfd', '..', '向上爬', '嵌套', 'cap_sys_chroot', '再 chroot', '双 chroot', '逃逸', '绕回', '回到宿主'] },
+          { label: 'pivot_root 在挂载树层面交换根，旧根可被卸载',
+            hint: 'pivot_root 和 chroot 的作用层面有什么不同？',
+            any: ['挂载树', '挂载层面', '交换根', '交换', '换挂载', 'mount namespace', '旧根可卸载', '可以卸载', '真正的根', '更安全', '标准做法'] },
+          { label: '完整流程：MS_PRIVATE 私有化 + bind mount 使其成为挂载点 + pivot_root + 卸载 oldroot',
+            hint: '少了 MS_PRIVATE 会怎样？少了 umount 会怎样？pivot_root 对 new_root 有什么硬性要求？',
+            any: ['ms_private', 'ms_rec', '私有', 'private', 'bind', 'bind mount', 'ms_bind', '绑定挂载', '挂载点', '必须是挂载点', 'umount', '卸载', 'mnt_detach', 'oldroot', '惰性卸载', 'pivot_root'] }
         ],
         hints: [
-          '从「签名要用哪把钥匙」这一步开始推，一步都不要跳。',
-          '第二问的关键：把「客户端」这三个字的含义展开——客户端意味着代码和数据都在别人手里。'
+          '关键区别在于：一个是在<b>路径解析</b>层面限制你，另一个是在<b>挂载树</b>层面换掉事实。已经打开的 fd 受路径解析限制吗？',
+          '只调 pivot_root 却不卸载 oldroot，容器里 <code>ls /oldroot</code> 会看到什么？这说明少做了哪一步？'
         ],
         probes: [
-          '如果对方把私钥放进 AndroidKeyStore，你的论证还成立吗？为什么？',
-          '那「防篡改」这件事，正确做法应该放在哪里？'
+          '为什么 pivot_root 之前必须先把 rootfs bind mount 一下？不做会报什么错？',
+          '如果进程在 chroot 之前打开了宿主 <code>/</code> 的目录 fd，之后用 <code>fchdir</code> 会发生什么？为什么？'
         ],
-        model: '<b>论证只要四步，每一步都是硬事实。</b><br>' +
-          '<b>第一步：签名在数学上必须用私钥。</b>RSA 只有两个动作：用公钥做、用私钥做。' +
-          '签名要产生「别人无法伪造」的东西，所以它必须用只有签名者知道的私钥——签名者做 <span class="mono">s = H(m)^d mod n</span>，' +
-          '验证者用公钥做 <span class="mono">s^e mod n</span> 看能不能还原出摘要。如果签名也能用公钥做，那任何人都能签，签名就失去意义了。<br>' +
-          '<b>第二步：既然客户端能产生签名，那把私钥就必须在客户端。</b>这不是推测——代码要跑起来，就必须拿到那把钥匙。' +
-          '它可能在 so 里、可能在 assets 里、可能运行时才解密出来，但它一定在。<br>' +
-          '<b>第三步：而客户端运行在一台攻击者完全控制的设备上。</b>这就是「客户端」这个词的全部含义：' +
-          '代码在别人手里、数据在别人手里、内存可以被任意读取、函数可以被任意 Hook。' +
-          '所以那把私钥<b>一定拿得到</b>：写死的就 dump 出来，运行时解密的就在解密之后读，' +
-          '放进 KeyStore 的——<b>调用它的代码同样在这台设备上，所以密钥的内容仍然可以被使用，只是你拿不到字节</b>（那是可用性问题，不是保密性问题）。<br>' +
-          '<b>第四步：结论。</b>客户端签名提供的安全性是<b>零</b>。它唯一还能起的作用是挡住「随手改个包就想通过校验」的人。' +
-          '正确做法是<b>把签名放到服务端</b>，或者用服务端协商下发的会话密钥做 MAC。<br>' +
-          '<b>这个结论对逆向的后果，恰恰是好消息：</b><br>' +
-          '① <b>签名一定可复现</b>——你不需要分解任何模数、也不需要「破解」RSA。你要么把私钥拿到手直接算，' +
-          '要么在进程内直接调用它的签名函数，要么把产生签名的整段逻辑搬出来；<br>' +
-          '② <b>你应该把精力从「算法」转到「输入串」</b>——既然算法层面没有问题，那复现不出来的原因几乎总是' +
-          '「待签名的原始串拼错了」（参数顺序、编码、大小写、时间戳格式）；<br>' +
-          '③ <b>它同时是一条评估结论</b>：如果你在做的是授权评估或加固评审，「客户端持有签名私钥」本身就是一条要写进报告的发现——' +
-          '31.11 那个案例里，CERT/CC 找到的正是这一类问题。',
-        after: '<p>反过来也要说清：<b>在客户端做「验签」是完全正常且正确的</b>——验签只需要公钥，而公钥可以公开。' +
-          '所以「客户端出现 Signature 相关代码」不等于有问题，<b>要看是 initSign 还是 initVerify</b>。</p>'
+        model: '核心区别一句话：<b>chroot 是「改路径」，pivot_root 是「换挂载树」。</b><code>chroot</code> 只修改进程 fs 结构里的根目录指针，被换掉的旧根<b>依然挂在系统上</b>，路径解析只是暂时看不见它而已；而 <code>pivot_root</code> 是在挂载命名空间里做真正的交换 —— 旧根变成一个普通挂载点，可以被彻底卸载。<br><br>chroot 的经典逃逸有两条。① <b>外部 fd 逃逸：</b>进程在 chroot <b>之前</b>打开了一个宿主机目录的 fd，chroot 之后调用 <code>fchdir(fd)</code> 把工作目录切过去，再 <code>chdir(&quot;..&quot;)</code> 逐级上爬，就回到了宿主机文件系统。<b>根因是：chroot 限制的是路径解析，而 fd 是对内核对象的直接引用，根本不走路径解析。</b>② <b>嵌套 chroot 逃逸：</b>进程若仍持有 <code>CAP_SYS_CHROOT</code>，可以在新根里再建一层目录、再 chroot 进去、然后 <code>chdir(&quot;..&quot;)</code> 跳到新根之外。现代内核已针对后者打了补丁，但只要还能再调 chroot 且能构造目录层级，就始终是隐患 —— 这也是为什么它不能当边界用。<br><br>完整的换根流程<b>四步都不能少</b>（对照 31.5 的 stepper）：<br>① <code>mount(NULL, &quot;/&quot;, NULL, MS_REC | MS_PRIVATE, NULL)</code> —— 把挂载树设为私有。<b>少了这步，容器里的挂载会传播回宿主机</b>，你在容器里挂个 tmpfs，宿主机的挂载表里也会冒出来。<br>② <code>mount(&quot;./rootfs&quot;, &quot;./rootfs&quot;, NULL, MS_BIND | MS_REC, NULL)</code> —— 绑定挂载到自身，让 rootfs 成为一个真正的挂载点。因为 <b>pivot_root 有一条硬性要求：new_root 必须已经是挂载点</b>，普通目录会直接返回 <code>EINVAL</code>。<br>③ <code>chdir(&quot;./rootfs&quot;); pivot_root(&quot;.&quot;, &quot;oldroot&quot;)</code> —— 交换根，旧根落到 <code>/oldroot</code>。<br>④ <code>umount2(&quot;/oldroot&quot;, MNT_DETACH)</code> —— <b>卸载旧根，这一步最常被漏掉</b>。不卸载的话容器里 <code>ls /oldroot</code> 就能看到整个宿主机文件系统，和 chroot 一样漏。因为此时工作目录还在旧根上，普通 <code>umount</code> 会 <code>EBUSY</code>，所以要用 <code>MNT_DETACH</code> 惰性卸载。<br><br>做完这四步，路径解析和 fd 引用两条逃逸通道同时被切断 —— 这正是 runc 等真实运行时的做法。'
       },
       {
-        id: 'c31q4', depth: 2, threshold: 0.7,
-        q: '为什么 RSA 需要填充？请说明<b>没有填充（裸 RSA）会带来哪两个具体后果</b>，' +
-          '以及在实际逆向里，<b>你用什么判据判断一个实现对明文做了随机填充</b>。',
+        id: 'c17q4', depth: 2, threshold: 0.7,
+        q: '一个容器用默认 bridge 网络启动，容器内监听 8080。请<b>逐跳描述</b>一个从容器发往 <code>8.8.8.8</code> 的数据包经过了哪些环节，并指出 <b>NAT 具体发生在哪一跳、为什么非做不可</b>。再说说 host 模式与 none 模式在这一路上分别少了什么、多了什么。',
         concepts: [
-          { label: '填充引入随机性，让同一明文每次产生不同密文',
-            hint: '填充里塞了什么？它对输出的影响是什么？',
-            any: ['随机', '随机数', '每次不同', '每次都不一样', '不确定', '随机化', '打破确定性'] },
-          { label: '后果一：裸 RSA 是确定性的，可被字典攻击/直接对照',
-            hint: '同一个明文两次加密结果一样，攻击者能做什么便宜事？',
-            any: ['字典', '穷举', '猜测', '对照', '相同明文相同密文', '确定', '试出来', '枚举'] },
-          { label: '后果二：可乘性——c(m₁)·c(m₂) mod n = c(m₁·m₂ mod n)，攻击者能在不知道明文的情况下加工密文',
-            hint: '两个密文相乘会得到什么？',
-            any: ['可乘', '乘法', '相乘', '乘积', '同态', 'c1*c2', '乘起来', '选择密文'] },
-          { label: '判据：同一明文、同一公钥的两次密文是否相同——不同说明有随机填充，相同说明没有随机成分',
-            hint: '最便宜、最直接的实验是什么？',
-            any: ['相同', '不同', '比对', '两条密文', '两次', '比较', '重复加密'] },
-          { label: '另一种验证方式：用私钥解出来的填充块（EM）里有固定的结构头，如 PKCS#1 v1.5 的 00 02',
-            hint: '如果你能解密，填充会以什么形式暴露出来？',
-            any: ['em', '填充块', '00 02', 'pkcs', 'v1.5', '结构头', '开头', '前两字节', '解出来看'] },
-          { label: '因此「RSA 复现对不上」时，第一顺位怀疑的是填充方案与输入数据形态，而不是算法被魔改',
-            hint: '对不上时你该先怀疑哪一头？',
-            any: ['填充', 'padding', '数据形态', '拼串', '拼接', '编码', '原始字节', '先怀疑', '顺序'] }
+          { label: 'veth pair：容器 eth0 与宿主 vethXXXX 是一对，一进一出',
+            hint: '容器里那块 eth0 是真的网卡吗？它的另一端在哪？',
+            any: ['veth', 'veth pair', '网卡对', '成对', '虚拟网卡', 'eth0', 'vethxxxx', '另一端', '对端', 'iflink', '@if'] },
+          { label: 'docker0 网桥做二层转发，再交给宿主 IP 层路由',
+            hint: 'docker0 本质是什么设备？它在哪一层工作？',
+            any: ['docker0', '网桥', 'bridge', '虚拟网桥', '二层', '交换机', '转发', 'mac', '路由表', 'ip 层', '路由'] },
+          { label: 'SNAT / MASQUERADE 在宿主机出口改写源地址，回包靠 conntrack 还原',
+            hint: '私有地址 172.17.0.2 怎么才能让外网把回包送回来？谁记下了这次转换？',
+            any: ['snat', 'nat', 'masquerade', 'masq', '源地址', '地址转换', '伪装', 'conntrack', '连接跟踪', '改写源', '转换为宿主 ip', '宿主 ip', '出口'] },
+          { label: 'host 模式共享宿主网络命名空间，无 veth/无网桥/无 NAT；none 模式只有 lo',
+            hint: '两种极端模式各自牺牲了什么、保留了什么？',
+            any: ['host 模式', 'host模式', '--network host', '共享宿主网络', '共享网络栈', '同一网络命名空间', '没有隔离', '无隔离', '端口冲突', 'none', '--network none', '只有 lo', '只有lo', '无网络', '没有网络'] }
         ],
         hints: [
-          '先想清楚：如果没有任何随机成分，同一个明文加密两次会得到什么？',
-          '再想一个更微妙的问题：即使你不知道明文，能不能拿两个密文做一次运算，得到一个「有意义的」新密文？'
+          '先想清楚：容器里那块 <code>eth0</code> 到底连着哪里？它在宿主侧对应的那块网卡长什么样？',
+          '容器的 IP 是 <code>172.17.0.2</code>，这个地址在公网上根本不存在。外网的应答包怎么可能找回来？'
         ],
         probes: [
-          'PKCS#1 v1.5 和 OAEP 都属于随机填充，那它们之间还有什么区别值得你在现场留意？',
-          '签名也有填充，它的填充结构和加密填充一样吗？如果不一样，你用加密的逻辑去复现签名会发生什么？'
+          '那外界想主动访问容器怎么办？描述一下 DNAT 发生在哪里。',
+          '<code>docker run -p 127.0.0.1:8080:8080</code> 和不写这个前缀有什么区别？为什么这关系到安全？'
         ],
-        model: '<b>填充的目的有两个：注入随机性，以及把明文「撑」成规范规定的结构。</b>没有它，RSA 会暴露两个致命性质。<br>' +
-          '<b>后果一：确定性 → 字典攻击。</b>裸 RSA 就是 <span class="mono">c = m^e mod n</span>，一个确定的函数。' +
-          '同一个明文、同一把公钥，算出来永远是同一个密文。于是攻击者根本不需要解密：' +
-          '他把候选明文（<span class="mono">"0"</span>、<span class="mono">"1"</span>、<span class="mono">"true"</span>、' +
-          '一批常见口令、一批可能的金额）逐个加密，看哪个密文与你抓到的一致。<b>密文比对本身就是一次免费的字典攻击。</b><br>' +
-          '<b>后果二：可乘性。</b>因为 <span class="mono">(m₁^e)·(m₂^e) = (m₁·m₂)^e</span>，所以在模 n 下：' +
-          '<span class="mono">c(m₁) × c(m₂) mod n = c(m₁ × m₂ mod n)</span>。' +
-          '这意味着攻击者可以把两个密文乘起来，得到一个「两数乘积的密文」——<b>而他完全不知道明文是什么</b>。' +
-          '这是选择密文攻击的基石之一。填充（尤其是 OAEP）的目的就是把这种代数结构破坏掉。<br>' +
-          '<b>现场判据，从便宜到贵：</b><br>' +
-          '① <b>同一明文两次加密，比对密文</b>——不同 ⇒ 有随机填充；完全相同 ⇒ 没有随机成分（裸 RSA 或固定填充）。' +
-          '这是最便宜、也最可靠的一条，本章 31.8 的实验就是让你亲手做一遍。<br>' +
-          '② <b>用私钥解一次，看填充块的结构</b>——PKCS#1 v1.5 加密填充开头是 <span class="mono">00 02</span>，' +
-          '解出来的东西是「填充块 + 明文」而不是明文本身。这一条最直观，但要求你手里有私钥。<br>' +
-          '③ <b>看长度</b>——带填充的密文长度恒等于模长；如果你能算出明文的长度，' +
-          '而密文长度明显大于它，那多出来的部分就是填充开销。<br>' +
-          '<b>这三条合起来给出一条重要的排查原则：</b>当「RSA 复现对不上」时，' +
-          '第一顺位怀疑的是<b>填充方案 / 参数</b>和<b>输入数据形态</b>，而不是「算法被魔改了」。' +
-          '<span class="hit">这条顺序能省下你几天时间——RSA 的大数运算被魔改的概率，远低于「你把明文的字节形态搞错了」的概率。</span>',
-        after: '<p>再补一个反向的坑：<b>不要用「我的密文 ≠ 抓包的密文」当失败判据。</b>' +
-          '有随机填充时，这两者本来就<b>不应该</b>相等。正确的验证是「用私钥解出预期明文」或者「让服务端接受」。</p>'
+        model: '逐跳走一遍（对照 31.7 的 stage）：<br><br><b>① 容器内进程发包</b>，源 <code>172.17.0.2</code>、目标 <code>8.8.8.8</code>，默认网关是 docker0 的地址 <code>172.17.0.1</code>。<b>② 进入容器的 eth0</b> —— 这块网卡不是硬件，而是 <b>veth pair 的一端</b>。<b>③ 包从宿主侧的 vethXXXX 出现</b> —— veth pair 的行为就是一进一出，像一根虚拟网线穿过两个网络命名空间。<b>④ docker0 网桥收到帧</b>，查转发表决定从哪个口转发。docker0 本质是<b>二层虚拟交换机</b>，同网段容器互 ping 靠它直接转发，<b>不经过 NAT</b>。<b>⑤ 目标不在 172.17.0.0/16 内，交给宿主机 IP 层做路由判断</b>，决定走物理网卡出去。<b>⑥ ★ NAT 就发生在这一跳</b>：在出口上做 <b>SNAT / MASQUERADE</b>，把源地址 <code>172.17.0.2</code> 改写成宿主机的出口 IP，同时在 <b>conntrack（连接跟踪表）</b>里记下这次转换。<b>⑦ 物理网卡 ethX 真正发出</b>，此时包的外观和宿主机自己发的完全一样。<b>⑧ 到达外网；回包回来后内核查 conntrack 把目标地址还原成 172.17.0.2</b>，再从 docker0 沿对应的 veth 送回容器。<br><br><b>为什么 NAT 非做不可：</b><code>172.17.0.2</code> 是私有地址，公网上没有路由，外网的回包根本不知道该送给谁 —— 连接必然失败。NAT 让成百上千个容器可以共用宿主机的<b>一个</b>公网 IP：靠改写源地址获得可达性，靠 conntrack 表在回程还原身份。<b>代价是外网无法主动连进容器</b>（容器 IP 在公网不存在），所以才需要端口映射：<code>-p 8080:8080</code> 会装一条 <b>DNAT</b> 规则，把发往宿主机 8080 的连接目标改写为 <code>172.17.0.2:8080</code> —— <b>出向 SNAT、入向 DNAT，是同一套 NAT 机制的对称使用</b>。<br><br><b>host 模式：整条路径全部消失。</b>容器直接共享宿主机的网络命名空间 —— 没有 veth、没有 docker0、没有 NAT，容器里 <code>ip addr</code> 看到的就是宿主机的网卡。收益是路径最短、性能最好、没有 NAT 开销；代价是<b>端口被独占</b>（宿主已占用 80，容器再听 80 会启动失败）、<b>网络隔离完全消失</b>（容器里改 iptables 会改到宿主机）。<b>none 模式：另一个极端</b>，只给一块 down 的 <code>lo</code>，连宿主都碰不到，适合离线计算或作为「白纸」自己手工配网。<br><br>排障顺序：容器 <code>ip addr</code> → 容器 <code>ip route</code> → 宿主 <code>ip link show master docker0</code> → <code>iptables -t nat -L</code>。四张表依次看，问题基本定位到具体哪一跳。'
       },
       {
-        id: 'c31q5', depth: 3, threshold: 0.7,
-        q: '同事遇到一个现象：<b>两个 App 都用了 RSA-2048，一个他能顺利复现加密结果，另一个怎么试都对不上。</b>' +
-          '请列出<b>至少四条</b>可能导致差异的原因，并给出你的<b>排查顺序</b>与理由。' +
-          '（这是一道综合题，请把你这一章学到的东西串起来用。）',
+        id: 'c17q5', depth: 3, threshold: 0.6,
+        q: '<b>综合题。</b>某云手机平台用容器跑安卓实例（容器内跑 Android 用户态）。风控会检测「当前是否运行在容器中」。请你：<br>① 列出<b>至少四条</b>容器环境特征，并说明每条的<b>内核出处</b>（是哪套机制留下的）；<br>② 如果让你负责伪装，你会怎么处理，<b>难点在哪</b>；<br>③ 顺带说说：为什么这类平台多用<b>容器</b>而不是虚拟机，以及为什么远端的 x86 服务器上要准备 ARM 镜像。',
         concepts: [
-          { label: '方向不同：一个在加密、一个在签名/验签（initSign 与 initVerify 是两种路径）',
-            hint: '同样写 SHA256withRSA，两个 App 可能在干两件不同的事。',
-            any: ['方向', '加密', '签名', '验签', 'initsign', 'initverify', 'cipher', 'signature', '用途不同'] },
-          { label: '填充不同：PKCS#1 v1.5 与 OAEP，或 OAEP 的哈希 / MGF 参数不同',
-            hint: '变换串的第三格写了什么？OAEP 的具体参数呢？',
-            any: ['填充', 'padding', 'pkcs', 'v1.5', 'oaep', 'mgf', 'noPadding', '变换串', 'getinstance'] },
-          { label: '公钥不是同一把：可能有多把公钥、或公钥被分片拼接、或你取错了那一段',
-            hint: '你确定你手里那段常量真的是它在用的那一把吗？',
-            any: ['公钥', '多把', '拼接', '分片', '尾段', '取错', '不是同一把', '换了一把', '公钥不对'] },
-          { label: '输入数据形态不同：原始串的拼接顺序、编码（hex/base64/UTF-8）、时间戳与 nonce 的有无',
-            hint: '你加密的到底是哪几个字节？',
-            any: ['拼串', '拼接', '顺序', '参数排序', '时间戳', 'nonce', '随机数', '盐', '编码', '原始字节', 'utF', '规范化'] },
-          { label: '密钥来源不同：服务端下发 / KeyStore / 协商派生，导致输入里带着你会漏掉的量',
-            hint: '密钥不一定是常量——它可能是每次会话算出来的。',
-            any: ['来源', '下发', 'keystore', '协商', '会话', '派生', '每次不同', '设备信息'] },
-          { label: '排查顺序应按成本从低到高：先核方向与数据形态、再核填充与公钥，最后才怀疑实现被魔改',
-            hint: '你手上有一堆假设，先验哪一个？',
-            any: ['顺序', '成本', '先便宜', '由低到高', '先', '便宜', '最便宜', '最后才', '先怀疑'] }
+          { label: '容器特征的具体项：/.dockerenv、/proc/1/cgroup 的容器 ID、网卡 @if 后缀、172.17 网段、随机主机名等',
+            hint: '从「容器运行时会留下什么痕迹」这个角度穷举：文件、cgroup、网络、主机名、挂载表。',
+            any: ['/.dockerenv', 'dockerenv', '/proc/1/cgroup', 'proc/1/cgroup', 'cgroup 路径', '容器id', '容器 id', 'kubepods', 'lxc', '@if', 'iflink', 'veth', '172.17', '172.18', '网段', '主机名', '随机主机名', '十六进制', 'overlay', '挂载表', 'mountinfo', '/proc/self/cgroup', 'lsns', '命名空间'] },
+          { label: '每条特征的出处：namespace（视图）、cgroup（分组）、veth（网络）、挂载（rootfs）',
+            hint: '不要只说「有痕迹」，要说出这个痕迹是被哪套内核机制产生的。',
+            any: ['namespace', '命名空间', 'cgroup', 'veth', '挂载', 'mount', 'rootfs', '联合文件系统', 'overlayfs', 'union', 'pid 命名空间', 'net 命名空间', 'uts', '来源'] },
+          { label: '伪装的难点：特征是「组合打分」而非单点，且反检测行为本身可疑；要像真的而不是像空的',
+            hint: '删掉 /.dockerenv 就安全了吗？一个「过于干净」的环境会不会更可疑？',
+            any: ['组合', '多条', '打分', '综合判断', '不止一条', '连锁', '改不干净', '难以完全', '反检测', '过于干净', '太干净', '不自然', '像真的', '一致性', '自洽', '内核层面', '改不了', '宿主内核', '无法伪造'] },
+          { label: '选容器的理由：开销小、密度高、启动快、共享内核',
+            hint: '对比虚拟机的启动开销和内存占用。',
+            any: ['开销小', '开销低', '密度', '密度高', '启动快', '轻量', '共享内核', '省内存', '成本', '资源占用低', '毫秒', '多实例', '一台机器跑很多'] },
+          { label: '跨架构理由：服务器多 x86_64，安卓生态以 ARM 为主，需 binfmt + QEMU 或对应架构镜像',
+            hint: '服务器和安卓各自的架构是什么？靠什么弥合这个错位？',
+            any: ['x86', 'x86_64', 'arm', 'arm64', '架构', 'binfmt', 'binfmt_misc', 'qemu', 'qemu-aarch64-static', '跨架构', '交叉', '指令翻译', '模拟', '生态', '错位', '服务器是 x86'] }
         ],
         hints: [
-          '把「复现一个 RSA 结果」需要的要素列一张清单：方向的判断、公钥、输入字节、填充方案与参数。逐个对照两个 App。',
-          '第二问的关键词是「成本」：哪些假设验证起来只要几分钟，哪些要几天？'
+          '第一部分请分头找：<b>文件系统</b>上有什么？<b>cgroup</b> 里有什么？<b>网络</b>上有什么？<b>主机名和挂载表</b>呢？每找到一条，都追问「这是哪套内核机制造成的」。',
+          '第二部分想一个反问：如果我把特征一条条删干净，风控会因此认为我是真机吗？一个「什么都不像」的环境，本身是不是一种异常？',
+          '第三部分回忆 31.3 的分层图：容器省掉的是哪一整层？再看看本章开头那句话 —— 服务器是什么架构，安卓生态是什么架构？'
         ],
         probes: [
-          '如果两个 App 的公钥看起来一模一样、填充也一样，但结果仍然不同，你的下一个怀疑点是什么？',
-          '为什么「实现被魔改」应该排在最后怀疑，而不是最先？'
+          '你说「删掉 /.dockerenv」，那 <code>/proc/1/cgroup</code> 里的容器 ID 呢？这条改得掉吗？为什么？',
+          '如果这个平台换成全部用虚拟机跑安卓，单机能开的实例数是变多还是变少？用户能感知到什么差异？',
+          '跨架构方案在什么情况下会失效？为什么它不能代替真机做兼容性验证？'
         ],
-        model: '<b>「复现 RSA 结果」需要的要素只有四样：方向、公钥、输入字节、填充。对不上，一定是这四样里至少一样不同。</b><br>' +
-          '<b>原因一：方向不同。</b>两个 App 都出现 <span class="mono">SHA256withRSA</span>，一个在做签名（<span class="mono">initSign</span>），' +
-          '一个在做验签（<span class="mono">initVerify</span>）——它们根本不是在产生同一个东西。<br>' +
-          '<b>原因二：填充不同。</b><span class="mono">RSA/ECB/PKCS1Padding</span> 与 ' +
-          '<span class="mono">RSA/ECB/OAEPWithSHA-1AndMGF1Padding</span> 会给出完全不同的结果；' +
-          '甚至同样是 OAEP，哈希与 MGF 的取值不同结果也不同。<br>' +
-          '<b>原因三：公钥不是同一把。</b>现场很常见的情况是：so 里硬编码了公钥的前 3/4，尾段由 Java 层传进来（第 9 章那个案例就是这样）；' +
-          '或者包里有多把公钥，你取错了那一段。<br>' +
-          '<b>原因四：输入数据形态不同。</b>这是最高频的原因：你加密的是 body 本身，' +
-          '而它加密的是「时间戳 + nonce + body」的拼接；或者你用了 UTF-8，而它先把 body 转成十六进制字符串再加密。' +
-          '<b>字节不一样，密文一定不一样。</b><br>' +
-          '<b>原因五：密钥来源不同。</b>一个用硬编码公钥，另一个用服务端下发的或协商出来的密钥——' +
-          '那它的输入里就带着一个你完全没考虑过的量。<br>' +
-          '<b>排查顺序（这是本题的重点）：按「验证成本」从低到高。</b><br>' +
-          '<b>① 先核方向</b>——看调用点的类名与方法名（<span class="mono">Cipher</span> 还是 <span class="mono">Signature</span>，' +
-          '<span class="mono">initSign</span> 还是 <span class="mono">initVerify</span>）。零成本，不看代码都能看出来。<br>' +
-          '<b>② 再核数据形态</b>——把两次的输入字节都 dump 出来，逐字节比对，而不是「我觉得应该是这段」。' +
-          '这一步的收益极高，因为它能直接暴露「少拼了一个字段」这类问题。<br>' +
-          '<b>③ 然后核填充</b>——把完整的变换串字符串打出来（不要凭文档猜），必要时确认 OAEP 的具体参数。<br>' +
-          '<b>④ 再核公钥</b>——用两次的公钥分别做一次验签或解密，确认你手里那把是真的、而且是同一把。<br>' +
-          '<b>⑤ 最后才怀疑实现被魔改。</b>理由很实际：<b>RSA 的魔改难度高、收益低</b>——' +
-          '大数运算写错一点点整个算法就不自洽，作者真要动手，更省事的做法是换算法而不是改 RSA。' +
-          '而前四条假设的验证成本都是分钟级。<br>' +
-          '<span class="hit">这道题的通用结论比答案本身重要：<b>当两个同类实现给出不同结果时，先把「所有输入要素」列成清单逐项对照，' +
-          '而不是跳到你最感兴趣的那个假设上去。</b>逆向里绝大多数「对不上」，最后都落在某个被你漏掉的输入上。</span>',
-        after: '<p>补一条自查工具：把「方向 / 输入字节 / 填充串 / 公钥指纹」四样做成一张对照表，两列分别是两个 App。' +
-          '填完之后，差异通常自己就跳出来了。</p>'
-      },
-      {
-        id: 'c31q6', depth: 3, threshold: 0.7,
-        q: '最后一个综合题：你要从零复现某个 App 的请求签名 <span class="mono">sign</span> 参数。' +
-          '请用本章的地图规划一条完整路线：<b>从「什么都不知道」开始，到「能稳定复现」结束</b>。' +
-          '要求说清每一步<b>为什么放在那个位置</b>，以及最后你打算<b>怎么验证</b>自己的复现是对的。',
-        concepts: [
-          { label: '第一步先分类：用长度、字符集、熵判断它属于六类里的哪一类（先排除编码与摘要）',
-            hint: '在不知道任何代码的情况下，你手上只有那串字符。',
-            any: ['分类', '六类', '地图', '长度', '字节数', '字符集', '熵', '先判断是哪类', '排除编码'] },
-          { label: '第二步剥编码：Base64 / Hex 解一次，拿到真正的原始字节再重量长度',
-            hint: '在编码后的形态上做判断会错在哪？',
-            any: ['base64', 'hex', '解码', '还原', '原始字节', '剥掉编码', '解一次'] },
-          { label: '第三步定位调用点：MessageDigest / Mac / Signature / Cipher，用 Hook 或自吐沙箱把调用栈与参数打出来',
-            hint: '你需要知道「是谁在算这个值」，怎么知道？',
-            any: ['调用点', 'hook', 'frida', '插桩', '自吐沙箱', '调用栈', '堆栈', '定位', '第 24 章'] },
-          { label: '第四步还原待签名的原始串：参数顺序、拼接方式、编码、大小写、时间戳与 nonce',
-            hint: '签名签的是「规范化后的字节」，这一步往往比算法更难。',
-            any: ['原始串', '拼串', '拼接', '顺序', '排序', '规范化', '时间戳', 'nonce', '编码', '大小写', '盐'] },
-          { label: '如果涉及非对称，按「读结构 → 判方向 → 对填充 → 查来源」处理；公钥要真的提取并核对',
-            hint: '本章讲的那条路线在这里怎么接上？',
-            any: ['公钥', '方向', '填充', '结构', 'der', 'spki', '来源', '读结构', '判方向'] },
-          { label: '密钥来源决定观测点：硬编码走静态搜索，派生/协商/下发走进程内观测，KeyStore 只能观测使用点',
-            hint: '「密钥从哪来」为什么会影响你去哪里看？',
-            any: ['来源', '硬编码', '派生', '协商', '下发', 'keystore', '观测点', '进程内', '第 31.14'] },
-          { label: '验证方式必须能证伪：不能比密文（有随机填充时本来就不等），要能解出预期明文或让服务端接受',
-            hint: '怎么证明你算对了，而不是「看起来像」？',
-            any: ['验证', '证伪', '服务端', '解密', '复算', '比对明文', '不能比密文', '实测'] }
-        ],
-        hints: [
-          '把这一章的小节顺序当成路线图：31.2 分类 → 31.3 / 31.9 定位 → 31.7 方向 → 31.8 填充 → 31.14 来源。',
-          '最后一问回到第 31.8 那个实验：为什么「密文比对」不是一个合法的验证方法？'
-        ],
-        probes: [
-          '如果这个 sign 其实是 HMAC，你的路线会在哪一步发生分叉？',
-          '如果一路查下去发现待签名的原始串里有一个你无法解释的字段，你怎么办？'
-        ],
-        model: '<b>一条完整路线，按成本从低到高排列——这也是本章贯穿始终的顺序原则。</b><br>' +
-          '<b>第 0 步：先不要动工具。</b>把 <span class="mono">sign</span> 的值复制出来，<b>量长度、数字符集、算熵</b>。' +
-          '这一步决定后面所有方向。长度 32 个十六进制字符 → 16 字节 → 优先怀疑摘要或 MAC；' +
-          '256 字节 → 非对称；只有 64 个可打印字符 → 先当编码处理。<br>' +
-          '<b>第 1 步：剥编码。</b>如果是 Base64 / Hex，先解一次，<b>在原始字节上重新量长度</b>。' +
-          '在编码后的形态上判断类别，是现场最常见的系统性错误。<br>' +
-          '<b>第 2 步：定位调用点。</b>这一步必须动工具，但目标很窄：' +
-          '<b>不是「把整个加密流程追出来」，而是「找到产生这个值的那一行」</b>。' +
-          '按类别缩小候选：摘要挂 <span class="mono">MessageDigest.digest</span>，MAC 挂 <span class="mono">Mac.doFinal</span>，' +
-          '非对称挂 <span class="mono">Signature.sign</span> / <span class="mono">initSign</span>。' +
-          '如果目标有加固或反调试，就换成第 24 章那种在 AOSP 层插桩的沙箱——<b>它的优势是不依赖宿主的反调试对抗</b>。<br>' +
-          '<b>第 3 步：还原输入串。</b>这是整条路线里最容易被低估的一步。' +
-          '签名签的从来不是「你以为的那段文本」，而是<b>规范化之后的字节</b>：参数可能按字典序排过、' +
-          '可能有时间戳和 nonce 拼在开头、可能大小写被统一过、可能 body 先转成了十六进制字符串。' +
-          '<span class="hit">在算法层面找半天找不到的差异，往往就在这一步。</span><br>' +
-          '<b>第 4 步：如果是非对称，按 31.9～31.12 的顺序处理。</b>' +
-          '读结构（是不是 DER/SPKI）→ 判方向（<span class="mono">initSign</span> 还是 <span class="mono">initVerify</span>）' +
-          '→ 对填充（变换串的第三格）→ 查来源（这把公钥从哪来、是不是分片拼接的）。' +
-          '特别注意最后一条：如果公钥是分片拼出来的，那你必须把每一片都拿全，否则提取出来的 n 是错的。<br>' +
-          '<b>第 5 步：确认密钥来源，据此决定观测点。</b>这是本章 31.14 那张表的直接应用：' +
-          '硬编码 → 静态搜索 + 结构识别；派生 → 找派生的输入；协商 / 下发 → 必须在进程内观测那一刻；' +
-          'KeyStore → 只能观测使用点。<b>来源判断错了，你会在一个密钥根本不存在的地方一直找。</b><br>' +
-          '<b>第 6 步：验证——而且验证方法本身要合法。</b>这一步最容易被做错。' +
-          '如果涉及带随机填充的 RSA，<b>「我的密文 ≠ 抓包的密文」不是一个失败判据</b>，因为两者本来就不该相等。' +
-          '可用的验证方式：<br>' +
-          '① <b>解出预期明文</b>（你手里有私钥时）；<br>' +
-          '② <b>让服务端接受</b>（最硬的验证：发一个你算出来的签名，看它返回成功还是签名错误）；<br>' +
-          '③ <b>对同一份输入做端到端复算</b>，逐字节比对中间量（输入串、摘要、填充块、模幂结果），' +
-          '这样即使最终值不等，你也能定位到是哪一步开始分叉的。<br>' +
-          '<b>把整条路线压成一句话：先用最便宜的方式分类，再用最窄的方式定位，然后花大力气还原输入串，' +
-          '最后用能证伪的方式验证。</b>本章所有的小节，都是这句话的某个环节的展开。',
-        after: '<p>如果这条路线走完还是复现不出来，请回到 31.14 那张表问一句：<b>「我是不是在一个密钥根本不存在的地方找密钥？」</b>' +
-          '这一问，通常比再翻一遍汇编有用。</p>'
+        model: '<b>① 容器特征的清单与出处（这是本章最实用的一张表）。</b><br>'
+          + '· <code>/.dockerenv</code> —— 文件系统标记，由 Docker 运行时在容器根目录创建（<b>有则可疑，无则不证明不是</b>：可以删，别的运行时也不建）。<br>'
+          + '· <code>cat /proc/1/cgroup</code> 出现 <code>/docker/&lt;64位ID&gt;</code>、<code>/kubepods/...</code>、<code>/lxc/...</code> —— <b>出自 cgroup 分组</b>：容器主进程被放进了运行时创建的 cgroup 层级里，路径本身就是证据。<br>'
+          + '· 网卡名形如 <code>eth0@if123</code>，或宿主上出现一堆 <code>vethXXXX</code> —— <b>出自网络命名空间 + veth pair</b>：那个 <code>@ifN</code> 后缀就是对端接口索引，等于自白「我是虚拟网卡对的一端」。<br>'
+          + '· IP 落在 <code>172.17.0.0/16</code> / <code>172.18.0.0/16</code>，网关是 <code>x.x.0.1</code> —— <b>出自 docker0 网桥的默认网段分配</b>。<br>'
+          + '· 主机名是一串随机十六进制 —— <b>出自 UTS 命名空间</b>：运行时在新建的 UTS 里随机设置了主机名。<br>'
+          + '· 挂载表（<code>/proc/self/mountinfo</code>）里出现大量 <code>overlay</code> / <code>tmpfs</code> 组合、缺少真机常见的分区挂载 —— <b>出自挂载命名空间 + 联合文件系统</b>。<br>'
+          + '· <code>/proc/self/ns/*</code> 的 inode 号与 init 不同、<code>lsns</code> 里进程数极少 —— <b>命名空间本身</b>的直接暴露。<br><br>'
+          + '<b>② 伪装该怎么做、难在哪。</b>做法：逐条对应地处理 —— 删 <code>/.dockerenv</code>、改 /proc 视图或 mask 掉 cgroup 路径、把网卡改名去特征并换网段、把主机名设成像真机的形式（如 <code>Pixel-7</code>）、补齐真实设备应有的挂载与文件。<b>难点有三层：</b>第一层，<b>单条不可靠、组合才致命</b> —— 风控是打分而非一票否决，你漏掉任何一条都可能被组合规则命中；第二层，<b>反检测行为本身就是特征</b> —— 环境「过于干净」（cgroup 只剩一条、挂载表空白、什么痕迹都没有）比留着痕迹更可疑，<b>伪装的目标是「像真的」，不是「像空的」</b>；第三层，也是最硬的：<b>有些特征在内核层面，用户态改不动</b> —— 你改不掉「内核是宿主的」，也改不掉真实的命名空间拓扑，只能尽量把可观测面做成自洽的。所以真正成熟的方案通常不是「删特征」，而是<b>让整套环境特征互相自洽</b>，包括 IP 归属、设备型号、传感器数据、网络时延等一整套。<span class="pill warn">具体平台的检测项与权重差异很大，需按目标逐个验证，待核实</span><br><br>'
+          + '<b>③ 为什么用容器而不是虚拟机。</b>对照 31.3 的分层图：容器<b>省掉了整个 Guest OS</b> —— 不用为每个实例引导内核、不用预留大块内存、不用复制一份 OS 镜像。结果是启动毫秒级、单机密度从「十几个」提升到「几十上百个」，<b>每用户成本直接下降一个量级</b>。代价是隔离更弱（内核漏洞共享风险），所以这类平台通常还会叠加额外的加固措施，并且不适合承载高安全等级的业务。<br><br>'
+          + '<b>为什么 x86 服务器上要准备 ARM 镜像。</b>因为存在架构错位：<b>服务器几乎全是 x86_64，而安卓应用生态以 ARM 为主</b>。弥合方式就是 31.10 那条链路 —— 内核的 <b>binfmt_misc</b> 识别 ARM64 的 ELF 并交给 <b>QEMU user-mode</b> 解释器执行，透明翻译指令、把系统调用转发给宿主内核。<b>注意最容易踩的坑：chroot 之后解释器路径在 rootfs 内解析，所以 <code>qemu-aarch64-static</code> 必须复制进 rootfs</b>，否则 <code>Exec format error</code>。它失效的场景包括大量 <code>ioctl</code>、自修改代码（JIT）、依赖特定 CPU 特性的代码 —— 这也是<b>为什么它不能代替真机</b>：安卓上的 ART 大量使用 JIT 与原生库，跨架构翻译下的行为与真机存在差异，兼容性和反调试行为的验证最终仍要回到真机或对应的模拟器方案（第 30 章）。'
       }
     ]
   }

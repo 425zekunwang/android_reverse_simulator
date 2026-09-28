@@ -75,10 +75,10 @@ for (const meta of COURSE.chapters) {
   delete sb.CHAPTER;
 }
 
-/* 第 1 章是早期内联格式，案例无法从数据文件抽取。
+/* 第 15 章（原第 1 章）是早期内联格式，案例无法从数据文件抽取。
    这里按同样口径手工登记一条，并标注来源，避免索引页漏掉它。 */
 entries.push({
-  no: 1, file: 'ch01-frida.html', h: '1.5C',
+  no: 15, file: 'ch15-frida.html', h: '15.5C',
   sectionTitle: '实战案例：一个银行 App 的三层 Hook 递进',
   c: {
     source: 'kanxue',
@@ -212,6 +212,6 @@ if (CHECK_ONLY) {
   fs.writeFileSync(target, html);
   console.log(`✅ 已生成 cases.html：${total} 条案例，覆盖 ${chaptersCovered} 章，最新 ${latest}`);
   const manual = entries.filter(e => e.manual).length;
-  if (manual) console.log(`   其中 ${manual} 条为手工登记（第 1 章为早期内联格式，无法自动抽取）`);
+  if (manual) console.log(`   其中 ${manual} 条为手工登记（第 15 章为早期内联格式，无法自动抽取）`);
   Object.keys(bySource).forEach(k => console.log(`   ${SOURCES[k].label}: ${bySource[k].length} 条`));
 }

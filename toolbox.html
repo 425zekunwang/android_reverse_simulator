@@ -40,32 +40,32 @@
       <dt>Frida</dt>
       <dd>跨平台动态代码插桩框架。把 JS 引擎注入目标进程，用 JS 写 Hook 逻辑。
       <br><span class="pill ok">已核实</span> <a href="https://frida.re" target="_blank" rel="noopener">frida.re</a>
-      <br><span class="muted small">对应章节：第 1、2、10 章</span></dd>
+      <br><span class="muted small">对应章节：第 15、16、24 章</span></dd>
     </div>
     <div class="g-item">
       <dt>frida-gum</dt>
       <dd>Frida 的底层 C 库，提供 Interceptor（inline hook）、Stalker（代码追踪）、
       MemoryAccessMonitor、代码生成与重定位等核心能力。想理解 Frida 原理必读。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/frida/frida-gum" target="_blank" rel="noopener">github.com/frida/frida-gum</a>
-      <br><span class="muted small">对应章节：第 1 章（Stalker 原理）</span></dd>
+      <br><span class="muted small">对应章节：第 15 章（Stalker 原理）</span></dd>
     </div>
     <div class="g-item">
       <dt>frida-ios-dump</dt>
       <dd>iOS 砸壳工具，基于 Frida 从内存 dump 已解密的 Mach-O 并重建二进制。
       <br><span class="pill warn">待核实</span> <span class="muted small">仓库地址请搜索确认</span>
-      <br><span class="muted small">对应章节：第 14 章</span></dd>
+      <br><span class="muted small">对应章节：第 28 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Dobby</dt>
       <dd>轻量级多平台 inline hook 框架，被 unidbg 用作 hook 后端。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/jmpews/Dobby" target="_blank" rel="noopener">github.com/jmpews/Dobby</a>
-      <br><span class="muted small">对应章节：第 7 章</span></dd>
+      <br><span class="muted small">对应章节：第 21 章</span></dd>
     </div>
     <div class="g-item">
       <dt>xHook</dt>
       <dd>爱奇艺开源的 Android PLT/GOT Hook 框架，用于 hook 导入函数（如 strcmp）。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/iqiyi/xHook" target="_blank" rel="noopener">github.com/iqiyi/xHook</a>
-      <br><span class="muted small">对应章节：第 1、7 章</span></dd>
+      <br><span class="muted small">对应章节：第 15、21 章</span></dd>
     </div>
   </div>
 
@@ -78,19 +78,19 @@
       <dt>Unicorn</dt>
       <dd>基于 QEMU 的 CPU 模拟器框架。只模拟 CPU，不模拟系统，所以轻量、可嵌入。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/unicorn-engine/unicorn" target="_blank" rel="noopener">github.com/unicorn-engine/unicorn</a>
-      <br><span class="muted small">对应章节：第 7 章</span></dd>
+      <br><span class="muted small">对应章节：第 21 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Capstone</dt>
       <dd>反汇编框架。把机器码翻译成汇编文本，支持 ARM/ARM64/x86 等多架构。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/capstone-engine/capstone" target="_blank" rel="noopener">github.com/capstone-engine/capstone</a>
-      <br><span class="muted small">对应章节：第 7 章</span></dd>
+      <br><span class="muted small">对应章节：第 21 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Keystone</dt>
       <dd>汇编框架。把汇编文本翻译成机器码，与 Capstone 互为逆运算。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/keystone-engine/keystone" target="_blank" rel="noopener">github.com/keystone-engine/keystone</a>
-      <br><span class="muted small">对应章节：第 7 章</span></dd>
+      <br><span class="muted small">对应章节：第 21 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(55,214,122,.45)">
       <dt>unidbg ★</dt>
@@ -100,7 +100,7 @@
       并支持 dynarmic / Apple M1 hypervisor / Linux KVM 多种加速后端。
       近期还加入了 <b>MCP 支持</b>，可让 AI 辅助调试。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/zhkl0228/unidbg" target="_blank" rel="noopener">github.com/zhkl0228/unidbg</a>
-      <br><span class="muted small">对应章节：第 7、8、9 章</span></dd>
+      <br><span class="muted small">对应章节：第 21、22、23 章</span></dd>
     </div>
     <div class="g-item">
       <dt>AndroidNativeEmu</dt>
@@ -109,7 +109,7 @@
       通过符号表 hook，<b>JavaVM / JNIEnv / hooked 函数全部由 Python 处理</b>。
       比 unidbg 轻量，适合快速验证想法。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/AeonLucid/AndroidNativeEmu" target="_blank" rel="noopener">github.com/AeonLucid/AndroidNativeEmu</a>
-      <br><span class="muted small">对应章节：第 7 章</span></dd>
+      <br><span class="muted small">对应章节：第 21 章</span></dd>
     </div>
   </div>
 
@@ -126,27 +126,27 @@
       完成时 logcat 中 tag 为 <code>ActivityThread</code> 的日志会打印 <code>fart run over</code>。
       作者同时提供了 <b>Frida 版 FART</b>，可精确到对某个类甚至某个函数的 CodeItem dump。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/hanbinglengyue/FART" target="_blank" rel="noopener">github.com/hanbinglengyue/FART</a>
-      <br><span class="muted small">对应章节：第 2、10、12 章</span></dd>
+      <br><span class="muted small">对应章节：第 16、24、26 章</span></dd>
     </div>
     <div class="g-item">
       <dt>fdex2</dt>
       <dd>另一条经典脱壳路线，通过 Hook <code>DexFile</code> 相关方法在内存中 dump dex。
       高版本 Android 需要适配（ART 内部结构变化）。
       <br><span class="pill warn">待核实</span> <span class="muted small">仓库地址请搜索确认</span>
-      <br><span class="muted small">对应章节：第 10 章</span></dd>
+      <br><span class="muted small">对应章节：第 24 章</span></dd>
     </div>
     <div class="g-item">
       <dt>jadx</dt>
       <dd>Dex 转 Java 反编译器。FART 脱出的 dex 常因结构损坏被拒绝，需要定制版放宽校验。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/skylot/jadx" target="_blank" rel="noopener">github.com/skylot/jadx</a>
-      <br><span class="muted small">对应章节：第 10 章</span></dd>
+      <br><span class="muted small">对应章节：第 24 章</span></dd>
     </div>
     <div class="g-item">
       <dt>AOSP</dt>
-      <dd>Android Open Source Project。第 4 章要定制 ART、第 12 章要移植 FART、第 16 章要编译模拟器，
+      <dd>Android Open Source Project。第 18 章要定制 ART、第 26 章要移植 FART、第 30 章要编译模拟器，
       都从这里拿源码。
       <br><span class="pill ok">已核实</span> <a href="https://source.android.com" target="_blank" rel="noopener">source.android.com</a>
-      <br><span class="muted small">对应章节：第 4、12、16 章</span></dd>
+      <br><span class="muted small">对应章节：第 18、26、30 章</span></dd>
     </div>
   </div>
 
@@ -157,45 +157,45 @@
   <div class="glossary">
     <div class="g-item" style="border-color:rgba(55,214,122,.45)">
       <dt>Obfuscator-LLVM (OLLVM) ★</dt>
-      <dd><b>本课程第 5 章的主角。</b>基于 LLVM 的开源代码混淆器，通过自定义 Pass 在编译期改写 IR。
+      <dd><b>本课程第 19 章的主角。</b>基于 LLVM 的开源代码混淆器，通过自定义 Pass 在编译期改写 IR。
       官方 wiki 明确的三个混淆选项：<code>-mllvm -sub</code>（指令替换）、
       <code>-mllvm -bcf</code>（虚假控制流）、<code>-mllvm -fla</code>（控制流平坦化），
       另有函数注解功能控制混淆范围。最新版本基于 <b>LLVM 4.0</b>。
       <br><span class="pill warn">注意</span> <span class="small">字符串加密<b>不是</b> OLLVM 官方特性，是衍生版本添加的</span>
       <br><span class="pill ok">已核实</span> <a href="https://github.com/obfuscator-llvm/obfuscator" target="_blank" rel="noopener">github.com/obfuscator-llvm/obfuscator</a>
-      <br><span class="muted small">对应章节：第 5、8、9 章</span></dd>
+      <br><span class="muted small">对应章节：第 19、22、23 章</span></dd>
     </div>
     <div class="g-item">
       <dt>LLVM</dt>
       <dd>模块化编译器框架。理解 Pass 机制（ModulePass / FunctionPass / BasicBlockPass / LoopPass）
       是读懂 OLLVM 源码的前提。
       <br><span class="pill ok">已核实</span> <a href="https://llvm.org" target="_blank" rel="noopener">llvm.org</a>
-      <br><span class="muted small">对应章节：第 5 章</span></dd>
+      <br><span class="muted small">对应章节：第 19 章</span></dd>
     </div>
     <div class="g-item">
       <dt>D-810</dt>
       <dd>IDA Pro 插件，用于反混淆 OLLVM 保护的代码（识别分发器、追踪状态变量）。
       <br><span class="pill warn">待核实</span> <span class="muted small">作者 GuideM，仓库路径可能已变更</span>
-      <br><span class="muted small">对应章节：第 5 章</span></dd>
+      <br><span class="muted small">对应章节：第 19 章</span></dd>
     </div>
     <div class="g-item">
       <dt>HexRaysDeob</dt>
       <dd>IDA Hex-Rays 反编译器插件，用来自动化还原 OLLVM 混淆。
       <br><span class="pill warn">待核实</span> <span class="muted small">仓库地址请搜索确认</span>
-      <br><span class="muted small">对应章节：第 5 章</span></dd>
+      <br><span class="muted small">对应章节：第 19 章</span></dd>
     </div>
     <div class="g-item">
       <dt>ADVMP</dt>
       <dd>开源 VMP（虚拟机保护）实现。课程用它作为"从开源实现理解 VMP 内部机制"的抓手。
       <br><span class="pill warn">待核实</span> <span class="muted small">仓库地址请搜索确认</span>
-      <br><span class="muted small">对应章节：第 6 章</span></dd>
+      <br><span class="muted small">对应章节：第 20 章</span></dd>
     </div>
     <div class="g-item">
       <dt>OpenSSL</dt>
-      <dd>第 9 章要手动编译它（<code>./Configure android-arm64</code>）得到带调试符号的密码学库，
+      <dd>第 23 章要手动编译它（<code>./Configure android-arm64</code>）得到带调试符号的密码学库，
       用它编译对照 so，与目标 so 做指令特征比对。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/openssl/openssl" target="_blank" rel="noopener">github.com/openssl/openssl</a>
-      <br><span class="muted small">对应章节：第 9 章</span></dd>
+      <br><span class="muted small">对应章节：第 23 章</span></dd>
     </div>
   </div>
 
@@ -211,7 +211,7 @@
       运行在内核态，比用户态 Frida 更难被检测。
       <br><span class="pill ok">已核实</span> <a href="https://ebpf.io" target="_blank" rel="noopener">ebpf.io</a>
       <br><span class="pill warn">安卓限制</span> <span class="small">受内核版本与厂商裁剪限制，通常需 root</span>
-      <br><span class="muted small">对应章节：第 11 章</span></dd>
+      <br><span class="muted small">对应章节：第 25 章</span></dd>
     </div>
     <div class="g-item">
       <dt>BCC / bpftrace / libbpf</dt>
@@ -220,7 +220,7 @@
       <br><span class="pill ok">已核实</span> <a href="https://github.com/iovisor/bcc" target="_blank" rel="noopener">github.com/iovisor/bcc</a> ·
       <a href="https://github.com/bpftrace/bpftrace" target="_blank" rel="noopener">bpftrace</a> ·
       <a href="https://github.com/libbpf/libbpf" target="_blank" rel="noopener">libbpf</a>
-      <br><span class="muted small">对应章节：第 11 章</span></dd>
+      <br><span class="muted small">对应章节：第 25 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Hyperpwn</dt>
@@ -228,13 +228,13 @@
       从 EL2 层做内存断点与指令追踪。<b>因为用 stage-2 页表做访问控制而不修改 guest 内存，
       反调试手段完全无法察觉</b>——这是当前调试对抗的天花板。
       <br><span class="pill warn">待核实</span> <span class="muted small">仓库地址请搜索确认</span>
-      <br><span class="muted small">对应章节：第 6、13 章</span></dd>
+      <br><span class="muted small">对应章节：第 20、27 章</span></dd>
     </div>
     <div class="g-item">
       <dt>0r0env</dt>
       <dd>课程作者提供的整套定制调试环境（定制 ROM / 内核），把内核级对抗能力打包成开箱即用。
       <br><span class="pill warn">待核实</span> <span class="muted small">以作者发布为准</span>
-      <br><span class="muted small">对应章节：第 13 章</span></dd>
+      <br><span class="muted small">对应章节：第 27 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Magisk</dt>
@@ -242,7 +242,7 @@
       通过 overlayfs / magic mount 实现 <b>systemless</b>（不改系统分区）的模块挂载，
       可以随时干净卸载。Zygisk 提供 Zygote 注入，DenyList 用于隐藏 root。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/topjohnwu/Magisk" target="_blank" rel="noopener">github.com/topjohnwu/Magisk</a>
-      <br><span class="muted small">对应章节：第 18 章</span></dd>
+      <br><span class="muted small">对应章节：第 32 章</span></dd>
     </div>
   </div>
 
@@ -256,7 +256,7 @@
       <dd>通用开源模拟器与虚拟机。课程用它讲虚拟化原理、网络模式（NAT/bridge/host-only）、
       以及编译调试 Linux 内核。
       <br><span class="pill ok">已核实</span> <a href="https://www.qemu.org" target="_blank" rel="noopener">qemu.org</a>
-      <br><span class="muted small">对应章节：第 15 章</span></dd>
+      <br><span class="muted small">对应章节：第 29 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(55,214,122,.45)">
       <dt>Waydroid ★</dt>
@@ -266,7 +266,7 @@
       <b>容器内的 Android 可直接访问所需硬件</b>——这是与模拟器的关键区别，性能接近原生。
       系统镜像基于 LineageOS，当前基于 Android 13。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/waydroid/waydroid" target="_blank" rel="noopener">github.com/waydroid/waydroid</a>
-      <br><span class="muted small">对应章节：第 18 章</span></dd>
+      <br><span class="muted small">对应章节：第 32 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(55,214,122,.45)">
       <dt>Cuttlefish ★</dt>
@@ -274,7 +274,7 @@
       而非物理硬件。它是理解现代云手机/云测设备的关键——很多云手机方案本质就是它或其变体。
       依赖 KVM，通过 Debian 包（cuttlefish-base / -user / -orchestration）安装。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/google/android-cuttlefish" target="_blank" rel="noopener">github.com/google/android-cuttlefish</a>
-      <br><span class="muted small">对应章节：第 16、18 章</span></dd>
+      <br><span class="muted small">对应章节：第 30、32 章</span></dd>
     </div>
     <div class="g-item">
       <dt>KVM</dt>
@@ -282,28 +282,28 @@
       （<code>KVM_CREATE_VM</code> / <code>KVM_CREATE_VCPU</code> / <code>KVM_RUN</code>）暴露给用户态。
       是 QEMU、Cuttlefish、crosvm 等共同依赖的底座。
       <br><span class="pill ok">已核实</span> <a href="https://www.linux-kvm.org" target="_blank" rel="noopener">linux-kvm.org</a>
-      <br><span class="muted small">对应章节：第 18 章</span></dd>
+      <br><span class="muted small">对应章节：第 32 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Docker</dt>
       <dd>容器化的事实标准。课程通过"手写一个迷你 Docker"来证明它不过是
       <b>namespaces + cgroup + rootfs + capabilities</b> 的封装，不是黑魔法。
       <br><span class="pill ok">已核实</span> <a href="https://www.docker.com" target="_blank" rel="noopener">docker.com</a>
-      <br><span class="muted small">对应章节：第 17 章</span></dd>
+      <br><span class="muted small">对应章节：第 31 章</span></dd>
     </div>
     <div class="g-item">
       <dt>debootstrap</dt>
       <dd>Debian/Ubuntu 的引导工具，可在指定目录构建最小根文件系统。
       课程用它手工构建 Docker 三种网络模式的实验环境。
       <br><span class="pill ok">已核实</span> <a href="https://wiki.debian.org/Debootstrap" target="_blank" rel="noopener">wiki.debian.org/Debootstrap</a>
-      <br><span class="muted small">对应章节：第 17 章</span></dd>
+      <br><span class="muted small">对应章节：第 31 章</span></dd>
     </div>
     <div class="g-item">
       <dt>remote_android</dt>
       <dd>课程作者的云端安卓项目——把前 17 章的技术（容器化、虚拟化、图形加速、反检测）
       整合落地成可远程访问的安卓运行环境。
       <br><span class="pill warn">待核实</span> <span class="muted small">以作者发布为准</span>
-      <br><span class="muted small">对应章节：第 18 章</span></dd>
+      <br><span class="muted small">对应章节：第 32 章</span></dd>
     </div>
   </div>
 
@@ -320,7 +320,7 @@
       内存 dump 与 patch、堆对象探查等。安装就是 <code>pip3 install objection</code>。
       <br><b>要记住的取舍：</b>它底层就是 Frida，所以<b>它的特征暴露面也是 Frida 的</b>——用它可以省掉写脚本，但省不掉去特征。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/sensepost/objection" target="_blank" rel="noopener">github.com/sensepost/objection</a>
-      <br><span class="muted small">对应章节：第 21 章（Frida 自动化与去特征）</span></dd>
+      <br><span class="muted small">对应章节：第 10 章（Frida 自动化与去特征）</span></dd>
     </div>
     <div class="g-item">
       <dt>r0capture</dt>
@@ -331,7 +331,7 @@
       <br><b>README 明确写了两条前提：</b>① 仅限安卓，<b>禁止使用模拟器</b>；② 推荐按 Frida 版本与安卓版本搭配（README 给了对应表）。
       <br><span class="muted small">上面是项目自述口径，不是本页的实测结论——<b>它失效的情况一定存在</b>（例如不走标准 TLS 栈的 native 直连）。</span>
       <br><span class="pill ok">已核实</span> <a href="https://github.com/r0ysue/r0capture" target="_blank" rel="noopener">github.com/r0ysue/r0capture</a>
-      <br><span class="muted small">对应章节：第 21、23 章</span></dd>
+      <br><span class="muted small">对应章节：第 10、12 章</span></dd>
     </div>
     <div class="g-item">
       <dt>r0tracer</dt>
@@ -340,7 +340,7 @@
       以及<b>针对加壳应用找不到类时切换 ClassLoader</b>。README 也提到 <code>hookALL()</code> 模式
       「小应用可用，大应用扛不住」——这是一个很实在的自我限制说明。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/r0ysue/r0tracer" target="_blank" rel="noopener">github.com/r0ysue/r0tracer</a>
-      <br><span class="muted small">对应章节：第 21、24 章</span></dd>
+      <br><span class="muted small">对应章节：第 10、13 章</span></dd>
     </div>
     <div class="g-item">
       <dt>hluda（去特征 Frida 分支）</dt>
@@ -348,9 +348,9 @@
       默认端口行为、线程特征等），从而绕过针对标准 Frida 的探测。
       <br><b>为什么标「待核实」：</b>它<b>没有唯一的上游官方仓库</b>，社区存在多个来源与版本
       （例如各类“魔改版 frida-server”分发），命名也不统一。<b>不要照抄某个 URL 或版本号</b>——
-      常见做法是自己按第 21 章讲的思路改源码后编译，或确认你所选分支的当前维护状态。
+      常见做法是自己按第 10 章讲的思路改源码后编译，或确认你所选分支的当前维护状态。
       <br><span class="pill warn">待核实</span> <span class="muted small">无单一上游，请自行确认来源与版本</span>
-      <br><span class="muted small">对应章节：第 21 章</span></dd>
+      <br><span class="muted small">对应章节：第 10 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(232,121,249,.45)">
       <dt>LSPosed ★</dt>
@@ -360,7 +360,7 @@
       <br><b>注意作用域（scope）：</b>模块只对你在管理器里勾选的 App 生效——这是它与 Frida「注入哪个进程就影响哪个进程」最大的操作差异。
       <br><span class="pill warn">待核实</span> <span class="muted small">README 给出的支持版本快照会滞后于实际 release，<b>请以仓库当前 release 说明为准</b></span>
       <br><span class="pill ok">已核实</span> <a href="https://github.com/LSPosed/LSPosed" target="_blank" rel="noopener">github.com/LSPosed/LSPosed</a>
-      <br><span class="muted small">对应章节：第 22 章（Xposed / LSPosed 开发指南）</span></dd>
+      <br><span class="muted small">对应章节：第 11 章（Xposed / LSPosed 开发指南）</span></dd>
     </div>
     <div class="g-item">
       <dt>Xposed（原版）</dt>
@@ -368,7 +368,7 @@
       也是 LSPosed 兼容的那套 API 的来源。原版对高版本 Android 的支持早已停止，
       现在学习时应把它当作<b>API 规范与历史参照</b>，实际动手用 LSPosed。
       <br><span class="pill warn">待核实</span> <span class="muted small">原版仓库与兼容性状态请自行确认</span>
-      <br><span class="muted small">对应章节：第 22 章</span></dd>
+      <br><span class="muted small">对应章节：第 11 章</span></dd>
     </div>
     <div class="g-item">
       <dt>mitmproxy</dt>
@@ -376,7 +376,7 @@
       它相对 Charles / Fiddler 的关键差异是<b>可脚本化</b>（Python 插件直接改写请求响应）——
       在遇到混淆型案例、需要按条件批量改写或自动打标时，这一点是决定性的。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/mitmproxy/mitmproxy" target="_blank" rel="noopener">github.com/mitmproxy/mitmproxy</a>
-      <br><span class="muted small">对应章节：第 23 章</span></dd>
+      <br><span class="muted small">对应章节：第 12 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Charles</dt>
@@ -384,7 +384,7 @@
       （含请求、响应与 Header）。图形界面友好、上手快，是很多人第一个抓包工具。
       <br><b>局限：</b>不可脚本化（对比 mitmproxy），复杂对抗场景下不够灵活。
       <br><span class="pill ok">已核实</span> <a href="https://www.charlesproxy.com/" target="_blank" rel="noopener">charlesproxy.com</a>
-      <br><span class="muted small">对应章节：第 23 章</span></dd>
+      <br><span class="muted small">对应章节：第 12 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Reqable</dt>
@@ -394,17 +394,17 @@
       <br><b>为什么值得在这里列出来：</b>它把「抓包 + 改包 + 调接口」放在同一个工具里，
       做协议分析时可以减少在多个工具间来回搬数据。
       <br><span class="pill ok">已核实</span> <a href="https://reqable.com/" target="_blank" rel="noopener">reqable.com</a>
-      <br><span class="muted small">对应章节：第 23 章</span></dd>
+      <br><span class="muted small">对应章节：第 12 章</span></dd>
     </div>
     <div class="g-item">
       <dt>AppMon（APPMON）</dt>
       <dd>官方 README 自述为「<b>an automated framework for monitoring and tampering system API calls of native macOS, iOS and android apps</b>」，
       <b>基于 Frida</b>。它的关注点不是某个具体算法，而是<b>应用调用了哪些系统 API</b>——
-      这正是第 24 章讲的"把观测点插在框架层，一次覆盖一大批样本"的思路来源。
+      这正是第 13 章讲的"把观测点插在框架层，一次覆盖一大批样本"的思路来源。
       <br><b>提醒：</b>课程里提到的 APPMON 与这个项目<b>是否同一个实现，请自行确认</b>；
       本页只保证这个仓库存在且定位吻合，不代课程下结论。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/dpnishant/appmon" target="_blank" rel="noopener">github.com/dpnishant/appmon</a>
-      <br><span class="muted small">对应章节：第 24 章（自吐沙箱与算法自监控）</span></dd>
+      <br><span class="muted small">对应章节：第 13 章（自吐沙箱与算法自监控）</span></dd>
     </div>
   </div>
 
@@ -419,55 +419,55 @@
       <dd>官方描述「<b>A tool for reverse engineering Android apk files</b>」。它做两件事：
       把 APK 解码成可读的资源 + smali，以及把改过的 smali/资源<b>回编译</b>成 APK。
       <br><b>它是"改包"这条路的起点</b>——但它只负责"解包与回编译"，<b>不负责签名</b>：
-      回编译出来的包必须自己重新签名才能安装，而<b>签名一变就会触发目标 App 的签名校验</b>（第 19 章）。
+      回编译出来的包必须自己重新签名才能安装，而<b>签名一变就会触发目标 App 的签名校验</b>（第 8 章）。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/iBotPeaches/Apktool" target="_blank" rel="noopener">github.com/iBotPeaches/Apktool</a>
       <br><span class="muted small">Apache-2.0 · Java · 创建于 2012-03 · 最近推送 2026-09</span>
-      <br><span class="muted small">对应章节：第 27 章（Smali 与重打包）、第 28 章（APK 结构）</span></dd>
+      <br><span class="muted small">对应章节：第 2 章（Smali 与重打包）、第 3 章（APK 结构）</span></dd>
     </div>
     <div class="g-item">
       <dt>smali / baksmali</dt>
       <dd>dex 字节码的<b>汇编器 / 反汇编器</b>：<code>baksmali</code> 把 dex 反汇编成 Smali 文本，
       <code>smali</code> 反过来把 Smali 汇编回 dex。<b>apktool 内部的 smali 处理就是靠它。</b>
       <br><b>它比 jadx 更适合"改"</b>：jadx 面向"读"，baksmali/smali 面向"读+写"这一对往返。
-      另外在 dex 结构受损时，<b>baksmali 的容忍度通常比 jadx 高</b>（第 2、10 章都提到过这一点）。
+      另外在 dex 结构受损时，<b>baksmali 的容忍度通常比 jadx 高</b>（第 16、24 章都提到过这一点）。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/google/smali" target="_blank" rel="noopener">github.com/google/smali</a>
       <br><span class="muted small">现已迁到 google 组织下（原为 JesusFreke/smali）；仓库未提供标准 SPDX 许可标识，<b>采用前请自行确认许可</b></span>
-      <br><span class="muted small">对应章节：第 27 章</span></dd>
+      <br><span class="muted small">对应章节：第 2 章</span></dd>
     </div>
     <div class="g-item">
       <dt>LIEF</dt>
       <dd>官方描述「<b>Library to Instrument Executable Formats (C++, Python, Rust)</b>」。
-      能把 ELF / PE / Mach-O <b>解析成结构化对象、并修改后写回</b>——正好对应第 28 章要拆的那四张表
+      能把 ELF / PE / Mach-O <b>解析成结构化对象、并修改后写回</b>——正好对应第 3 章要拆的那四张表
       （头 / 程序头 / 节表 / 符号表）。<b>和 pyelftools 的区别是它能"改"</b>，不只是"读"。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/lief-project/LIEF" target="_blank" rel="noopener">github.com/lief-project/LIEF</a>
       <br><span class="muted small">Apache-2.0 · C++ · 创建于 2017-03 · 最近推送 2026-09</span>
-      <br><span class="muted small">对应章节：第 28 章</span></dd>
+      <br><span class="muted small">对应章节：第 3 章</span></dd>
     </div>
     <div class="g-item">
       <dt>pyelftools</dt>
       <dd>官方描述「<b>Parsing ELF and DWARF in Python</b>」。纯 Python、零依赖的 ELF 解析库，
-      <b>非常适合"边学边验证"</b>：你在第 28 章学一个字段，就用它读一个真实 so 出来的值对照一下。
+      <b>非常适合"边学边验证"</b>：你在第 3 章学一个字段，就用它读一个真实 so 出来的值对照一下。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/eliben/pyelftools" target="_blank" rel="noopener">github.com/eliben/pyelftools</a>
       <br><span class="muted small">Python · 创建于 2013-06 · 最近推送 2026-07</span>
-      <br><span class="muted small">对应章节：第 28 章</span></dd>
+      <br><span class="muted small">对应章节：第 3 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Androguard</dt>
       <dd>官方描述「<b>Reverse engineering and pentesting for Android applications</b>」。
-      Python 生态里做 APK/DEX 静态分析最完整的一套：解析清单、反编译、调用图、<b>还能直接按第 28 章的索引区结构去读 dex</b>。
+      Python 生态里做 APK/DEX 静态分析最完整的一套：解析清单、反编译、调用图、<b>还能直接按第 3 章的索引区结构去读 dex</b>。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/androguard/androguard" target="_blank" rel="noopener">github.com/androguard/androguard</a>
       <br><span class="muted small">Apache-2.0 · Python · 创建于 2014-09 · 最近推送 2026-09</span>
-      <br><span class="muted small">对应章节：第 28、29 章</span></dd>
+      <br><span class="muted small">对应章节：第 3、4 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(163,230,53,.45)">
       <dt>MobSF ★</dt>
       <dd>官方描述「<b>Mobile Security Framework — an automated, all-in-one mobile application (Android/iOS/Windows) pen-testing, malware analysis and security assessment framework</b>」。
       官方 README 给了 Docker 起服务的方式（拉镜像 → 映射 8000 端口 → 浏览器访问，默认账号 <code>mobsf/mobsf</code>，<b>凭据请以官方当期说明为准</b>）。
       <br><b>要清楚它能给什么、给不了什么：</b>静态侧给 Manifest 风险项、硬编码密钥、权限、第三方 SDK；
-      <b>给不出真正的业务逻辑缺陷与运行时行为</b>——那是 Drozer 那一侧的事（第 29 章）。
+      <b>给不出真正的业务逻辑缺陷与运行时行为</b>——那是 Drozer 那一侧的事（第 4 章）。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/MobSF/Mobile-Security-Framework-MobSF" target="_blank" rel="noopener">github.com/MobSF/Mobile-Security-Framework-MobSF</a>
       <br><span class="muted small">GPL-3.0 · 创建于 2015-01 · 最近推送 2026-09</span>
-      <br><span class="muted small">对应章节：第 29 章</span></dd>
+      <br><span class="muted small">对应章节：第 4 章</span></dd>
     </div>
     <div class="g-item">
       <dt>Drozer</dt>
@@ -478,39 +478,39 @@
       ② 它测的是<b>组件暴露面</b>，不是业务逻辑漏洞。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/WithSecureLabs/drozer" target="_blank" rel="noopener">github.com/WithSecureLabs/drozer</a>
       <br><span class="muted small">Python · 创建于 2012-02 · 最近推送 2026-04</span>
-      <br><span class="muted small">对应章节：第 29 章</span></dd>
+      <br><span class="muted small">对应章节：第 4 章</span></dd>
     </div>
     <div class="g-item">
       <dt>DIVA（靶场）</dt>
       <dd>官方描述「<b>DIVA Android — Damn Insecure and vulnerable App for Android</b>」。
-      一个<b>故意做得很不安全</b>的练习 App，官方 README 列了 13 个挑战（覆盖第 29 章讲的大部分风险类型）。
-      <br><b>为什么在工具箱里放一个"漏洞靶场"：</b>第 29 章的所有判定方法都需要一个<b>可以合法动手</b>的目标——
+      一个<b>故意做得很不安全</b>的练习 App，官方 README 列了 13 个挑战（覆盖第 4 章讲的大部分风险类型）。
+      <br><b>为什么在工具箱里放一个"漏洞靶场"：</b>第 4 章的所有判定方法都需要一个<b>可以合法动手</b>的目标——
       靶场就是这个目标。<span class="hit">在靶场上把工具跑熟，再去看真实 App，你的判断才不是猜的。</span>
       <br><span class="pill warn">待核实</span> <span class="muted small">README 未声明适配到哪个 Android 版本，高版本上部分挑战可能已无法复现</span>
       <br><span class="pill ok">已核实</span> <a href="https://github.com/payatu/diva-android" target="_blank" rel="noopener">github.com/payatu/diva-android</a>
       <br><span class="muted small">GPL-3.0 · Java · 创建于 2016-01 · 最近推送 2023-05（较久未更新）</span>
-      <br><span class="muted small">对应章节：第 29 章</span></dd>
+      <br><span class="muted small">对应章节：第 4 章</span></dd>
     </div>
     <div class="g-item">
       <dt>CERT Keyfinder</dt>
       <dd>官方描述「<b>A tool for finding and analyzing private (and public) key files, including support for Android APK files</b>」。
-      在 APK 里搜私钥/公钥文件——正好对应第 31 章那句「<b>先把假的排除掉，再研究真的</b>」：
+      在 APK 里搜私钥/公钥文件——正好对应第 6 章那句「<b>先把假的排除掉，再研究真的</b>」：
       很多"加密算法"其实只是把密钥硬编码进了包里。
       <br><b>⚠️ 必须知道的一条：该仓库已归档（archived），最后一次代码推送是 2022-11。</b>
       <span class="hit">归档意味着它不再接受更新与修复——把它当作"思路与脚本参考"，不要当作长期依赖。</span>
       <br><span class="pill warn">已归档</span> <a href="https://github.com/CERTCC/keyfinder" target="_blank" rel="noopener">github.com/CERTCC/keyfinder</a>
       <br><span class="muted small">Python · 创建于 2018-07 · 归档于 2022-11 之后</span>
-      <br><span class="muted small">对应章节：第 31 章</span></dd>
+      <br><span class="muted small">对应章节：第 6 章</span></dd>
     </div>
     <div class="g-item" style="border-color:rgba(163,230,53,.45)">
       <dt>AndProxy</dt>
       <dd>官方描述「<b>Android library for intercepting Binder transactions and system calls via GOT hook and seccomp, enabling dynamic modification of IPC data and syscall behavior</b>」。
-      <br>它是第 26 章那条判断的工程化兑现：<b>Binder 的物理落点是对 <code>/dev/binder</code> 做 <code>ioctl</code></b>——
+      <br>它是第 1 章那条判断的工程化兑现：<b>Binder 的物理落点是对 <code>/dev/binder</code> 做 <code>ioctl</code></b>——
       所以用 GOT Hook 劫持 <code>libbinder.so</code> 里的 <code>ioctl</code>，就能拦下全部 Binder 事务，并解析出服务名与方法名。
       <br><b>它同时也印证了"底层手段总带版本枷锁"：</b>仅支持 ARM64，且需要内核 ≥ 5.10（Seccomp 用户态通知）。
       <br><span class="pill ok">已核实</span> <a href="https://github.com/ggggmllll/AndProxyDemo" target="_blank" rel="noopener">github.com/ggggmllll/AndProxyDemo</a>
       <br><span class="muted small">GPL-2.0 · C++ · 创建于 2026-03 · 最近推送 2026-04</span>
-      <br><span class="muted small">对应章节：第 26 章（本章案例）</span></dd>
+      <br><span class="muted small">对应章节：第 1 章（本章案例）</span></dd>
     </div>
   </div>
 
@@ -520,9 +520,9 @@
 
   <div class="glossary">
     <div class="g-item"><dt>DBI</dt><dd>Dynamic Binary Instrumentation，动态二进制插桩。运行时插入代码观测/修改程序行为。</dd></div>
-    <div class="g-item"><dt>ART ★</dt><dd>Android Runtime，Android 5.0 起取代 Dalvik。把 dex 编译为机器码执行，保留 Java 反射能力。第 4 章要直接改它的源码。</dd></div>
+    <div class="g-item"><dt>ART ★</dt><dd>Android Runtime，Android 5.0 起取代 Dalvik。把 dex 编译为机器码执行，保留 Java 反射能力。第 18 章要直接改它的源码。</dd></div>
     <div class="g-item"><dt>JNIEnv</dt><dd>JNI 环境指针，Native 代码调用 Java 层的唯一入口。每线程一份。</dd></div>
-    <div class="g-item"><dt>RegisterNatives</dt><dd>JNI 动态注册接口。加固常用它让函数地址飘忽不定——第 4 章的定制 ART 就针对它。</dd></div>
+    <div class="g-item"><dt>RegisterNatives</dt><dd>JNI 动态注册接口。加固常用它让函数地址飘忽不定——第 18 章的定制 ART 就针对它。</dd></div>
     <div class="g-item"><dt>Inline Hook</dt><dd>在函数入口写入跳转指令劫持执行流。需可写内存权限与指令重定位能力。</dd></div>
     <div class="g-item"><dt>基本块 ★</dt><dd>Basic Block。只有一个入口一个出口、内部无分支的指令序列。控制流分析与 Trace 的基本单位。</dd></div>
     <div class="g-item"><dt>不透明谓词 ★</dt><dd>Opaque Predicate。结果恒定但静态难以判定的条件表达式，虚假控制流的核心构件。</dd></div>
@@ -542,21 +542,21 @@
     <div class="g-item"><dt>FairPlay</dt><dd>Apple 的 DRM。App Store 应用代码段加密，运行时由内核解密到内存——这是 iOS 砸壳存在的原因。</dd></div>
     <div class="g-item"><dt>SSL Pinning</dt><dd>证书绑定。App 内置服务端证书/公钥并校验，使中间人抓包失败。</dd></div>
     <div class="g-item"><dt>SVC</dt><dd>ARM 的 Supervisor Call 指令。App 直接内联 SVC 可绕过 libc，使基于 libc Hook 的监控失效。</dd></div>
-    <div class="g-item"><dt>四大组件 ★</dt><dd>Activity（界面）/ Service（无界面后台）/ BroadcastReceiver（接收广播）/ ContentProvider（跨进程数据共享）。必须在清单里显式声明；<b>系统只认识组件，不认识你的业务逻辑</b>。第 26 章。</dd></div>
-    <div class="g-item"><dt>组件导出 exported ★</dt><dd>决定"别的 App 能不能唤起这个组件"。历史规则是"带 intent-filter 就默认导出"；Android 12 起带 intent-filter 的组件必须显式声明。<b>它同时是攻击面与逆向入口</b>。第 26、29 章。</dd></div>
-    <div class="g-item"><dt>ContentProvider 创建时机</dt><dd>它的 onCreate <b>早于 Application.onCreate</b>——系统要先装好"对外提供的能力"，才认为进程准备好了。加固与 SDK 自动初始化常用它抢最早时机。第 26 章。</dd></div>
-    <div class="g-item"><dt>Handler / Looper / MessageQueue ★</dt><dd>安卓的消息循环模型。每个线程最多一个 Looper；消息按 <code>when</code>（时间戳）排序而非入队顺序；<code>post(Runnable)</code> 与 <code>sendMessage</code> 走同一条路。<b>主线程被卡住 = 某条消息执行太久 = ANR</b>。第 26 章。</dd></div>
-    <div class="g-item"><dt>Binder ★</dt><dd>安卓的跨进程通信机制。<b>物理落点是对 <code>/dev/binder</code> 做 ioctl</b>（所以基于文件 syscall 的监控看不到它）；调用方 UID/PID 由内核填入、不可伪造；只做一次数据拷贝。第 26 章。</dd></div>
-    <div class="g-item"><dt>AIDL</dt><dd>接口定义语言。生成 Stub（服务端）与 Proxy（客户端），把跨进程调用封装成看起来像普通方法调用的形式。<b>asInterface 是分叉点：同进程返回本地对象（不走 Binder），跨进程才走 transact</b>。第 26 章。</dd></div>
-    <div class="g-item"><dt>Smali ★</dt><dd>Dalvik/ART 字节码的可读文本形式。<b>寄存器式</b>（<code>.registers</code>/<code>.locals</code>，参数寄存器 <code>p0…</code> 在编号末尾），五行 invoke 按调用类型区分，返回值必须紧跟 <code>move-result*</code>。第 27 章。</dd></div>
-    <div class="g-item"><dt>dex vs jar</dt><dd>Android 类加载器<b>只认 dex</b>，不认 JVM 字节码。所以"能被安卓动态加载的 jar"实质是<b>一个内含 <code>classes.dex</code> 的 zip</b>。第 26 章。</dd></div>
-    <div class="g-item"><dt>dex 索引区</dt><dd>string_ids / type_ids / proto_ids / field_ids / method_ids / class_defs。<b>去重 + 定长寻址</b>是它存在的理由；抽取壳抽走的正是 <code>class_defs</code> 指向的 <code>code_item</code> 里的 insns。第 28 章。</dd></div>
-    <div class="g-item"><dt>段 vs 节 ★</dt><dd>ELF 里两套视角：<b>程序头（段）给加载器看</b>，决定怎么映射进内存；<b>节表（节）给分析者看</b>，是 <code>.text/.rodata</code> 这套命名。<code>p_memsz &gt; p_filesz</code> 的那部分就是 .bss 的来源。第 28 章。</dd></div>
-    <div class="g-item"><dt>分区存储 ★</dt><dd>Scoped Storage。Android 10 引入（可用 <code>requestLegacyExternalStorage</code> 临时退回），Android 11 起强制。要访问共享目录须走 MediaStore 或申请「所有文件访问权限」。<b>具体分界以官方文档为准</b>。第 26 章。</dd></div>
-    <div class="g-item"><dt>RSA ★</dt><dd>非对称加密。<b>公钥本来就是公开的</b>——这是它与对称/摘要最大的不同。<b>方向容易搞反</b>：公钥加密+私钥解密（保密）vs 私钥签名+公钥验签（防篡改）。客户端几乎只能拿到公钥。第 31 章。</dd></div>
-    <div class="g-item"><dt>填充 padding（RSA）</dt><dd>PKCS#1 v1.5（<b>同明文同公钥两次加密密文相同</b>）vs OAEP（带随机数，两次密文不同）。<b>"看到 RSA 却复现不出结果"的头号原因</b>。第 31 章。</dd></div>
-    <div class="g-item"><dt>SPKI</dt><dd>Subject Public Key Info，证书/密钥文件里公钥的标准编码结构。<b>从证书里提取公钥，本质上就是解析到这一段</b>。第 31 章。</dd></div>
-    <div class="g-item"><dt>MCP（Model Context Protocol）</dt><dd>把工具能力标准化暴露给大模型的协议。<b>与"把代码粘进聊天框"的本质区别是模型可以主动索取信息</b>（按需取某个函数的伪代码、查交叉引用）。第 32 章。</dd></div>
+    <div class="g-item"><dt>四大组件 ★</dt><dd>Activity（界面）/ Service（无界面后台）/ BroadcastReceiver（接收广播）/ ContentProvider（跨进程数据共享）。必须在清单里显式声明；<b>系统只认识组件，不认识你的业务逻辑</b>。第 1 章。</dd></div>
+    <div class="g-item"><dt>组件导出 exported ★</dt><dd>决定"别的 App 能不能唤起这个组件"。历史规则是"带 intent-filter 就默认导出"；Android 12 起带 intent-filter 的组件必须显式声明。<b>它同时是攻击面与逆向入口</b>。第 1、4 章。</dd></div>
+    <div class="g-item"><dt>ContentProvider 创建时机</dt><dd>它的 onCreate <b>早于 Application.onCreate</b>——系统要先装好"对外提供的能力"，才认为进程准备好了。加固与 SDK 自动初始化常用它抢最早时机。第 1 章。</dd></div>
+    <div class="g-item"><dt>Handler / Looper / MessageQueue ★</dt><dd>安卓的消息循环模型。每个线程最多一个 Looper；消息按 <code>when</code>（时间戳）排序而非入队顺序；<code>post(Runnable)</code> 与 <code>sendMessage</code> 走同一条路。<b>主线程被卡住 = 某条消息执行太久 = ANR</b>。第 1 章。</dd></div>
+    <div class="g-item"><dt>Binder ★</dt><dd>安卓的跨进程通信机制。<b>物理落点是对 <code>/dev/binder</code> 做 ioctl</b>（所以基于文件 syscall 的监控看不到它）；调用方 UID/PID 由内核填入、不可伪造；只做一次数据拷贝。第 1 章。</dd></div>
+    <div class="g-item"><dt>AIDL</dt><dd>接口定义语言。生成 Stub（服务端）与 Proxy（客户端），把跨进程调用封装成看起来像普通方法调用的形式。<b>asInterface 是分叉点：同进程返回本地对象（不走 Binder），跨进程才走 transact</b>。第 1 章。</dd></div>
+    <div class="g-item"><dt>Smali ★</dt><dd>Dalvik/ART 字节码的可读文本形式。<b>寄存器式</b>（<code>.registers</code>/<code>.locals</code>，参数寄存器 <code>p0…</code> 在编号末尾），五行 invoke 按调用类型区分，返回值必须紧跟 <code>move-result*</code>。第 2 章。</dd></div>
+    <div class="g-item"><dt>dex vs jar</dt><dd>Android 类加载器<b>只认 dex</b>，不认 JVM 字节码。所以"能被安卓动态加载的 jar"实质是<b>一个内含 <code>classes.dex</code> 的 zip</b>。第 1 章。</dd></div>
+    <div class="g-item"><dt>dex 索引区</dt><dd>string_ids / type_ids / proto_ids / field_ids / method_ids / class_defs。<b>去重 + 定长寻址</b>是它存在的理由；抽取壳抽走的正是 <code>class_defs</code> 指向的 <code>code_item</code> 里的 insns。第 3 章。</dd></div>
+    <div class="g-item"><dt>段 vs 节 ★</dt><dd>ELF 里两套视角：<b>程序头（段）给加载器看</b>，决定怎么映射进内存；<b>节表（节）给分析者看</b>，是 <code>.text/.rodata</code> 这套命名。<code>p_memsz &gt; p_filesz</code> 的那部分就是 .bss 的来源。第 3 章。</dd></div>
+    <div class="g-item"><dt>分区存储 ★</dt><dd>Scoped Storage。Android 10 引入（可用 <code>requestLegacyExternalStorage</code> 临时退回），Android 11 起强制。要访问共享目录须走 MediaStore 或申请「所有文件访问权限」。<b>具体分界以官方文档为准</b>。第 1 章。</dd></div>
+    <div class="g-item"><dt>RSA ★</dt><dd>非对称加密。<b>公钥本来就是公开的</b>——这是它与对称/摘要最大的不同。<b>方向容易搞反</b>：公钥加密+私钥解密（保密）vs 私钥签名+公钥验签（防篡改）。客户端几乎只能拿到公钥。第 6 章。</dd></div>
+    <div class="g-item"><dt>填充 padding（RSA）</dt><dd>PKCS#1 v1.5（<b>同明文同公钥两次加密密文相同</b>）vs OAEP（带随机数，两次密文不同）。<b>"看到 RSA 却复现不出结果"的头号原因</b>。第 6 章。</dd></div>
+    <div class="g-item"><dt>SPKI</dt><dd>Subject Public Key Info，证书/密钥文件里公钥的标准编码结构。<b>从证书里提取公钥，本质上就是解析到这一段</b>。第 6 章。</dd></div>
+    <div class="g-item"><dt>MCP（Model Context Protocol）</dt><dd>把工具能力标准化暴露给大模型的协议。<b>与"把代码粘进聊天框"的本质区别是模型可以主动索取信息</b>（按需取某个函数的伪代码、查交叉引用）。第 7 章。</dd></div>
   </div>
 
   <hr>
@@ -573,7 +573,7 @@
 
   <div class="chapnav">
     <a href="index.html"><div class="cn-dir">◀ 返回</div><div class="cn-title">课程地图</div></a>
-    <a class="next" href="ch01-frida.html"><div class="cn-dir">开始学习 ▶</div><div class="cn-title">第 1 章 · Frida 高级逆向</div></a>
+    <a class="next" href="ch15-frida.html"><div class="cn-dir">开始学习 ▶</div><div class="cn-title">第 15 章 · Frida 高级逆向</div></a>
   </div>
 
   <p class="muted center" style="margin-top:40px">
