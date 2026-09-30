@@ -5,6 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>工具箱 · 本课程涉及的真实项目 | 安卓高级研修班模拟器</title>
 <link rel="stylesheet" href="assets/style.css">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<meta name="description" content="《安卓高级研修班》交互式模拟器：32 章安卓逆向工程课程，用可动手操作的代码推演器、动画舞台、动手实验室与苏格拉底追问，把 Frida、脱壳、OLLVM、VMP、算法还原讲成能上手的手艺。">
+<meta name="theme-color" content="#0b0f14">
+<meta property="og:type" content="website">
+<meta property="og:title" content="工具箱 · 本课程涉及的真实项目 | 安卓高级研修班模拟器">
+<meta property="og:description" content="《安卓高级研修班》交互式模拟器：32 章安卓逆向工程课程，用可动手操作的代码推演器、动画舞台、动手实验室与苏格拉底追问，把 Frida、脱壳、OLLVM、VMP、算法还原讲成能上手的手艺。">
+<meta property="og:image" content="assets/favicon.svg">
+<meta name="twitter:card" content="summary">
 </head>
 <body data-no-badge>
 <div class="wrap">
@@ -515,6 +523,113 @@
   </div>
 
   <!-- ================================================================ -->
+  <h2 id="my-artifacts-h"><span class="h2-num">MY</span>我的产出</h2>
+  <p>这里放的是<b>你自己做出来的东西</b>，不是讲义。每通过一个动手实验室，
+  系统会把你的结论与正确答案整理成一份可复用的产出物——学完 32 章，你会攒下一套真正能用的工具集。</p>
+  <div id="myArtifacts"></div>
+
+  <script>
+  // 注意：本块在 <body> 中段、app.js 之前执行，必须等 DOM 解析完
+  // （app.js 在 </body> 前加载）再读取产出物 API。
+  document.addEventListener('DOMContentLoaded', function () {
+    const host = document.getElementById('myArtifacts');
+    if (!host || !window.AKKC_listArtifacts) return;
+    const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+      c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+    function render() {
+      const list = (window.AKKC_listArtifacts ? window.AKKC_listArtifacts() : []) || [];
+      if (!list.length) {
+        host.innerHTML =
+          '<div class="my-artifacts"><div class="ma-empty">' +
+          '还没有产出物。<br>去任意章节做一次<b>🧪 动手实验室</b>并答对，' +
+          '产出物就会自动出现在这里。<br><br>' +
+          '<a href="ch16-fart.html">→ 从第 16 章的脱壳实验开始</a>' +
+          '</div></div>';
+        return;
+      }
+      const items = list.slice().reverse().map((a, i) =>
+        '<div class="ma-item">' +
+          '<div class="mai-top">' +
+            (a.chapter ? '<span class="mai-ch">CH ' + esc(a.chapter) + '</span>' : '') +
+            '<span class="mai-name">' + esc(a.name || '未命名产出') + '</span>' +
+            '<span class="mai-date">' + (a.at ? new Date(a.at).toLocaleString('zh-CN') : '') + '</span>' +
+          '</div>' +
+          '<pre><code data-art="' + i + '"></code></pre>' +
+          '<div class="mai-acts">' +
+            '<button class="btn ghost" data-copy="' + i + '">⧉ 复制</button>' +
+            (a.page ? '<a class="btn ghost" style="text-decoration:none" href="' + esc(a.page) + '">↗ 回到该章</a>' : '') +
+            '<button class="btn ghost" data-del="' + i + '">🗑 删除</button>' +
+          '</div>' +
+        '</div>').join('');
+
+      const exported = [
+        '# 安卓高级研修班 · 我的产出物',
+        '# 导出时间：' + new Date().toLocaleString('zh-CN'),
+        '# 共 ' + list.length + ' 项',
+        ''
+      ];
+      list.forEach((a, i) => {
+        exported.push('='.repeat(60));
+        exported.push('## ' + (i + 1) + '. ' + (a.name || '未命名') + (a.chapter ? '（第 ' + a.chapter + ' 章）' : ''));
+        exported.push('='.repeat(60));
+        exported.push(a.code || '');
+        exported.push('');
+      });
+
+      host.innerHTML =
+        '<div class="my-artifacts">' +
+          '<div class="ma-head"><b>📦 我的产出</b>' +
+            '<span class="ma-count">' + list.length + ' 项</span>' +
+            '<span class="ma-acts">' +
+              '<button class="btn" id="maExport">⬇ 导出全部（Markdown）</button>' +
+              '<button class="btn ghost" id="maClear">清空</button>' +
+            '</span></div>' +
+          items +
+        '</div>';
+
+      // 用 textContent 填充代码，避免 HTML 转义问题
+      host.querySelectorAll('code[data-art]').forEach(el => {
+        const a = list.slice().reverse()[parseInt(el.dataset.art, 10)];
+        if (a) el.textContent = a.code || '';
+      });
+
+      host.querySelectorAll('[data-copy]').forEach(btn => {
+        btn.onclick = () => {
+          const a = list.slice().reverse()[parseInt(btn.dataset.copy, 10)];
+          window.AKKC_copyText(a.code || '', ok => {
+            btn.textContent = ok ? '✓ 已复制' : '✗ 复制失败';
+            setTimeout(() => { btn.textContent = '⧉ 复制'; }, 1500);
+          });
+        };
+      });
+      host.querySelectorAll('[data-del]').forEach(btn => {
+        btn.onclick = () => {
+          const idx = list.length - 1 - parseInt(btn.dataset.del, 10);
+          list.splice(idx, 1);
+          window.AKKC.store.set('artifacts', list);
+          render();
+        };
+      });
+      const ex = document.getElementById('maExport');
+      if (ex) ex.onclick = () => {
+        window.AKKC_copyText(exported.join('\n'), ok => {
+          ex.textContent = ok ? '✓ 已复制到剪贴板' : '✗ 复制失败';
+          setTimeout(() => { ex.textContent = '⬇ 导出全部（Markdown）'; }, 1800);
+        });
+      };
+      const cl = document.getElementById('maClear');
+      if (cl) cl.onclick = () => {
+        if (!confirm('确定清空全部 ' + list.length + ' 项产出物？此操作不可撤销。')) return;
+        window.AKKC.store.set('artifacts', []);
+        render();
+      };
+    }
+    render();
+  });
+  </script>
+
+  <!-- ================================================================ -->
   <h2><span class="h2-num">GL</span>名词速查</h2>
   <p>按技术层级排列的术语索引。带 <span class="pill acc">★</span> 的是贯穿全课的核心概念。</p>
 
@@ -582,5 +697,6 @@
 </div>
 
 <script src="assets/app.js"></script>
+<script src="assets/ux.js"></script>
 </body>
 </html>

@@ -180,6 +180,38 @@
   }
   global.AKKC_similarity = similarity;
 
+  /* ------------------------------------------------------------ 复制 / 产出物 */
+  function copyText(text, cb) {
+    const done = ok => { try { cb(ok); } catch (e) {} };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => done(true), () => done(copyFallback(text)));
+    } else done(copyFallback(text));
+  }
+  function copyFallback(text) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed'; ta.style.left = '-9999px';
+      document.body.appendChild(ta); ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return ok;
+    } catch (e) { return false; }
+  }
+
+  /* 产出物仓库：实验室通过后把成果存下来，工具箱页面集中展示 */
+  function saveArtifact(a) {
+    const list = store.get('artifacts', []) || [];
+    const dup = list.findIndex(x => x && x.name === a.name && x.chapter === a.chapter);
+    if (dup >= 0) list[dup] = a; else list.push(a);
+    store.set('artifacts', list.slice(-200));
+    return true;
+  }
+  function listArtifacts() { return store.get('artifacts', []) || []; }
+  global.AKKC_copyText = copyText;
+  global.AKKC_saveArtifact = saveArtifact;
+  global.AKKC_listArtifacts = listArtifacts;
+
   /* ------------------------------------------------------------ 顶部导航 / 进度 */
   function mountTopbar() {
     const ch = document.body.dataset.chapter ? parseInt(document.body.dataset.chapter, 10) : null;
@@ -259,32 +291,50 @@
   }
 
   /* ==========================================================================
-     组件 1：代码步进器  CodeStepper
-     用法： new CodeStepper(el, { lines:[{code, note, state:{}, mem:''}], title })
+     组件 1：代码推演器  CodeStepper（调试器化）
+     用法： new CodeStepper(el, {
+       lines:[{code, note, state:{}, mem:''}], title,
+       repl:  true,                  // 用 Frida REPL 皮肤
+       wrong: {h, body, exit} | '<html>'   // 「如果改错了会怎样」反例
+     })
+     实战化改造（对照真实调试器）：
+       • 断点：点行首圆点下断点，「继续」直接跑到下一个断点（而非一格一格点）
+       • 可改状态：双击状态值即可改写，用来验证「改一个寄存器，分支就变了」
+       • 反例演示：一键播放错误路径，看清代价
      ========================================================================== */
   function CodeStepper(root, cfg) {
     const self = this;
     this.root = root; this.cfg = cfg; this.i = 0;
+    this.bps = {};        // 断点：行下标 -> true
+    this.overrides = {};  // 用户手工改过的状态值
     const steps = cfg.lines || [];
 
     root.classList.add('stepper');
+    if (cfg.repl) root.classList.add('repl');
     root.innerHTML =
       '<div class="stepper-head"><span class="st-title">' + (cfg.title || '代码推演') + '</span>' +
+        (cfg.repl ? '<span class="pill ok mono">frida-repl</span>' : '') +
         '<span class="pill acc mono">' + steps.length + ' 步</span></div>' +
       '<div class="stepper-body">' +
         '<div class="stepper-code"></div>' +
         '<div class="stepper-side">' +
           '<h5>这一步在做什么</h5><div class="stepper-explain"></div>' +
-          '<h5>状态</h5><table class="state-table"></table>' +
+          '<h5>状态<span class="muted small" style="font-weight:400;letter-spacing:0;text-transform:none"> · 双击可改</span></h5>' +
+          '<table class="state-table"></table>' +
+          '<div class="stepper-dirty" style="display:none"></div>' +
           '<div class="stepper-mem" style="margin-top:12px"></div>' +
         '</div>' +
       '</div>' +
+      (cfg.wrong ? '<div class="wrongbox" style="display:none"></div>' : '') +
       '<div class="stepper-ctl">' +
         '<button class="btn" data-a="reset">↺ 重置</button>' +
         '<button class="btn" data-a="prev">◀ 上一步</button>' +
         '<button class="btn primary" data-a="next">下一步 ▶</button>' +
+        '<button class="btn" data-a="cont" title="直接执行到下一个断点">⏩ 继续到断点</button>' +
         '<button class="btn ghost" data-a="all">全部展开</button>' +
+        (cfg.wrong ? '<button class="btn danger" data-a="wrong">💥 如果改错了会怎样</button>' : '') +
         '<div class="step-dots"></div>' +
+        '<span class="dbg-status"><span class="dbg-bp">无断点</span></span>' +
       '</div>';
 
     const codeEl = $('.stepper-code', root);
@@ -293,8 +343,15 @@
     steps.forEach((s, k) => {
       const d = document.createElement('span');
       d.className = 'ln'; d.dataset.ln = k + 1;
-      d.innerHTML = s.code == null ? '&nbsp;' : s.code;
+      d.innerHTML = (s.code == null ? '&nbsp;' : s.code);
+      // 断点 gutter：点行首圆点下/清断点（真实调试器习惯）
+      const bp = document.createElement('span');
+      bp.className = 'bp';
+      bp.title = '点击在第 ' + (k + 1) + ' 步下断点';
+      bp.onclick = ev => { ev.stopPropagation(); self.toggleBP(k); };
+      d.insertBefore(bp, d.firstChild);
       codeEl.appendChild(d);
+
       const dot = document.createElement('i');
       dot.title = '第 ' + (k + 1) + ' 步';
       dot.onclick = () => self.go(k);
@@ -308,6 +365,22 @@
       else if (a === 'prev') self.go(self.i - 1);
       else if (a === 'reset') self.go(0);
       else if (a === 'all') self.go(steps.length - 1);
+      else if (a === 'cont') self.cont();
+      else if (a === 'wrong') {
+        const wb = $('.wrongbox', root);
+        const on = wb.style.display === 'none';
+        wb.style.display = on ? '' : 'none';
+        if (on) {
+          wb.innerHTML = self.wrongHTML();
+          if (!wb.dataset.sent) { wb.dataset.sent = '1'; self.done('stepper-wrong'); }
+        }
+      }
+    });
+
+    // 双击状态值 → 就地编辑
+    $('.state-table', root).addEventListener('dblclick', e => {
+      const td = e.target.closest('td.editable');
+      if (td) self.editState(td);
     });
 
     document.addEventListener('keydown', e => {
@@ -318,6 +391,152 @@
 
     this.go(0);
   }
+
+  /* ---- 断点 ---- */
+  CodeStepper.prototype.toggleBP = function (k) {
+    if (this.bps[k]) delete this.bps[k]; else this.bps[k] = true;
+    const el = $$('.stepper-code .ln', this.root)[k];
+    if (el) {
+      const on = !!this.bps[k];
+      el.classList.toggle('bp-skip', false);
+      $('.bp', el).classList.toggle('on', on);
+      el.title = on ? '断点 · 点圆点清除' : '';
+    }
+    this.syncBPStatus();
+  };
+  CodeStepper.prototype.bpList = function () {
+    return Object.keys(this.bps).filter(k => this.bps[k]).map(Number).sort((a, b) => a - b);
+  };
+  CodeStepper.prototype.syncBPStatus = function () {
+    const el = $('.dbg-bp', this.root);
+    if (!el) return;
+    const n = this.bpList().length;
+    el.innerHTML = n ? '<b>' + n + '</b> 个断点' : '无断点';
+  };
+  /* 继续执行到下一个断点；没有断点则跑到结尾 */
+  CodeStepper.prototype.cont = function () {
+    const steps = this.cfg.lines || [];
+    const next = this.bpList().find(k => k > this.i);
+    if (next == null) {
+      if (!this.bpList().length) {
+        this.go(steps.length - 1);
+        this.flash(-1, '没有断点，已直接执行到结尾');
+      } else {
+        this.flash(-1, '后面没有断点了，停在第 ' + (this.i + 1) + ' 步');
+      }
+      return;
+    }
+    // 中间跳过的行压暗，模拟"一次跑过多行"
+    $$('.stepper-code .ln', this.root).forEach((el, k) => {
+      el.classList.toggle('bp-skip', k > this.i && k < next);
+    });
+    this.go(next);
+    this.flash(next, '命中断点 · 第 ' + (next + 1) + ' 步');
+  };
+  CodeStepper.prototype.flash = function (k, msg) {
+    const el = k >= 0 ? $$('.stepper-code .ln', this.root)[k] : null;
+    if (el) {
+      el.classList.remove('bp-hit');
+      void el.offsetWidth;
+      el.classList.add('bp-hit');
+      setTimeout(() => el.classList.remove('bp-hit'), 1100);
+    }
+    if (msg) {
+      const st = $('.dbg-status', this.root);
+      const old = $('.dbg-bp', this.root).innerHTML;
+      const tmp = document.createElement('span');
+      tmp.className = 'dbg-msg';
+      tmp.style.color = 'var(--warn)';
+      tmp.textContent = '· ' + msg;
+      st.appendChild(tmp);
+      setTimeout(() => tmp.remove(), 2200);
+      $('.dbg-bp', this.root).innerHTML = old;
+    }
+  };
+
+  /* ---- 状态值就地编辑 ---- */
+  CodeStepper.prototype.editState = function (td) {
+    if (td.querySelector('input')) return;
+    const self = this;
+    const key = td.dataset.key;
+    const shown = td.dataset.raw || td.textContent;
+    td.innerHTML = '<input type="text">';
+    const inp = td.querySelector('input');
+    inp.value = this.overrides[key] !== undefined ? this.overrides[key] : shown;
+    inp.focus(); inp.select();
+    let cancelled = false;
+    inp.onkeydown = ev => {
+      ev.stopPropagation();
+      if (ev.key === 'Enter') { ev.preventDefault(); inp.blur(); }
+      if (ev.key === 'Escape') { cancelled = true; inp.blur(); }
+    };
+    inp.onblur = () => {
+      if (!cancelled) {
+        const v = inp.value.trim();
+        if (v && v !== shown) this.overrides[key] = v;
+        else delete this.overrides[key];
+        if (Object.keys(this.overrides).length) this.done('stepper-edit');
+      }
+      this.renderState();
+    };
+  };
+  CodeStepper.prototype.renderState = function () {
+    const steps = this.cfg.lines || [];
+    const s = steps[this.i] || {};
+    const st = s.state || {};
+    const ov = this.overrides;
+    const tbl = $('.state-table', this.root);
+    const keys = Object.keys(st);
+    tbl.innerHTML = keys.length
+      ? keys.map(k => {
+          const user = ov[k] !== undefined;
+          return '<tr' + (user ? ' class="user-edited"' : '') + '>' +
+            '<td>' + esc(k) + '</td>' +
+            '<td class="editable" data-key="' + esc(k) + '" data-raw="' + esc(st[k]) + '" ' +
+              'title="双击可改写这个值">' + esc(user ? ov[k] : st[k]) +
+              (user ? '<span class="edit-tag">已改</span>' : '') + '</td></tr>';
+        }).join('')
+      : '<tr><td colspan="2" class="muted">（本例无寄存器状态）</td></tr>';
+
+    // 改过值就明确警告：教学预设 ≠ 你的推演结果
+    const dirty = $('.stepper-dirty', this.root);
+    if (!dirty) return;
+    const n = Object.keys(ov).length;
+    if (n) {
+      dirty.style.display = '';
+      dirty.innerHTML =
+        '<div class="note warn" style="margin:10px 0 0;padding:9px 12px;font-size:12.5px">' +
+        '<b>⚠ 你手工改了 ' + n + ' 个值</b><br>' +
+        '右侧后续步骤显示的仍是<b>教学预设值</b>，不是你的推演结果——' +
+        '这正是实战里最容易出错的地方：<b>改了一个寄存器，后面的分支就不再是讲义里那条了</b>。' +
+        '<button class="btn ghost" style="padding:2px 8px;font-size:11.5px;margin-left:6px" ' +
+        'data-a="clearov">恢复预设</button>' +
+        '</div>';
+      const b = $('[data-a="clearov"]', dirty);
+      if (b) b.onclick = () => this.clearOverrides();
+    } else dirty.style.display = 'none';
+  };
+  CodeStepper.prototype.clearOverrides = function () {
+    this.overrides = {};
+    this.renderState();
+  };
+
+  /* ---- 反例 ---- */
+  CodeStepper.prototype.wrongHTML = function () {
+    const w = this.cfg.wrong;
+    if (typeof w === 'string') return w;
+    return '<div class="wb-h">💥 ' + (w.h || '如果这一步做错了') + '</div>' +
+      '<div>' + (w.body || '') + '</div>' +
+      (w.exit ? '<div class="wb-exit">' + w.exit + '</div>' : '');
+  };
+
+  /* ---- 完成事件（供 TOC 完成度 / 进度统计消费） ---- */
+  CodeStepper.prototype.done = function (kind) {
+    this.root.dispatchEvent(new CustomEvent('akkc:done', {
+      bubbles: true, detail: { kind: kind || 'stepper', chapter: document.body.dataset.chapter }
+    }));
+  };
+
   CodeStepper.prototype.go = function (n) {
     const steps = this.cfg.lines || [];
     this.i = Math.max(0, Math.min(steps.length - 1, n));
@@ -325,20 +544,20 @@
     $$('.stepper-code .ln', this.root).forEach((el, k) => {
       el.classList.toggle('active', k === this.i);
       el.classList.toggle('done', k < this.i);
+      if (k >= this.i) el.classList.remove('bp-skip');
     });
     $$('.step-dots i', this.root).forEach((el, k) => {
       el.classList.toggle('on', k === this.i);
       el.classList.toggle('past', k < this.i);
     });
     $('.stepper-explain', this.root).innerHTML = s.note || '<span class="muted">—</span>';
-    const tbl = $('.state-table', this.root);
-    const st = s.state || {};
-    tbl.innerHTML = Object.keys(st).length
-      ? Object.keys(st).map(k => '<tr><td>' + esc(k) + '</td><td>' + esc(st[k]) + '</td></tr>').join('')
-      : '<tr><td colspan="2" class="muted">（本例无寄存器状态）</td></tr>';
+    this.renderState();
     const mem = $('.stepper-mem', this.root);
     if (s.mem) { mem.style.display = ''; mem.innerHTML = s.mem; }
     else mem.style.display = 'none';
+
+    // 走到最后一步 = 本推演器完成
+    if (this.i === steps.length - 1 && steps.length > 1) this.done('stepper');
   };
 
   /* ==========================================================================
@@ -412,6 +631,9 @@
       this.state.done = true;
       const s2 = store.get('soc', {}) || {}; s2[this.cfg.id] = this.state; store.set('soc', s2);
       markComplete(this.cfg.chapter, { soc: true });
+      this.root.dispatchEvent(new CustomEvent('akkc:done', {
+        bubbles: true, detail: { kind: 'teacher', chapter: this.cfg.chapter }
+      }));
     }
   };
 
@@ -653,19 +875,34 @@
     });
     $('.q-exp', this.root).classList.add('show');
     const s = store.get('quiz', {}) || {};
-    s[c.id] = { ok: ok, at: Date.now() }; store.set('quiz', s);
+    const qid = c.id || ('q-' + (document.body.dataset.chapter || 'x') + '-' + (c.stem || '').slice(0, 24));
+    s[qid] = { ok: ok, at: Date.now() }; store.set('quiz', s);
     if (ok && c.chapter) {
       const qs = Object.values(s).filter(x => x && x.ok).length;
       if (qs >= (c.completeAt || 3)) markComplete(c.chapter, { quiz: true });
+      this.root.dispatchEvent(new CustomEvent('akkc:done', {
+        bubbles: true, detail: { kind: 'quiz', chapter: c.chapter }
+      }));
     }
   };
 
   /* ==========================================================================
      组件 4：决策树 / 情境演练  Decision
+     实战化改造：选错不能只说"再想想"——
+       • 把错误路径的**后果演下去**（d-consequence，逐条铺开代价）
+       • 累计**时间代价**（d-cost），让"错误决策 = 烧掉的时间"可感知
+       • 记录**所有走过的路径**（d-tracks），支持只回退一步重选
+     数据兼容：node.scenario / node.q / node.choices[{t,next}] / node.terminal
+              / node.verdict('good'|'bad') / node.verdictTitle / node.result
+     新增可选字段：choice.cost（该选择消耗的时间文案）、choice.consequence（选后立刻显示的后果）
      ========================================================================== */
   function Decision(root, cfg) {
     const self = this;
     this.root = root; this.cfg = cfg;
+    this.history = [];        // 走过的节点 id，用于"只回退一步"
+    this.choicePath = [];     // 选择路径：["情境一 · A", "情境二 · C"]
+    this.tracks = [];         // 走完的结局：{path, good}
+    this.costs = [];          // 累计时间代价（分钟）
     root.className = 'decision';
     this.render(cfg.start);
   }
@@ -673,8 +910,20 @@
     const self = this;
     const node = this.cfg.nodes[nodeId];
     if (!node) return;
-    this.path = (this.path || []).concat(node.label || nodeId);
+    this.nodeId = nodeId;
     let html = '';
+
+    // 上一手选择的即时后果（把错误演下去，而不是只说"错了"）
+    if (this.lastConsequence) {
+      html += '<div class="d-consequence">' +
+        '<div class="dc-h"><span class="dc-step">上一步的后果</span>' +
+        (this.lastConsequence.title || '这个选择有问题') + '</div>' +
+        '<div>' + this.lastConsequence.body + '</div>' +
+        (this.lastConsequence.time
+          ? '<div class="dc-time">⏱ 已消耗：' + this.lastConsequence.time + '</div>' : '') +
+        '</div>';
+    }
+
     if (node.scenario) html += '<div class="d-scenario">' + node.scenario + '</div>';
     if (node.q) html += '<div class="q-stem" style="margin-bottom:12px;font-weight:600;color:var(--fg)">' + node.q + '</div>';
 
@@ -687,21 +936,95 @@
       html += '<div class="d-result show ' + (good ? 'good' : 'bad') + '">' +
         '<div style="font-weight:700;margin-bottom:6px;color:' + (good ? 'var(--ok)' : 'var(--bad)') + '">' +
         (good ? '✅ ' : '⚠️ ') + (node.verdictTitle || (good ? '这是一条可行路径' : '这条路会踩坑')) + '</div>' +
-        (node.result || '') + '</div>' +
-        '<div class="d-path">决策路径：' + esc(this.path.join(' → ')) + '</div>' +
-        '<div style="margin-top:12px"><button class="btn primary" data-restart="1">↺ 换个选择重来</button></div>';
+        (node.result || '') + '</div>';
+
+      // 时间账单
+      const total = this.costs.reduce((a, b) => a + b, 0);
+      if (total > 0) {
+        html += '<div class="d-cost"><span>⏱ 本次演练累计消耗</span>' +
+          '<span class="dc-total">' + fmtCost(total) + '</span></div>';
+      }
+
+      // 全部走过的路径（含之前踩过的坑）
+      const curPath = this.choicePath.join(' → ');
+      if (this.tracks.length || !good) {
+        const all = this.tracks.concat([{ path: curPath, good: good }]);
+        html += '<div class="d-tracks"><b>你走过的路径</b>' +
+          all.map(t => '<div class="dt-row"><span class="' + (t.good ? 'dt-good' : 'dt-bad') + '">' +
+            (t.good ? '✅' : '❌') + '</span><span>' + esc(t.path) + '</span></div>').join('') +
+          '</div>';
+      }
+
+      html += '<div class="d-path">你的选择路径：' + esc(curPath || '（未做选择）') + '</div>' +
+        '<div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">' +
+        (this.history.length > 1
+          ? '<button class="btn" data-back="1">↩ 只回退一步（保留前面的决策）</button>' : '') +
+        '<button class="btn primary" data-restart="1">↺ 从头重来</button>' +
+        '</div>';
     }
     this.root.innerHTML = html;
     this.root.onclick = e => {
-      const go = e.target.dataset && e.target.dataset.go;
-      if (go != null) {
-        const c = node.choices[parseInt(go, 10)];
-        self.path = self.path.slice(0, -1).concat((node.label || nodeId) + '·选' + 'ABCDEF'[parseInt(go, 10)]);
+      const d = e.target.dataset || {};
+      if (d.go != null) {
+        const i = parseInt(d.go, 10);
+        const c = node.choices[i];
+        // 记录这一手的代价与后果
+        if (c.cost) this.costs.push(c.cost);
+        if (c.consequence) {
+          this.lastConsequence = typeof c.consequence === 'string'
+            ? { body: c.consequence, time: c.cost ? fmtCost(c.cost) : '' }
+            : Object.assign({}, c.consequence, { time: c.cost ? fmtCost(c.cost) : '' });
+        } else {
+          this.lastConsequence = null;
+        }
+        this.history.push(nodeId);
+        this.choicePath.push((node.label || nodeId) + ' · ' + 'ABCDEF'[i]);
         self.render(c.next);
       }
-      if (e.target.dataset && e.target.dataset.restart) { self.path = []; self.render(self.cfg.start); }
+      if (d.back) {
+        // 只回退一步：回到上一个决策点，保留更早的选择
+        const prev = self.history.pop();
+        self.choicePath.pop();
+        self.lastConsequence = null;
+        if (self.costs.length) self.costs.pop();
+        self.render(prev || self.cfg.start);
+      }
+      if (d.restart) {
+        self.choicePath = []; self.history = []; self.costs = [];
+        self.lastConsequence = null;
+        self.render(self.cfg.start);
+      }
     };
+
+    // 到达结局 → 记入路径库 + 通知 TOC
+    if (node.terminal) {
+      const good = node.verdict === 'good';
+      if (good) {
+        this.tracks.push({ path: this.choicePath.join(' → '), good: true });
+        this.root.dispatchEvent(new CustomEvent('akkc:done', {
+          bubbles: true, detail: { kind: 'decision', chapter: document.body.dataset.chapter }
+        }));
+      }
+      // 存储：这一章的决策题是否走通过
+      const ch = document.body.dataset.chapter;
+      if (ch) {
+        const s = store.get('decision', {}) || {};
+        const key = ch + ':' + (this.cfg.id || this.choicePath[0] || 'd');
+        s[key] = { good: good, at: Date.now() };
+        store.set('decision', s);
+      }
+    }
   };
+
+  /* 时间代价格式化：cost 单位为分钟 */
+  function fmtCost(min) {
+    if (min == null) return '';
+    if (min < 60) return min + ' 分钟';
+    const h = min / 60;
+    if (h < 8) return (Math.round(h * 10) / 10) + ' 小时';
+    if (h < 40) return Math.round(h) + ' 小时（约 ' + Math.round(h / 8) + ' 个工作日）';
+    return Math.round(h) + ' 小时（约 ' + Math.round(h / 8) + ' 个工作日，' + Math.round(h / 160) + ' 个人月）';
+  }
 
   /* ==========================================================================
      组件 5：终端模拟  Term
@@ -946,13 +1269,26 @@
     h += '<div class="lab-out" id="' + (cfg._outId = 'lab-out-' + Math.floor(Math.random() * 1e6)) + '">' +
       '<div class="lab-placeholder">' + (cfg.placeholder || '填好上面的内容，然后点左边的按钮。') + '</div></div>';
 
+    // ---- 风控条：错得越多，"被风控"的压力越大 ----
+    h += '<div class="lab-risk">' +
+      '<span class="lr-label">🛡 风控值</span>' +
+      '<span class="lr-bar"><i></i></span>' +
+      '<span class="lr-val">0%</span>' +
+      '<span class="lr-hint muted">' + (cfg.riskHint || '真实目标上，连续试错会触发风控/验证码甚至封号。') + '</span>' +
+      '</div>';
+
     if (cfg.footer) h += '<div class="lab-footer">' + cfg.footer + '</div>';
     root.innerHTML = h;
     this.outEl = document.getElementById(cfg._outId);
+    this.riskEl = $('.lab-risk', root);
+    this.risk = 0;          // 0-100
+    this.fails = 0;         // 连续失败次数
+    this.locked = false;
 
     root.addEventListener('click', e => {
       const a = e.target.dataset && e.target.dataset.lab;
       if (!a) return;
+      if (this.locked) return;
       if (a === 'run') this.run();
       else if (a === 'check') this.check();
       else if (a === 'answer') this.answer();
@@ -996,6 +1332,11 @@
       ok = r.ok; detail = r.detail || '';
     } catch (e) { ok = false; detail = '检查时出错：' + e.message; }
 
+    // ---- 风控：错一次涨一点，连续错到阈值就"被锁" ----
+    if (ok) { this.fails = 0; this.risk = Math.max(0, this.risk - 40); }
+    else { this.fails++; this.risk = Math.min(100, this.risk + 34); }
+    this.paintRisk();
+
     this.outEl.innerHTML =
       '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '">' +
         '<b>' + (ok ? '✅ 对了' : '❌ 还不对') + '</b>' +
@@ -1004,6 +1345,133 @@
       (ok && this.cfg.after ? '<div class="lab-msg key">' + this.cfg.after + '</div>' : '') +
       (!ok && this.tries >= 2 && this.cfg.showAnswer
         ? '<div class="lab-note">试了 ' + this.tries + ' 次了。可以点「🔓 看正确答案」，但看完要自己重算一遍。</div>' : '');
+
+    if (ok && this.risk >= 60) {
+      this.outEl.innerHTML +=
+        '<div class="lab-msg warn"><b>🛡 注意风控</b>' +
+        '<div class="lab-note">你答对了，但前面已经试错 ' + this.fails +
+        ' 次。真实环境里这些失败请求<b>已经进了对方的风控日志</b>——' +
+        '下次换个思路：先静态分析缩小范围，再用一次性验证。</div></div>';
+    }
+
+    if (ok) {
+      this.emit('lab');
+      this.mountArtifact(v);
+    }
+  };
+
+  /* ---- 风控条绘制 ---- */
+  Lab.prototype.paintRisk = function () {
+    if (!this.riskEl) return;
+    const bar = $('.lr-bar i', this.riskEl);
+    const val = $('.lr-val', this.riskEl);
+    if (bar) bar.style.width = this.risk + '%';
+    if (val) val.textContent = this.risk + '%';
+    this.riskEl.classList.toggle('warn', this.risk >= 40 && this.risk < 80);
+    this.riskEl.classList.toggle('danger', this.risk >= 80);
+
+    if (this.risk >= 100 && !this.locked) this.lock();
+  };
+  Lab.prototype.lock = function () {
+    const self = this;
+    this.locked = true;
+    const sec = this.cfg.lockSec || 15;
+    this.root.classList.add('locked');
+    this.root.dataset.lockSec = sec;
+    let left = sec;
+    const it = setInterval(() => {
+      left--;
+      self.root.dataset.lockSec = left;
+      if (left <= 0) {
+        clearInterval(it);
+        self.locked = false;
+        self.risk = 45;
+        self.paintRisk();
+        self.root.classList.remove('locked');
+        self.outEl.innerHTML =
+          '<div class="lab-msg warn"><b>🔓 锁定解除</b>' +
+          '<div class="lab-note">刚才那 ' + sec + ' 秒，就是真实场景里被风控拦下的代价。' +
+          '这次先想清楚再动手——<b>先看提示，或者先做静态分析</b>。</div></div>';
+      }
+    }, 1000);
+  };
+
+  /* ---- 产出物：可复制、可存入工具箱 ---- */
+  Lab.prototype.mountArtifact = function (vals) {
+    const cfg = this.cfg;
+    let code = '', name = '', sub = '';
+    try {
+      if (cfg.artifact) {
+        name = cfg.artifact.name || cfg.title || '实验产出';
+        sub = cfg.artifact.sub || '';
+        code = typeof cfg.artifact.code === 'function' ? cfg.artifact.code(vals, this) : cfg.artifact.code;
+      } else if (cfg.expected) {
+        // 没显式配置产出物时，自动把「我的输入 + 正确答案」整理成实验记录
+        name = (cfg.title || '实验') + ' · 实验记录';
+        sub = '自动生成';
+        const lines = ['# ' + (cfg.title || '实验记录'),
+                       '# 章节：第 ' + (document.body.dataset.chapter || '?') + ' 章',
+                       '', '[我的输入]'];
+        (cfg.inputs || []).forEach((inp, i) => {
+          lines.push((inp.label || ('字段' + i)).replace(/<[^>]+>/g, '') + ' = ' + (vals[inp.key || i] || '（空）'));
+        });
+        const ans = cfg.showAnswer ? String(cfg.showAnswer).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '') : '';
+        if (ans) { lines.push('', '[正确答案]', ans.trim()); }
+        lines.push('', '# 复述一遍：把上面的结论用自己的话写下来，才算真的会了。');
+        code = lines.join('\n');
+      }
+    } catch (e) { return; }
+    if (!code) return;
+
+    const old = $('.lab-artifact', this.root);
+    if (old) old.remove();
+
+    const box = document.createElement('div');
+    box.className = 'lab-artifact';
+    const cid = 'art-' + Math.floor(Math.random() * 1e6);
+    box.innerHTML =
+      '<div class="la-head"><b>📦 本次产出物</b>' +
+        '<span class="la-sub">' + esc(name) + (sub ? ' · ' + esc(sub) : '') + '</span>' +
+        '<span class="la-acts">' +
+          '<button class="btn ghost" data-art="copy">⧉ 复制</button>' +
+          '<button class="btn ok" data-art="save">💾 存入工具箱</button>' +
+        '</span></div>' +
+      '<pre id="' + cid + '"><code></code></pre>' +
+      '<div class="la-foot">' +
+        '这部分<b>不是讲义，是你自己的成果</b>。存进工具箱后，可在「🧰 工具箱 → 我的产出」集中查看与导出。' +
+      '</div>';
+    $('#' + cid + ' code', box).textContent = code;
+
+    const anchor = $('.lab-risk', this.root);
+    this.root.insertBefore(box, anchor || null);
+
+    box.addEventListener('click', e => {
+      const a = e.target.dataset && e.target.dataset.art;
+      if (a === 'copy') {
+        const btn = e.target;
+        copyText(code, ok => {
+          btn.textContent = ok ? '✓ 已复制' : '✗ 复制失败';
+          setTimeout(() => { btn.textContent = '⧉ 复制'; }, 1500);
+        });
+      } else if (a === 'save') {
+        const btn = e.target;
+        saveArtifact({
+          name: name,
+          chapter: document.body.dataset.chapter || '',
+          page: location.pathname.split('/').pop(),
+          code: code,
+          at: Date.now()
+        });
+        btn.textContent = '✓ 已存入工具箱';
+        btn.disabled = true;
+      }
+    });
+  };
+
+  Lab.prototype.emit = function (kind) {
+    this.root.dispatchEvent(new CustomEvent('akkc:done', {
+      bubbles: true, detail: { kind: kind || 'lab', chapter: document.body.dataset.chapter }
+    }));
   };
   Lab.prototype.run = function () {
     const v = this.vals();
@@ -1172,7 +1640,7 @@
     $$('[data-term]').forEach(el => { new Term(el, JSON.parse(el.dataset.term)); });
   }
 
-  global.AKKC = { $, $, esc, norm, CodeStepper, SocraticTeacher, Quiz, Decision, Term, Stage, Deck, Lab, Case, store, COURSE };
+  global.AKKC = { $, $, esc, norm, CodeStepper, SocraticTeacher, Quiz, Decision, Term, Stage, Deck, Lab, Case, store, COURSE, copyText, saveArtifact, listArtifacts, fmtCost };
 
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
   else boot();
