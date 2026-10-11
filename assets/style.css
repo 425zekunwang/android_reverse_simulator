@@ -107,7 +107,7 @@ body {
 .chapter-hero {
   border: 1px solid var(--line);
   background: linear-gradient(160deg, var(--panel-2), var(--panel));
-  border-radius: 16px; padding: 28px 30px; margin-bottom: 28px;
+  border-radius: 16px; padding: 20px 26px; margin-bottom: 16px;
   position: relative; overflow: hidden;
 }
 .chapter-hero::after {
@@ -116,19 +116,19 @@ body {
   pointer-events: none;
 }
 .chapter-hero .ch-no {
-  display: inline-block; font-family: var(--mono); font-size: 12px; font-weight: 700;
+  display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 700;
   letter-spacing: 2px; color: var(--acc);
   border: 1px solid rgba(77,163,255,.35); background: rgba(77,163,255,.09);
-  padding: 3px 10px; border-radius: 999px; margin-bottom: 12px;
+  padding: 3px 10px; border-radius: 999px; margin-bottom: 10px;
 }
-.chapter-hero h1 { margin: 0 0 10px; font-size: 30px; line-height: 1.3; letter-spacing: -.4px; }
-.chapter-hero .lede { color: var(--fg-2); font-size: 16px; margin: 0; max-width: 760px; }
+.chapter-hero h1 { margin: 0 0 8px; font-size: 24px; line-height: 1.3; letter-spacing: -.4px; }
+.chapter-hero .lede { color: var(--fg-2); font-size: 13.5px; margin: 0; max-width: 860px; line-height: 1.65; }
 .chapter-hero .hero-meta {
-  display: flex; gap: 18px; flex-wrap: wrap; margin-top: 18px;
-  padding-top: 16px; border-top: 1px dashed var(--line);
-  font-size: 13px; color: var(--fg-3);
+  display: flex; gap: 12px; flex-wrap: wrap; margin-top: 12px;
+  padding-top: 10px; border-top: 1px dashed var(--line);
+  font-size: 12px; color: var(--fg-3);
 }
-.chapter-hero .hero-meta b { color: var(--fg-2); font-weight: 600; }
+.chapter-hero .hero-meta b { color: var(--fg-2); font-weight: 600; font-size: 13px; }
 
 /* ---------------------------------------------------------------- 标题 */
 h2 {
@@ -1490,4 +1490,260 @@ body.focus-mode .chapter-hero::after { opacity: 0; }
   body { background: #fff; color: #111; }
   .code-wrap.collapsible > pre { max-height: none !important; overflow: visible !important; }
   .code-wrap.collapsible::after { display: none !important; }
+}
+
+/* ==========================================================================
+   Duolingo 关卡地图（首页 32 章 + 章节内小关地图复用）
+   --------------------------------------------------------------------------
+   设计要点：
+   - 蛇形 Z 字排布：6 列蛇形，节点用 CSS Grid 摆位，连线用 SVG path
+   - 当前节点放大 + 强光晕；已通关填色 + 勾；未达灰
+   - 一屏装下 32 节点（不要长进度条的核心：地图本身高度受控）
+   - 不显示明显的"长滚动条"，整张地图留在视口里
+   ========================================================================== */
+
+/* 外壳：宽度跟随 <body>，左右多给一点呼吸 */
+.duo-map {
+  position: relative;
+  width: 100%;
+  margin: 20px 0 36px;
+  padding: 28px 12px 24px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(77,163,255,.05), transparent 60%);
+}
+.duo-map::before {
+  /* 顶部进度条：已通关/总数，更直观 */
+  content: '';
+  position: absolute; left: 0; right: 0; top: 0; height: 3px;
+  background: linear-gradient(90deg, var(--ok) 0%, var(--ok) var(--map-pct, 0%),
+                                       rgba(255,255,255,.06) var(--map-pct, 0%), rgba(255,255,255,.06) 100%);
+  border-radius: 16px 16px 0 0;
+  pointer-events: none;
+}
+.duo-map-head {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 10px; margin-bottom: 18px; padding: 0 6px;
+}
+.duo-map-title {
+  font-size: 13px; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase;
+  color: var(--fg-3);
+}
+.duo-map-title b { color: var(--fg); font-size: 16px; margin-right: 4px; }
+.duo-map-stats {
+  display: flex; gap: 14px; font-size: 12px; color: var(--fg-3);
+}
+.duo-map-stats b { color: var(--ok); font-family: var(--mono); }
+
+/* SVG 连线层：绝对定位，铺满 grid */
+.duo-map svg.duo-lines {
+  position: absolute; inset: 0; width: 100%; height: 100%;
+  pointer-events: none;
+}
+.duo-map svg.duo-lines path {
+  fill: none; stroke-width: 3;
+  stroke: var(--line-2);
+  stroke-linecap: round;
+  stroke-dasharray: 4 6;
+  opacity: .55;
+}
+.duo-map svg.duo-lines path.done { stroke: var(--ok); stroke-dasharray: none; opacity: .8; }
+
+/* 节点网格：6 列；蛇形 Z 字，节点间用 CSS Grid gap 控制间距 */
+.duo-nodes {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 14px 4px;
+  padding: 4px 0;
+}
+/* 蛇形定位由 JS 显式控制（gridRow + gridColumn），不需要 RTL */
+.duo-cols-6 { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+.duo-cols-1 { grid-template-columns: repeat(1, minmax(0, 1fr)); }
+.duo-cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.duo-cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* 节点单元 */
+.duo-node {
+  position: relative;
+  display: flex; flex-direction: column; align-items: center;
+  text-align: center; text-decoration: none;
+  padding: 4px 0; min-height: 86px;
+  color: var(--fg-3);
+  transition: transform .25s ease;
+}
+.duo-node:hover { transform: translateY(-2px); }
+.duo-node .dn-circle {
+  position: relative; width: 50px; height: 50px;
+  border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 16px; font-family: var(--mono);
+  background: var(--bg-3);
+  border: 2px solid var(--line-2);
+  color: var(--fg-3);
+  box-shadow: 0 2px 0 rgba(0,0,0,.4);
+}
+.duo-node .dn-circle::after {
+  content: ''; position: absolute; inset: -8px;
+  border-radius: 50%; border: 2px solid transparent;
+  transition: border-color .25s ease;
+}
+.duo-node .dn-num { letter-spacing: -.5px; }
+.duo-node .dn-label {
+  margin-top: 6px;
+  font-size: 10.5px; line-height: 1.3; color: var(--fg-3);
+  max-width: 96px; word-break: keep-all;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* 状态 */
+.duo-node.locked .dn-circle { opacity: .55; }
+.duo-node.locked .dn-circle::before {
+  content: '🔒'; position: absolute; font-size: 18px; filter: drop-shadow(0 1px 0 rgba(0,0,0,.4));
+}
+
+.duo-node.done .dn-circle {
+  background: linear-gradient(160deg, var(--ok), #0fa260);
+  border-color: #b6f5c8;
+  color: #062113;
+  box-shadow: 0 0 0 4px rgba(55,214,122,.18), 0 2px 0 rgba(0,0,0,.4);
+}
+.duo-node.done .dn-circle::after { content: '✓'; position: absolute; right: -4px; bottom: -4px;
+  width: 22px; height: 22px; border-radius: 50%;
+  background: var(--ok); color: #062113;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 800; border: 2px solid var(--bg); }
+.duo-node.done .dn-label { color: var(--ok); }
+
+/* 当前章节：放大 + 强光晕 + 脉冲提示 */
+.duo-node.current .dn-circle {
+  width: 64px; height: 64px; font-size: 19px;
+  border-color: var(--acc);
+  box-shadow: 0 0 0 6px rgba(77,163,255,.25),
+              0 0 24px rgba(77,163,255,.55),
+              0 4px 0 rgba(0,0,0,.4);
+  animation: duo-pulse 2.4s ease-in-out infinite;
+}
+.duo-node.current .dn-label { color: var(--fg); font-weight: 700; }
+.duo-node.current .dn-circle::after { border-color: rgba(77,163,255,.35); }
+@keyframes duo-pulse {
+  0%, 100% { box-shadow: 0 0 0 6px rgba(77,163,255,.25),
+                         0 0 24px rgba(77,163,255,.55),
+                         0 4px 0 rgba(0,0,0,.4); }
+  50%      { box-shadow: 0 0 0 10px rgba(77,163,255,.08),
+                         0 0 32px rgba(77,163,255,.8),
+                         0 4px 0 rgba(0,0,0,.4); }
+}
+
+/* 不可点击：禁用 hover */
+.duo-node:not([href]) { cursor: default; pointer-events: none; }
+
+/* 章节内的小关地图（mini-map）：吸顶、紧凑、单行节点 */
+.mini-map {
+  position: sticky;
+  top: var(--tb-h, 52px);
+  z-index: 89;             /* 顶栏 100/位置条 90 之间 */
+  margin: 6px 0 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(11,15,20,.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 8px 12px;
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px;
+  --mm-h: 44px;
+}
+/* 阅读区：默认情况滚动不会"找不到位置"——一旦进入内容区，
+   章节的 collapsed 小标题视觉弱化，让可见当前关卡更突出 */
+body.in-chapter .sec.collapsed { opacity: .55; }
+body.in-chapter .sec.collapsed:hover { opacity: .85; }
+body.in-chapter .sec.open .sec-head h2 { color: var(--acc); }
+/* 已读 / 远离当前 的章节：head 更紧凑，节省屏幕 */
+body.in-chapter .sec.collapsed .sec-head {
+  padding: 8px 14px;
+  margin-bottom: 2px;
+}
+body.in-chapter .sec.collapsed .sec-head h2 { font-size: 12.5px; margin-top: 0; line-height: 1.4; }
+body.in-chapter .sec.collapsed .sec-head .sec-chev { width: 20px; height: 20px; font-size: 11px; }
+body.in-chapter .sec.collapsed .sec-head .sec-state { font-size: 10.5px; }
+body.in-chapter .sec.collapsed .sec-head .h2-num { font-size: 11px; }
+.mini-map .mm-label {
+  font-weight: 700; letter-spacing: .6px; color: var(--fg-3);
+  font-size: 11px; padding-right: 6px;
+  border-right: 1px solid var(--line-2);
+  flex: none;
+}
+.mini-map .mm-track {
+  position: relative; flex: 1; min-width: 0;
+  height: var(--mm-h);
+  display: flex; align-items: center;
+}
+.mini-map .mm-line {
+  position: absolute; left: 14px; right: 14px; top: 50%;
+  height: 3px; background: var(--line-2); border-radius: 2px; transform: translateY(-50%);
+  pointer-events: none;
+}
+.mini-map .mm-line i {
+  display: block; height: 100%; background: var(--ok); border-radius: 2px;
+  width: 0; transition: width .35s ease;
+}
+.mini-map .mm-nodes {
+  position: relative; display: flex; align-items: center; gap: 0; flex: 1;
+  padding: 0 14px; overflow-x: auto; overflow-y: hidden;
+  scroll-behavior: smooth;
+  scrollbar-width: none;
+}
+.mini-map .mm-nodes::-webkit-scrollbar { display: none; }
+.mini-map .mm-n {
+  position: relative;
+  flex: 1 0 auto; min-width: 30px;
+  display: flex; align-items: center; justify-content: center;
+  text-align: center;
+}
+.mini-map .mm-n .mm-dot {
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 11px; font-family: var(--mono);
+  background: var(--bg-3);
+  border: 2px solid var(--line-2);
+  color: var(--fg-3);
+  cursor: pointer; transition: all .25s ease;
+}
+.mini-map .mm-n .mm-dot:hover { border-color: var(--acc); color: var(--fg); }
+.mini-map .mm-n.read .mm-dot {
+  background: var(--ok); border-color: var(--ok); color: #062113;
+}
+.mini-map .mm-n.current .mm-dot {
+  width: 30px; height: 30px; font-size: 13px;
+  border-color: var(--acc); color: var(--fg);
+  box-shadow: 0 0 0 4px rgba(77,163,255,.22), 0 0 12px rgba(77,163,255,.5);
+}
+.mini-map .mm-n.current .mm-dot::after {
+  content: ''; position: absolute; inset: -8px;
+  border-radius: 50%; border: 2px solid rgba(77,163,255,.35);
+  animation: duo-pulse 2.4s ease-in-out infinite;
+}
+.mini-map .mm-stats {
+  font-size: 11px; color: var(--fg-3); font-family: var(--mono);
+  padding-left: 8px; border-left: 1px solid var(--line-2); flex: none;
+}
+.mini-map .mm-stats b { color: var(--fg); font-size: 13px; }
+
+/* 移动端 */
+@media (max-width: 860px) {
+  .duo-cols-6 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .duo-nodes { gap: 14px 4px; }
+  .duo-node .dn-circle { width: 44px; height: 44px; font-size: 14px; }
+  .duo-node.current .dn-circle { width: 56px; height: 56px; font-size: 17px; }
+  .duo-node .dn-label { font-size: 10px; max-width: 80px; }
+  .mini-map .mm-label { font-size: 10px; }
+  .mini-map .mm-stats { font-size: 10px; }
+}
+@media (max-width: 520px) {
+  .duo-cols-6 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .duo-nodes { gap: 12px 4px; }
+  .duo-node .dn-circle { width: 40px; height: 40px; font-size: 13px; }
+  .duo-node.current .dn-circle { width: 50px; height: 50px; font-size: 15px; }
 }

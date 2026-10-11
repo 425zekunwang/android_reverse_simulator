@@ -839,6 +839,270 @@
   }
 
   /* ==========================================================================
+     Duolingo 关卡地图
+     ==========================================================================
+     两个变体共用同一套渲染函数：
+       • mountIndexMap()    —— 首页 32 章总地图，替换 .course-grid
+       • mountMiniMap()     —— 章节页内顶部小关地图（11–31 个圆点）
+     节点状态：
+       • done     —— 来自 AKKC_STORE.chapters[no].done
+       • current  —— 当前正在读（首页=最近 lastRead.ch；章节页内=curIdx）
+       • locked   —— 顺序模式未解锁（占位用，本课不强制锁，置为可点）
+     ========================================================================== */
+
+  /* ---- 通用：渲染一组节点（蛇形 Z 字）----
+     nodes: [{no, title, file, done, current}]
+     cols: 6（首页），1（章节内小关地图）
+     蛇形定位：行号 r, 行内位 i, 列号 c =
+       r = Math.floor(idx / cols)
+       pos = idx % cols
+       c = (r % 2 === 0) ? pos : (cols - 1 - pos)
+  */
+  function buildDuoNodes(nodes, opts) {
+    opts = opts || {};
+    let cols = opts.cols || 6;
+    // 响应式：依据视口宽度自适应列数（蛇形几何需要固定列数，
+    // 但 JS 显式 gridColumn 定位后浏览器会扩展模板，故不能在 @media 里靠 CSS override）
+    if (cols === 6) {
+      const vw = global.innerWidth || 1280;
+      if (vw <= 520) cols = 3;
+      else if (vw <= 860) cols = 4;
+    }
+    const wrap = doc.createElement('div');
+    wrap.className = 'duo-nodes duo-cols-' + cols;
+    wrap.style.direction = 'ltr';
+
+    const refs = [];
+    nodes.forEach((n, idx) => {
+      const r = Math.floor(idx / cols);
+      const pos = idx % cols;
+      const c = (r % 2 === 0) ? pos : (cols - 1 - pos);
+      const a = doc.createElement('a');
+      a.className = 'duo-node' + (n.done ? ' done' : '') + (n.current ? ' current' : '');
+      if (n.file) a.href = n.file; else a.removeAttribute('href');
+      a.title = n.title;
+      a.dataset.no = String(n.no);
+      a.style.gridRow = (r + 1);
+      a.style.gridColumn = (c + 1);
+      a.innerHTML =
+        '<span class="dn-circle"><span class="dn-num">' + n.no + '</span></span>' +
+        '<span class="dn-label">' + (n.shortTitle || n.title || '') + '</span>';
+      wrap.appendChild(a);
+      refs.push({ no: n.no, el: a });
+    });
+    return { wrap, refs };
+  }
+
+  /* ---- 通用：在容器里画蛇形连接线（SVG path）---- */
+  function drawDuoLines(container, refs) {
+    // 容器已有 SVG 占位：append svg
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = doc.createElementNS(ns, 'svg');
+    svg.setAttribute('class', 'duo-lines');
+    svg.setAttribute('preserveAspectRatio', 'none');
+    container.insertBefore(svg, container.firstChild);
+
+    // 等下一帧，让 Grid 布局稳定，再读取节点中心坐标
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const rect = container.getBoundingClientRect();
+      svg.setAttribute('viewBox', '0 0 ' + rect.width + ' ' + rect.height);
+      svg.setAttribute('width', rect.width);
+      svg.setAttribute('height', rect.height);
+
+      const pts = refs.map(r => {
+        const c = r.el.querySelector('.dn-circle').getBoundingClientRect();
+        return {
+          no: r.no,
+          x: c.left + c.width / 2 - rect.left,
+          y: c.top + c.height / 2 - rect.top
+        };
+      });
+
+      // 按节点在数组中的顺序连接相邻两个（蛇形已通过 gridRow/gridColumn 定位）
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i], b = pts[i + 1];
+        const dx = Math.abs(a.x - b.x);
+        const dy = Math.abs(a.y - b.y);
+        let d;
+        if (dx < 2) {
+          // 同列垂直：直线
+          d = 'M ' + a.x + ' ' + a.y + ' L ' + b.x + ' ' + b.y;
+        } else if (dy < 2) {
+          // 同行水平：直线
+          d = 'M ' + a.x + ' ' + a.y + ' L ' + b.x + ' ' + b.y;
+        } else {
+          // 蛇形 Z 字拐弯：S 曲线，用横向中点作控制点
+          const mx = (a.x + b.x) / 2;
+          d = 'M ' + a.x + ' ' + a.y +
+              ' C ' + mx + ' ' + a.y + ', ' + mx + ' ' + b.y + ', ' + b.x + ' ' + b.y;
+        }
+        const p = doc.createElementNS(ns, 'path');
+        p.setAttribute('d', d);
+        // 如果两节点都 done，连线 done
+        const both = refs[i].el.classList.contains('done') &&
+                     refs[i + 1].el.classList.contains('done');
+        if (both) p.setAttribute('class', 'done');
+        svg.appendChild(p);
+      }
+    }));
+  }
+
+  /* ---- 首页：32 章关卡地图 ----
+     渲染策略：
+       1) 拿到 COURSE.chapters、AKKC_STORE.chapters、lastRead
+       2) 已 done 的高亮；当前章=lastRead.ch（最新一章）
+       3) 不用额外解锁锁（开放全部学习），未做=灰圈可点（不让用户因为"未解锁"卡住）
+  */
+  function mountIndexMap() {
+    if (!/^index(\.html)?$/.test(pageKey)) return;
+    const map = $('#map');
+    if (!map || map.dataset.duoReady === '1') return;
+    map.dataset.duoReady = '1';
+    map.innerHTML = '';                    // 清掉旧 grid
+
+    const C = global.COURSE;
+    const S = global.AKKC_STORE;
+    if (!C || !C.chapters) return;
+
+    function render() {
+      const chapters = S ? S.get('chapters', {}) || {} : {};
+      const last = ux.get('lastRead', null);
+      const currentCh = (last && last.ch) || null;
+
+      const nodes = C.chapters.map(c => ({
+        no: c.no,
+        title: c.title,
+        file: c.file,
+        done: !!(chapters[c.no] && chapters[c.no].done),
+        current: c.no === currentCh
+      }));
+
+      const doneN = nodes.filter(n => n.done).length;
+      const total = nodes.length;
+
+      let shell = map.querySelector('.duo-map');
+      if (!shell) {
+        shell = doc.createElement('div');
+        shell.className = 'duo-map';
+        map.appendChild(shell);
+      }
+      shell.innerHTML =
+        '<div class="duo-map-head">' +
+          '<div class="duo-map-title"><b>' + total + ' 关卡</b>关卡地图</div>' +
+          '<div class="duo-map-stats">已通关 <b>' + doneN + '</b>/' + total +
+            ' · 当前关卡 <b>' + (currentCh || '第 1 关') + '</b></div>' +
+        '</div>';
+      shell.style.setProperty('--map-pct', Math.round(doneN / total * 100) + '%');
+      const { wrap, refs } = buildDuoNodes(nodes, { cols: 6 });
+      shell.appendChild(wrap);
+      drawDuoLines(shell, refs);
+
+      // 滚动到当前关卡（仅首屏）
+      requestAnimationFrame(() => {
+        const cur = shell.querySelector('.duo-node.current');
+        if (cur) {
+          const mapTop = shell.getBoundingClientRect().top + global.scrollY;
+          if (global.scrollY < mapTop - 20) {
+            global.scrollTo({ top: mapTop - 80, behavior: reduceMotion ? 'auto' : 'smooth' });
+          }
+        }
+      });
+    }
+    render();
+
+    // 暴露给 akkc:done 事件，重新渲染（最新 done 状态、最新当前关卡、最新连线）
+    global.AKKC_repaintIndex = render;
+  }
+
+  /* ---- 章节内：小关地图 ----
+     顶部吸顶，11–31 个圆点，单行溢出滚动；当前节放大高亮。
+     关键：当前圆点要在视口中（auto-scroll into view）。
+  */
+  function mountMiniMap() {
+    if (!sections.length) return;
+
+    // 插在位置条下面、章节正文之前
+    const bar = $('.sec-bar');
+    const hero = $('.chapter-hero') || $('h1') || $('.wrap > h2');
+
+    const host = doc.createElement('div');
+    host.className = 'mini-map';
+    host.innerHTML =
+      '<span class="mm-label">本章小关</span>' +
+      '<div class="mm-track">' +
+        '<div class="mm-line"><i></i></div>' +
+        '<div class="mm-nodes"></div>' +
+      '</div>' +
+      '<span class="mm-stats"><b>1</b>/' + sections.length + '</span>';
+
+    const nodesBox = host.querySelector('.mm-nodes');
+    const refs = [];
+    sections.forEach((s, i) => {
+      const n = doc.createElement('div');
+      n.className = 'mm-n';
+      n.title = s.title;
+      n.innerHTML = '<span class="mm-dot" tabindex="0">' + (i + 1) + '</span>';
+      nodesBox.appendChild(n);
+      refs.push({ idx: i, wrap: n, dot: n.querySelector('.mm-dot') });
+    });
+
+    // 挂载：紧跟位置条
+    if (bar && bar.parentNode) bar.parentNode.insertBefore(host, bar.nextSibling);
+    else if (hero && hero.parentNode) hero.parentNode.insertBefore(host, hero.nextSibling);
+    else doc.body.insertBefore(host, doc.body.firstChild);
+
+    function refresh() {
+      const readN = sections.filter(x => readSet.has(x.id)).length;
+      host.querySelector('.mm-line i').style.width =
+        Math.round(readN / sections.length * 100) + '%';
+      host.querySelector('.mm-stats').innerHTML =
+        '<b>' + readN + '</b>/' + sections.length;
+
+      refs.forEach(r => {
+        const isRead = readSet.has(sections[r.idx].id);
+        const isCur = r.idx === curIdx;
+        r.wrap.classList.toggle('read', isRead);
+        r.wrap.classList.toggle('current', isCur);
+        r.dot.setAttribute('aria-current', isCur ? 'true' : 'false');
+      });
+
+      // 滚动当前节点到视口中
+      const cur = refs[curIdx];
+      if (cur) {
+        const cr = cur.wrap.offsetLeft, cw = cur.wrap.clientWidth || 32;
+        const box = nodesBox, bcr = box.getBoundingClientRect();
+        const wrapLeft = box.scrollLeft;
+        if (cr < bcr.left - wrapLeft + 30 || cr + cw > bcr.right - wrapLeft - 30) {
+          box.scrollTo({ left: cr - bcr.width / 2 + cw / 2, behavior: 'smooth' });
+        }
+      }
+    }
+
+    // 点击 / 键盘 → 跳转
+    refs.forEach(r => {
+      const act = () => setOpen(r.idx, { scroll: true });
+      r.dot.addEventListener('click', act);
+      r.dot.addEventListener('keydown', e => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); act(); }
+      });
+    });
+
+    // 阅读区标识：让 collapsed head 在视觉上让位给当前关卡
+    doc.body.classList.add('in-chapter');
+
+    // 重写 paint 让小关地图也刷新
+    const oldPaint = paint;
+    paint = function () {
+      oldPaint();
+      refresh();
+    };
+    refresh();
+
+    // 暴露给外部（resume card、hashchange 都用它来 refresh）
+    global.AKKC_miniMapRefresh = refresh;
+  }
+
+  /* ==========================================================================
      启动
      ========================================================================== */
   function init() {
@@ -846,6 +1110,7 @@
     mountBurger();
     mountFocusToggle();
     mountCodeTools();
+    mountIndexMap();                  // 首页关卡地图（仅 index）
 
     const gl = $$('h2').find(h => /名词表/.test(h.textContent || ''));
     if (gl && !gl.id) gl.id = 'glossary';
@@ -862,6 +1127,7 @@
       readSet = new Set(Array.isArray(savedRead) ? savedRead : []);
 
       mountSecBar();
+      mountMiniMap();                  // 章节内小关地图（紧跟位置条）
       applyHash();
 
       if (!location.hash) {
@@ -870,6 +1136,16 @@
         curIdx = idx >= 0 ? idx : 0;
       }
       setOpen(curIdx, { });
+      // 如果有 openSec 记忆（非默认第 1 关），把视口带到当前关附近
+      // 否则保持顶部，hero + 小关地图直接看到
+      if (curIdx > 0) {
+        // 等 paint 后再滚，避免错位
+        setTimeout(() => {
+          const t = sections[curIdx].head.getBoundingClientRect().top + window.scrollY;
+          // 让当前关头部刚好落在小关地图下方（保留 ~120px 视窗）
+          window.scrollTo({ top: Math.max(0, t - 120), behavior: reduceMotion ? 'auto' : 'smooth' });
+        }, 30);
+      }
       measureBars();
       setTimeout(measureBars, 300);
     }
@@ -886,6 +1162,11 @@
       ux.set('read:' + pageKey, Array.from(readSet));
     });
     setInterval(() => { if (sections.length) ux.set('read:' + pageKey, Array.from(readSet)); }, 15000);
+
+    // 监听章节完成（done 状态变化）→ 刷新首页地图
+    doc.addEventListener('akkc:done', () => {
+      if (/^index(\.html)?$/.test(pageKey) && global.AKKC_repaintIndex) global.AKKC_repaintIndex();
+    });
 
     global.AKKC_expandAll = expandAll;
     global.AKKC_stepMode = stepMode;

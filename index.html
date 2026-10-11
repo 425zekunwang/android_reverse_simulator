@@ -37,6 +37,10 @@
     </div>
   </div>
 
+  <!-- 关卡地图：放在 hero 之后立即出现，是首页的主视图。
+       ux.js 的 mountIndexMap() 会接管 #map，把 32 章渲染成 Duolingo 蛇形关卡。 -->
+  <div id="map"></div>
+
   <div class="stat-row" id="progress">
     <div class="stat"><div class="sv" id="svDone">0</div><div class="sl">已完成章节</div></div>
     <div class="stat"><div class="sv" id="svSoc">0</div><div class="sl">通关的追问关卡</div></div>
@@ -56,42 +60,36 @@
   </div>
 
   <div class="note warn">
-    <div class="note-h">📖 章节顺序 = 学习顺序（32 章已按从易到难重排）</div>
-    <p>本站内容来自三份大纲、<b>逐步补全</b>：最初只有 <b>3w 计划班</b>的目录（18 章），
-    后来拿到 <b>2w 计划班</b>目录补出 7 章，最后拿到 <b>1w 计划班</b>目录又补出 7 章。
-    <span class="hit">于是曾经出现一个问题：章节号记录的是"写作批次"，不是学习顺序——最难的部分被排在了最前面。</span>
-    现在编号已按学习顺序重排（入门 → 基础补遗 → 进阶），<strong>照编号往下读即可</strong>。</p>
-    <div class="tbl-wrap" style="margin-top:10px">
-      <table class="tbl">
-        <thead><tr><th>阶段</th><th>章节</th><th>性质</th><th>你该什么时候看</th></tr></thead>
-        <tbody>
-          <tr>
-            <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">第一程 · 入门地基</span></td>
-            <td>第 <b>1–7</b> 章<br><span class="muted small">（原 1w 计划）</span></td>
-            <td><b>最基础</b>：四大组件 / 生命周期 / Handler / Binder、Smali 与重打包、APK·DEX·ELF 格式、应用安全风险与审计、环境配置与定位方法论、RSA、AI 辅助</td>
-            <td><b>完全零基础从这里开始。</b>这 7 章回答的是"安卓本身怎么跑起来"</td>
-          </tr>
-          <tr>
-            <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">第二程 · 基础技能补遗</span></td>
-            <td>第 <b>8–14</b> 章<br><span class="muted small">（原 2w 计划）</span></td>
-            <td><b>基础</b>：加固全景、JNI/NDK 开发、Frida 自动化、Xposed/LSPosed、抓包与协议、自吐沙箱、白盒密码</td>
-            <td>补上"逆向工作"的必备技能，是第 15–32 章默认你会的前置</td>
-          </tr>
-          <tr>
-            <td><span class="pill acc">第三程 · 进阶与深水区</span></td>
-            <td>第 <b>15–32</b> 章<br><span class="muted small">（原 3w 计划）</span></td>
-            <td>进阶：脱壳演进、编译器中立、虚拟机保护、跨平台与基础设施</td>
-            <td>已经有逆向底子，想往深水区走</td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-    <p><b>两个具体例子：</b><br>
-    ① 第 16 章讲 FART 脱壳时，默认你已知"加固分哪几代、壳的特征怎么判定"——这块在第 8 章。<br>
-    ② 第 22 章讲算法还原时，默认你已会抓包拿到请求样本，也默认你知道"这个方法是怎么被系统调起来的"——
-    前者在第 12 章，后者在 <b>第 1 章</b>。</p>
-    <p style="margin-bottom:0"><span class="hit">所以顺序不影响正确性，但影响你的挫败感。</span>
-    不确定从哪开始的话，直接看下面那张卡片里的<b>「零基础完整路线」</b>。</p>
+    <div class="note-h">📖 章节顺序 = 学习顺序（按编号照读即可）</div>
+    <p>三段式：<b style="color:#a3e635">入门地基</b>（第 1–7 章，1w 计划）→ <b style="color:#e879f9">基础补遗</b>（第 8–14 章，2w 计划）→ <b class="acc">进阶与深水区</b>（第 15–32 章，3w 计划）。
+    <span class="hit">顺序不影响正确性，但影响挫败感。</span>不确定从哪开始，看下面的「学习路线」卡片。</p>
+    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--fg-3);font-size:12.5px">展开 32 章分组细节</summary>
+      <div class="tbl-wrap" style="margin-top:10px">
+        <table class="tbl">
+          <thead><tr><th>阶段</th><th>章节</th><th>性质</th><th>何时看</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">入门地基</span></td>
+              <td>第 <b>1–7</b> 章</td>
+              <td>四大组件 / Smali / 文件格式 / 安全审计 / 定位方法论 / RSA / AI</td>
+              <td>完全零基础从这里开始</td>
+            </tr>
+            <tr>
+              <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">基础补遗</span></td>
+              <td>第 <b>8–14</b> 章</td>
+              <td>加固全景 / JNI / Frida / Xposed / 抓包 / 沙箱 / 白盒</td>
+              <td>逆向工作的必备技能</td>
+            </tr>
+            <tr>
+              <td><span class="pill acc">深水区</span></td>
+              <td>第 <b>15–32</b> 章</td>
+              <td>脱壳演进 / ARM & C++ / OLLVM / VMP / unidbg / 算法还原 / eBPF / iOS / 云手机 / 模拟器 / 容器</td>
+              <td>已经有逆向底子再走</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </details>
   </div>
 
   <div style="display:flex;gap:12px;flex-wrap:wrap;margin:26px 0">
@@ -103,8 +101,6 @@
     <button class="btn ghost" id="btnReset" style="padding:11px 22px;font-size:14px">↺ 清空学习进度</button>
     <button class="btn ghost" id="btnExport" style="padding:11px 22px;font-size:14px">⬇ 导出进度</button>
   </div>
-
-  <div id="map"></div>
 
   <hr>
 
@@ -286,29 +282,9 @@
   const soc = S.get('soc', {}) || {};
   const quiz = S.get('quiz', {}) || {};
 
-  // ---- 按阶段渲染卡片 ----
+  // ---- 关卡地图由 ux.js 的 mountIndexMap() 渲染（替换旧的阶段分组卡片） ----
+  // 这里只做统计、不再渲染网格
   const map = document.getElementById('map');
-  Object.keys(C.tracks).forEach(tk => {
-    const list = C.chapters.filter(c => c.track === tk);
-    if (!list.length) return;
-    const sec = document.createElement('div');
-    sec.className = 'track-section';
-    sec.innerHTML =
-      '<div class="track-label"><span class="dot" style="background:' + C.tracks[tk].color + '"></span>' +
-      C.tracks[tk].name + '</div>' +
-      '<div class="course-grid">' + list.map(c => {
-        const st = chapters[c.no] || {};
-        const socDone = Object.values(soc).filter(x => x && x.cleared && x.done).length;
-        return '<a class="ccard' + (st.done ? ' done' : '') + '" href="' + c.file + '">' +
-          '<div class="cc-top"><span class="cc-no">CH ' + String(c.no).padStart(2, '0') + '</span>' +
-          '<span class="cc-check">✅</span></div>' +
-          '<h3>' + c.title + '</h3>' +
-          '<p>' + c.desc + '</p>' +
-          '<div class="cc-tags">' + c.tags.map(t => '<span class="cc-tag">' + t + '</span>').join('') + '</div>' +
-          '<span class="cc-bar"></span></a>';
-      }).join('') + '</div>';
-    map.appendChild(sec);
-  });
 
   // ---- 统计 ----
   const doneCount = Object.values(chapters).filter(c => c && c.done).length;
@@ -431,11 +407,18 @@
       card.style.outline = '2px solid var(--acc)';
       detailBox.style.display = '';
       detailBox.innerHTML = '<div class="note-h">' + p.title + '</div>' + p.body;
-      // 高亮地图上对应章节卡片
-      document.querySelectorAll('.ccard').forEach(cc => {
-        const no = parseInt((cc.querySelector('.cc-no').textContent.match(/\d+/) || [0])[0], 10);
-        cc.style.outline = p.chs.includes(no) ? '2px solid var(--acc)' : '';
-        cc.style.opacity = p.chs.includes(no) ? '1' : '.4';
+      // 高亮关卡地图上对应章节节点（按 data-no 匹配）
+      document.querySelectorAll('.duo-node').forEach(n => {
+        const no = parseInt(n.dataset.no || '0', 10);
+        if (p.chs.includes(no)) {
+          n.style.outline = '3px solid var(--acc)';
+          n.style.outlineOffset = '4px';
+          n.style.borderRadius = '50%';
+          n.style.opacity = '1';
+        } else {
+          n.style.outline = '';
+          n.style.opacity = '.35';
+        }
       });
       detailBox.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     };
