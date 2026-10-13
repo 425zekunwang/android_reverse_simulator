@@ -17,7 +17,12 @@ window.CHAPTER = {
       title: '第三条路：把 so 搬进 PC 里跑',
       intuition: {
         tag: '直觉模型 · 无菌病房里做手术',
-        body: '<p>真机 + Frida 调试，像在<b>闹市街头做手术</b>：病人（App）活着，但随时有交警（反调试）来查、围观群众（其他线程）在动、天气（网络 / 时间 / 电量）还在变。模拟执行则是把病人请进<b>无菌病房</b>：没有交警、没有围观群众、天气恒定。</p><p>代价是：病房里<b>什么都没有</b>。呼吸机、输液泵、监护仪，你得一台一台自己搬进来。搬设备的过程，就叫<b>补环境</b>。</p>'
+        body: '<p>真机 + Frida 调试，像在<b>闹市街头做手术</b>：病人（App）活着，但随时有交警（反调试）来查、围观群众（其他线程）在动、天气（网络 / 时间 / 电量）还在变。模拟执行则是把病人请进<b>无菌病房</b>：没有交警、没有围观群众、天气恒定。</p><p>代价是：病房里<b>什么都没有</b>。呼吸机、输液泵、监护仪，你得一台一台自己搬进来。搬设备的过程，就叫<b>补环境</b>。</p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> 这套打法在 JS 逆向里你早就在用了——只不过没人叫它"模拟执行"。你在 Node 里 <code>require(&apos;crypto-js&apos;)</code>、把目标网站那段混淆的 JS 用 jsdom 喂一遍、补上 <code>window</code>/<code>navigator</code>/<code>fetch</code>，让它能跑出来——和 unidbg 在 PC 上加载 so、补 JNIEnv、跑出结果，是<b>同一个动作的不同载体</b>。</p>' +
+          '<p><b>对位</b>:<br>· unidbg ≈ Node 沙箱 + jsdom 跑目标 JS<br>· Unicorn ≈ jsdom + 隔离 VM（只给你一个执行场所，什么都不给你）<br>· 加载 .so ≈ <code>require</code> / 动态 import 模块<br>· 调 native 函数 ≈ 直接 <code>require</code> 模块后调用其方法<br>· 补 JNIEnv / syscall ≈ 补 <code>window</code> / <code>navigator</code> / <code>document.cookie</code> / <code>fetch</code><br>· Worker Pool 并发复用 emulator ≈ Node <code>Worker</code> / <code>child_process</code> 池子跑多份 JS</p>' +
+          '<p><b>关键差异</b>:JS 跑在 V8 上，目标代码本来就是同语言；而 unidbg 跑 ARM 机器码，是<b>跨 ISA</b> 模拟——成本高一个量级。所以 JS 逆向里几乎没人"裸 V8"，先套个 vm/jsdom 就完事；安卓逆向里不少人从 Unicorn 起步，就是因为这层 ISA 鸿沟天然存在。</p>' +
+          '<p><b>逆向视角</b>:你下次看到"补环境"三个字，直接换成脑子里的"在 Node 里跑 SDK 要补的那堆 navigator/canvas/webgl/fetch"——成本结构、踩坑顺序、什么时候该放弃静态改走调用，几乎一一对应。</p>')
       },
       html: T.note('key', '🔑 一句话定位', '<p>模拟执行 = <b>不启动 App、不需要真机</b>，直接在 PC 上加载 so，把里面的加密函数「跑」出结果。它不解决「看懂算法」，它解决「<b>让算法替你干活</b>」。</p>') +
         '<p>走到加密函数这一步，逆向工程通常只有三条路：</p>' +
@@ -56,7 +61,10 @@ window.CHAPTER = {
         '<li><b>进程与线程</b>：没有调度、没有 TLS，连<b>栈</b>都要你自己 map 出来并设置 SP。</li>' +
         '</ul>' +
         T.note('ok', '✅ 但「什么都没有」恰恰是优点', '<p>正因为没有操作系统，环境的每一个变量都由你决定：<b>没有反调试</b>（没有 ptrace、没有 /proc 检查的真实语义）、<b>没有副作用</b>（不写文件、不发网络）、<b>完全可复现</b>（同一份输入永远同一份输出）。再叠加 <span class="mono">UC_HOOK_CODE</span> 这种逐指令级别的观测能力，你得到的是一个<b>可以单步、可以 trace、可以随时暂停的确定性沙盒</b>。</p>') +
-        '<p>这也是为什么 Unicorn 被大量嵌进各类工具链：轻量、可嵌入、API 小。代价就是——<b>环境要你自己搭</b>。</p>',
+        '<p>这也是为什么 Unicorn 被大量嵌进各类工具链：轻量、可嵌入、API 小。代价就是——<b>环境要你自己搭</b>。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>Unicorn ≈ jsdom / vm.createContext</b>——都是"只给你一个执行环境，连本体都不预装，全靠你自己挂"。Capstone ≈ <code>acorn</code> / <code>@babel/parser</code>（字节→文本）；Keystone ≈ <code>@babel/generator</code> / <code>escodegen</code>（文本→字节）。</p>' +
+          '<p>Unicorn 强调"只有 CPU、一切外部依赖都没有"，对应 JS 侧就是 <code>vm.runInNewContext("")</code> 出来的空——<code>fetch</code>、<code>Buffer</code>、<code>globalThis.crypto</code> 全部得自己挂上。Unicorn 的优势（无副作用、可单步、可复现）正好对应 jsdom 在 Node 里"无 DOM 真实副作用、可控环境跑同一份 JS"的卖点，<b>两者思路同构</b>。</p>'),
       quiz: {
         id: 'q7-1', chapter: 7, answer: 1,
         stem: '关于 Capstone / Unicorn / Keystone 三者的分工，下列说法<b>正确</b>的是？',
@@ -228,7 +236,11 @@ window.CHAPTER = {
       h: '21.5',
       title: '补环境全景：so 的依赖图谱与补全代价',
       html: T.note('bad', '⚠️ 本章真正的难点在这里', '<p>真实 so 里的函数<b>不是孤立的</b>。它会调 <span class="mono">malloc</span>、<span class="mono">memcpy</span>、<span class="mono">strlen</span>，会访问 <span class="mono">JNIEnv</span> 的函数表，会执行 <span class="mono">SVC</span> 系统调用，会读 <span class="mono">/proc/self/status</span>。而 Unicorn 里<b>什么都没有</b>——这些调用会跳到未映射内存，程序直接崩。</p><p><b>「补环境」就是把这些依赖一个个手工实现。</b>下面这张图，画的就是一个 so 的全部外部依赖，以及每补一项它能往前走多远。</p>') +
-        '<p>按依赖的<b>性质</b>分，需要补的东西一共五类。<span class="pill acc">① ② 属于「系统层」</span> <span class="pill acc">③ ④ 属于「虚拟机层」</span> <span class="pill acc">⑤ 属于「Java 业务层」</span>，越往后越难补，因为越往后越接近目标的业务逻辑。</p>',
+        '<p>按依赖的<b>性质</b>分，需要补的东西一共五类。<span class="pill acc">① ② 属于「系统层」</span> <span class="pill acc">③ ④ 属于「虚拟机层」</span> <span class="pill acc">⑤ 属于「Java 业务层」</span>，越往后越难补，因为越往后越接近目标的业务逻辑。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>补环境 ≈ 补浏览器环境（mock window / navigator / canvas / fetch）</b>。五类依赖在 JS 侧完全同构：①「libc」≈ 你自己实现的 <code>Buffer</code> / <code>crypto</code> 工具函数；②「syscall」≈ <code>fetch</code> / <code>XMLHttpRequest</code> / <code>navigator.sendBeacon</code> 这类能发起真实副作用的 API，要替换成可控桩；③「JNIEnv 表」≈ <code>window</code> 上挂的那一堆方法（<code>document.getElementById</code>、<code>localStorage.getItem</code>）——native 只认位置不认实现，挂自己的桩就能换调用；④「JavaVM」≈ <code>globalThis</code> / Realm 那一层；⑤「Java 回调」≈ <code>document.querySelector</code>、<code>canvas.getContext</code> 这类要造出"假 DOM 节点"才有的返回值。</p>' +
+          '<p><b>关键差异</b>:JS 补环境时 SDK 是同语言同 ISA（都是 JS），第⑤类"假 DOM 节点"几乎可以直接用 jsdom 兜住；而 unidbg 的第⑤类是 Java 字节码 ↔ ARM 指令两套世界，要造"假类 + 假 JNI 返回值"是两套语义模型。所以 unidbg 的五类里、第五类不是"成本高"而是"质变难"。</p>' +
+          '<p><b>逆向视角</b>:你在 JS 里判断"这个 SDK 是补环境还是直接抠算法"，对应的就是本章"看导入表、估算 JNI 占比"那一步——先把第⑤类的占比摸清楚，再决定动手姿势。</p>'),
       stage: {
         title: '补环境全景：五类依赖，逐项补齐，看 so 能走多远',
         speed: 2000,
@@ -680,7 +692,11 @@ window.CHAPTER = {
         '<p>注意上表最后一行——<b>两者不是竞争关系，而是流程上的先后关系</b>。这也引出了本节最重要的一条建议：</p>' +
         T.note('ok', '✅ 推荐工作流（先 Frida，后 unidbg）', '<ol><li><b>先用 Frida RPC 在真机上跑通</b>，确认函数可以被成功调用；</li><li><b>采集几组「输入 → 输出」样本对</b>，作为后续一切的<b>黄金参照</b>；</li><li>同时观察它调了什么（JNI 回调多不多？syscall 多不多？有没有读 /proc？）——<b>这就是补环境难度评估</b>；</li><li>评估结果可接受 → 迁到 unidbg，用样本对逐组回归验证；</li><li>评估结果是「地狱级」→ 老老实实继续用 Frida RPC，或者回到静态分析。</li></ol>') +
         T.note('bad', '⚠️ 没有样本对的 unidbg 迁移＝闭眼开车', '<p>unidbg 最危险的失败模式不是崩溃，是<b>静默地算错</b>。补错了环境、跳过了 <span class="mono">JNI_OnLoad</span>、时间函数返回了不合适的值——它都会给你一个<b>格式正常但内容错误</b>的结果。<b>手里没有真机样本对，你根本发现不了。</b></p>') +
-        '<p>什么时候<b>必须</b>上 unidbg？当 Frida 路线被物理掐死的时候：目标 App 反调试太强无法稳定附着、没有可用设备、需要每秒上千次调用、或者要把算法能力封装成一个对外 HTTP 服务。<b>除此之外，Frida RPC 往往是更省事的选择。</b></p>',
+        '<p>什么时候<b>必须</b>上 unidbg？当 Frida 路线被物理掐死的时候：目标 App 反调试太强无法稳定附着、没有可用设备、需要每秒上千次调用、或者要把算法能力封装成一个对外 HTTP 服务。<b>除此之外，Frida RPC 往往是更省事的选择。</b></p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>「unidbg 黑盒调用」≈「在 Node 里直接 <code>require</code> 抠出来的算法 JS 文件 + 内存打包成服务」</b>，「Frida RPC」≈「用 puppeteer / iv8 / curl_cffi 跑真浏览器拿结果」。</p>' +
+          '<p>这两个工作流的角色分工<b>完全同构</b>:unidbg 主内、PC 跑 so、不依赖设备——这正是 Node 直接 require 抠出来的算法的天然形态。Frida RPC 走真机/真环境——在 JS 这边就是 iv8-web-reverse、puppeteer 操控真浏览器、或者 Cookie replay 回放。决策依据也一样:补环境成本 / 调用频率 / 是否可服务化。"先 Frida 采样本对再决定是否迁移 unidbg" ≈ <b>先 iv8 跑出 20 组样本对验证，再决定要不要抠算法复刻成纯 Node</b>。</p>' +
+          '<p><b>关键差异</b>:JS 这条路"迁移"成本几乎为零（require 一下就行），所以几乎没人专门搭"算法服务化"框架——直接 <code>node</code> 跑就是服务。unidbg 必须有 Worker Pool，因为<a>跨 ISA 模拟的实例化开销</a>不缓存就被打死。</p>'),
       quiz: {
         id: 'q7-4', chapter: 7, answer: 3,
         stem: '你在做某 App 的接口签名逆向。Frida RPC 已经在真机上跑通了，但接口需要每秒数百次签名，真机方案顶不住。评估后发现：目标 so <b>只调了 malloc/memcpy，做了 2 个 syscall，完全不回调 Java 层</b>。最合理的决策是？',
@@ -841,7 +857,11 @@ window.CHAPTER = {
     { t: 'AndroidNativeEmu', d: 'Python 项目（AeonLucid/AndroidNativeEmu），基于 Unicorn + Keystone，把①库函数②syscall③JNIEnv④JavaVM 框架化。官方自称 educational project，「partly emulate」。' },
     { t: 'unidbg', d: 'Java 项目（zhkl0228/unidbg），一体化 native 模拟执行框架：内置 ELF 加载、syscall 模拟、JNIEnv/JavaVM 实现、DalvikVM 假虚拟机。支持多后端（Unicorn / dynarmic / M1 hypervisor / Linux KVM）、gdb stub、trace、内存泄漏检测、Worker Pool 与 MCP 调试。' },
     { t: 'Dobby / xHook', d: '<b>Dobby</b>（jmpews/Dobby）是轻量级多平台 inline hook 框架，unidbg 用它实现 native 函数的 inline hook；<b>xHook</b>（iqiyi/xHook）是爱奇艺开源的 Android PLT/GOT hook 框架，unidbg 用它实现 import hook——也就是自动化的「补库函数」。' },
-    { t: '黑盒调用', d: '不还原算法逻辑，只把 so 当函数用：喂输入、取输出。落地形态有 Frida RPC（真机）与 unidbg（PC）两种，选择取决于补环境成本。' }
+    { t: '黑盒调用', d: '不还原算法逻辑，只把 so 当函数用：喂输入、取输出。落地形态有 Frida RPC（真机）与 unidbg（PC）两种，选择取决于补环境成本。' },
+    { t: '↔ Web 对位 · unidbg ≈ Node + jsdom 跑目标 JS', d: '二者都是"在脱离浏览器/设备的环境跑目标代码并喂输入取输出"。unidbg 加载 .so + 补 JNIEnv，对应 Node 直接 require 抠出来的算法 JS / 在 jsdom 里跑目标 SDK。区别是 unidbg 要跨 ARM 指令集模拟（成本高），Node 跑 JS 是同语言同 ISA（成本低）。' },
+    { t: '↔ Web 对位 · 补环境 ≈ 补浏览器 mock (window/navigator/canvas)', d: '概念完全同构。① libc≈自己写 Buffer/crypto 工具；② syscall≈把 fetch/XHR/navigator.sendBeacon 替换成可控桩；③ JNIEnv 表≈window 上的方法表，按位置挂桩；④ JavaVM≈globalThis/Realm 那一层；⑤ Java 业务回调≈document.querySelector/canvas.getContext 等要造假 DOM 节点才能返回值的 API。' },
+    { t: '↔ Web 对位 · unidbg 黑盒调用 ≈ 抠出算法 JS 后 require 调用', d: '决定姿势的逻辑一一对应。Frida RPC（真机跑 App）≈ iv8-web-reverse / puppeteer 跑真浏览器取结果；unidbg（PC 加载 so）≈ Node 直接 require 抠出来的算法 JS。先 Frida 采样本对再迁 unidbg ≈ 先 iv8 跑出样本对再决定要不要抠算法纯 Node 化。' },
+    { t: '↔ Web 对位 · 静默算错 ≈ 算法复刻结果"格式对但内容错"', d: '两种工作流共同的失败模式：模拟器/沙箱环境某项依赖接错了，函数不崩、返回正常长度，但内容与真机/真浏览器对不上。规避方式也同构——必须保留"真机/真浏览器原始响应"作为黄金样本，服务化时内置健康检查。' }
   ],
 
   teacher: {
@@ -850,6 +870,31 @@ window.CHAPTER = {
     sub: '模拟执行不是「高级 Frida」——要能说清它到底模拟了什么、缺了什么、代价在哪',
     intro: '<p style="margin:0">这一章我会盯住三件事追问：<b>Unicorn 到底模拟了什么</b>、<b>补环境补的究竟是什么</b>、<b>什么时候该用它、什么时候不该</b>。答不上来不要紧，但别用「反正 unidbg 能跑」这种话糊弄过去——工具会崩的那天，你手里得有判断力。</p>',
     questions: [
+      {
+        id: 'c21qWeb', depth: 2, threshold: 0.7,
+        q: 'unidbg 让你在 PC 上模拟安卓环境跑 so 算法。说出这个思路在 Web 逆向里的对位物，并说出一条关键差异。',
+        concepts: [
+          { label: 'unidbg ≈ Node + jsdom 跑算法', hint: '不需要真机/真 App 就能跑。', any: ['jsdom', 'Node', '模拟', '环境', '跑', '算法'] },
+          { label: '指令级模拟 ≈ iv8/V8 执行', hint: '把目标指令集搬过来执行。', any: ['iv8', 'V8', 'wasm', '模拟', '执行', '解释'] },
+          { label: 'Stub 掉系统调用', hint: '不需要的部分直接造假。', any: ['stub', 'mock', '伪造', '打桩', '假'] }
+        ],
+        hints: [
+          '先抓核心：两边都是「在 PC 上伪造一个目标环境，让算法自己跑起来，然后观测」。',
+          '再想差异：unidbg 要模拟的是 ARM 指令 + Android 系统调用，jsdom 伪造的是浏览器 API。'
+        ],
+        probes: [
+          '追问：为什么跑通之后还要「对齐」？什么情况下模拟环境跑出的结果和真机不一致？',
+          '再追问：unidbg 需要补 JNI 调用，jsdom 方案需要补哪些浏览器 API？'
+        ],
+        model: '<b>参考答案</b>：<br><b>对位</b>：<b>unidbg ≈ Node + jsdom 跑算法</b>——都不需要真机/真 App，' +
+          '在 PC 上伪造目标环境让算法自己执行；<b>unidbg 的指令级模拟 ≈ 用 V8/iv8 在 Node 里执行 wasm/JS</b>；' +
+          '<b>unidbg 的 stub/mock 系统调用 ≈ jsdom 里 mock 掉 navigator/document 等浏览器 API</b>。<br>' +
+          '<b>关键差异</b>：① <b>模拟的层次不同</b>——unidbg 模拟的是 <b>CPU 指令 + Android 系统调用 + JNI 桥</b>（要补 JNIEnv 函数表），' +
+          'jsdom 只伪造 <b>浏览器 JS API</b>（DOM、navigator、crypto），不涉及指令级；' +
+          '② <b>对齐难度</b>——unidbg 跑 so 常遇到 anti-debug、TEE、时序校验，需要大量 stub 才能跑通；' +
+          'jsdom 方案通常补几个 API 就能跑，但遇到 WASM + V8 特化行为时也会不一致。<br>' +
+          '<b>共同价值</b>：把「需要真机/真浏览器」的成本降到零，让算法还原变成可自动化的一步。'
+      },
       {
         id: 'c7q1', depth: 1, threshold: 0.7,
         q: '用一句话说清 <b>Unicorn 模拟了什么、没模拟什么</b>。这个「没模拟」的部分，在实战中会以什么形式暴露出来？',

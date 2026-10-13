@@ -18,7 +18,11 @@ window.CHAPTER = {
         body:
           '<p>你是一家机场的安保负责人。传统做法是：<b>站在出口拦人翻包</b>——这相当于用户态 hook（Frida、PLT hook），你在行李已经离开传送带之后才动手，动作大、容易被看见。</p>' +
           '<p>eBPF 的做法是：<b>把一台只会执行你写的检查清单的机器人，直接装到传送带内部</b>。这台机器人上岗前要过机场自己的严格审查（<b>验证器</b>），上岗后只能用机场指定的几件工具（<b>helper 函数</b>），只能把结果写进一本共享登记本（<b>BPF Map</b>），而且明令禁止三件事：<b>不许搬走行李、不许改动行李、不许赖着不走（不许死循环、不许睡眠阻塞）</b>。</p>' +
-          '<p>机器人被锁死在传送带里，旅客（App）根本看不见它——这就是 eBPF 对逆向最大的价值，也是它最大的风险来源。</p>'
+          '<p>机器人被锁死在传送带里，旅客（App）根本看不见它——这就是 eBPF 对逆向最大的价值，也是它最大的风险来源。</p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> 把 eBPF 放到 JS 世界，就是<b>V8 的 <code>--trace-opt</code> / <code>--trace-deopt</code> 或 Chrome DevTools 的 Performance 火焰图</b>——都是"不读源码、只看函数实际执行"的可观测性手段。eBPF 在内核做系统调用 / 函数级 trace，相当于你用 DevTools 看 JS 函数的热度、调用关系和 JIT 编译事件。</p>' +
+          '<p><b>对位</b>: <b>内核可观测性 ≈ 运行时可观测性</b>; eBPF 的 kprobe / uprobe 函数级 trace ≈ V8 trace flag / Performance 火焰图看热点。</p>' +
+          '<p><b>关键差异</b>: JS 侧的运行时可观测性大多发生在"同一个 V8 实例 / 同一个进程"里——你开 DevTools 跑 Performance，页面多少能感知到（调试器开着、profiler 在跑）。eBPF 的观测发生在<b>目标进程地址空间之外（内核态）</b>，只要不往目标进程注入代码，目标自己读不到被观测的证据。所以 eBPF 的"对目标透明"比 DevTools 的多数 trace 更彻底——这是它对抗检测的核心，也是第 24 章 frida 检测那段的反面。</p>')
       },
       html:
         '<p><b>BPF</b>（Berkeley Packet Filter）不是什么新概念——1992 年就提出了，它是 <code>tcpdump</code> 背后那套' + T.term('包过滤', '在网络栈中按规则筛掉不需要的报文，只把关心的包交给上层，避免无谓的数据拷贝') + '机制的底座，干的事很窄：从网络包里按规则挑出你要的那些。</p>' +
@@ -33,7 +37,10 @@ window.CHAPTER = {
           '<p>所以本章中任何涉及「当前支持情况」「最新内核版本」「某配置项默认是否开启」的表述，<b>都请当成线索而不是结论</b>，一律以你自己设备上的实测结果为准。文中不确定的点会用 ' + T.pill('warn', '待核实') + ' 标出。</p>') +
         T.note('', '📌 一句话记住 eBPF 和 Frida 的分工',
           '<p>' + T.term('Frida', '用户态动态插桩框架，需要注入目标进程，改变其内存与指令') + ' 是「<b>进到敌人家里装摄像头</b>」——看得细，但你要先破门而入，家里的人一定知道有人来过。eBPF 是「<b>在小区门口的电线杆上装摄像头</b>」——看不清家里沙发的花纹，但能看清谁几点进出、拎了什么包，而且住户完全不知道摄像头存在。</p>' +
-          '<p>两者的观测粒度和隐蔽性是一组<b>此消彼长</b>的权衡，不是谁替代谁。第 27 章讲的内核态对抗里，eBPF 是标准观测手段。</p>')
+          '<p>两者的观测粒度和隐蔽性是一组<b>此消彼长</b>的权衡，不是谁替代谁。第 27 章讲的内核态对抗里，eBPF 是标准观测手段。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>eBPF 内核态 trace ≈ V8 的 --trace-opt / DevTools Performance 火焰图</b>。你在 JS 逆向里用这些手段看函数热度、JIT 编译和调用链，跟 eBPF 用 kprobe / uprobe 看内核 / 用户函数同属"运行时可观测性"。</p>' +
+          '<p>具体差异: DevTools 的 trace 跑在<b>同一个进程同一个 V8 实例</b>里，页面多少能感知（开了调试器、跑了 profiler）；eBPF 的观测在<b>目标地址空间之外</b>，只要不注入，目标读不到。所以安卓这边"让 App 无感"比 JS 侧更彻底——这也是第 24 章 Frida 检测会失败、而内核观测不容易被检测的原因。</p>'),
     },
 
     /* ================= 25.2 生命周期 stage ================= */
@@ -714,7 +721,8 @@ window.CHAPTER = {
           { t: 'o', s: '12: sched_cls  name trafficController  ...  run_time_ns 0' },
           { t: 'w', s: '# 注意：看不到任何程序 ≠ 内核不支持；\n#      看得到程序 ≠ 你有权限加载自己的程序。两件事要分开判断。' },
           { t: 'p', s: 'ls /data/local/tmp/', note: '<b>最后：观测者的落脚点。</b>你的 loader 是个用户态可执行文件，得先在设备上有个位置。这一步也提醒你——<b>内核态观测隐蔽，但观测者本身不隐蔽</b>。<code>/data/local/tmp</code> 是最常用的位置，也正因如此它是各种检测的重点扫描区域。' },
-          { t: 'o', s: 'trace_open\nminimal.bpf.o' }
+          { t: 'o', s: 'trace_open\nminimal.bpf.o' },
+          { t: 'w', s: '↔ Web 对位：探测内核是否支持 eBPF（CONFIG_BPF_SYSCALL / BTF 等）≈ 探测浏览器 / Node 运行时能力（feature detection，看某个 API 是否存在）', note: '同属“先确认环境支不支持，再决定走哪条路”。差异：JS 的 feature detection 在同源 JS 里直接 typeof / in 判断，秒级；安卓要在 root shell 里读 /proc/config.gz、ls /sys/kernel/btf，且不同设备裁剪差异极大，结论不能跨设备套用。' }
         ]
       },
       after:
@@ -1125,3 +1133,15 @@ window.CHAPTER = {
     ]
   }
 };
+
+window.CHAPTER.teacher.questions.push({
+  id: 'c25qWeb', depth: 2, threshold: 0.7,
+  q: '用 Web/JS 逆向里你熟悉的概念，解释“eBPF 在内核态对 App 做函数级 trace，而 App 自身完全无感”这件事。说出至少两个对位物和它们的差异。',
+  concepts: [
+    { label: '说出至少一个对位概念（如 V8 --trace-opt / DevTools Performance 火焰图）', hint: '想想你用什么看 JS 函数的热度、调用、JIT 编译', any: ['trace-opt', 'trace-deopt', 'performance', '火焰图', 'v8', 'profiler', 'devtools', 'jit', '热点', 'trace'] },
+    { label: '说出关键差异（eBPF 观测发生在目标进程地址空间之外，App 无感）', hint: 'DevTools trace 多少会让页面知道有调试器；eBPF 的隐蔽性来自哪？', any: ['地址空间', '内核', '透明', '无感', '进程外', '隐蔽', '检测不到', '探针', '观测者'] }
+  ],
+  hints: ['想想 V8 的 --trace-opt / --trace-deopt 或 Chrome DevTools Performance 火焰图', 'eBPF 的隐蔽性来自“观测在目标进程地址空间之外”'],
+  probes: ['安卓里所有依赖“在目标进程内留东西”的检测，对内核态观测为什么一律失效？'],
+  model: '<b>参考答案</b>: eBPF 内核态 trace ≈ V8 的 --trace-opt / --trace-deopt 或 DevTools Performance 火焰图——都是“看函数热度和调用序列”的可观测性手段；内核可观测性 ≈ 运行时可观测性。对位物：① 函数级 trace——V8 的 trace flag 看 JIT 编译 / 去优化事件，eBPF 的 kprobe / uprobe 看任意内核 / 用户函数的进入与返回，都是“不读源码、只看实际执行”。② 对目标透明——DevTools 的某些 trace 对页面并不完全透明（开了调试器、跑了 profiler，页面能感知）；eBPF 的观测发生在目标进程的地址空间之外（内核态），只要不往目标进程里注入代码，目标自己读不到被观测的证据。关键差异：JS 侧的运行时可观测性大多发生在“同一个进程 / 同一个 V8 实例”里，观测者多少要在目标里留痕；eBPF 把观测者搬到了内核，天然在目标的可见范围之外。'
+});

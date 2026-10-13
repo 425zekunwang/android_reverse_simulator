@@ -444,7 +444,12 @@ window.CHAPTER = {
           '<p>关键不在清单，在<b>依赖</b>：没有电闸，插座和门禁都装不上；' +
           '但没有监视器，你照样能进屋干活，只是慢。</p>' +
           '<p>所以「环境没配好」从来不是一个是非题，而是一句<b>程度描述</b>：' +
-          '你缺的是哪一块，它让你的哪一类观测手段直接失效。这就是本章第一节要给的地图。</p>'
+          '你缺的是哪一块，它让你的哪一类观测手段直接失效。这就是本章第一节要给的地图。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 把安卓逆向环境想成"装修一间工作室"——对 JS 逆向工程师来说，几乎每一样东西都有现成的浏览器对应物。安卓的"环境配置"在浏览器里通常就是「打开 DevTools」，但遇到 App 嵌的 WebView、小程序或签名强校验的混合 App 时，你就要搭一套"浏览器增强版"来对付它了。</p>' +
+            '<p><b>对位</b>:<br>· 设备（真机/模拟器）≈ 多浏览器环境（Chrome/Firefox/Safari/手机模拟器）<br>· root ≈ Chrome DevTools Protocol / 远程调试（拿到与原生代码同级的访问权）<br>· 抓包证书（系统信任库）≈ 浏览器代理证书（Charles/Reqable Burp 根证书）<br>· Hook 框架（Frida/Xposed）≈ 浏览器扩展（Tampermonkey、油猴脚本）/DevTools Snippets 注入 / 浏览器 hook 脚本（重写 window.fetch / XMLHttpRequest）<br>· 调试器（IDA/JDWP）≈ DevTools 断点（含 XHR/fetch/事件断点）+ 浏览器 console.log 实时观测<br>· logcat ≈ Network 面板 + Console 面板 + Application 标签（localStorage/Cookie/IndexedDB 视图）</p>' +
+            '<p><b>关键差异</b>:浏览器默认给了你"全部权限"——你能直接看源码、看网络、看 DOM、看事件；安卓的每一种观测都要付一笔"环境成本"，五块拼图必须按依赖关系依次配。这是从 JS 逆向跨到安卓逆向最反直觉的一关：习惯了"装个插件就开干"的人，会被 root/证书/Hook 三道门依次卡住。</p>' +
+            '<p><b>逆向视角</b>:用浏览器 DevTools 调试网页时，你同时也是"已 root"的状态——能看到源码、能拦截请求、能改 DOM、能改返回值。把这种"全观测"心态带到安卓逆向：先想清楚"这次任务要哪种观测"，再去为它付对应的环境成本；不要"先按教程配齐再说"，那是没有浏览器经验的人才会犯的错。</p>')
       },
       html:
         T.note('key', '🔑 先把判断立在这里',
@@ -1126,7 +1131,12 @@ window.CHAPTER = {
           '<li><b>把房间冻结住逐寸搜</b>（动态调试）——最彻底，也最贵。</li>' +
           '</ul>' +
           '<p>本章要建立的判断力是：<b>面对一个具体现象，先付哪一笔成本。</b>' +
-          '排错顺序的原则只有一条——<span class="hit">先做那个「即使失败也几乎不花钱」的动作。</span></p>'
+          '排错顺序的原则只有一条——<span class="hit">先做那个「即使失败也几乎不花钱」的动作。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这七条"找钥匙的办法"，在 JS 逆向里几乎一条不漏地有对应物——而且 JS 逆向的日常工作顺序就是"先做零成本的、再上重的"。</p>' +
+            '<p><b>对位</b>:<br>· 字符串搜索 ≈ 在 webpack/vite 编译后的 bundle 里搜明文（"登录失败"/"余额不足"/URL 路径/token 前缀）<br>· 静态结构 ≈ 看 webpack 模块结构、SourceMap、AST 折叠、跨文件 import 关系<br>· Profiling/Trace ≈ Chrome DevTools Performance 面板录制 + 取样；fiddler/wireshark 长会话<br>· 日志线索 ≈ DevTools Console / Network 时间窗过滤；自定义 console.log/tag 加 console.group 分组<br>· 调用栈 ≈ DevTools 报错栈（区分 minified/source mapped）、Error.stack 取栈、堆栈追溯<br>· UI 反推 ≈ React DevTools 的组件树、Vue DevTools 的组件层级→找到 onClick 绑定的函数<br>· 动态调试 ≈ DevTools Sources 断点 + Scope 变量观察 + XHR/fetch/Event Listener breakpoints</p>' +
+            '<p><b>关键差异</b>:JS 逆向"天然零成本"——所有线索在浏览器里都默认开了；而安卓的每一步都要先付环境成本（七条线索里最便宜的"字符串搜索"对应 jadx 反编译，这一步本身就已经要装 jadx 了）。所以安卓逆向的"梯子"比 JS 逆向陡得多——这也是为什么这本书花一整章讲"环境配置"。但<b>思路完全相同</b>：先做失败也几乎不花钱的，拿到强证据就跳级，被结构性排除的划掉。</p>' +
+            '<p><b>逆向视角</b>:做 JS 逆向时你脑子里跑的也是这七条——只是顺序更随意（因为浏览器都给齐了）。把"先搜字符串、再看结构、再 trace、再断点"这条纪律带到安卓：任何不熟悉的样本，第一件事永远是"反编译 + 搜明文"，不要上来就 attach IDA。</p>')
       },
       html:
         T.note('key', '🔑 全章骨架：七条线索与它们的成本',
@@ -1196,7 +1206,11 @@ window.CHAPTER = {
                '这是很好的<b>假设来源</b>，但需要别的手段把它变成证据'],
               ['动态调试挂不上', '要么环境问题，要么对方在检测',
                '<b>最有价值的一次失败</b>：确认了「有人不希望被调试」，于是转向抢时序或换观测层']
-            ]))
+            ])) +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 这张"七条线索成本阶梯"在 JS 逆向里几乎天然成立——<b>浏览器默认就把成本 1 和成本 2 全开了</b>，所以 JS 逆向工程师日常几乎只用前 4 条（搜字符串、看调用图、看 trace、看栈），后 3 条只在对付 App 嵌的 WebView 或自吐 JS 时才用得上。</p>' +
+          '<p><b>对位速查</b>:① 字符串搜索 ≈ 在 minified bundle 里 Ctrl+Shift+F 搜明文 / 字段名；② 静态结构 ≈ 看 webpack chunk 划分 + import 关系 + AST 折叠；③ 调用栈 ≈ DevTools 报错栈 / Error.stack；④ UI 反推 ≈ React/Vue DevTools 组件树→onClick；⑤ Profiling/Trace ≈ Chrome Performance 面板录制；⑥ 日志 ≈ DevTools Console 时间窗；⑦ 动态调试 ≈ Sources 面板断点 + XHR/fetch breakpoints + scope 变量观察。</p>' +
+          '<p><b>关键差异</b>:JS 逆向里 "成本 1 + 成本 2" 是免费的（浏览器都给了），"成本 4" 才是要动手的开始（要写 hook 脚本/装扩展）；而安卓里光是"成本 1"（jadx 反编译）就要装工具，更别说 "成本 4" 的 hook / root / 调试。所以安卓逆向的<b>成本斜率比 JS 陡得多</b>，但思路完全一样：先零成本的、失败也能砍范围；拿到强证据跳级；被结构性排除直接划掉。</p>')
         ,
       stage: {
         title: '七条线索 · 成本阶梯（从最便宜爬到最贵）',
@@ -1490,7 +1504,12 @@ window.CHAPTER = {
           '<p>你关心两件事：<b>最上面的业务痕迹从哪一行开始</b>（事发点），' +
           '以及<b>最下面那笔交易是怎么被发起的</b>（入口）。</p>' +
           '<p>如果这张收据上所有的名字都被涂成了「a、b、c」，那你手里的纸还在，信息已经没了——' +
-          '这就是栈退化。</p>'
+          '这就是栈退化。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 调用栈读法（业务边界 / 入口 / 代理帧 / 栈退化）在 JS 逆向里几乎完全一致——只不过栈帧的"语言层 / 系统层 / 业务层"换了一种分法。</p>' +
+            '<p><b>对位</b>:<br>· 系统/框架帧（android.* / java.* / androidx.*）≈ V8 内部 / Node.js 内部 / 浏览器内置 API（EventTarget.dispatchEvent / setTimeout 回调 / Promise 微任务）<br>· 业务框架帧（第三方 SDK / 网络库 / 加解密封装）≈ axios/fetch 包装 / 业务 SDK（sentry/统计SDK）/ 自研请求层<br>· 业务逻辑帧 ≈ 你要逆向的目标代码（被 webpack/vite 编译后的应用业务代码）<br>· 代理帧（反射 / Lambda / 动态代理）≈ 箭头函数内联 / Promise.then 链式回调 / EventTarget 自动绑定 / 浏览器 polyfill 自动包装<br>· 栈退化（a.a.a / 无行号 / 内联缺失）≈ minified bundle（变量名被改、source map 被删、函数被 inline/arrow 化）</p>' +
+            '<p><b>关键差异</b>:JS 栈通常自带 source map（开发环境）或者有 .map 文件可以还原——这让"业务边界 / 业务入口"的判定比安卓轻松得多。安卓的栈退化是<b>编译期被强制抹掉</b>（混淆+剥离），而 JS 栈退化通常只是<b>缺少映射</b>（source map 没加载、或者代码确实被 minify 了）。前者恢复几乎不可能，后者只要拿到 .map 就能瞬间还原。</p>' +
+            '<p><b>逆向视角</b>:判读栈的"三层切法"在两边通用——JS 里是「V8/Node 内部 / 三方库 / 业务代码」，安卓里是「系统/框架 / 三方库 / 业务代码」。判读时永远以"包名/模块名归属"为准，不要看名字猜业务。退化栈在 JS 里的处理方法也是同一套：先看能否加载 source map；不能就换观测（hook 函数入口 / 在关键位置 console.trace()）而不是继续硬读。</p>')
       },
       html:
         '<p>调用栈之所以被单独列为一条线索，是因为它有一种别的线索没有的性质：' +
@@ -1570,7 +1589,12 @@ window.CHAPTER = {
           '</ul>' +
           '<p style="margin-bottom:0"><span class="hit">退化的结论不是「这条线索没用」，而是：' +
           '「名字与行号这条路被关掉了，我需要一个不依赖名字的观测」</span>——' +
-          '于是转向运行时打点、指令级 trace，或者直接用地址做动态调试。</p>'),
+          '于是转向运行时打点、指令级 trace，或者直接用地址做动态调试。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 调用栈的"三段分层 + 业务边界 / 入口"在 JS 逆向里几乎是同一套思路，只是分层对象换成 "V8/浏览器内置 / 三方库 / 业务代码"，代理帧换成 "Promise.then / 箭头函数 / polyfill"。</p>' +
+          '<p><b>对位速查</b>:系统/框架帧 ≈ <span class="mono">at XMLHttpRequest.send</span> / <span class="mono">at Promise.then</span> / <span class="mono">at setTimeout</span> callback；业务框架帧 ≈ axios 包装 / 业务 SDK / 自研请求层；业务帧 ≈ 目标被 webpack 编译后的应用代码；代理/合成帧 ≈ Promise 链自动包装 / 箭头函数内联 / EventTarget 自动绑定。</p>' +
+          '<p><b>关键差异</b>:JS 栈通常带 source map，开发环境里文件名/行号齐全；生产环境 minified 之后才是 "a.a.a" 形态——而且<b>即使 source map 没了</b>，你仍然可以通过 AST 反混淆、hook 关键函数、加载 .map 文件<b>拿回</b>这些信息。安卓的栈退化是混淆器主动抹掉的，恢复几乎不可能。这是 JS 逆向工程师跨到安卓时最大的"心理落差"：你习惯了 "source map 在手、栈随意看"，到了安卓会发现<b>栈信息一旦被抹就找不回来</b>，所以拿到完整栈后要立刻存档。</p>' +
+          '<p><b>逆向视角</b>:判读栈的 "三层切法 + 两个方向（业务边界/入口）" 在两边通用——JS 里是 "V8/Node 内部 → 三方库 → 业务代码"，从栈顶往下找"第一个属于目标代码"的帧就是业务边界，从栈底往上找就是入口。代理/合成帧永远要"穿过不看"。</p>'),
       lab: {
         title: '实验：调用栈判读器（真实解析 + 分层 + 三坐标定位）',
         goal: '标出三个坐标 + 说出理由',
@@ -2381,7 +2405,10 @@ window.CHAPTER = {
     { t: 'Method Profiling', d: '按采样或插桩方式采集方法调用。产出是<b>候选集</b>而非证据：短方法会被采样丢掉，被内联的方法根本不在调用关系里。正确用法是当「假设生成器」。' },
     { t: '交叉引用', d: '「谁引用了这段代码」的关系。在符号被剥离的 native 目标里，它和导入表、常量并列为三大抓手（第 21.13 的 ModuleMap 是它的工程化形态）。' },
     { t: '导入表', d: 'ELF 模块声明「我用到哪些外部函数」的表。它必须存在（动态链接依赖它），所以**符号被剥离也不会消失**——这是 native 静态分析最稳的一张地图。' },
-    { t: '基线', d: '在动手改行为之前记录下的「未干预状态下的输入输出」。没有基线，你无法判断后面的现象是目标的真实行为还是你的干预造成的。' }
+    { t: '基线', d: '在动手改行为之前记录下的「未干预状态下的输入输出」。没有基线，你无法判断后面的现象是目标的真实行为还是你的干预造成的。' },
+    { t: '↔ Web 对位 · 安卓逆向的"环境依赖图" ≈ 浏览器 DevTools 的"N 个面板"', d: '安卓的"五块拼图"（设备/root/证书/Hook/调试）需要按依赖关系依次配，对应到 JS 逆向里就是 "DevTools 面板们默认全开 + 必要时补环境"。日常网页逆向不需要任何配环境动作（打开 DevTools 就够），但一旦遇到 App 嵌的 WebView、小程序、混合签名 App，就要把"五块拼图"的对应物（Fiddler/Charles 证书 + 远程 Chrome 调试 + WebView inspect + 脱壳）按依赖装齐。关键差异：JS 工程师习惯"零环境成本"，跨到安卓时要把"装环境"当成新成本来算。' },
+    { t: '↔ Web 对位 · 七条线索 = "先搜字符串 → 看调用图 → trace → 断点" 的成本阶梯', d: '本章的七条线索（字符串搜索 / 静态结构 / 调用栈 / UI 反推 / 日志 / Profiling / 动态调试）在 JS 逆向里完全成立——只是顺序更随意，因为浏览器默认给了"成本 1+2"。JS 工程师对应到"先 Ctrl+Shift+F 搜明文 → 看 webpack chunk / import 关系 → 看 DevTools 报错栈 → React DevTools 找 onClick → Chrome Performance 录制 → Sources 面板断点"。思路完全一样，差别只在<b>成本斜率</b>：JS 平缓（默认全开），安卓陡峭（每一步都要付环境成本）。' },
+    { t: '↔ Web 对位 · 调用栈三段分层 ≈ "V8/浏览器内置 → 三方库 → 业务代码"', d: '调用栈的"系统/框架 / 业务框架 / 业务逻辑"三段切法在 JS 里是 "V8 内部 / Promise 调度 / EventTarget / 浏览器内置 API"（最底层）、"axios/fetch 包装 / 业务 SDK / 自研请求层"（中间）、"应用业务代码"（最上层）。判读方法完全通用：从栈顶往下找第一个属于目标包名的帧 = 业务边界；从栈底往上找第一个属于目标包名的帧 = 业务入口；反射/合成帧（JS 里就是 Promise.then 链 / 箭头函数内联 / polyfill 包装）永远"穿过不看"。最大差异：JS 栈通常带 source map，栈退化时还能加载 .map 还原；安卓栈退化后基本无法恢复，所以拿到完整栈要立刻存档。' }
   ],
 
   teacher: {
@@ -2394,6 +2421,30 @@ window.CHAPTER = {
       '失败时你到底得到了什么、以及这个结论能不能被别人复核。</b></p>' +
       '<p>答不上来没关系，我会给你提示——但提示不算过关。</p>',
     questions: [
+      {
+        id: 'c05qWeb', depth: 2, threshold: 0.7,
+        q: '安卓逆向的「环境搭建 + 定位 sign 入口」和你熟悉的 Web 调试完全对位。说出 adb、logcat、断点各自的 Web 对位物，并各说一条差异。',
+        concepts: [
+          { label: 'adb ≈ Chrome DevTools Protocol', hint: '都是控制目标进程的桥。', any: ['CDP', 'DevTools', '协议', '桥', '远程调试'] },
+          { label: 'logcat ≈ console.log', hint: '都是看运行日志。', any: ['console', '日志', 'log', '打印'] },
+          { label: '断点定位 sign ≈ XHR/fetch 断点回溯', hint: '从请求倒推生成逻辑。', any: ['断点', 'breakpoint', 'Network', 'XHR', 'fetch', '回溯'] },
+          { label: 'adb pull ≈ Sources 面板 Save As', hint: '把代码导出到本地。', any: ['Save As', '导出', 'Sources', '保存', '下载'] }
+        ],
+        hints: [
+          '先想「桥」：adb 和 CDP 都是「你在 PC 上控制目标进程里的东西」的通道。',
+          '再想定位思路：安卓找 sign 入口和前端找 sign 函数，都是从「现象」往「生成处」回溯。'
+        ],
+        probes: [
+          '追问：logcat 是全系统共享的（能看到所有 App 的日志），console 只能看到自己页面的——这个差异能帮你做什么、又会暴露什么？',
+          '再追问：安卓为什么常用 Spawn 模式（程序启动前插桩），而前端很少需要「启动前注入」？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>adb ≈ CDP</b>：都是 PC 控制目标进程的桥（装包、拉文件、执行命令 / 接管页面执行 JS）。' +
+          '差异：adb 是系统级通道（能操作任意 App、文件系统、Shell），CDP 只能控制你授权的那个页面。<br>' +
+          '② <b>logcat ≈ console.log</b>：都是看运行时日志。差异：<b>logcat 是整个系统共享的</b>——你能看到其他 App 的日志（很多 App 把敏感信息打到 log 里），而 JS 只能看到自己页面的 console。<br>' +
+          '③ <b>断点定位 sign ≈ Network 面板下 XHR/fetch 断点回溯</b>：两边思路一样——从「现象」（返回值/请求）往「生成处」回溯，找到入口函数再逐层看。' +
+          '差异：安卓的入口可能是 Java 也可能是 native(so)，需要先确认分层；前端基本都在 JS 层（除非走了 WASM）。<br>' +
+          '④ <b>adb pull base.apk ≈ Sources 面板 Save As</b>：都是把代码从目标环境导出到本地。差异：adb pull 拉的是<b>文件系统里的 APK 原件</b>，前端 Save As 存的是<b>浏览器已经加载/编译后的资源</b>。'
+      },
       {
         id: 'c30q1', depth: 1, threshold: 0.7,
         q: '有人跟你说：「先解锁 root 再说，反正现在都这么干。」<br>' +

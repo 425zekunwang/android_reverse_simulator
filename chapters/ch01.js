@@ -30,7 +30,20 @@ window.CHAPTER = {
           '</ul>' +
           '<p><span class="hit">这个模型一旦建立，很多逆向里的困惑会自己消失：' +
           '为什么断点要下在 onCreate 而不是 main、为什么"启动后什么都不做"的 App 也在耗电、' +
-          '为什么加固壳第一件事就是覆写 <span class="mono">attachBaseContext</span>。</span></p>'
+          '为什么加固壳第一件事就是覆写 <span class="mono">attachBaseContext</span>。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 「没有 main、被回调驱动、随时可能被无声杀掉」——' +
+            '这套模型你在 Web 端也见过，只是换了形态：<b>一个 SPA 站点就是"一排入口"，而不是"一个程序"</b>。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· 大厅经理（系统）≈ 浏览器标签页调度（用户切走/关闭，页面被 discard 或 frozen）<br>' +
+            '· 服务窗口（组件）≈ 路由 + Controller + 事件订阅，每个都是可被外部触发的入口<br>' +
+            '· 没有 main ≈ 页面没有"入口脚本跑完就结束"的概念，一切靠事件与生命周期钩子<br>' +
+            '· 系统随时杀你 ≈ 页面的 frozen / discarded 状态（Chrome 内存不够时直接丢弃后台标签页）</p>' +
+            '<p><b>关键差异</b>:安卓的"杀"是<b>进程级、无声、无回调</b>（onStop 之后随时消失，连 onDestroy 都不一定调）；' +
+            '浏览器的 discard 至少会保留一条恢复路径，JS 上下文也有机会先跑 <code>pagehide</code> / <code>visibilitychange</code>。</p>' +
+            '<p><b>逆向视角</b>:你在 Web 端判断"代码在哪跑"靠入口文件和路由表；' +
+            '在安卓侧要先问<b>"这个进程、这个组件是被谁拉起的"</b>——多进程 App 里，主进程的 hook 抓不到 ' +
+            '<code>:remote</code> 进程里的代码，正如你在 iframe / Service Worker 里下的钩子抓不到主页面逻辑。</p>')
       },
       html:
         T.note('key', '🔑 本章要建立的三个坐标系',
@@ -220,7 +233,22 @@ window.CHAPTER = {
           '</ul>' +
           '<p><span class="hit">记住一条：<b>onPause 和 onStop 的区别是"还看得见"和"看不见"。</b>' +
           '而 Android 的设计意图是让 App 在 onStop 之后<b>随时可以被无声杀掉而不需要更多回调</b>——' +
-          '所以你保存状态的动作必须发生在 onStop 之前。</span></p>'
+          '所以你保存状态的动作必须发生在 onStop 之前。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这套生命周期在 Web 端你每天都在用,只是没意识到——' +
+            '它就是 <b>Vue/React 组件的 beforeMount / mounted / activated / deactivated / beforeUnmount</b>。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· onCreate ≈ <code>beforeCreate + created + beforeMount</code>(一次性 setup)<br>' +
+            '· onResume ≈ <code>activated</code>(用户能交互)<br>' +
+            '· onPause ≈ <code>deactivated</code>(失焦但还可见)<br>' +
+            '· onStop ≈ <code>deactivated</code> 走完(完全隐藏)<br>' +
+            '· onDestroy ≈ <code>beforeUnmount + unmounted</code>(可被静默回收)</p>' +
+            '<p><b>关键差异</b>:浏览器<b>不会</b>像 Android 那样随时杀你——页面不显示就是"冻起来"(' +
+            'Page Lifecycle API 的 frozen 状态),除非内存真的不够。SPA 里你看不到 destroyed 直接没了的情况,' +
+            '但 PWA / 后台 tab 就有。</p>' +
+            '<p><b>逆向视角</b>:Web 端在某个组件上挂 hook(DevTools / 油猴)的位置选择,' +
+            '等价于 Android 选 <code>attachBaseContext</code> / <code>Application.onCreate</code> / <code>onResume</code> ' +
+            '的判断——"我要 hook 的代码在哪个生命周期里跑"。</p>')
       },
       html:
         '<p>生命周期最容易被误解的一点是：<b>它不是一条直线，而是一个可以被系统任意打断、任意重入的状态机。</b></p>' +
@@ -611,7 +639,21 @@ window.CHAPTER = {
           '</ul>' +
           '<p><span class="hit">于是"主线程被卡住"这件事就有了精确的含义：' +
           '<b>不是前台在忙，而是前台在办一件事的时候不肯放手，后面所有号牌都办不了。</b>' +
-          '这就是 ANR。</span></p>'
+          '这就是 ANR。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这套模型你在 Web 端<b>每天都在用</b>，只是名字不同——' +
+            '它就是 JS 的<b>事件循环（Event Loop）+ 宏任务队列</b>，同构到令人不安。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· Looper（死循环里喊"下一位"）≈ <code>Event Loop</code> 的主循环<br>' +
+            '· MessageQueue（按 <code>when</code> 排序的单链表）≈ 宏任务队列（<code>setTimeout</code> / IO 回调）<br>' +
+            '· Handler.post(Runnable) ≈ <code>setTimeout(fn, 0)</code> 入队<br>' +
+            '· postDelayed（"不早于"这个时间）≈ <code>setTimeout</code> 的延迟语义（忙起来一样会晚）</p>' +
+            '<p><b>关键差异</b>:① JS 事件循环里<b>微任务（Promise）有独立优先级</b>，安卓 Handler 靠同步屏障近似实现；' +
+            '② 安卓的 ANR 是<b>系统会弹窗杀你</b>的硬约束，JS 主线程卡死只是"页面没响应"，没人杀你——' +
+            '所以安卓对"主线程别阻塞"的要求比前端苛刻得多（前端 Long Task 超过 50ms 才开始被嫌弃）。</p>' +
+            '<p><b>逆向视角</b>:Web 端你想"看某段代码什么时候跑"，会在 console 里打时间戳；' +
+            '安卓侧你要问的第一个问题是<b>"这段代码在哪个线程、哪个 Looper 上"</b>——' +
+            'hook 之前先确认这个 Handler 绑的是哪个 Looper，否则你以为 hook 了全局，其实只逮住一条支线。</p>')
       },
       html:
         '<p>这套机制是安卓最核心的并发模型。它值得你花时间，因为：' +
@@ -1444,7 +1486,9 @@ window.CHAPTER = {
     { t: 'DexClassLoader', d: '可加载任意路径 dex/jar/apk 的类加载器，是插件化与加固壳的核心手段。参数包括 dex 路径、优化目录（新版本已忽略）、so 搜索路径、父加载器。' },
     { t: 'InMemoryDexClassLoader', d: '直接从内存中的 ByteBuffer 加载 dex，不落盘。因此"去文件系统找解密后的 dex"这条路对它无效，必须 dump 内存。' },
     { t: '存储沙箱的三次转折', d: '分区存储之前（可读写整张 sdcard）→ Android 10 引入分区存储（可用 requestLegacyExternalStorage 临时退回）→ Android 11 起强制分区存储（需 MediaStore 或「所有文件访问权限」）。具体分界以官方文档为准。' },
-    { t: 'W^X 与可执行目录限制', d: '较新 Android 版本禁止 App 从可写目录执行本地代码，因此"把 so 放 sdcard 再 dlopen"在新系统上会失败。分析此类方案前必须先确认目标版本是否还允许。' }
+    { t: 'W^X 与可执行目录限制', d: '较新 Android 版本禁止 App 从可写目录执行本地代码，因此"把 so 放 sdcard 再 dlopen"在新系统上会失败。分析此类方案前必须先确认目标版本是否还允许。' },
+    { t: '↔ Web 对位 · 事件循环', d: '安卓主线程的 Looper/MessageQueue 概念,和浏览器 Event Loop 完全同构:都是"主线程等消息 → 分发 → 回调",区别是浏览器用 microtask/task 队列,安卓用 Handler/Message。逆向时"消息队列执行顺序"的判断方法两边一样。' },
+    { t: '↔ Web 对位 · 路由钩子', d: '安卓的四大组件入口 ≈ 路由表 + Controller + 事件总线:每条入口都是攻击面。Web 端"从一个未公开入口找到隐藏功能"的思路,和安卓"从 export 组件找到脱壳/调试入口"完全平行。' }
   ],
 
   teacher: {
@@ -1457,6 +1501,33 @@ window.CHAPTER = {
       '有了坐标系，你会先问"这段代码是被谁、在什么时候、在哪个线程上调起来的"，然后钩子自己就浮出来了。</p>' +
       '<p>我要问的就是坐标系。答不上来可以要提示，但提示不算过关。</p>',
     questions: [
+      {
+        id: 'c01qWeb', depth: 2, threshold: 0.7,
+        q: '你在 Web/JS 逆向里天天和事件循环打交道。请用你熟悉的 Web 概念，解释安卓的「四大组件 + 生命周期 + Handler/Looper + Zygote」这套模型：说出至少两个对位物，并各说一条关键差异。',
+        concepts: [
+          { label: '生命周期 ≈ 前端路由钩子', hint: 'onCreate/onResume/onDestroy 对应前端哪些钩子？', any: ['路由钩子', 'beforeEnter', 'activated', 'unmounted', 'created', '生命周期', 'deactivated'] },
+          { label: 'Handler/Looper ≈ 事件循环', hint: '主线程怎么等消息、分发消息？', any: ['事件循环', 'Event Loop', '任务队列', '微任务', 'MessageQueue', '消息队列'] },
+          { label: '四大组件 ≈ 被外部触发的入口', hint: 'Activity/Service/Receiver 分别像前端的什么？', any: ['路由', 'Controller', '事件总线', '入口', '页面', '接口'] },
+          { label: 'Zygote fork ≈ iframe 继承父窗口', hint: 'App 进程是怎么诞生的？', any: ['iframe', '继承', '复制', '父', '子进程', 'window'] }
+        ],
+        hints: [
+          '先把「被框架调度、不是自己跑」这个共同点抓住：onCreate 和路由 beforeEnter 都是系统/框架回调。',
+          '再想主线程：安卓的 Looper 取一条消息跑一个回调，和 JS 事件循环取一个宏任务执行，模型完全一样。'
+        ],
+        probes: [
+          '追问：既然事件循环同构，为什么安卓会有 ANR，而你很少听说 JS 的「主线程卡死」被系统杀掉？',
+          '再追问：postMessage 是异步消息，Binder 却常被说成同步 RPC——这个差异会怎么影响你写 hook 脚本？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>生命周期 ≈ 路由钩子</b>。onCreate/onResume/onPause/onDestroy 是<b>系统调度</b>的回调，' +
+          '对应前端的 beforeEnter/activated/deactivated/unmounted——共同点是「不是你自己跑的，是框架调的」。' +
+          '差异：安卓的生命周期由 AMS 跨进程驱动（用户按 Home、来电都会触发），前端路由钩子只由导航触发。<br>' +
+          '② <b>Handler/Looper/MessageQueue ≈ Event Loop + 任务队列</b>。两者完全同构：主线程休眠等消息 → 被唤醒 → 取出 → 执行回调 → 回到等待。' +
+          '差异：JS 事件循环里还有微任务（Promise）优先级机制，安卓 Handler 靠 postDelayed / 同步屏障实现类似调度。<br>' +
+          '③ <b>四大组件 ≈ 被外部请求触发的入口</b>：Activity≈页面/路由，Service≈后台 Controller，BroadcastReceiver≈事件总线订阅，' +
+          'ContentProvider≈数据源。差异：安卓的入口由<b>外部 Intent</b> 触发（任何 App 都能拉起你），前端入口是用户主动导航——这就是组件暴露成为攻击面的根因。<br>' +
+          '④ <b>Zygote fork ≈ iframe 继承父 window</b>：每个 App 进程都不是从零启动，而是从 Zygote 复制一份已初始化的运行时；' +
+          'iframe 也是子 frame 继承父 window 的全局环境。差异：Zygote 复制的是整个 ART 运行时 + 预加载类，iframe 只继承 window 对象。'
+      },
       {
         id: 'c26q1', depth: 1, threshold: 0.7,
         q: '用你自己的话说清楚：<b>为什么说"安卓 App 不是从头执行到尾的程序"？</b>' +

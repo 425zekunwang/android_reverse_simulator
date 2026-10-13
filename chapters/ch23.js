@@ -42,6 +42,14 @@ window.CHAPTER = {
         body: '<p>法医认尸靠牙齿、骨骼、DNA —— 这些是<b>内脏</b>，外面穿什么衣服都不影响判断。侦察兵认人靠口令 —— <b>口令（输入）</b>改了，人还是那个人。</p>'
           + '<p><b>加盐</b>就是给算法换了件衣服：算法本体一个字节没动，只是喂进去的数据多了一段。<b>魔改常量</b>才是换了内脏：IV、K 表、S 盒被动过，验尸官一看 DNA 就知道「这不是标准 MD5」。</p>'
           + '<p>所以结论只有一句：<b>常量比对永远是你的第一动作</b>。它一次回答两个问题 —— 这是哪个算法，以及它有没有被改内脏。</p>'
+          + T.note('cool', '🌐 Web/JS 逆向视角', '<p><span class="pill">JS 视角</span> 这一章的「加盐 / 改常量 / 动态表」三分类,在 Web 端完整同构 —— Web 协议里的 sign 算不对,几乎是同一套问题的镜像。</p>'
+            + '<p><b>对位</b>:<br>'
+            + '· 加盐(改输入) ≈ Web 站把 sign=md5(ts + nonce + body),或者 md5(body + salt),salt 可能是硬编码字符串、可能是 page 里写死的 object key<br>'
+            + '· 魔改常量(改内脏) ≈ Web 站自己写了个 md5.js,常量值被换、或者轮函数被改、或者干脆就 sha256 套皮叫 md5<br>'
+            + '· 动态编码表 ≈ Web 端 vmp/sdk 运行时拼出来一张 base64 表 / xor 密钥数组,直接搜 grep 整个 bundle 都搜不到<br>'
+            + '· HMAC 0x36 / 0x5C 指纹 ≈ Web 端你在 JS 里看到 `new Uint8Array(64).fill(0x36)`,就锁定 HMAC 了</p>'
+            + '<p><b>关键差异</b>:Web 端最大的优势是「源码就在浏览器里」 —— 你可以直接在 DevTools 里给 `update`/`digest`/`final` 下断点,或者 hook `crypto.subtle.sign` 看真实输入;而安卓只能在 native 层用 Frida hook 对应的 JNI 边界点,语言屏障 + 反调试让定位成本上去一档。</p>'
+            + '<p><b>逆向视角</b>:用「常量是否标准」做第一刀 —— md5 永远 67452301,sha256 头 8 字是那串常数;Web 端直接在 console 里 `console.log` 出 `CryptoJS.MD5("x").toString()` 当对照,然后看目标站 `sign=` 字段和它对不对得上,瞬间归档到「改输入 / 改内脏 / 改表」三个抽屉之一,和本章的 23.5 表格完全同构。</p>')
       },
       html: T.note('key', '🔑 本章主线', '<p>一个标准化算法（MD5 / SHA / AES / Base64）要变成「非标准」，只有三条路，而且它们<b>可以自由叠加</b>：</p>'
           + '<p>① <b>改输入</b>（加盐 / 改拼接顺序 / 多次哈希）；② <b>改内脏</b>（魔改 IV、K 表、S 盒、编码表）；③ <b>改代码形态</b>（OLLVM 控制流平坦化、指令替换、虚假控制流）。</p>'
@@ -53,7 +61,9 @@ window.CHAPTER = {
           ['OLLVM', '控制流与指令序列', '<span class="hit">✅ 常量还在</span>，只是被拆散、被搬进分发器', '用 BPO 类插件 / 符号执行恢复原结构']
         ])
         + T.note('warn', '⚠️ 本章最容易混的一对概念', '<p><b>加盐和改常量是两个不同维度的改造，不能互相推导。</b>加了盐的 MD5 仍然是标准 MD5 —— 你拿网上的 MD5 工具算不对，不是算法被改了，是<b>你喂的输入不对</b>。反过来，改了 K 表的 MD5，无论你怎么加盐都算不出正确结果，因为压缩函数本身就是错的。</p>'
-          + '<p>判断口诀：<b>常量没变但密文对不上 → 去找盐；常量变了 → 去比对差异。</b></p>')
+          + '<p>判断口诀：<b>常量没变但密文对不上 → 去找盐；常量变了 → 去比对差异。</b></p>'
+          + T.note('cool', '🌐 JS 视角批注', '<p><span class="pill">JS 类比</span> 一句话概括:<b>[加盐 / 改常量] ≈ Web 端 sign 算不对时的两类根因</b> —— 一个在输入侧(站点的拼接规则你猜错了),一个在算法侧(站点自己魔改 CryptoJS / 自己实现 md5)。</p>'
+            + '<p>Web 端实战:site 的 sign = md5(stringify(body) + "&key=" + SECRET_KEY) —— SECRET_KEY 是静态 salt,在源码里能搜到,常量化;但若站点自己写了 `function md5(s){ /* 自己实现 */ }`,那常量就是错的,你怎么改输入都算不对,得先 reverse 出它自己的轮函数。这两条排查路径在 Web 端和本章完全同构,只是 Web 端你可以直接在 console 试错。</p>'))
         + T.note('', '🧭 本章路线图', '<p>23.2 先给自己造一份带符号的「已知样本」（手动编译 OpenSSL）→ 23.3–23.4 解决动态编码表 → 23.5 讲透加盐 vs 改常量 → 23.6–23.10 处理 OLLVM 与魔改 HMAC → 23.11 用 Frida RPC 把成果变成产能。</p>'),
       after: '<p>读完 23.1，你应该已经能把任何一个「算不对的密文」先归档到三个抽屉之一。<b>归档错了，后面所有力气都会白费</b> —— 比如明明是加盐，你却去 dump 内存找表，那就完全是两个方向。</p>'
     },
@@ -111,7 +121,9 @@ window.CHAPTER = {
           + '<p>它的弱点也很明显：<b>表终究要在某一刻变成完整的 64 个字节落在内存里</b>。算得再花哨，最后都是一次内存写入。</p>')
         + T.note('', '🧭 核心手法：动静态比对（diff）', '<p><b>静态看</b>：这块内存在文件里是空的（<span class="mono">.bss</span> 段，全 0），或者是某个无意义的初始值。</p>'
           + '<p><b>动态看</b>：程序跑起来之后，同一个地址变成了一张完整的表。</p>'
-          + '<p><b>差值就是你要的东西。</b> 这不是猜测，这是同一块内存在两个时刻的差集。下面这个动图演示的就是这个过程。'),
+          + '<p><b>差值就是你要的东西。</b> 这不是猜测，这是同一块内存在两个时刻的差集。下面这个动图演示的就是这个过程。')
+        + T.note('cool', '🌐 JS 视角批注', '<p><span class="pill">JS 类比</span> 一句话概括:<b>「动态生成的表」≈ Web 端 closure / IIFE 里算出来的字符串 / 数组常量</b>。Web 端因为源码就在浏览器里,直接打开 Sources 面板断点或者在 console 里 `console.log(table.join(""))` 就能拿到 —— 比安卓 side 友好很多,但「表是算出来的」这件事在两端完全同构。</p>'
+          + '<p>Web 端对应场景:某 vmp/OB 加密站点把 base64 表 / xor 密钥数组 / sm4 sbox 用 `const tbl = [...new Array(64)].map((_,i)=>String.fromCharCode((i*7+33)&0xff))` 这种方式动态生成,grep 整个 bundle 找不到明文,但只要 hook `String.fromCharCode` 或者下断点就能拿到完整表 —— 和本章「内存 dump 出来那一刻」完全等价,只是工具从 Frida 换成 Chrome DevTools。</p>'),
       stage: {
         title: '动静态内存比对：64 字节 Base64 表是怎么长出来的',
         speed: 1500,
@@ -630,7 +642,9 @@ window.CHAPTER = {
         + T.note('key', '🔑 先把标准结构摆清楚', '<p>HMAC 的完整结构是：<span class="mono">H((K ⊕ opad) || H((K ⊕ ipad) || m))</span>，其中 <span class="mono">ipad = 0x36</span>、<span class="mono">opad = 0x5C</span>，<b>各自重复 64 次</b>（因为 MD5/SHA-1 的块长是 64 字节）。</p>'
           + '<p>把它展开成可执行的动作，一共是<b>四次 MD5 初始化、两次内外层哈希</b>：</p>'
           + '<p>① 建内层：<span class="mono">K_inner = K ⊕ 0x36…36</span>（64 字节）；② 喂数据：<span class="mono">MD5_Update(K_inner)</span> 然后 <span class="mono">MD5_Update(m)</span>；③ 收尾得 <span class="mono">inner = MD5_Final()</span>（16 字节）；④ 建外层：<span class="mono">K_outer = K ⊕ 0x5C…5C</span>；⑤ 喂数据：<span class="mono">MD5_Update(K_outer)</span> 然后 <span class="mono">MD5_Update(inner)</span>；⑥ 收尾得最终 16 字节。</p>'
-          + '<p><b>识别 HMAC 的铁证就是 <span class="mono">0x36</span> 和 <span class="mono">0x5C</span> 这两个字节常量</b>，以及「64 字节的异或缓冲区」这个结构。</p>')
+          + '<p><b>识别 HMAC 的铁证就是 <span class="mono">0x36</span> 和 <span class="mono">0x5C</span> 这两个字节常量</b>，以及「64 字节的异或缓冲区」这个结构。</p>'
+          + T.note('cool', '🌐 JS 视角批注', '<p><span class="pill">JS 类比</span> 一句话概括:<b>HMAC-MD5 ≈ `CryptoJS.HmacSHA256(message, key)` / `crypto.subtle.sign("HMAC", key, data)`</b> —— 同样的 ipad=0x36 / opad=0x5C 内核,只是 JS 端你不需要关心循环,标准库帮你填。</p>'
+            + '<p>关键差异:Web 端 HMAC 的复杂度不在算法本体(标准库一行搞定),而在<b>key 在哪</b> —— key 可能被埋进 wasm、可能从服务端 mtop 协议下发、可能就是页面上某个隐藏表单字段。本章讲「密钥在 native 怎么抠」,在 Web 端完全平移成「key 在 wasm 内存怎么 dump / 从 response 哪个字段怎么抠」。`new Uint8Array(64).fill(0x36)` 这种写法在 JS 里几乎不会自己手写,但在 wasm 编译产物 / vmp 字节码里偶尔能看到,看到就能秒判 HMAC 家族。</p>'))
         + T.tbl(['改造点', '标准做法', '样本里的常见魔改', '还原手段'], [
           ['ipad/opad', '<span class="mono">0x36</span> / <span class="mono">0x5C</span>', '换成别的两个字节值，或改成加法/减法而非异或', '在异或循环附近找循环不变量；两个「重复填充 64 次」的常量几乎必是它们'],
           ['块长', '64 字节', '改成 32 或 128，绕过特征匹配', '看缓冲区分配大小与循环计数'],
@@ -699,7 +713,9 @@ window.CHAPTER = {
       title: 'Frida 辅助 SO 算法还原与 RPC 自动化封装',
       html: '<p>前面所有工作都在回答「算法是什么」。这一节回答一个更实际的问题：<b>知道了之后，怎么把它变成能批量出活的工具？</b></p>'
         + '<p>很多场景下你其实<b>不需要</b>完整还原算法：密钥是服务端下发的、盐是运行时派生的、或者算法里有个你暂时啃不动的魔改。这时候最实用的做法是 —— <b>把目标进程当成一个黑盒函数</b>：输入明文进去，拿密文出来。这就是 ' + T.term('黑盒调用', '不还原算法内部逻辑，直接把目标进程当成一个函数：输入明文、观察密文。适合密钥/盐在服务端或运行时派生、静态无法还原的场景。') + '。</p>'
-        + T.note('key', '🔑 Frida 辅助还原的三种用法（从轻到重）', '<p>① <b>验证假设</b>：你猜是「MD5 + 前缀盐 <span class="mono">abc</span>」，直接 hook update 函数看它被调用几次、每次的 buffer 内容是什么 —— 一秒钟证伪；② <b>观测中间状态</b>：dump 函数入口/出口的参数与返回值，确认数据流向（这是 23.7 里定位那个「多出来的异或」的手段）；③ <b>黑盒调用</b>：直接调用目标的加密函数，把它当作 API 用。三种用法可以叠加，但<b>只有第三种能变成产能</b>。</p>'),
+        + T.note('key', '🔑 Frida 辅助还原的三种用法（从轻到重）', '<p>① <b>验证假设</b>：你猜是「MD5 + 前缀盐 <span class="mono">abc</span>」，直接 hook update 函数看它被调用几次、每次的 buffer 内容是什么 —— 一秒钟证伪；② <b>观测中间状态</b>：dump 函数入口/出口的参数与返回值，确认数据流向（这是 23.7 里定位那个「多出来的异或」的手段）；③ <b>黑盒调用</b>：直接调用目标的加密函数，把它当作 API 用。三种用法可以叠加，但<b>只有第三种能变成产能</b>。</p>'
+          + T.note('cool', '🌐 JS 视角批注', '<p><span class="pill">JS 类比</span> 一句话概括:<b>Frida RPC 黑盒调用 ≈ Web 端 Puppeteer/Playwright 拉起浏览器当 sign oracle</b> —— 当密钥在服务端、算法在 wasm / vmp 黑盒里、纯算成本过高时,把整个浏览器当函数调。</p>'
+            + '<p>关键差异:Web 端这条路更短 —— `page.evaluate(()=> window.__sig__("hello"))` 一行就把加密函数当 RPC 用,不需要 attach/load 的管道;而安卓这边要经历 reverse-tcp 端口监听、设备掉线重连、反调试绕过的全套基建。两边 ②③ 的工程化结构(HTTP 服务化 + 异常兜底 + 批量调用)是同构的,只是 Web 端用 Puppeteer / Playwright / Camoufox,安卓端用 Frida + Python frida 库。</p>')),
       stepper: {
         title: '从「手工 attach」到「RPC 服务化」的四级演进',
         lines: [
@@ -900,7 +916,10 @@ window.CHAPTER = {
     { t: 'BPO 类插件', d: '一类「二进制补丁 / 自动化反混淆」思路的 IDA 插件，用于还原 OLLVM 保护的非标准算法：识别混淆模式 → 自动打补丁 → 让 IDA 反编译恢复正常。<b>具体插件仓库地址待核实，请自行搜索确认</b>；本章讲的是它的思路而非某个具体实现。' },
     { t: 'FLIRT 签名', d: 'IDA 的库函数识别技术，用已知静态库（.a）生成 .sig 签名，让 IDA 自动认出目标二进制里被内联或裁剪过的库函数。<b>自己手动编译一份带符号的 OpenSSL，就是最可靠的已知样本来源</b>。' },
     { t: 'Frida RPC', d: '通过 rpc.exports 把注入脚本里的函数暴露给宿主语言调用。Python 端用 script.exports_sync.方法名(...) 同步调用。作用是把「手工 hook」升级为「可批量调用的接口」。' },
-    { t: '黑盒调用', d: '不还原算法内部逻辑，直接把目标进程当成一个函数：输入明文、观察密文。适合密钥/盐在服务端或运行时派生、静态无法还原的场景，工程上用 RPC + HTTP 服务封装成产能。' }
+    { t: '黑盒调用', d: '不还原算法内部逻辑，直接把目标进程当成一个函数：输入明文、观察密文。适合密钥/盐在服务端或运行时派生、静态无法还原的场景，工程上用 RPC + HTTP 服务封装成产能。' },
+    { t: '↔ Web 对位 · HMAC-SHA256 / HMAC-SHA1', d: '安卓 native 里的 HMAC 和 Web Crypto 的 `crypto.subtle.sign("HMAC", key, data)` / `CryptoJS.HmacSHA256(msg, key)` 是同一份算法 —— 都是 `H((K⊕opad) || H((K⊕ipad) || m))`,ipad=0x36,opad=0x5C。识别指纹完全通用:`new Uint8Array(blocksize).fill(0x36)` 这一行(在 JS 里标准库帮你做了)就是铁证。逆向成本差异主要在「key 在哪」:安卓 native 的 key 要 hook SecretKeySpec / Frida dump 内存;Web 端的 key 要从 wasm / mtop / cookie 三路里抠。' },
+    { t: '↔ Web 对位 · 动态编码表 vs 闭包算字符串', d: '安卓 native 里 .bss 段全 0、运行时算出来的 Base64 表 / AES S 盒,在 Web 端完全同构 —— closure 里 `(function(){ var t=[]; for(var i=0;i<64;i++) t.push(String.fromCharCode((i*7+0x33)&0xff)); return t; })()` 这种用法,搜不到明文、必须下断点或 hook `String.fromCharCode` 才拿得到。和本章 23.3 的「动静态内存比对」完全同构,只是 Web 端工具更轻:Chrome DevTools + console.log 就够,不用 Frida Stalker。' },
+    { t: '↔ Web 对位 · 加盐/改常量 vs sign 算不对', d: '「加盐(改输入) vs 魔改常量(改内脏)」的三分类在 Web 协议还原里完全平移 —— 抓包发现 site 的 sign=`xxx`,你用 `CryptoJS.MD5(body)` 算不对,要么 body 在 send 前被拼了一段 salt(改输入),要么 site 自己写了 md5.js(改内脏),要么 site 用的是自实现的 sm3/hmac-sha512。区分方式:本地 `CryptoJS.MD5("test").toString()` 当基准,sign 字段 vs 它对得对不上 → 「输入侧问题」还是「算法侧问题」,对应到本章 23.5 的分类。' }
   ],
 
   teacher: {
@@ -909,6 +928,30 @@ window.CHAPTER = {
     sub: '常量没变却算不对、表在静态里根本不存在 —— 这两件事你必须能立刻说清原因。',
     intro: '<p style="margin:0">这一章我会反复用同一个句式问你：<b>「你凭什么说它是加盐，而不是魔改？」</b> 答不上来，说明你还在凭感觉还原。五道题，难度递增，最后一道是综合场景 —— 那道题答不出来，说明这一章你只是读过了，没有学会。</p>',
     questions: [
+      {
+        id: 'c23qWeb', depth: 2, threshold: 0.7,
+        q: '还原 dex 里的 HMAC/SM3/AES，和你还原前端 JS 里的签名算法，本质上是一回事。说出至少两组对位，并各说一条关键差异。',
+        concepts: [
+          { label: 'dex 里的 HMAC/SM3 ≈ JS 里的 HMAC/SM3', hint: '同一套算法在两边的形态。', any: ['HMAC', 'SM3', 'SM2', '签名', 'sign', '算法'] },
+          { label: '抠算法 ≈ 从 bundle 抠实现', hint: '从反编译代码里还原实现。', any: ['抠', '还原', 'bundle', '实现', '反编译'] },
+          { label: '常量表/查表 ≈ 大常量数组', hint: '算法的魔法数字都藏在表里。', any: ['常量', '查表', '数组', '魔法数字', 'S 盒'] },
+          { label: '定位入口', hint: '从调用点回溯到算法实现。', any: ['入口', '定位', '回溯', '断点', '调用栈'] }
+        ],
+        hints: [
+          '先想算法本身：HMAC/SM3/AES 的数学定义和语言无关——你在 Smali 里看到的循环、异或、移位，和 JS 里一模一样。',
+          '再想差异：安卓的算法可能在 native(so)，前端可能在 WASM——这时要从「读代码」升级到「逆汇编」。'
+        ],
+        probes: [
+          '追问：为什么抠出来的算法「跑得对」还不够，还要验证边界情况？',
+          '再追问：算法在 so 里和在 dex 里，还原路径有什么不同？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>dex 里的 HMAC/SM3/AES ≈ 前端 JS 里的同名算法</b>：算法数学定义与语言无关，' +
+          '你在 Smali 或压缩后的 JS 里看到的循环、异或、移位、常量表是同一套东西；差异：<b>安卓的算法常在 native(so) 里</b>（ARM 汇编），' +
+          '前端通常在 JS 层，少数在 WASM——层次不同，工具就从 jadx 升级到 IDA/wasm-decompile。<br>' +
+          '② <b>抠算法 ≈ 从 bundle 抠实现</b>：都是从反编译结果里定位实现、抽出可复现代码；差异：前端有 source map 时能直接拿源码，dex 没有等价物。<br>' +
+          '③ <b>常量表/查表 ≈ 大常量数组</b>：AES 的 S 盒、SM3 的 T 常量都是魔法数字，两边都是「看到一串奇怪常量 = 算法就在附近」；差异：安卓的常量在只读数据段，前端在 JS 数组字面量里。<br>' +
+          '<b>纪律</b>：抠出来只是第一步——必须用多组真实输入对齐输出，覆盖边界情况（空串、超长、特殊字符）才算还原成功。'
+      },
       {
         id: 'c9q1', depth: 1, threshold: 0.6,
         q: '你在一个 so 里搜到了完整的 MD5 常量（四个 IV + 64 个 K 表），全部与标准值一致。但用标准 MD5 计算同一个明文，结果和 App 输出的密文对不上。<b>你凭什么判断这是「加盐」而不是「魔改」？判断依据是什么？</b>',

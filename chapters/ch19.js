@@ -27,7 +27,24 @@ window.CHAPTER = {
               '<b>后端</b>才是按图纸施工的工人（IR → 机器码）。</p>' +
               '<p>OLLVM 就是混进中端的一个恶作剧设计师：它不换材料、不改功能，只是把图纸上的走廊全画成迷宫。' +
               '房子住起来一模一样（程序行为不变），但任何人拿到图纸都看不懂户型了。<b>它改的是图纸，不是房子</b> —— 这就是为什么' +
-              '你 dump 出来的字符串还是明文，代码却完全读不懂。</p>'
+              '你 dump 出来的字符串还是明文，代码却完全读不懂。</p>' +
+              T.note('cool', '🌐 Web/JS 逆向视角',
+                '<p><span class="pill">JS 视角</span> OLLVM 的 IR 中端 + 自定义 Pass 模式，在 JS 世界有一个<b>完全同构</b>的对位：' +
+                '<b>Babel AST + 自定义 Plugin</b>。OLLVM 在 LLVM IR 上做结构改写，Babel 在 JavaScript AST 上做同样形态的改写 —— ' +
+                '操作对象都是源码的中间表示、改的都是结构不是语义、产出的代码功能完全一致但肉眼读不懂。</p>' +
+                '<p><b>对位</b>:<br>' +
+                '· <b>LLVM IR</b> ≈ <b>JS AST</b>（都是带类型/作用域信息的中间表示）<br>' +
+                '· <b>FunctionPass (runOnFunction)</b> ≈ <b>Plugin 遍历 FunctionDeclaration / 节点 visitor</b>（操作粒度都是函数级）<br>' +
+                '· <b>-mllvm -fla / -bcf / -sub</b> ≈ <b>babel-plugin-transform-xxx</b>（混淆插件名）<br>' +
+                '· <b>Obfuscator-LLVM 项目</b> ≈ <b>javascript-obfuscator (obfuscator.io) / jsjiami</b>（都是主流开源混淆器）<br>' +
+                '· <b>IRBuilder / SplitEdge</b> ≈ <b>@babel/types + @babel/generator</b>（构造新节点 + 输出回代码的工具）</p>' +
+                '<p><b>关键差异</b>：LLVM IR 是<b>强类型、SSA 形式</b>的三地址码，混淆后端还要再生成机器码；' +
+                'JS AST 是<b>动态弱类型</b>的语法树，混淆完直接生成 JS 源码跑在浏览器里。所以 OLLVM 的混淆对运行时性能影响很小（机器码优化层还能补救），' +
+                '而 JS 混淆直接吃掉 V8 的优化机会（字符串数组、不透明谓词都很容易让 V8 deopt）。</p>' +
+                '<p><b>逆向视角</b>：你看到 so 里一坨 switch ≈ JS 里看到一坨 <code>while(true) switch(_0xabc[opcode])</code>；' +
+                '看到 string 数组 ≈ JS 字符串表 <code>var _0x1234=[...]</code> + RC4 解密；' +
+                '看到不透明谓词 ≈ JS 的 <code>if(7*7===49){...}</code> 永真分支。' +
+                '<b>两边拆法几乎一样 —— 都是先动态 Trace 真实路径，再按特征常量折叠或反编译。</b></p>')
       },
       html:
         '<p><b>OLLVM</b> 全称 <b>Obfuscator-LLVM</b>，是一个基于 LLVM 的开源代码混淆器，论文是 Junod / Rinaldini / Wehrli / Michielin 的 ' +
@@ -199,7 +216,17 @@ window.CHAPTER = {
                '  <span class="k">return</span> r;               <span class="c">// B4 汇合</span>\n' +
                '}') +
         '<p>点击播放，看着这 5 个块一步步变成“分发器 + 状态机”。<b>请特别留意右侧 switchVar 的取值序列</b> —— ' +
-        '那是后面反混淆的唯一钥匙。</p>',
+        '那是后面反混淆的唯一钥匙。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>-fla 控制流平坦化 ≈ obfuscator.io 的 <code>controlFlowFlattening: true</code></b>。' +
+          '两者<b>完全同构</b>:都是把 <code>if/while</code> 拆成 <code>while(true) switch(opcode)</code> 状态机、' +
+          '都是用一个<b>状态变量/字符串</b> 决定下一步跳哪个 case、都需要序言块写下一状态再回 dispatcher。</p>' +
+          '<p><b>对位细节</b>:OLLVM 的 <code>switchVar</code> ≈ OB 的 <code>_0xabc[opcode_index]</code>(从字符串数组里取索引);' +
+          'OLLVM 的 <code>dispatch</code> 基本块 ≈ OB 的 dispatcher 函数(套在 <code>while(true)</code> 里);' +
+          'OLLVM 的 case 编号顺序 ≈ OB 的 hash 字典顺序(都丢失了原始分支语义)。</p>' +
+          '<p><b>破法完全一样</b>:都是<b>动态 Trace 状态变量/opcode 取值序列</b>、' +
+          '按顺序拼起来还原路径。AST 反混淆工具(babel-deobfuscator、' +
+          'de4js、synchrony)的核心算法就是 OB 平坦化的 D-810 等价物。</p>'),
       stage: {
         title: '控制流平坦化：从可读 CFG 到 switch 状态机',
         speed: 2100,
@@ -373,7 +400,16 @@ window.CHAPTER = {
           '<p>纯静态方案（D-810 / HexRaysDeob 这类）必须<b>先判定谓词恒真</b>，再删死分支。' +
           '由于谓词构造是无限的（加固厂商会自己加变体），静态规则库总有漏网之鱼。' +
           '更麻烦的是：<code>-bcf</code> 常和 <code>-fla</code> 叠加使用 —— 垃圾分支也被塞进 case 列表里，' +
-          '于是你面对的是一个“平坦化 + 一堆走不到的 case”的复合体。</p>')
+          '于是你面对的是一个“平坦化 + 一堆走不到的 case”的复合体。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>-bcf 虚假控制流 ≈ JS 永真/永假不透明谓词</b>。' +
+          'JS 混淆器(obfuscator.io 的 <code>deadCode: true</code> / <code>debugProtection: true</code>) 也会塞一堆 <code>if(7*7===49){...}else{...}</code> 或' +
+          '<code>if(![]){...}</code> 这种恒真表达式,后面跟死代码块,让静态阅读者多算几百条路。</p>' +
+          '<p><b>对位细节</b>:OLLVM 的 <code>x*(x+1) % 2 == 0</code> ≈ JS 的 <code>if(!![]+!![]===2){...}</code>;' +
+          'OLLVM 的假块塞垃圾指令 ≈ JS 的假块塞 debugger / throw / 死循环;两者<b>都依赖编译器/引擎不做数论推理或布尔代数化简</b>。</p>' +
+          '<p><b>破法完全一样</b>:<b>动态跑一遍,记录走过的基本块/语句偏移,删掉从未执行的</b>。' +
+          'JS 侧对应的是 hook 在关键点后扫一遍 console.log 实际触发的行号,或者用 AST 工具(如 babel-plugin-transform-remove-dead-code)做恒等式折叠。' +
+          '<b>两边都不要试图静态证明谓词,跑一遍就知道。</b></p>'))
     },
 
     /* ============ 19.5 ============ */
@@ -1275,6 +1311,7 @@ window.CHAPTER = {
   ],
 
   glossary: [
+    { t: '↔ Web 对位 · OLLVM 三兄弟 = JS 三大混淆', d: '一一对应：控制流平坦化(fla) ≈ OB 的 dispatcher（都是把 if-else 链改成 while+switch 状态机）；字符串加密 ≈ 字符串数组 + index 查表；虚假控制流(bcf) ≈ 永不执行的 if 分支。关键差异：OLLVM 作用在 LLVM IR 层（编译器层，任何语言编译后都能加），OB 是 JS 源码层工具——所以看到 OLLVM 产物要先认清它站在哪一层。' },
     { t: 'OLLVM', d: 'Obfuscator-LLVM 的简称，基于 LLVM 的开源代码混淆器。论文为 Junod / Rinaldini / Wehrli / Michielin 的《Obfuscator-LLVM — Software Protection for the Masses》(IEEE/ACM SPRO 2015)。当前版本基于 LLVM 4.0。国内加固厂商大量基于它的 fork 做二次开发。' },
     { t: 'LLVM IR', d: 'Intermediate Representation，LLVM 的中间表示。一种类型化、SSA 形式的类汇编语言，是前端（Clang）与后端（机器码生成）之间的通用货币，也是 OLLVM 所有混淆手术的操作对象。' },
     { t: 'Pass', d: 'LLVM 中作用于 IR 的转换或分析单元，是一切优化的基本砖块。按作用范围分 ModulePass / FunctionPass / BasicBlockPass / LoopPass。OLLVM 三大混淆都注册为 FunctionPass。' },
@@ -1298,6 +1335,28 @@ window.CHAPTER = {
            '我要你说清它<b>在 IR 上动了哪几刀</b>、为什么动完 IDA 就废了、以及你<b>凭什么</b>能还原。' +
            '答不上来我会一层层追问，直到你说出机制为止。</p>',
     questions: [
+      {
+        id: 'c19qWeb', depth: 2, threshold: 0.7,
+        q: 'OLLVM 三兄弟（bcf/fla/sub）和 JS 三大混淆完全同构。请说出三组对位，并各说一条关键差异。',
+        concepts: [
+          { label: '控制流平坦化 ≈ OB dispatcher', hint: 'if-else 链被改成 while-switch。', any: ['平坦化', 'dispatcher', '控制流', 'OB', 'switch', 'while', '调度'] },
+          { label: 'OLLVM 字符串加密 ≈ 字符串数组+index', hint: '代码里不直接写字面量。', any: ['字符串', '数组', 'index', 'RC4', '加密', '常量'] },
+          { label: '虚假控制流 ≈ 永不执行的分支', hint: '塞垃圾让反编译难看。', any: ['虚假', '死代码', '永不执行', '分支', 'fake', '垃圾'] }
+        ],
+        hints: [
+          '先抓最像的那对：控制流平坦化在 OLLVM 和 OB 里是同一个反模式——把顺序结构改成状态机调度。',
+          '再想差异：OLLVM 作用在 LLVM IR（编译器层，对所有语言生效），OB 只作用在 JS。'
+        ],
+        probes: [
+          '追问：为什么控制流平坦化对「逆虚拟机」反而没用？',
+          '再追问：OLLVM 在编译器层做混淆，OB 在源码层做——这个层次差异对破法有什么影响？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>控制流平坦化（fla）≈ JS 控制流平坦化（OB 的 dispatcher）</b>：完全同一个反模式——' +
+          '把顺序的 if-else 链拆成基本块，用一个 while+switch 的状态机调度。差异：OLLVM 在 LLVM IR 层做（任何语言编译后都能加），OB 是 JS 专用工具。<br>' +
+          '② <b>字符串加密 ≈ 字符串数组 + index 查表</b>：都是「代码里不直接写字面量」，运行时才解密/查表取出；差异：OLLVM 的字符串常在数据段加密存放，OB 把字符串塞进一个数组按索引取。<br>' +
+          '③ <b>虚假控制流（bcf）≈ 永不执行的 if 分支</b>：都是塞垃圾分支让反编译结果变丑、让人读错；差异：OLLVM 用不透明谓词（opaque predicate）构造恒真/恒假条件，OB 直接加死代码。<br>' +
+          '<b>破法一致</b>：平坦化就找 dispatcher 的入口块、按实际执行路径还原；字符串就 hook 解密函数/让代码自己跑一遍。'
+      },
       {
         id: 'c5q1', depth: 1, threshold: 0.6,
         q: 'OLLVM 的三大混淆 <code>-fla</code> / <code>-bcf</code> / <code>-sub</code>，本质上是往编译流程的哪一环插入了什么？<b>为什么偏偏是这个位置</b>——而不是源码层，也不是最终的汇编层？',

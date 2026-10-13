@@ -1402,7 +1402,7 @@ body.focus-mode .chapter-hero::after { opacity: 0; }
 
 /* ---------------------------------------------------------------- 常驻位置条 */
 .sec-bar {
-  position: sticky; top: var(--tb-h, 52px); z-index: 90;
+  position: static; z-index: 90;
   display: flex; align-items: center; gap: 11px;
   padding: 7px 20px; font-size: 12.5px;
   background: rgba(13,18,25,.95); backdrop-filter: blur(12px);
@@ -1639,10 +1639,9 @@ body.focus-mode .chapter-hero::after { opacity: 0; }
 /* 不可点击：禁用 hover */
 .duo-node:not([href]) { cursor: default; pointer-events: none; }
 
-/* 章节内的小关地图（mini-map）：吸顶、紧凑、单行节点 */
+/* 章节内的小关地图（mini-map）：紧凑、单行节点（不吸顶，随页面滚动） */
 .mini-map {
-  position: sticky;
-  top: var(--tb-h, 52px);
+  position: static;
   z-index: 89;             /* 顶栏 100/位置条 90 之间 */
   margin: 6px 0 14px;
   border: 1px solid var(--line);

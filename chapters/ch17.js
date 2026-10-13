@@ -27,7 +27,17 @@ window.CHAPTER = {
           '<li>你写的小函数，它可能直接<b>塞进调用处</b>，让这个函数根本不存在（<b>内联</b>）</li>' +
           '</ul>' +
           '<p>所以逆向的本质不是"把汇编逐句翻回 C"，而是<strong>认出编译器惯用的那些翻译套路</strong>。' +
-          '本章就是把这些套路一个个认全。</p>'
+          '本章就是把这些套路一个个认全。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这一章的「native 指令世界」在你熟悉的 JS 世界里有一个镜像：<b>WASM</b>。' +
+            'ARM/AArch64 汇编 ≈ WASM 字节码 / <code>wat</code> 文本；IDA / Ghidra 反编译 so ≈ <code>wasm-decompile</code> / <code>wasm2wat</code> 反编译 wasm。' +
+            '都是「高级语言外的第二条指令世界，需要专门的逆向工具」。</p>' +
+            '<p><b>对照</b>:<br>' +
+            '· 调用约定（寄存器传参 x0-x7 / R0-R3）≈ WASM 的栈 / 线性内存传参——两边都不用「函数默认共享一个作用域」<br>' +
+            '· C++ 对象模型（vtable / RTTI）≈ JS 里用「对象 + 原型链 / class」表达多态——但 wasm 没有原生对象/虚表，这点 so 难一档<br>' +
+            '· <code>objdump</code> / <code>readelf</code> 看 ELF 符号 ≈ wasm 的符号表——都是「看 native 字节码里的导出名」</p>' +
+            '<p><b>关键差异</b>:WASM 是<b>栈式、线性内存、无寄存器</b>的精简模型，反编译结构相对固定；ARM so 还牵扯<b>寄存器分配、调用约定、C++ 虚表与 RTTI 这些内存布局</b>，' +
+            '而这些信息在编译后大量丢失、只能靠 IDA/Ghidra 的启发式恢复。所以「看 so」比「看 wasm」难，但心智模型（第二条指令世界 + 专用反编译工具）完全同构。</p>')
       },
       html:
         T.note('key', '🔑 本章的三个层次',
@@ -36,7 +46,20 @@ window.CHAPTER = {
           '<li><b>认出套路</b>：if、循环、函数调用、结构体、数组在汇编里的固定形态</li>' +
           '<li><b>看懂对象</b>：C++ 的类、虚函数、RTTI 在内存里怎么摆——这是硬骨头</li>' +
           '</ol>') +
-        '<p>先从最基础的指令集开始。但注意：这里有一个<strong>安卓平台特有的坑</strong>，它让无数人的 Frida 脚本静默失效。</p>'
+        '<p>先从最基础的指令集开始。但注意：这里有一个<strong>安卓平台特有的坑</strong>，它让无数人的 Frida 脚本静默失效。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>ARM 汇编 ≈ WASM 字节码 / wat 文本，IDA/Ghidra 反编译 so ≈ wasm-decompile / wasm2wat 反编译 wasm</b>。' +
+          '你用 <code>wasm2wat</code> 把 .wasm 翻成可读的 wat 文本时，就像读 so 的 ARM 指令——都是「把第二种指令世界翻成能读的东西」。' +
+          '<br><b>差异</b>:WASM 反编译产物结构相对固定（栈式、线性内存）；ARM so 还牵扯寄存器传参、调用约定、C++ vtable/RTTI 这些「内存布局」层面的信息，反编译难度高一档。</p>'),
+      term: {
+        title: 'ARM / AArch64 与 Web/JS 逆向的对位',
+        lines: [
+          { t: 'o', s: '↔ Web 对位 · ARM/AArch64 汇编（native 指令）≈ WASM 字节码 / wat 文本', note: '都是「高级语言外的第二条指令世界」，都需要专门的逆向工具。差异:so 还牵扯寄存器传参、调用约定、C++ 对象内存布局（vtable/RTTI），反编译比 wasm 难一档。' },
+          { t: 'o', s: '↔ Web 对位 · IDA / Ghidra 反编译 so ≈ wasm-decompile / wasm2wat 反编译 wasm', note: '都是「native 字节码的逆向工具」。差异:这两类反编译器对 C++ 对象模型（虚表/RTTI）的恢复能力比 wasm 工具强很多，因为 wasm 没有原生对象/虚表概念。' },
+          { t: 'o', s: '↔ Web 对位 · objdump / readelf 看 ELF 符号 ≈ wasm 的符号表', note: '都是「看 native 字节码里的导出符号」。差异:ELF 还有节表、重定位、动态符号，信息比 wasm 的有限符号丰富。' },
+          { t: 'o', s: '↔ Web 对位 · C++ 调用约定（寄存器传参）≈ WASM 栈 / 线性内存传参', note: '都是「高级语言函数调用在底层被重新表达」。差异:ARM 用固定寄存器（x0-x7 / AAPCS64）传参，wasm 用 operand stack + 线性内存；恢复参数名都靠逆向者自己。' }
+        ]
+      },
     },
 
     /* ============================================================ 17.2 */
@@ -1075,6 +1098,29 @@ window.CHAPTER = {
            '我会逼你把机制说清楚：<b>为什么 +1？为什么要查表？为什么参数读不到？</b><br>' +
            '答不上来可以要提示，但提示不算过关。</p>',
     questions: [
+      /* ---------- 映射题（Web/JS 逆向视角）---------- */
+      {
+        id: 'c17qWeb', depth: 2, threshold: 0.7,
+        q: '用你在 Web/JS 逆向里熟悉的概念解释本章的「ARM / C++ native 逆向」：读 so 的汇编、用 IDA/Ghidra 反编译、理解调用约定和 vtable，本质上和什么做法是一回事？说出至少两个对位物，并指出关键差异。',
+        concepts: [
+          { label: '把 ARM/AArch64 汇编类比成 WASM 字节码 / wat 文本', hint: '都是「高级语言外的第二条指令世界」，都要靠专门的工具翻成能读的形式。', any: ['wasm', 'wat', '字节码', '第二条指令', '指令世界', '汇编', 'arm', 'aarch64'] },
+          { label: '把 IDA / Ghidra 反编译 so 类比成 wasm-decompile / wasm2wat 反编译 wasm', hint: '两边都是「native 字节码的逆向工具」。', any: ['反编译', 'ghidra', 'ida', 'wasm2wat', 'wasm-decompile', 'decompile', '反汇编'] },
+          { label: '把调用约定（寄存器传参）类比成 WASM 的栈 / 线性内存传参', hint: '两边都不用「函数默认共享一个作用域」，参数都被重新表达到更底层。', any: ['调用约定', '寄存器传参', 'aapcs', '栈', '线性内存', '传参', 'x0', '参数'] },
+          { label: '把 C++ vtable / RTTI 类比成 JS 的对象 + 原型链 / class 多态', hint: '都是表达「运行时多态」的机制，只是 so 里它变成内存里的一张函数指针表。', any: ['vtable', '虚表', 'rtti', '原型链', 'prototype', '多态', 'class', '对象'] },
+          { label: '关键差异：so 还牵扯寄存器分配、调用约定、C++ 虚表/RTTI 内存布局（编译后大量丢失，靠启发式恢复），比 wasm 难一档', hint: '为什么「看 so」比「看 wasm」更难？', any: ['寄存器', '调用约定', 'vtable', 'rtti', '内存布局', '丢失', '启发式', '更难', '难一档'] }
+        ],
+        hints: [
+          '想想你用 wasm2wat 把一个 .wasm 反编译成可读 wat 文本时，心智模型是不是「把第二种指令世界翻成能读的」——和读 so 汇编一样。',
+          'ARM 用寄存器（x0-x7）传参、C++ 把虚函数地址塞进一张 vtable；WASM 用操作数栈 + 线性内存传参、没有原生对象。这两组「底层表达」是不是同构？'
+        ],
+        probes: [
+          'WASM 是栈式、无寄存器、线性内存的精简模型；ARM so 还有寄存器分配和 C++ 虚表。这些额外信息让 so 反编译比 wasm 多了哪些恢复工作？',
+          'objdump / readelf 看 ELF 符号，对应到 JS 世界是看什么？它和 wasm 的符号表信息量谁更丰富？'
+        ],
+        model: '<b>参考答案</b>：ARM/C++ native 逆向的核心是「把第二种指令世界（native）翻回能读、能推理的形式」，这和 Web/JS 里的 WASM 逆向是同一个心智模型。' +
+               '<br><b>对位物</b>：① ARM/AArch64 汇编 ≈ WASM 字节码 / wat 文本；② IDA/Ghidra 反编译 so ≈ wasm-decompile / wasm2wat 反编译 wasm；③ 调用约定（寄存器传参）≈ WASM 的栈 / 线性内存传参；④ C++ vtable/RTTI ≈ JS 的对象 + 原型链表达的多态。' +
+               '<br><b>关键差异</b>：WASM 是栈式、线性内存、无寄存器的精简模型，反编译结构相对固定；ARM so 还牵扯寄存器分配、调用约定、C++ 虚表与 RTTI 这些内存布局信息，而这些在编译后大量丢失、只能靠 IDA/Ghidra 的启发式恢复。所以「看 so」比「看 wasm」难一档，但心智模型完全同构。'
+      },
       {
         id: 'c3q1', depth: 1, threshold: 0.7,
         q: 'ARM 用<b>地址最低位</b>标记指令集——请解释这个机制是怎么工作的，' +

@@ -20,7 +20,24 @@ window.CHAPTER = {
         body: '<p>别人给的房子，你只能挪家具：装个 Frida 脚本、改改 smali，房东（ART 虚拟机）不高兴就把你赶出去。' +
               '自己盖房子，你可以<strong>在地基里埋传感器</strong>——哪根管子流过什么，你天生就知道。' +
               '本章说的「定制 ART」，就是自己浇一遍地基。</p>' +
-              '<p>代价是：地基是 C++ 写的，而且是<strong>现代 C++</strong>。你连图纸都读不懂，就别谈改图纸。</p>'
+              '<p>代价是：地基是 C++ 写的，而且是<strong>现代 C++</strong>。你连图纸都读不懂，就别谈改图纸。</p>' +
+              T.note('cool', '🌐 Web/JS 逆向视角',
+                '<p><span class="pill">JS 视角</span> 这章讲「ART 沙箱 — 在隔离环境跑 ART」整件事，换到 JS 逆向世界，' +
+                '就是<strong>Node.js 的 vm / vm2 模块</strong>：把一段 JS 放进去跑，主进程和沙箱里的代码互相隔离，' +
+                '你在外面看不到里面执行的细节、里面也碰不到外面的真实 window / document / Cookie。' +
+                '两者都解决同一个问题——<b>「在不信任的代码面前，给自己一层受控的观察位」</b>。</p>' +
+                '<p><b>对位</b>:<br>' +
+                '· <b>ART 沙箱 (隔离运行 ART runtime)</b> ≈ <b>Node.js vm.runInContext / vm2</b> —— 都是「在隔离环境跑代码」<br>' +
+                '· <b>沙箱化 sandboxing</b> ≈ <b>iframe sandbox 属性 / Node vm 的 context 选项</b> —— 都是「限制能访问什么」<br>' +
+                '· <b>AOSP 自带 ART (system image)</b> ≈ <b>浏览器自带 V8 / Node 自带 V8</b> —— 都是「宿主环境自带的引擎」<br>' +
+                '· <b>Cuttlefish / 模拟器跑 Android</b> ≈ <b>Docker 里跑 Node 自动化</b> —— 都是「环境复现」<br>' +
+                '· <b>Anbox / Waydroid (Android 容器)</b> ≈ <b>Docker 跑 headless Chrome / Node</b> —— 都是「无头宿主」</p>' +
+                '<p><b>关键差异</b>:Android 沙箱是「进程级 + Linux UID + seccomp-bpf」多重隔离，' +
+                '远比 Node vm 的「对象可见性隔离」厚重；Node vm 同源代码能拿到同一份原型链，' +
+                'ART 沙箱里两边连 VTable 都不共享。</p>' +
+                '<p><b>逆向视角</b>:判断「我看到的代码是跑在沙箱里还是真机里」时，' +
+                'JS 侧查 vm context / proxy trap 痕迹，Android 侧查 /proc/self/status 的 uid、' +
+                '<code>selinux</code> 状态、<code>ro.boot.qemu</code> 属性；两边都靠环境指纹反检测。</p>')
       },
       html:
         T.note('key', '🔑 本章主线',
@@ -57,7 +74,16 @@ window.CHAPTER = {
         T.note('key', '🔑 关键类比',
           '<p>这套分层与 HotSpot 的「对象头 = mark word + klass pointer」是同一个思路：对象本身不携带方法代码，' +
           '只携带一个<strong>指向自己类描述的指针</strong>。方法是「类的属性」，不是「对象的属性」。</p>') +
-        '<p>下面把这条链一步步走一遍。注意右侧内存表格里<strong>每一次写入</strong>——那些就是你在 <span class="mono">gdb</span> 里真正会看到的东西。</p>',
+        '<p>下面把这条链一步步走一遍。注意右侧内存表格里<strong>每一次写入</strong>——那些就是你在 <span class="mono">gdb</span> 里真正会看到的东西。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>对象 → klass_ → 方法表 → ArtMethod</b> 这条链 ≈ <b>V8 里的对象 → Hidden Class (Map) → 跳转目标</b>。' +
+          '两边都是「对象本身不存方法，只存一个指向『自己是什么类』的指针」。</p>' +
+          '<p><b>关键差异</b>:V8 的 Hidden Class 是<b>运行期动态生成</b>的（按属性赋值顺序塑形），' +
+          '同一段 JS 在不同执行顺序下会得到不同的 Map；ART 的 mirror::Class 来自 Dex，' +
+          '结构是<b>编译期固定</b>的（除了 ART 自己的运行时 hook 会改字段）。' +
+          '所以 JS 里「同一个 class、属性顺序不同」会出现 polymorphic / megamorphic 性能陷阱，' +
+          'ART 里则没有这种事。逆向时如果看到 v8 heap snapshot 里的多个相似 Map，' +
+          '对应到 ART 侧就是「同一个类、不同 ArtMethod 版本」的局面。</p>'),
       stage: {
         title: '一次 Java 方法调用的完整寻址路径',
         speed: 1600,
@@ -541,7 +567,15 @@ window.CHAPTER = {
           '<p>既然映射是在 <span class="mono">RegisterNatives</span> 里被交给虚拟机的，那我们就在<b>那个函数内部</b>加一行日志。' +
           '此刻 Java 方法、签名、函数地址三者同时在手上——<strong>这是整个系统里信息最完备的一瞬间</strong>。</p>' +
           '<p>比起 hook <span class="mono">RegisterNatives</span> 这个 API（会被反调试发现 hook 框架的存在），' +
-          '直接改虚拟机源码<b>在代码里就完成了记录</b>，没有额外痕迹需要隐藏。</p>'),
+          '直接改虚拟机源码<b>在代码里就完成了记录</b>，没有额外痕迹需要隐藏。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>RegisterNatives</b> ≈ <b>JS 里的 Object.defineProperty / Reflect.defineMetadata</b>，' +
+          '更接近 <b>动态注入 + 运行期函数指针表</b>。在 JS 侧,Webpack / Vite 打包后的 chunk 加载、' +
+          'CommonJS 的 <code>module.exports</code> 替换,本质都是「在运行时把名字映射到函数地址」。</p>' +
+          '<p><b>关键差异</b>:JS 的「动态注册」更彻底——函数引用是 GC 对象,匿名函数、箭头函数、' +
+          'Proxy 包装的函数全都能注册;ART 的动态注册还要写明 JNI 签名 <code>(I)V</code> 这类强类型描述符,' +
+          '因为 Java 方法重载靠签名区分。逆向 JS bundle 时只要 hook <code>module.exports.__esModule</code> 写入点' +
+          '就能拿到模块导出表;对应到 ART 侧就是 hook <code>RegisterNatives</code> 拿到 native 方法表。</p>')),
       stepper: {
         title: '给 ART 的 RegisterNatives 插一行探针（右侧看映射逐条累积）',
         lines: [
@@ -714,7 +748,15 @@ window.CHAPTER = {
           '<p>编译器把函数体<b>展开到每一个调用处</b>，从而消除调用开销（压栈、跳转、返回）。' +
           '但 <span class="mono">inline</span> 关键字<b>只是建议</b>，真正拍板的是编译器的优化决策：函数体够小 + 开了 <span class="mono">-O2</span>/<span class="mono">-O3</span>，' +
           '它就会内联，<b>你写不写 inline 都可能被内联</b>。</p>') +
-        '<p>这带来三个连锁后果，它们全都发生在<strong>调试期</strong>，而根源在<strong>编译期</strong>：</p>',
+        '<p>这带来三个连锁后果，它们全都发生在<strong>调试期</strong>，而根源在<strong>编译期</strong>：</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>C++ inline</b> ≈ <b>V8 的 inlining + escape analysis</b>——' +
+          '都是引擎把"调用开销"当优化目标,把多个函数体/对象访问合并成一段连续指令。' +
+          'V8 的 TurboFan 会把 hot 函数 inline 掉、把临时对象直接消解在寄存器里,后果完全对位。</p>' +
+          '<p><b>关键差异</b>:V8 的内联发生在<b>运行期 JIT 编译阶段</b>(Ignition 收集 profile,TurboFan 优化),' +
+          '同一个函数在不同调用点可能被分别 inline 多次,inline 决策还能 deoptimize 回退;' +
+          'C++ inline 是 AOT 静态决定,不可逆。逆向 V8 优化后的代码要看「共享 IC 处理函数」,逆向 O3 编译的 so 要看「连续基本块」——' +
+          '两者都在反汇编里找「找不到的函数」,思路一致。</p>'),
       stage: {
         title: 'inline 之后，调试器看到的和你想的不一样',
         speed: 1600,
@@ -1101,6 +1143,7 @@ window.CHAPTER = {
     },
   ],
   glossary: [
+    { t: '↔ Web 对位 · ART = V8，沙箱隔离 = vm 上下文', d: '都是「字节码 + 分层执行」的引擎：dex 在 ART 上跑、JS 在 V8 上跑，都是先解释执行、热代码走 JIT/AOT 编译成机器码。关键差异是隔离层级——ART 的沙箱是<b>进程级 + UID + 内核权限</b>（一个 App 崩了不影响别的），V8 sandbox / Node vm 是<b>进程内</b>的上下文隔离。这解释了为什么安卓 hook 必须深入 ART 的 C++ 结构（ArtMethod / DexFile），而前端 hook 停在 JS 层就够。' },
     { t: 'mirror::Object', d: 'Java 对象在 Native 层的镜像结构，也是所有 Java 对象的内存头部。第一个字段 klass_ 指向该对象的 mirror::Class，另有 monitor 锁信息。类似 HotSpot 的 mark word + klass pointer。' },
     { t: 'mirror::Class', d: 'Java 类的镜像，描述「这个类有哪些方法和字段」。含方法表、字段表、vtable、接口表。同一个类在虚拟机里只有一份，全部实例共享。' },
     { t: 'ArtMethod', d: '单个 Java 方法的元数据。关键字段：declaring_class_（声明类）、access_flags_（访问标志）、dex_code_item_offset_（Dex 代码偏移）、entry_point_from_quick_compiled_code_（实际执行入口，可为解释器/JIT/AOT）。是所有 Java Hook 的底层抓手。' },
@@ -1122,6 +1165,32 @@ window.CHAPTER = {
            '而会问你「如果那个字段不存在，会发生什么」。答不上来我会给提示，两次之后给追问——三次都答不上，我会把标准答案讲给你听，但你的进度条不会动。</p>',
     questions: [
       /* ---------- 第 1 题 ---------- */
+      {
+        id: 'c18qWeb', depth: 2, threshold: 0.7,
+        q: 'ART 是 dex 的执行环境（含沙箱与类加载）。说出它和你熟悉的 JS 执行环境的对位物，并各说一条关键差异。',
+        concepts: [
+          { label: 'ART ≈ V8', hint: '都是字节码的执行引擎。', any: ['V8', '引擎', '运行时', '解释器', '执行'] },
+          { label: '沙箱隔离 ≈ vm 上下文/sandbox', hint: '代码跑在受控环境里。', any: ['vm', '沙箱', '隔离', '上下文', 'sandbox'] },
+          { label: '类加载 ≈ 动态 import', hint: '运行时按需加载新代码。', any: ['import', '动态', '加载', 'require', '模块'] },
+          { label: 'JIT/AOT ≈ 解释器/TurboFan', hint: '先解释跑，热代码编译成机器码。', any: ['JIT', 'AOT', 'TurboFan', '编译', '优化'] }
+        ],
+        hints: [
+          '先想「字节码 + 引擎」这个组合：dex 在 ART 上跑，JS 在 V8 上跑，都先解释后编译。',
+          '再想沙箱：ART 用 UID/权限隔离 App，V8 sandbox/Node vm 隔离代码执行上下文。'
+        ],
+        probes: [
+          '追问：为什么「ART 内部结构（ArtMethod/DexFile）」是 Frida hook 的重点，而 V8 内部结构你一般不需要碰？',
+          '再追问：ART 的 AOT 产物(oat)换设备就失效，V8 的优化代码缓存也有类似问题吗？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>ART ≈ V8</b>：都是「字节码 + 分层执行」的引擎——dex 在 ART、JS 在 V8，都是先解释执行、热代码走 JIT/AOT 编译成机器码；' +
+          '差异：ART 的编译产物(oat/vdex)与设备架构、系统版本绑定，换设备就失效；V8 的优化代码基本不跨版本持久化。<br>' +
+          '② <b>沙箱隔离 ≈ V8 sandbox / Node vm 上下文</b>：都让不可信代码跑在受控环境里；差异：<b>ART 的隔离是进程级 + UID + 内核权限</b>（一个 App 崩了不影响别的），' +
+          'V8 sandbox 是<b>进程内</b>的（同进程不同上下文），Node vm 也只是弱隔离——这是安卓「更安全也更难绕」的根源。<br>' +
+          '③ <b>类加载器(DexClassLoader) ≈ 动态 import()</b>：都支持运行时加载新代码（安卓热修复/插件化的基础）；' +
+          '差异：安卓加载的是 dex 字节码、能加载任意新类，动态 import 加载的是 JS 模块。<br>' +
+          '④ <b>关键</b>：安卓 hook 要深入 ART 的 C++ 结构（ArtMethod、DexFile、dex_code_item_offset_），因为这些是「方法真身」的所在地；' +
+          '前端 hook 一般停在 JS 层，因为 JS 层就能拿到全部逻辑。'
+      },
       {
         id: 'c4q1', depth: 1, threshold: 0.7,
         q: '一个 Java 对象在 Native 层就是一块内存。这块内存的<b>最开头</b>放着什么？为什么对象本体里<b>不直接存方法代码</b>，而要多绕一层？',

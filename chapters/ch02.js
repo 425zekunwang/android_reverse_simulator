@@ -32,7 +32,22 @@ window.CHAPTER = {
           '<li><b>机器方言</b>（ARM/AArch64 指令）——只有 native 的 so 才是这个形态，<b>那是第 17 章的战场</b></li>' +
           '</ul>' +
           '<p>逆向里最常见的两个错位就在这里：<b>用读手稿的习惯去读发行版</b>（以为反编译出来的是源码），' +
-          '和<b>用改发行版的力气去改官方译本</b>（对着设备上的 oat 打补丁，然后被系统重建覆盖）。</p>'
+          '和<b>用改发行版的力气去改官方译本</b>（对着设备上的 oat 打补丁，然后被系统重建覆盖）。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这六种形态在你熟悉的 JS 世界里几乎是镜像的——' +
+            '只是名字换了一下。把 <code>APK</code> 看作整个 SPA 站点（HTML+JS+CSS+资源，' +
+            '一个自包含的发布包），里面装的 <code>classes.dex</code> ≈ 线上跑的 <code>main.js</code> / <code>app.js</code>' +
+            '（人写的不是它）。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <code>APK</code> ≈ 整个 SPA 站点（自包含发布包）<br>' +
+            '· <code>classes.dex / oat / vdex</code> ≈ 打包后的 <code>main.js</code>（线上跑的代码）<br>' +
+            '· <b>Smali ≈ 关闭 source map 后、babel/webpack 编译出的最低可读 JS</b><br>' +
+            '· Java 源码（jadx 反编译）≈ 第三方 <code>.js</code> 反混淆/格式化后的代码（变量名/结构常被混淆）<br>' +
+            '· d8 / R8（Java→dex）≈ babel / swc / terser（高级语言→目标字节码）</p>' +
+            '<p><b>关键差异</b>:JS 那边的 source map 让你能直接还原行号 + 变量名;Smali 这边没有 source map，' +
+            '所以"猜出来的 Java"（jadx）经常和 Smali 对不上——这就是为什么改包要回 Smali 而不是改 jadx 产物。</p>' +
+            '<p><b>逆向视角</b>:你做 JS 逆向看到 main.js 第一眼会想"这是 webpack 编译过的，关掉 source map 的样子"，' +
+            '看到 <code>.smali</code> 第一眼要想"这是 d8/R8 编译过的，没有 source map 的样子"——定位和改写的思路完全一样。</p>')
       },
       html:
         T.note('key', '🔑 本章的三条边界（先划清楚，后面才不串）',
@@ -45,7 +60,11 @@ window.CHAPTER = {
           '本章不再重复。<span class="hit">同一台手机，两条语言：Java 层说 dex 字节码，native 层说 ARM 机器码。</span></li>' +
           '</ol>') +
         '<p>先看这台"翻译机"的完整流水线。下面这个动画把一份代码的六种形态排成一条链，' +
-        '并标出<b>你能改、改了会生效</b>的那一环到底在哪。</p>',
+        '并标出<b>你能改、改了会生效</b>的那一环到底在哪。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>APK ≈ 整个 SPA 包</b>,<b>Smali ≈ 关掉 source map 的 main.js</b>。' +
+          '你在 JS 逆向里抓包下回来的 "压缩混淆后的 main.js"，就是安卓视角下的 "smali"——' +
+          '都是"线上跑的、人写的不是它、只能改文本然后重新编译回字节码"的那一环。</p>'),
       stage: {
         title: '一份 Java 代码的六种形态 · 改哪一环才有用',
         speed: 1700,
@@ -363,7 +382,19 @@ window.CHAPTER = {
           '<p>规矩只有一条，但它是全部混乱的来源：<b>参数从最右边开始放。</b>' +
           '这意味着"靠左的那批"是给你放局部变量的，"靠右的那批"是别人塞进来的参数。</p>' +
           '<p>于是同一个柜子有两个名字：按绝对编号叫 <code>v4</code>，按"第 0 个参数"叫 <code>p0</code>。' +
-          '<b>它们说的是一模一样的东西。</b>新手看 Smali 觉得乱，八成是没意识到自己面对的是"同一排柜子的两套命名"。</p>'
+          '<b>它们说的是一模一样的东西。</b>新手看 Smali 觉得乱，八成是没意识到自己面对的是"同一排柜子的两套命名"。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这套 "v 编号 / p 编号" 的双命名，' +
+            '在 JS 引擎里是同一个意思的两副面孔——只是命名习惯不同。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <code>vN</code>（按绝对位置）≈ JS 里的"栈槽索引" / V8 的 <code>frame[0], frame[1]</code><br>' +
+            '· <code>pN</code>（按参数序号）≈ JS 里的 <code>arguments[0]</code> 或解构后的形参名 <code>a, b, c</code><br>' +
+            '· <code>.registers N</code>（总数固定、不能再加）≈ JS 函数刚进入时的栈帧大小（V8 一次分配好）<br>' +
+            '· 宽类型 long/double 占两个槽位 ≈ JS 里 BigInt 不能和 Number 直接相加（不同表示要拆）</p>' +
+            '<p><b>关键差异</b>:JS 引擎的栈帧分配对你是透明的，你写 <code>function(a, b)</code> 引擎自己算;但 Smali 里你得自己<b>数槽位</b>，' +
+            '<code>.registers</code> 改一个数字整个方法体都错位——这就是 "我只改了一个数字，怎么全错了" 的根源。</p>' +
+            '<p><b>逆向视角</b>:看到 Smali 里混用 <code>v</code> 和 <code>p</code> 别慌，先用 <code>locals = .registers - 参数槽位数</code> ' +
+            '换算一下再读;这跟 V8 调试图里要把 "argument index" 和 "stack slot" 区分开是同一种肌肉记忆。</p>')
       },
       html:
         '<p>下面把这条规矩用动画走一遍。注意两个例子用的是<b>同一个 <code>.registers 8</code></b>，' +
@@ -963,7 +994,21 @@ window.CHAPTER = {
           'try/catch 是"我给这段划个范围，出事就跳到备用格子"。</p>' +
           '<p>所以读 Smali 的控制流，关键不是认关键字，而是<b>认跳转方向和目标标签</b>：' +
           '谁跳到谁、什么条件下跳、跳过去的那段是"成功路径"还是"失败路径"。' +
-          '<span class="hit">把这三点认出来，一段控制流你就读懂了。</span></p>'
+          '<span class="hit">把这三点认出来，一段控制流你就读懂了。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 字节码"只剩跳"这一点，和 V8/SpiderMonkey 的字节码生成完全同构——' +
+            'JSC 的 <code>BytecodeGenerator</code> 也是把所有 JS 控制流翻译成一组 <code>JumpIfTrue/JumpIfFalse/Loop</code> 类指令。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <code>if-eqz / if-nez</code> ≈ JS 里的 <code>JumpIfToBooleanTrue/False</code>（V8 的 <code>JumpIfToBooleanTrue</code>）<br>' +
+            '· <code>switch</code>（查表跳转）≈ V8 的 <code>SwitchOnSmiTable</code> / <code>SwitchOnString</code><br>' +
+            '· <code>try/catch</code>（标号区间）≈ JS 的 <code>TryFinally</code> / <code>Catch</code> 字节码<br>' +
+            '· <code>:cond_0</code> 这种标签 ≈ V8 反汇编输出里的 <code>__jump_table</code> / <code>__case_X</code><br>' +
+            '· OB 控制流平坦化（<code>while(true){switch}</code>）≈ Smali 里 <code>goto + switch</code> 反向复刻</p>' +
+            '<p><b>关键差异</b>:JS 引擎的字节码保留了变量名（debug info），你 V8 调试图里能直接看 <code>x > 0</code>;' +
+            'Smali 只有寄存器和标签，<b>所有条件值都要靠"读到的 v 寄存器里刚才装了什么"去还原</b>，' +
+            '所以 Smali 控制流比 JS 字节码难读一个量级。</p>' +
+            '<p><b>逆向视角</b>:遇到大段 <code>goto</code> + <code>switch</code> 嵌套，' +
+            '别尝试手撕——直接用 <code>jadx</code> 看反编译的 Java 拿主干逻辑，再用 Smali 精确定位关键跳转条件;这跟 JS 里 "AST 看结构 + 字节码看执行" 是一样的套路。</p>')
       },
       html:
         '<p>标签（label）是 Smali 里唯一"为了给人看"而存在的东西之一。它长这样：<code>:cond_0</code>、' +
@@ -1969,7 +2014,20 @@ window.CHAPTER = {
           '<p>现在你把门锁换了（改代码 + 重新签名）。<b>锁更新了、也更结实了，但房东手里存着原钥匙的拓片</b>——' +
           '他把拓片和现在的锁一比，立刻知道换过锁。</p>' +
           '<p>更麻烦的是：他可以<b>不吭声</b>。不报警、不赶你走，只是悄悄把你家的水电改了——' +
-          '这就是 2.15 案例里说的"隐式签名校验"，也是它比闪退可怕得多的原因。</p>'
+          '这就是 2.15 案例里说的"隐式签名校验"，也是它比闪退可怕得多的原因。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这套"改内容→签名对不上"的死循环，' +
+            '你在 JS 逆向里每周都能碰到——只是名字叫 <b>SRI / CSP / integrity</b>。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· APK 签名 v1/v2/v3/v4 ≈ 前端 <b>Subresource Integrity (SRI)</b> 的 hash 属性 + 多个 CSP 版本共存<br>' +
+            '· 重签名（换私钥重签）≈ 上传一份 <code>integrity="sha384-..."</code> 不匹配的 JS，浏览器直接拒加载<br>' +
+            '· "App 自己读签名做比对"（隐式校验）≈ 前端用 <code>crypto.subtle.digest</code> 在 JS 里再算一次 bundle hash 对比（防中间人篡改 CDN）<br>' +
+            '· 完整性校验（dex/so CRC/SHA）≈ 前端用 <code>webpack</code> 的 <code>contenthash</code> 给 chunk 命名 + 上线前 <code>npm audit</code><br>' +
+            '· "三角校验"（多份互相牵制）≈ 强混淆里的"反调试 + 环境检测 + 完整性" 三件套，单独改一个都会被另一个戳穿</p>' +
+            '<p><b>关键差异</b>:SRI 失效浏览器就 <b>拒绝加载</b>（最外层防护，立竿见影）;但安卓签名校验是<b>App 自己在 Java/native 里读</b>，' +
+            '可以"装看不见"——隐式校验悄悄改变功能，比直接闪退危险得多。</p>' +
+            '<p><b>逆向视角</b>:看到 App 自检签名 + 自检 dex hash + 自检 so path 这套组合，别死磕绕过;先想"它是不是在玩隐式校验"——' +
+            '这跟 JS 里碰到 "token 计算对了，但接口返回 0" 时第一反应是 "是不是 bundle hash 被换了" 是同一种思考路径。</p>')
       },
       html:
         '<p>把"签名变了"这件事拆开看，你会发现它必然触发一串连锁反应：</p>' +
@@ -2851,7 +2909,10 @@ window.CHAPTER = {
     { t: '重打包（二次打包）', d: '解包 → 改动 → 回编译 → 重新签名的完整动作。灰产用它植入后门，开发者用签名/完整性校验对抗它（第 8 章"防二次打包"）。' },
     { t: '后门植入', d: '把不属于原作者的代码塞进 APK 的常见入口：Application / attachBaseContext、入口 Activity、native so、dlsym 劫持、dex 插桩、assets payload。' },
     { t: 'attachBaseContext', d: 'Application 里最早的 Java 执行点之一。加固壳用它抢先执行，植入方也盯它——谁先拿到执行权谁占主动。' },
-    { t: 'split APK / App Bundle', d: '商店分发的现代形态：基础包 + 若干 split。直接对 split 做 apktool 处理通常要先合并，属于工具链层面的坑。' }
+    { t: 'split APK / App Bundle', d: '商店分发的现代形态：基础包 + 若干 split。直接对 split 做 apktool 处理通常要先合并，属于工具链层面的坑。' },
+    { t: '↔ Web 对位 · APK ≈ 整个 SPA 包', d: 'APK 是个自包含的发布包：dex + 资源 + 清单 + 签名，跟 SPA 站点里的 HTML+JS+CSS+资源 + integrity 一一对应。逆向时把 APK 当 "整个 SPA 的产物" 来想，比把它当成 "一堆零散的 dex 文件" 更容易建立全局视角。' },
+    { t: '↔ Web 对位 · Smali ≈ 关闭 source map 后的 main.js', d: 'baksmali 把 dex 翻译成 Smali，就像 webpack/babel 编译后、没开 source map 时拿到的 JS——人能读、能 grep、能改，但没了变量名和行号。改包要回 Smali 而不是 jadx 的 Java，跟 JS 逆向要改 bundle 而不是格式化后的源码是同一个原因。' },
+    { t: '↔ Web 对位 · APK 签名 ≈ CSP/SRI', d: '签名既是 "身份证明"（谁发的）又是 "完整性证明"（内容没被改），对应前端的 CSP 来源限制 + SRI 的 integrity hash。改完内容签名必然失效——和 SRI 不匹配浏览器就拒加载同构。差异在：SRI 是浏览器立竿见影地拒，安卓签名校验是 App 自己在 Java/native 里读，可以 "装看不见" 做隐式校验。' }
   ],
 
   /* ============================================================== 严师 */

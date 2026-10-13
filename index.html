@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>安卓高级研修班 · 交互式模拟器</title>
 <link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/index.css">
 <link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
 <meta name="description" content="《安卓高级研修班》交互式模拟器：32 章安卓逆向工程课程，用可动手操作的代码推演器、动画舞台、动手实验室与苏格拉底追问，把 Frida、脱壳、OLLVM、VMP、算法还原讲成能上手的手艺。">
 <meta name="theme-color" content="#0b0f14">
@@ -14,264 +15,264 @@
 <meta property="og:image" content="assets/favicon.svg">
 <meta name="twitter:card" content="summary">
 </head>
-<body>
+<body class="home">
 <div class="wrap wide">
 
-  <div class="chapter-hero">
-    <span class="ch-no">COURSE SIMULATOR</span>
-    <h1>《安卓高级研修班》交互式模拟器</h1>
-    <p class="lede">
-      这不是一份讲义，而是一台<strong>可以动手操作的机器</strong>。32 章内容被拆成可交互组件：
-      <em>代码推演器</em>让你逐步执行 Frida 脚本与汇编，
-      <em>动画舞台</em>把看不见的内存、寄存器、class 加载流程画出来，
-      <em>动手实验室</em>要求你亲手算出真实结果，
-      <em>决策演练</em>逼你在真实情境下选路线，
-      而每个章节底部都蹲着一位<em>不断追问的老师</em>——不把关键概念说全，他不会放你走。
-    </p>
-    <div class="hero-meta">
-      <span><b>32</b> 章</span>
-      <span><b>8</b> 个学习阶段</span>
-      <span><b>600+</b> 个交互组件</span>
-      <span><b>170</b> 道苏格拉底追问</span>
-      <span>进度自动保存在本地</span>
-    </div>
-  </div>
+  <!-- ============================== HERO ============================== -->
+  <header class="hero">
+    <div class="orb orb-a"></div>
+    <div class="orb orb-b"></div>
 
-  <!-- 关卡地图：放在 hero 之后立即出现，是首页的主视图。
-       ux.js 的 mountIndexMap() 会接管 #map，把 32 章渲染成 Duolingo 蛇形关卡。 -->
-  <div id="map"></div>
-
-  <div class="stat-row" id="progress">
-    <div class="stat"><div class="sv" id="svDone">0</div><div class="sl">已完成章节</div></div>
-    <div class="stat"><div class="sv" id="svSoc">0</div><div class="sl">通关的追问关卡</div></div>
-    <div class="stat"><div class="sv" id="svQuiz">0</div><div class="sl">答对的自测题</div></div>
-    <div class="stat"><div class="sv" id="svPct">0%</div><div class="sl">总进度</div></div>
-  </div>
-
-  <div class="note key">
-    <div class="note-h">怎么用这台模拟器</div>
-    <p style="margin-bottom:8px">每一章的结构是固定的，按顺序走一遍效果最好：</p>
-    <ol style="margin:0">
-      <li><strong>先读「直觉模型」</strong>——用一个生活类比建立粗颗粒的理解，别急着看代码。</li>
-      <li><strong>再玩「动画 / 推演器」</strong>——把抽象机制变成看得见的箭头、内存格和寄存器变化。</li>
-      <li><strong>然后做「决策演练」</strong>——真实工程里没有标准答案，只有权衡。选错了才有收获。</li>
-      <li><strong>最后被「严师」拷问</strong>——这是唯一能验证"我真的懂了"而不是"我看过了"的环节。</li>
-    </ol>
-  </div>
-
-  <div class="note warn">
-    <div class="note-h">📖 章节顺序 = 学习顺序（按编号照读即可）</div>
-    <p>三段式：<b style="color:#a3e635">入门地基</b>（第 1–7 章，1w 计划）→ <b style="color:#e879f9">基础补遗</b>（第 8–14 章，2w 计划）→ <b class="acc">进阶与深水区</b>（第 15–32 章，3w 计划）。
-    <span class="hit">顺序不影响正确性，但影响挫败感。</span>不确定从哪开始，看下面的「学习路线」卡片。</p>
-    <details style="margin-top:8px"><summary style="cursor:pointer;color:var(--fg-3);font-size:12.5px">展开 32 章分组细节</summary>
-      <div class="tbl-wrap" style="margin-top:10px">
-        <table class="tbl">
-          <thead><tr><th>阶段</th><th>章节</th><th>性质</th><th>何时看</th></tr></thead>
-          <tbody>
-            <tr>
-              <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">入门地基</span></td>
-              <td>第 <b>1–7</b> 章</td>
-              <td>四大组件 / Smali / 文件格式 / 安全审计 / 定位方法论 / RSA / AI</td>
-              <td>完全零基础从这里开始</td>
-            </tr>
-            <tr>
-              <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">基础补遗</span></td>
-              <td>第 <b>8–14</b> 章</td>
-              <td>加固全景 / JNI / Frida / Xposed / 抓包 / 沙箱 / 白盒</td>
-              <td>逆向工作的必备技能</td>
-            </tr>
-            <tr>
-              <td><span class="pill acc">深水区</span></td>
-              <td>第 <b>15–32</b> 章</td>
-              <td>脱壳演进 / ARM & C++ / OLLVM / VMP / unidbg / 算法还原 / eBPF / iOS / 云手机 / 模拟器 / 容器</td>
-              <td>已经有逆向底子再走</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </details>
-  </div>
-
-  <div style="display:flex;gap:12px;flex-wrap:wrap;margin:26px 0">
-    <a class="btn primary" href="ch01-android-model.html" style="text-decoration:none;padding:11px 22px;font-size:14px">▶ 从第 1 章开始</a>
-    <a class="btn" href="#map" style="text-decoration:none;padding:11px 22px;font-size:14px">🗺 浏览全部 32 章</a>
-    <a class="btn" href="slides.html" style="text-decoration:none;padding:11px 22px;font-size:14px">📊 复习演示稿</a>
-    <a class="btn" href="cases.html" style="text-decoration:none;padding:11px 22px;font-size:14px">📁 实战案例库</a>
-    <a class="btn" href="toolbox.html" style="text-decoration:none;padding:11px 22px;font-size:14px">🧰 工具箱（30+ 真实项目）</a>
-    <button class="btn ghost" id="btnReset" style="padding:11px 22px;font-size:14px">↺ 清空学习进度</button>
-    <button class="btn ghost" id="btnExport" style="padding:11px 22px;font-size:14px">⬇ 导出进度</button>
-  </div>
-
-  <hr>
-
-  <h2><span class="h2-num">PATH</span>选一条路线，别从头读到尾</h2>
-
-  <p>32 章不是都要按顺序学完的。<strong>先确定你的目标，再选路线</strong>——这能帮你省下大量时间。
-  点击下面任意一条路线，地图上对应的章节会被高亮。</p>
-
-  <div class="grid3" id="paths">
-    <div class="card path-card" data-path="algo" style="cursor:pointer;border-color:rgba(55,214,122,.35)">
-      <div class="card-title" style="color:var(--ok)">🎯 算法还原（最短路径）</div>
-      <p class="muted small" style="margin-bottom:10px">目标：拿到 App 的签名/加密结果，能用代码复现。</p>
-      <div class="flex" style="gap:6px">
-        <span class="pill ok">CH 15</span><span class="pill ok">CH 17</span>
-        <span class="pill ok">CH 21</span><span class="pill ok">CH 22</span><span class="pill ok">CH 23</span>
-      </div>
-      <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>5 章即可干活。</b>第 19、20 章是为"遇到 OLLVM/VMP 啃不动"时准备的加深内容，可以后补。
+    <div class="hero-inner">
+      <span class="ch-no anim-in">COURSE SIMULATOR · V2</span>
+      <h1 class="anim-in d1">《安卓高级研修班》<span class="grad">交互式模拟器</span></h1>
+      <p class="lede anim-in d2">
+        不是讲义，是一台<strong>可以动手操作的机器</strong>：<em>代码推演器</em>逐步执行 Frida 脚本与汇编，
+        <em>动画舞台</em>画出内存与寄存器，<em>动手实验室</em>让你亲手算出结果，
+        每章末尾还有一位<em>不断追问的严师</em>——不说透不放你走。
       </p>
+      <div class="hero-meta anim-in d3">
+        <span><b>32</b>章</span>
+        <span><b>8</b>个学习阶段</span>
+        <span><b>600+</b>个交互组件</span>
+        <span><b>170</b>道苏格拉底追问</span>
+      </div>
+    </div>
+
+    <!-- 右侧装饰终端：营造「工程感」 -->
+    <div class="hero-term anim-in d4" aria-hidden="true">
+      <div class="ht-bar"><i></i><i></i><i></i></div>
+      <pre><span class="c">#  hook 一下看看</span>
+<span class="k">$</span> frida -U -l hook.js <span class="f">com.target.app</span>
+<span style="color:#37d67a">[+]</span> attached: pid=<span class="n">28471</span>
+<span style="color:#37d67a">[+]</span> Sign.so <span class="c">// 找到了</span>
+<span class="k">></span> Interceptor.attach(<span class="m">0x7c4f2a10</span>)
+<span class="s">"sig"</span>: <span class="s">"9f2c…e41a"</span> <span class="caret"></span></pre>
+    </div>
+  </header>
+
+  <!-- ============================== 关卡地图 + 侧边栏 ============================== -->
+  <div class="home-grid">
+    <!-- 左：32 章关卡地图（主视图，ux.js mountIndexMap() 接管渲染） -->
+    <div id="map"></div>
+
+    <!-- 右：进度 + 玩法 + 顺序 + 行动 -->
+    <aside class="side">
+      <div class="stat-row rv-stagger" id="progress">
+        <div class="stat"><div class="sv" id="svDone">0</div><div class="sl">已完成章节</div></div>
+        <div class="stat"><div class="sv" id="svSoc">0</div><div class="sl">通关追问关卡</div></div>
+        <div class="stat"><div class="sv" id="svQuiz">0</div><div class="sl">答对自测题</div></div>
+        <div class="stat"><div class="sv" id="svPct">0%</div><div class="sl">总进度</div></div>
+      </div>
+
+      <div class="panel rv">
+        <div class="panel-h">🧭 每章的固定玩法</div>
+        <div class="steps">
+          <div class="step"><span class="step-no">01</span><b>读「直觉模型」</b><p>生活类比建立粗理解，先别碰代码。</p></div>
+          <div class="step"><span class="step-no">02</span><b>玩「动画 / 推演器」</b><p>把抽象机制变成看得见的箭头与寄存器。</p></div>
+          <div class="step"><span class="step-no">03</span><b>做「决策演练」</b><p>真实工程只有权衡，选错才有收获。</p></div>
+          <div class="step"><span class="step-no">04</span><b>被「严师」拷问</b><p>验证"真懂了"而不是"看过了"。</p></div>
+        </div>
+      </div>
+
+      <div class="panel rv">
+        <div class="panel-h">📖 学习顺序：三段式</div>
+        <p class="panel-p">
+          <b style="color:#a3e635">入门地基</b> 1–7 章 →
+          <b style="color:#e879f9">基础补遗</b> 8–14 章 →
+          <b class="acc">深水区</b> 15–32 章。
+          <span class="hit">顺序不影响正确性，但影响挫败感。</span>
+        </p>
+        <details class="mini">
+          <summary>展开 32 章分组细节</summary>
+          <div class="tbl-wrap" style="margin:10px 0 2px">
+            <table class="tbl dense">
+              <thead><tr><th>阶段</th><th>章节</th><th>性质</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">入门地基</span></td>
+                  <td><b>1–7</b></td>
+                  <td>四大组件 / Smali / 文件格式 / 安全审计 / 定位 / RSA / AI</td>
+                </tr>
+                <tr>
+                  <td><span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">基础补遗</span></td>
+                  <td><b>8–14</b></td>
+                  <td>加固全景 / JNI / Frida / Xposed / 抓包 / 沙箱 / 白盒</td>
+                </tr>
+                <tr>
+                  <td><span class="pill acc">深水区</span></td>
+                  <td><b>15–32</b></td>
+                  <td>脱壳 / ARM / OLLVM / VMP / unidbg / 算法还原 / eBPF / 模拟器</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+
+      <div class="panel rv">
+        <div class="cta-col">
+          <a class="btn primary" href="ch01-android-model.html" style="text-decoration:none">▶ 从第 1 章开始</a>
+          <a class="btn" href="slides.html" style="text-decoration:none">📊 复习演示稿</a>
+          <a class="btn" href="cases.html" style="text-decoration:none">📁 实战案例库</a>
+          <a class="btn" href="toolbox.html" style="text-decoration:none">🧰 工具箱（30+ 项目）</a>
+          <div class="cta-mini">
+            <button class="btn ghost" id="btnExport">⬇ 导出进度</button>
+            <button class="btn ghost" id="btnReset">↺ 清空进度</button>
+          </div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ============================== 学习路线 ============================== -->
+  <div class="sec-head rv">
+    <h2><span class="h2-num">PATH</span>选一条路线，别从头读到尾</h2>
+    <p class="sec-sub">32 章不必按顺序学完。<strong>先定目标，再选路线</strong>——点击卡片，地图上对应章节会高亮。</p>
+    <hr class="sec-rule">
+  </div>
+
+  <div class="grid5 rv-stagger" id="paths">
+    <div class="card path-card" data-path="algo" style="cursor:pointer;border-color:rgba(55,214,122,.35)">
+      <div class="card-title" style="color:var(--ok)">🎯 算法还原</div>
+      <p class="muted small" style="margin-bottom:8px">最短路径：复现 App 的签名/加密结果。</p>
+      <div class="flex" style="gap:5px">
+        <span class="pill ok">15</span><span class="pill ok">17</span>
+        <span class="pill ok">21</span><span class="pill ok">22</span><span class="pill ok">23</span>
+      </div>
+      <p class="small" style="margin:10px 0 0;color:var(--fg-3)"><b>5 章即可干活。</b>OLLVM/VMP 啃不动时再回第 19、20 章加深。</p>
+      <span class="path-cta">查看详情 →</span>
     </div>
 
     <div class="card path-card" data-path="unpack" style="cursor:pointer;border-color:rgba(77,163,255,.35)">
       <div class="card-title" style="color:var(--acc)">📦 脱壳 / 加固对抗</div>
-      <p class="muted small" style="margin-bottom:10px">目标：把加壳 App 的原始 dex 或 so 完整还原出来。</p>
-      <div class="flex" style="gap:6px">
-        <span class="pill acc">CH 15</span><span class="pill acc">CH 16</span>
-        <span class="pill acc">CH 18</span><span class="pill acc">CH 24</span><span class="pill acc">CH 26</span>
+      <p class="muted small" style="margin-bottom:8px">把加壳 App 的原始 dex / so 完整还原。</p>
+      <div class="flex" style="gap:5px">
+        <span class="pill acc">15</span><span class="pill acc">16</span>
+        <span class="pill acc">18</span><span class="pill acc">24</span><span class="pill acc">26</span>
       </div>
-      <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>关键是第 18 章。</b>读懂 ART 源码才能自己定位脱壳点——只会用别人的 FART，遇到新壳就没辙。
-      </p>
+      <p class="small" style="margin:10px 0 0;color:var(--fg-3)"><b>关键是第 18 章。</b>会读 ART 源码，才能自己定位脱壳点。</p>
+      <span class="path-cta">查看详情 →</span>
     </div>
 
     <div class="card path-card" data-path="anti" style="cursor:pointer;border-color:rgba(255,95,109,.35)">
       <div class="card-title" style="color:var(--bad)">🛡️ 反检测 / 环境对抗</div>
-      <p class="muted small" style="margin-bottom:10px">目标：让分析环境不被发现，或识别对方的环境检测。</p>
-      <div class="flex" style="gap:6px">
-        <span class="pill bad">CH 20</span><span class="pill bad">CH 25</span>
-        <span class="pill bad">CH 27</span><span class="pill bad">CH 29</span><span class="pill bad">CH 32</span>
+      <p class="muted small" style="margin-bottom:8px">让分析环境不被发现，或识别对方检测。</p>
+      <div class="flex" style="gap:5px">
+        <span class="pill bad">20</span><span class="pill bad">25</span>
+        <span class="pill bad">27</span><span class="pill bad">29</span><span class="pill bad">32</span>
       </div>
-      <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>核心思想是降维。</b>把观测点放到比对手更低的层级（内核、Hypervisor），对方的检测就看不见你。
-      </p>
+      <p class="small" style="margin:10px 0 0;color:var(--fg-3)"><b>核心思想是降维。</b>观测点放到比对手更低的层级。</p>
+      <span class="path-cta">查看详情 →</span>
     </div>
 
     <div class="card path-card" data-path="zero" style="cursor:pointer;border-color:rgba(163,230,53,.45)">
-      <div class="card-title" style="color:#a3e635">🌱 零基础完整路线（照编号读）</div>
-      <p class="muted small" style="margin-bottom:10px">目标：先搞懂"安卓本身是怎么跑起来的"，再谈逆向。</p>
-      <div class="flex" style="gap:6px">
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 1</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 2</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 3</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 5</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 8</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 9</span>
-        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">CH 12</span>
+      <div class="card-title" style="color:#a3e635">🌱 零基础路线</div>
+      <p class="muted small" style="margin-bottom:8px">先搞懂"安卓怎么跑起来"，再谈逆向。</p>
+      <div class="flex" style="gap:5px">
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">1</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">2</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">3</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">5</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">8</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">9</span>
+        <span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">12</span>
       </div>
-      <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>一行逆向经验都没有？从这里开始。</b>先读第 1–7 章补"安卓自己的模型"：
-        组件与 IPC → Smali 与改包 → 文件格式 → 应用安全 → 环境与定位 → RSA → AI 辅助。
-        <span class="hit">学完第 1–7 章，第 8–14 章会变得好读很多。</span>
-      </p>
+      <p class="small" style="margin:10px 0 0;color:var(--fg-3)"><b>照编号读。</b>先补"安卓自己的模型"，再进技巧。</p>
+      <span class="path-cta">查看详情 →</span>
     </div>
 
     <div class="card path-card" data-path="basic" style="cursor:pointer;border-color:rgba(232,121,249,.42)">
-      <div class="card-title" style="color:#e879f9">🧱 基础技能补遗（第 8–14 章）</div>
-      <p class="muted small" style="margin-bottom:10px">目标：把第 15–32 章默认你已经会的前置补上。</p>
-      <div class="flex" style="gap:6px">
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 8</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 9</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 10</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 11</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 12</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 13</span>
-        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">CH 14</span>
+      <div class="card-title" style="color:#e879f9">🧱 基础技能补遗</div>
+      <p class="muted small" style="margin-bottom:8px">补齐第 15–32 章默认你会的前置。</p>
+      <div class="flex" style="gap:5px">
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">8</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">9</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">10</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">11</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">12</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">13</span>
+        <span class="pill" style="background:rgba(232,121,249,.14);border-color:#e879f9;color:#f5c6ff">14</span>
       </div>
-      <p class="small" style="margin:12px 0 0;color:var(--fg-3)">
-        <b>基础补齐就走这条。</b>加固全景 → JNI/NDK → Frida 自动化 → Xposed/LSPosed → 抓包与协议 → 自吐沙箱 → 白盒密码。
-        走完再进第 15–32 章，你会发现那些章节的"默认前提"全都有了。
-      </p>
+      <p class="small" style="margin:10px 0 0;color:var(--fg-3)"><b>补完再进深水区。</b>那些"默认前提"全都有了。</p>
+      <span class="path-cta">查看详情 →</span>
     </div>
   </div>
 
   <div id="pathDetail" class="note key" style="display:none"></div>
 
-  <hr>
+  <!-- ============================== 知识地图 ============================== -->
+  <div class="sec-head rv">
+    <h2><span class="h2-num">MAP</span>知识地图：一条向下要控制权的路线</h2>
+    <p class="sec-sub">从 Java 层 Hook，到 Native 层，到 ART 内部，到编译器 Pass，到 VMP 解释器，最后到内核与 Hypervisor。</p>
+    <hr class="sec-rule">
+  </div>
 
-  <h2><span class="h2-num">MAP</span>整门课的知识地图</h2>
-
-  <p>把这 25 章摊开来看，它其实是一条<strong>不断向下要控制权</strong>的路线：从 Java 层 Hook，到 Native 层，
-  到 ART 虚拟机内部，到混淆器的编译器 Pass，到 VMP 的解释器，最后到内核与 Hypervisor。</p>
-
-  <div class="card">
-    <div class="card-title">🎯 三大核心能力，外加一个地基</div>
-    <div class="note" style="margin-top:12px;border-color:rgba(163,230,53,.35)">
-      <div class="note-h" style="color:#a3e635">地基：安卓自己的模型（第 1–7 章）</div>
-      <p style="margin-bottom:0">下面三种能力都站在同一个前提上：<b>你得知道安卓是怎么运作的。</b>
-      组件怎么被系统唤起、代码跑在哪条线程、进程之间怎么说话、dex 长什么样、改了包会破坏什么——
-      <span class="hit">这些不是"进阶知识"，它们是坐标系。</span>
-      <b>第 1 章（应用模型）、3 章（文件格式）、5 章（定位方法）</b>是这块地基的三根柱子。
-      没有它，你所有的"下钩子"都只能靠试。</p>
-    </div>
-    <div class="grid3" style="margin-top:12px">
-      <div class="note" style="margin:0">
+  <div class="map-grid">
+    <div class="card rv" style="margin:0">
+      <div class="card-title">🎯 三大核心能力 + 一个地基</div>
+      <div class="note" style="margin-top:10px;border-color:rgba(163,230,53,.35)">
+        <div class="note-h" style="color:#a3e635">地基：安卓自己的模型（1–7 章）</div>
+        <p style="margin-bottom:0">三种能力都站在同一个前提上：<b>你得知道安卓怎么运作。</b>
+        <b>第 1、3、5 章</b>是这块地基的三根柱子——没有它，所有"下钩子"都只能靠试。</p>
+      </div>
+      <div class="note" style="margin:10px 0 0">
         <div class="note-h">能力一：加壳 / 混淆对抗</div>
-        <p style="margin-bottom:0">壳把真 dex 藏起来 → 你要在它解密的那一刻截胡（脱壳）；
-        混淆把逻辑打散 → 你要用动态执行轨迹把它拼回来。
-        <b>第 16、19、20、24、26、27 章</b>都在打这场仗，而<b>第 8 章</b>是这张战场的地图。</p>      </div>
-      <div class="note ok" style="margin:0">
+        <p style="margin-bottom:0">在壳解密的那一刻截胡（脱壳），用动态轨迹把打散的逻辑拼回来。
+        <b>第 16、19、20、24、26、27 章</b>打这场仗，<b>第 8 章</b>是战场地图。</p>
+      </div>
+      <div class="note ok" style="margin:10px 0 0">
         <div class="note-h">能力二：算法还原</div>
-        <p style="margin-bottom:0">App 把标准算法魔改（换表、加盐、塞进 OLLVM）→ 你要靠
-        <b>常量特征比对</b> + <b>动态抓中间状态</b>认出它到底是哪个算法的变种，
-        再用 unidbg 黑盒调用直接出结果。<b>第 17、21、22、23 章</b>是主线，
-        <b>第 13、14、6 章</b>处理"密钥根本不在你手上"的三种极端情况。</p>
+        <p style="margin-bottom:0"><b>常量特征比对</b> + <b>动态抓中间状态</b>认出魔改算法，再用 unidbg 黑盒调用出结果。
+        <b>第 17、21、22、23 章</b>是主线。</p>
       </div>
-      <div class="note" style="margin:0;border-color:rgba(232,121,249,.35)">
+      <div class="note" style="margin:10px 0 0;border-color:rgba(232,121,249,.35)">
         <div class="note-h" style="color:#e879f9">能力三：观测能力本身</div>
-        <p style="margin-bottom:0">上面两种能力都建立在一件事上：<b>你得先看得见</b>。
-        JNI 怎么绑定（<b>第 9 章</b>）、Frida 怎么自动化与去特征（<b>第 10 章</b>）、
-        Xposed/LSPosed 怎么常驻（<b>第 11 章</b>）、抓包怎么突破校验（<b>第 12 章</b>）、
-        怎么让算法自己招供（<b>第 13 章</b>）——<b>这一层不牢，后面全是碰运气。</b></p>
+        <p style="margin-bottom:0">JNI 绑定（<b>9</b>）、Frida（<b>10</b>）、Xposed（<b>11</b>）、抓包（<b>12</b>）、自吐沙箱（<b>13</b>）——
+        <b>这一层不牢，后面全是碰运气。</b></p>
       </div>
+    </div>
+
+    <div class="tbl-wrap rv" style="margin:0">
+      <table class="tbl dense">
+        <thead><tr><th>层级</th><th>你控制的东西</th><th>章节</th><th>典型对手</th></tr></thead>
+        <tbody>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用模型</span></td><td>组件、生命周期、IPC</td><td>1</td><td>"代码被谁调起来"</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">Smali / 改包</span></td><td>Dalvik 字节码、重打包</td><td>2</td><td>签名 / 完整性校验</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">文件格式</span></td><td>APK / DEX / ELF 结构</td><td>3</td><td>加固破坏文件结构</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用缺陷</span></td><td>导出组件、存储、WebView</td><td>4</td><td>App 自身漏洞</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">分析方法</span></td><td>环境、七条定位线索</td><td>5</td><td>"找不到关键代码"</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">公钥密码</span></td><td>RSA、公钥、填充</td><td>6</td><td>客户端验签</td></tr>
+          <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">工具形态</span></td><td>反编译器 + 大模型</td><td>7</td><td>混淆"读不完"</td></tr>
+          <tr><td><span class="pill cool">加固方案</span></td><td>壳的代际、特征判定</td><td>8</td><td>市面各类加固壳</td></tr>
+          <tr><td><span class="pill">Java 层</span></td><td>类方法、字段</td><td>9、15、16</td><td>Java 层加密</td></tr>
+          <tr><td><span class="pill acc">Hook 框架</span></td><td>注入时机、Zygote</td><td>10、11</td><td>Frida / Xposed 检测</td></tr>
+          <tr><td><span class="pill">协议层</span></td><td>HTTP(S)、TLS、socket</td><td>12</td><td>证书绑定</td></tr>
+          <tr><td><span class="pill warn">密码学实现</span></td><td>算法表、密钥嵌入</td><td>13、14</td><td>白盒 AES、DFA</td></tr>
+          <tr><td><span class="pill acc">Native 层</span></td><td>so 导出、JNI 接口表</td><td>15、17、22、23</td><td>OLLVM 加密函数</td></tr>
+          <tr><td><span class="pill warn">虚拟机层</span></td><td>ART 源码、解释器</td><td>16、18、24、26</td><td>抽取壳</td></tr>
+          <tr><td><span class="pill acc">编译器层</span></td><td>LLVM IR / Pass</td><td>19</td><td>控制流平坦化</td></tr>
+          <tr><td><span class="pill bad">字节码层</span></td><td>VMP 解释器、映射表</td><td>20、22</td><td>虚拟机保护</td></tr>
+          <tr><td><span class="pill bad">内核 / HV</span></td><td>syscall、调试寄存器</td><td>25、27、29</td><td>反调试</td></tr>
+          <tr><td><span class="pill ok">基础设施</span></td><td>namespace、cgroup、KVM</td><td>30、31、32</td><td>风控环境检测</td></tr>
+        </tbody>
+      </table>
     </div>
   </div>
 
-  <div class="tbl-wrap">
-    <table class="tbl">
-      <thead><tr><th>层级</th><th>你控制的东西</th><th>对应章节</th><th>典型对手</th></tr></thead>
-      <tbody>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用模型层</span></td><td>组件、生命周期、消息循环、IPC</td><td>1</td><td>"这段代码是被谁调起来的"</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">文件格式层</span></td><td>APK / DEX / ELF 的结构</td><td>3</td><td>加固对文件结构的破坏</td></tr>
-        <tr><td><span class="pill cool">加固方案层</span></td><td>壳的代际、特征与判定</td><td>8</td><td>市面上各类加固壳</td></tr>
-        <tr><td><span class="pill">Java 层</span></td><td>类方法、字段</td><td>15、16、9</td><td>简单校验、Java 层加密</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">Smali / 改包层</span></td><td>Dalvik 字节码、重打包</td><td>2</td><td>签名校验、完整性校验</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">应用缺陷层</span></td><td>导出组件、存储、WebView</td><td>4</td><td>App 自身的漏洞</td></tr>
-        <tr><td><span class="pill">协议层</span></td><td>HTTP(S)、TLS、socket 报文</td><td>12</td><td>证书绑定、自定义协议</td></tr>
-        <tr><td><span class="pill acc">Native 层</span></td><td>so 导出函数、JNI 接口表</td><td>15、17、22、23、9</td><td>OLLVM 混淆的加密函数、隐藏入口的壳</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">分析方法层</span></td><td>环境配置、七条定位线索</td><td>5</td><td>"找不到关键代码"</td></tr>
-        <tr><td><span class="pill acc">Hook 框架层</span></td><td>注入时机、Zygote</td><td>10、11</td><td>Frida / Xposed 特征检测</td></tr>
-        <tr><td><span class="pill acc">编译器层</span></td><td>LLVM IR / Pass</td><td>19</td><td>控制流平坦化、虚假控制流</td></tr>
-        <tr><td><span class="pill warn">虚拟机层</span></td><td>ART 源码、解释器</td><td>16、18、24、26、13</td><td>抽取壳、DexProtector</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">公钥密码层</span></td><td>RSA、公钥、填充</td><td>6</td><td>客户端验签、假 RSA</td></tr>
-        <tr><td><span class="pill warn">密码学实现层</span></td><td>算法表结构、密钥嵌入方式</td><td>13、14</td><td>白盒 AES、DFA 故障分析</td></tr>
-        <tr><td><span class="pill bad">字节码层</span></td><td>VMP 解释器、映射表</td><td>20、22</td><td>虚拟机保护</td></tr>
-        <tr><td><span class="pill bad">内核 / Hypervisor</span></td><td>syscall、调试寄存器</td><td>25、27、29</td><td>反调试、Frida 检测</td></tr>
-        <tr><td><span class="pill" style="background:rgba(163,230,53,.14);border-color:#a3e635;color:#dbffa3">工具形态层</span></td><td>反编译器 + 大模型</td><td>7</td><td>混淆导致的"读不完"</td></tr>
-        <tr><td><span class="pill ok">基础设施层</span></td><td>namespace、cgroup、KVM</td><td>30、31、32</td><td>风控环境检测</td></tr>
-      </tbody>
-    </table>
-  </div>
-
-  <div class="note warn">
+  <div class="note warn rv">
     <div class="note-h">⚠️ 一句话学习建议</div>
-    <p style="margin-bottom:0">这条路线<strong>不能跳着学</strong>。第 19 章看不懂 OLLVM 源码，是因为第 17 章汇编没读透；
-    第 20 章啃不动 VMP，是因为第 19 章的 LLVM Pass 没吃透。
-    如果你的目标是算法还原（大多数人都是），<b>第 15 → 17 → 21 → 22 → 23 章就是最短路径</b>，
-    剩下的章节是让你在遇到"这招不管用"的时候，知道该往哪一层去找答案。</p>
-    <p style="margin:12px 0 0"><b>如果你完全零基础</b>，路径更简单——<b>照编号从第 1 章往下读</b>：
-    先读 <b>1 → 2 → 3 → 5</b>（安卓怎么运作 → 怎么改包 → 文件格式 → 环境与定位），
-    再走 <b>8 → 9 → 12</b>（壳的分代 → JNI 怎么绑定 → 怎么抓到第一份样本），最后才进 <b>15 → 17 → 21 → 22 → 23</b>。</p>
-    <p style="margin:12px 0 0">看着绕了 7 步，但每一步都在拆掉后面的一堵墙：
-    <b>不学 1，你在第 16 章会看不懂"为什么 dump 出来是空的"、在第 5 章会不知道该怎么找代码；
-    不学 2，你连"改一行试试"这个最便宜的手段都用不了；
-    不学 12，第 22 章的算法还原连靶子都没有。</b>
+    <p style="margin-bottom:0">这条路线<strong>不能跳着学</strong>：看不懂 OLLVM，多半是汇编没读透；啃不动 VMP，多半是 LLVM Pass 没吃透。
+    目标是算法还原的话，<b>15 → 17 → 21 → 22 → 23 就是最短路径</b>；零基础则照编号从第 1 章往下读：
+    <b>1 → 2 → 3 → 5</b>（安卓模型 → 改包 → 格式 → 定位），再 <b>8 → 9 → 12</b>，最后进深水区。
     <span class="hit">先补地基再往上盖，比爬到一半发现地基是空的要快。</span></p>
   </div>
 
-  <hr>
-  <p class="muted center" style="margin-top:40px">
-    本模拟器基于课程章节结构编写，内容解读由 AI 补全整理，仅供学习参考 · 请勿用于任何未经授权的目标
-  </p>
+  <!-- ============================== 页脚 ============================== -->
+  <footer class="home-foot">
+    <span>本模拟器基于课程章节结构编写，内容解读由 AI 补全整理，仅供学习参考</span>
+    <span>请勿用于任何未经授权的目标 · Android Reverse Engineering Course Simulator</span>
+  </footer>
 </div>
 
 <script src="assets/app.js"></script>
@@ -282,9 +283,7 @@
   const soc = S.get('soc', {}) || {};
   const quiz = S.get('quiz', {}) || {};
 
-  // ---- 关卡地图由 ux.js 的 mountIndexMap() 渲染（替换旧的阶段分组卡片） ----
-  // 这里只做统计、不再渲染网格
-  const map = document.getElementById('map');
+  // ---- 关卡地图由 ux.js 的 mountIndexMap() 渲染 ----
 
   // ---- 统计 ----
   const doneCount = Object.values(chapters).filter(c => c && c.done).length;
@@ -306,6 +305,21 @@
       if (cur >= to) clearInterval(t);
     }, 28);
     if (to === 0) el.textContent = '0' + (suffix || '');
+  }
+
+  // ---- 滚动 reveal：进入视口后加 .rv-on ----
+  const reduceMotion = window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const revealEls = document.querySelectorAll('.rv, .rv-stagger');
+  if (reduceMotion || !('IntersectionObserver' in window)) {
+    revealEls.forEach(el => el.classList.add('rv-on'));
+  } else {
+    const io = new IntersectionObserver(entries => {
+      entries.forEach(e => {
+        if (e.isIntersecting) { e.target.classList.add('rv-on'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.08, rootMargin: '0px 0px -6% 0px' });
+    revealEls.forEach(el => io.observe(el));
   }
 
   // ---- 重置 / 导出 ----
@@ -403,9 +417,13 @@
   document.querySelectorAll('.path-card').forEach(card => {
     card.onclick = () => {
       const p = PATHS[card.dataset.path];
-      document.querySelectorAll('.path-card').forEach(c => c.style.outline = '');
-      card.style.outline = '2px solid var(--acc)';
+      document.querySelectorAll('.path-card').forEach(c => c.classList.remove('active'));
+      card.classList.add('active');
       detailBox.style.display = '';
+      // 重新触发浮出动画
+      detailBox.style.animation = 'none';
+      void detailBox.offsetWidth;
+      detailBox.style.animation = '';
       detailBox.innerHTML = '<div class="note-h">' + p.title + '</div>' + p.body;
       // 高亮关卡地图上对应章节节点（按 data-no 匹配）
       document.querySelectorAll('.duo-node').forEach(n => {

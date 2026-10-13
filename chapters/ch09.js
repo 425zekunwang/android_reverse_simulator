@@ -27,7 +27,26 @@ window.CHAPTER = {
           '哪张表里第几个槽位是 <span class="mono">FindClass</span>，是标准规定的，' +
           '跟你是 Android 还是桌面 JVM、是 ARM 还是 x86 都无关。</p>' +
           '<p><span class="hit">这个"位置写死"的性质，就是后面一切逆向技巧的根：' +
-          '既然位置是固定的，那就能换一张表；既然能换表，就能整张替换成假的。</span></p>'
+          '既然位置是固定的，那就能换一张表；既然能换表，就能整张替换成假的。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 整个 JNI 桥在你熟悉的 JS 世界里有一个非常准确的对应物——' +
+            '<b>WebAssembly + JS 互操作层</b>。两边都是"高级语言要调 native，但又不想改 native 的内部表示"的故事，' +
+            '用同一套思路（规范固定的桥 + 位置写死的表）解决了同一个问题。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <b>JNI 规范</b> ≈ <b>WebAssembly 规范 + JS interop 规范</b>（都是"语言间互调"的标准接口定义）<br>' +
+            '· <b>JNIEnv 函数表</b> ≈ <b>WASM 线性内存 + import 表</b>（调用都按固定偏移/下标）<br>' +
+            '· <b>.so 动态库</b> ≈ <b>.wasm 模块</b>（都是"跨语言模块"，都被宿主按需加载）<br>' +
+            '· <b>System.loadLibrary("x")</b> ≈ <b>WebAssembly.instantiate / dynamic import()</b>（把模块拽进运行时）<br>' +
+            '· <b>native 方法注册 (RegisterNatives)</b> ≈ <b>WASM exports 表</b>（把 C 函数暴露给上层调用）<br>' +
+            '· <b>NewStringUTF / GetStringUTFChars</b> ≈ <b>WASM 内存读写 + TextEncoder/TextDecoder</b>（字符串跨边界转换）<br>' +
+            '· <b>native 性能优势</b> ≈ <b>WASM 比 JS 快</b>（直接编译、跳过 JIT）<br>' +
+            '· <b>ART 解释/AOT</b> ≈ <b>V8 Ignition 字节码 / TurboFan 优化编译</b>（都是"先解释、跑热了再优化"的两阶段）</p>' +
+            '<p><b>关键差异</b>:JS 工程师是 Wasm 的<b>调用方</b>(JS 调 WASM 是正常方向),' +
+            '而 Android 工程师更多是 JNI 的<b>两边都要写</b>的中间人(Java 调 C、C 也要回调 Java)。' +
+            '这个"双向桥"是 JNI 比 Wasm interop 复杂得多的根因——你看到 native 调 Java 的那一半,先想到的是' +
+            '<b>WASM 反过来调 host function</b>(比如 wasm-bindgen 暴露的 JS 函数),那个心智模型基本是镜像的。</p>' +
+            '<p><b>逆向视角</b>:你在 JS 逆向里遇到 "主语言(JS)调 native(WASM)"时常用的"看 import 表 + exports 表 + 线性内存 dump"思路,' +
+            '到了安卓 JNI 这边就是 "看 JNIEnv 函数表 + RegisterNatives 表 + 内存 dump"。两边的"看哪张表"和"怎么 dump"几乎可以照搬。</p>')
       },
       html:
         T.note('key', '🔑 本章要回答的三个问题',
@@ -48,7 +67,13 @@ window.CHAPTER = {
           '<p style="margin-bottom:0">很多人以为"JNI 就是 Java 调 C"。' +
           '实际上 JNI 是<b>双向</b>的，而且<b>反向的那一半（native 调 Java）才是加固和风控的重灾区</b>——' +
           '因为反调试、签名校验、上报埋点，几乎都要回调 Java 层拿信息。' +
-          '只盯着"Java→native"这一半，你会漏掉一半的战场。</p>'),
+          '只盯着"Java→native"这一半，你会漏掉一半的战场。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>so ≈ WASM 模块</b>,<b>RegisterNatives ≈ WASM exports 表</b>,' +
+          '<b>System.loadLibrary ≈ WebAssembly.instantiate / dynamic import()</b>。' +
+          '这一节讲的"Java 加载 so → JNI_OnLoad → 动态注册"六步流程,就是 JS 那边的' +
+          '"fetch .wasm → WebAssembly.instantiate → 拿到 exports"六步流程的镜像——' +
+          '区别只是 JS 这边是你主动 import 触发,JNI 这边是 System.loadLibrary 在类初始化时被自动触发。</p>'),
 
       stepper: {
         title: '一次 native 方法调用，运行时到底走了几步',
@@ -199,7 +224,14 @@ window.CHAPTER = {
           '① <b>对象类型忘写结尾分号</b>——<span class="mono">Ljava/lang/String</span> 是错的，必须 <span class="mono">Ljava/lang/String;</span>。<br>' +
           '② <b>数组把 <span class="mono">[</span> 写到后面</b>——<span class="mono">byte[]</span> 是 <span class="mono">[B</span>，不是 <span class="mono">B[</span>。<br>' +
           '③ <b>以为泛型有描述符</b>——<b>没有</b>。泛型在编译后被擦除，<span class="mono">Map&lt;String,String&gt;</span> 在 JNI 里就是 <span class="mono">Ljava/util/Map;</span>。' +
-          '<span class="hit">这条特别重要：你在 hook 里看到的签名永远是擦除后的，别试图从签名里读出泛型信息。</span></p>'),
+          '<span class="hit">这条特别重要：你在 hook 里看到的签名永远是擦除后的，别试图从签名里读出泛型信息。</span></p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>JNI 描述符 ≈ WASM 函数的类型签名</b>。' +
+          'JVM 用 <code>(Ljava/lang/String;I)Ljava/lang/String;</code> 这种紧凑字符串描述方法签名,' +
+          'WASM 用 <code>(param i32 i64) (result i32)</code> 或 wasm-bindgen 生成的 TypeScript 类型签名;' +
+          '两边都是"<b>用一串短字符表达函数入参和返回值的形状</b>"。' +
+          '区别是 JNI 描述符没有泛型(WASM 没有泛型概念所以没这问题)、' +
+          '而且 JNI 是给 VM 内部用的,人写起来头大,WASM 签名是给 wasm-bindgen 之类的工具自动生成,人不用手写。</p>'),
 
       lab: {
         title: '实验一：JNI 签名生成器（把 Java 声明翻成描述符）',
@@ -621,7 +653,22 @@ window.CHAPTER = {
           '而且<strong>必须自己注销</strong>——没人会替你回收。</p>' +
           '<p>还有一种<strong>弱引用</strong>：你能拿着它去问"这本书还在不在"，' +
           '但<strong>它不阻止书被收走</strong>。对象被回收后，这张弱引用就变成"查无此书"。</p>' +
-          '<p>JNI 的引用规则几乎和这套一模一样，而<strong>最容易出事故的就是"临时号牌用完了"</strong>。</p>'
+          '<p>JNI 的引用规则几乎和这套一模一样，而<strong>最容易出事故的就是"临时号牌用完了"</strong>。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 三种 JNI 引用在你熟悉的 JS 世界里几乎是镜像的——' +
+            '因为 V8 引擎的 GC 和 ART 的 GC 在<b>所有权语义</b>上是同一个东西,只是触发回收的边界不一样。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· <b>局部引用</b> ≈ JS 函数里的<b>普通局部变量</b>(闭包里的 let/const,函数返回后变 unreachable 等下一轮 GC)<br>' +
+            '· <b>全局引用</b> ≈ <b>全局变量 / module-level binding</b>(GC 不主动回收,你必须手动 null 掉)<br>' +
+            '· <b>弱全局引用</b> ≈ <b>WeakRef / FinalizationRegistry</b>(不阻止 GC,回收后 deref 返回 undefined)<br>' +
+            '· <b>局部引用表 512 上限</b> ≈ <b>V8 函数的临时寄存器栈</b>溢出(你写 1 万层 async await 也能把 stack 撑爆,类似机制)<br>' +
+            '· <b>DeleteGlobalRef 忘了</b> ≈ <b>闭包忘记释放定时器/事件监听器</b>(都是"看着没事,其实内存一直在涨"的慢性病)</p>' +
+            '<p><b>关键差异</b>:JS 的 GC 是<b>自动+可观察</b>的——你在 DevTools 里随时能 force GC,' +
+            '也能看到 retainers 链;而 JNI 的"局部引用表"是<b>显式配额</b>(默认 512),溢出了直接 fatal error,不会有 GC 来救你。' +
+            '这就是为什么"在小循环里不 DeleteLocalRef"在 JS 端没事(GC 自动收),在 JNI 端就会崩。</p>' +
+            '<p><b>逆向视角</b>:你在分析一个"莫名崩在循环里"的加固 App 时,脑子里要立刻弹出两个备选——' +
+            '<b>① JS 端类比</b>:闭包循环引用导致的 OOM / 定时器没清导致的内存爆炸;' +
+            '<b>② 安卓端类比</b>:局部引用表溢出。两者都是"循环里不停 new 对象"导致,排查套路完全平行:加打印看每次创建多少,加计数器看是否成线性增长。</p>')
       },
       html:
         T.tbl(['引用类型', '生命周期', '谁负责释放', '典型误用'],
@@ -1594,7 +1641,10 @@ window.CHAPTER = {
     { t: 'AttachCurrentThread', d: 'JavaVM 的接口。在 native 自建的线程里使用 JNI 前必须先附着到虚拟机并获得属于该线程的 JNIEnv；退出前应 DetachCurrentThread。JNIEnv 不能跨线程使用。' },
     { t: 'Name Mangling', d: 'JNI 规范的类名与符号名转换规则。顺序很关键：必须先转义原有下划线（_ → _1），再做点转下划线（. → _），否则两种下划线将无法区分。重载方法使用长名（两个下划线加参数描述符）。' },
     { t: '影子函数表', d: '加固方案伪造的一张结构合法的 JNIEnv 函数表。它使得针对"系统那张表"的 hook 全部落空，且不产生任何错误——是 JNI 对抗中典型的静默失败来源。' },
-    { t: 'Native 化', d: '把原本写在 Java 层的逻辑（典型如 Activity.onCreate）改为 native 方法，使 dex 里只剩声明而没有方法体。它属于"让代码不在这里"，与"让代码看不懂"的混淆是两类不同的对抗手段。' }
+    { t: 'Native 化', d: '把原本写在 Java 层的逻辑（典型如 Activity.onCreate）改为 native 方法，使 dex 里只剩声明而没有方法体。它属于"让代码不在这里"，与"让代码看不懂"的混淆是两类不同的对抗手段。' },
+    { t: '↔ Web 对位 · JNI 整体 ≈ Wasm + JS interop', d: '把整套 JNI 机制当作"Java 版的 WebAssembly"来看最贴切：都是高级语言调 native 的桥、用固定偏移的函数表、字符串通过线性内存转换、模块按需被宿主加载。区别在于 JNI 双向（Java↔C），而 Wasm 主调方向是 JS→Wasm，反向要走 wasm-bindgen 这种额外封装。逆向时的"看 import 表 / exports 表 / 内存 dump"思路在 JNI 这边就是"看 JNIEnv 函数表 / RegisterNatives 表 / 进程内存 dump"，可照搬。' },
+    { t: '↔ Web 对位 · JNI 引用 ≈ JS 变量与 GC 引用', d: '局部引用≈JS 函数里的普通局部变量（函数返回变 unreachable 等 GC）；全局引用≈全局变量/module binding（不会自动回收，必须手动 null）；弱全局引用≈WeakRef（不阻止 GC，回收后返回 undefined）。关键差异是 JNI 的局部引用表有显式上限（默认 512），溢出会 fatal error，没有 GC 救场——所以"循环里不停 new"在 JS 没事、在 JNI 会崩。逆向时排查"莫名循环崩溃"两边思路一样：加打印看每次创建多少，加计数器看是否线性增长。' },
+    { t: '↔ Web 对位 · RegisterNatives ≈ WASM exports + 运行时 hook 框架', d: '动态注册把"Java 方法名→native 函数地址"三元组表交给虚拟机，对应到 Wasm 生态就是"模块 exports 表+绑定层"——wasm-bindgen / emscripten 生成的 JS 胶水代码把 C 函数挂到 JS 对象上。两边都暴露了一份"名字→地址"的映射表，逆向者都是去 hook 那一刻拿到完整对应关系。区别是 Wasm exports 在加载后基本不变（除非显式重新实例化），而 RegisterNatives 可以被加固方分次/延迟/Unregister+重注册来制造动态变化。' }
   ],
 
   teacher: {
@@ -1607,6 +1657,28 @@ window.CHAPTER = {
       '答不出来，说明你只是在背脚本，不是在理解机制。</p>' +
       '<p>准备好了就开始。答不上来可以要提示——但提示不算过关。</p>',
     questions: [
+      {
+        id: 'c09qWeb', depth: 2, threshold: 0.7,
+        q: 'JNI 是 Java 和 C/C++ 之间的桥。说出它的 Web 对位物，并说出一条关键差异。',
+        concepts: [
+          { label: 'JNI/JNIEnv ≈ N-API/FFI', hint: '高级语言调 native 的桥。', any: ['N-API', 'FFI', 'addon', '桥', '接口'] },
+          { label: '.so (ARM 字节码) ≈ WASM 模块', hint: '都是第二条指令世界。', any: ['WASM', 'wasm', '模块', 'C', 'Rust', '字节码'] },
+          { label: 'native 方法注册', hint: '运行时怎么把 Java 方法和 C 函数对上。', any: ['注册', '注册表', '符号', '绑定', '映射'] }
+        ],
+        hints: [
+          '先想「跨语言调用」：JS 调 C 用 FFI/N-API，Java 调 C 用 JNI——都要做类型转换和生命周期管理。',
+          '再想 native 库：.so 和 .wasm 都是「你不能用高级语言直接读的二进制」，都要专门工具。'
+        ],
+        probes: [
+          '追问：为什么 hook JNI 层往往是「算法在 native 里」的第一个信号？',
+          '再追问：JNI 方法可以动态注册（RegisterNatives）也可以静态注册（命名约定）——这给逆向带来了什么不同？'
+        ],
+        model: '<b>参考答案</b>：<br><b>对位</b>：<b>JNI/JNIEnv ≈ N-API / FFI（Node addon）</b>——都是高级语言与 native(C/C++/Rust) 之间的桥，' +
+          '都要处理参数类型转换、引用生命周期、异常传递。<b>.so(ARM 字节码) ≈ WASM 模块</b>——都是「高级语言之外的第二条指令世界」，都要专门工具逆（IDA/Ghidra vs wasm-decompile）。<br>' +
+          '<b>关键差异</b>：① <b>JNI 有一个「env 函数表」中间层</b>，Java 侧的一切 native 能力都走 JNIEnv 的函数指针表——hook JNIEnv 上的函数（如 GetStringUTFChars）能一次性看到所有跨语言调用，' +
+          'FFI 没有这种统一收口点；② <b>注册方式</b>：JNI 支持静态注册（Java_类名_方法名 命名约定）和动态注册（RegisterNatives，函数名可任意）——' +
+          '动态注册会让「按符号名找函数」失效，这是安卓特有的门槛，而 WASM 的导入导出符号始终可枚举。'
+      },
       {
         id: 'c20q1', depth: 1, threshold: 0.7,
         q: '用你自己的话说清楚：<b>动态注册和静态注册，机制上的根本区别是什么？</b>' +

@@ -56,7 +56,16 @@ window.CHAPTER = {
           '是（看参数 / 看调用栈 / 追谁调用了谁）→ <b>上 r0tracer 批量打点</b>。<br>' +
           '不是 → 进第 ③ 步。</p>' +
           '<p style="margin-bottom:0"><b>③ "我要的是业务语义吗？"</b><br>' +
-          '是（还原算法、构造参数、复现协议）→ <b>只能手写</b>，工具最多帮你把线索捞出来（见 10.5、10.7）。</p>'),
+          '是（还原算法、构造参数、复现协议）→ <b>只能手写</b>，工具最多帮你把线索捞出来（见 10.5、10.7）。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>Frida 自动化 ≈ Playwright 批量爬虫脚本</b>。' +
+          '你在 Node 里写一段脚本循环打开 N 个页面、hook 它们的 fetch、批量打印返回值——' +
+          '这就是安卓视角下的"批量 hook 脚本"。</p>' +
+          '<p><b>具体差异</b>:Frida 脚本跑在 PC 上、通过 RPC 指挥手机里的 App 进程；' +
+          'Playwright 脚本也跑在 Node 上、通过 CDP 指挥浏览器。两边都是"外部脚本驱动目标进程"，' +
+          '但 Frida 的 RPC（<code>rpc.exports</code>）让你能<b>从脚本侧主动调用 App 里的 Java/native 函数</b>，' +
+          '这最接近 Playwright 的 <code>page.evaluate</code> 远程调用——' +
+          '都是"我把参数传进去、你把结果吐出来"的主被动调用。</p>'),
       after: T.note('', '📌 本章的地图',
         '<p style="margin-bottom:0"><b>10.2–10.5</b> 是自动化三件套（objection / r0capture / r0tracer）；' +
         '<b>10.6–10.9</b> 是"从能 hook 到能主动调用"（Invoke Java / 抓包分工 / nop / dlopen）；' +
@@ -179,7 +188,23 @@ window.CHAPTER = {
           '<p>但请把这句话刻在脑子里：<strong>objection 底层就是 Frida</strong>。' +
           '它不是另一个更隐蔽的工具，它只是<b>把 Frida 脚本包了一层命令行</b>。' +
           '所以——<span class="miss">它的特征暴露面，就是 Frida 的暴露面，一处不多、一处不少。</span>' +
-          '你用 objection 被检测到，换成手写脚本一样会被检测到，因为被检测的不是脚本，是 Frida 本身。</p>'
+          '你用 objection 被检测到，换成手写脚本一样会被检测到，因为被检测的不是脚本，是 Frida 本身。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 把"手写 Frida 脚本"类比到 JS 世界，就是' +
+            '<b>手写 Puppeteer / Playwright 脚本</b>驱动一个无头浏览器；objection 这类"免脚本操作台"≈' +
+            '你装好的一套 Playwright 辅助插件。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· Frida 注入 App 进程 ≈ Playwright attach 到浏览器页<br>' +
+            '· 手写 hook 脚本 ≈ <code>page.evaluate()</code> 改页面里的函数<br>' +
+            '· objection / r0tracer ≈ 现成的批量自动化打点脚本<br>' +
+            '· Frida spawn（程序启动前插桩）≈ 给浏览器加启动参数 / 用<b>油猴启动脚本</b>在页面 JS 执行前注入</p>' +
+            '<p><b>关键差异</b>:Frida 是<b>同步 RPC</b>——你的 JS 在 PC 上发指令，App 进程里同步执行并返回；' +
+            'Playwright 的 <code>page.evaluate</code> 也同步拿返回值，但<b>进程边界</b>不同：' +
+            'Frida 跨的是"PC ↔ 手机 App 进程"，你改的是<b>已在内存里跑着的 native/Java 代码</b>；' +
+            'Playwright 跨的是"Node ↔ 浏览器渲染进程"，你改的是<b>JS 运行时</b>。' +
+            '所以 Frida 能改 native 层（so），Playwright 改不到浏览器底层的 C++。</p>' +
+            '<p><b>读到这里你该想起</b>:你写 Playwright 批量抓数据时也常说"通用动作能固化、业务逻辑只能手写"——' +
+            '本章 10.1 的三笔账和这句话是同一个意思。</p>')
       },
       html:
         '<p>objection 的定位很清楚：<b>基于 Frida 的免脚本运行时操作台</b>。' +
@@ -526,7 +551,11 @@ window.CHAPTER = {
           { t: '', s: '' },
           { t: 'e', s: '} else if (task == "拆协议、复现请求、做参数溯源") {' },
           { t: 'o', s: '  → 第 12 章。那是"拿到流量之后"的工作。' },
-          { t: 'w', s: '记住：本章负责"把水引出来"，第 12 章负责"分析水里的东西"' }
+          { t: 'w', s: '记住：本章负责"把水引出来"，第 12 章负责"分析水里的东西"' },
+          { t: 'w', s: '↔ Web 对位：Frida 自动化 ≈ Playwright/Puppeteer 批量驱动无头浏览器',
+            note: '<b>对位</b>:Frida 注入 App 进程 ≈ Playwright attach 到浏览器页；手写 hook 脚本 ≈ page.evaluate 改页面函数；' +
+              'r0tracer/objection 批量打点 ≈ 批量自动化脚本。<br>' +
+              '<b>差异</b>:Frida 是 PC↔手机进程的同步 RPC、能改 native 层（so）；Playwright 是 Node↔浏览器渲染进程的 CDP 调用、只改 JS 运行时。' }
         ]
       },
       after:
@@ -2579,6 +2608,48 @@ window.CHAPTER = {
       '以及为什么不能换个更省事的做法。</b></p>' +
       '<p>答不上来可以要提示，但我要提醒你：提示不算过关。说不全，我就继续问。</p>',
     questions: [
+      {
+        id: 'c10qWeb', depth: 2, threshold: 0.7,
+        q: '用你在 Web/JS 逆向里熟悉的概念，解释「Frida 自动化脚本」（手写 hook 脚本 + objection/r0tracer 这类工具）。' +
+          '请说出至少两个对位物，并讲清它们的关键差异。',
+        concepts: [
+          { label: '对位物：Playwright / Puppeteer 批量脚本（外部脚本驱动目标进程）',
+            hint: '想想你在 Node 里怎么批量驱动无头浏览器',
+            any: ['playwright', 'puppeteer', '无头浏览器', '无头', '批量脚本', '自动化脚本', '爬虫', 'headless'] },
+          { label: '对位物：page.evaluate / CDP 远程调用 ≈ Frida RPC（脚本侧主动调目标函数）',
+            hint: 'Frida 的 rpc.exports 在 JS 世界里最接近什么',
+            any: ['page.evaluate', 'evaluate', 'cdp', 'rpc', 'rpc.exports', '主动调用', '远程调用', '远程'] },
+          { label: '对位物：油猴启动脚本 / 浏览器启动参数 ≈ Frida spawn（程序启动前插桩）',
+            hint: 'Frida spawn 是"在 App 跑起来之前就插桩"，JS 世界里哪件事一样',
+            any: ['油猴', 'tampermonkey', '启动脚本', '启动前', '启动参数', 'spawn', '插桩', '注入前'] },
+          { label: '差异：Frida 是 PC↔手机进程的同步 RPC，能改 native 层（so）；Playwright 只改 JS 运行时',
+            hint: '两边都能"调用目标里的函数"，但能改的层不一样——为什么',
+            any: ['同步', 'rpc', 'native', 'so', '跨进程', '渲染进程', '只能改 js', '只改 js', '边界', '进程边界'] },
+          { label: '差异：objection 只是把 Frida 脚本包了层命令行，暴露面不变；正如通用脚本封装不改变底层',
+            hint: 'objection 比手写脚本"更隐蔽"吗',
+            any: ['暴露面', '封装', '命令行', '底层还是 frida', '特征不变', '一处不多', '不更隐蔽'] }
+        ],
+        hints: [
+          '把"写 Frida 脚本"想成"写 Playwright 脚本"：都是外部脚本指挥一个目标进程。',
+          'Frida spawn 在进程启动前插桩；JS 世界里"在页面 JS 跑之前注入"是怎么做的？'
+        ],
+        probes: [
+          '那我问：Frida 的 rpc.exports 让你从脚本侧调用 App 里的 Java 函数，Playwright 的哪一句最像它？为什么？',
+          '再问：Frida 能 hook native 的 so，Playwright 能 hook 浏览器底层的 C++ 吗？这差异的根源是什么？'
+        ],
+        model: '<b>参考答案</b>:<br>' +
+          '「Frida 自动化」在 JS 世界里最接近<b>Playwright / Puppeteer 批量驱动无头浏览器</b>：' +
+          '都是"在 PC/Node 上写一段脚本，去指挥另一个进程里的代码"。<br>' +
+          '· <b>对位 1</b>:Frida 注入 App 进程 ≈ Playwright attach 到浏览器页面；手写 hook 脚本 ≈ <code>page.evaluate</code> 改页面函数。<br>' +
+          '· <b>对位 2</b>:Frida 的 <code>rpc.exports</code>（脚本侧主动调 App 里的函数）≈ Playwright 的 <code>page.evaluate</code>，都是"传参进去、结果吐出来"的主被动调用。<br>' +
+          '· <b>对位 3</b>:Frida spawn（App 启动前插桩）≈ 油猴启动脚本 / 浏览器启动参数（页面 JS 执行前注入）。<br>' +
+          '· <b>对位 4</b>:r0tracer/objection 批量打点 ≈ 你写过的批量自动化爬虫脚本（通用动作固化）。<br><br>' +
+          '<b>关键差异（不要说"差不多"）</b>:<br>' +
+          '① <b>进程边界不同</b>:Frida 是 PC ↔ 手机 App 进程的<b>同步 RPC</b>，能改已在内存里跑着的 <b>native/Java 代码</b>（包括 so）；' +
+          'Playwright 是 Node ↔ 浏览器渲染进程的 CDP 调用，<b>只改 JS 运行时</b>，碰不到浏览器底层的 C++。<br>' +
+          '② <b>objection 不更隐蔽</b>:它只是把 Frida 脚本包了层命令行，底层暴露面一处不多一处不少——' +
+          '正如一个"脚本封装工具"改变不了它底层依赖的运行时。所以被检测的是 Frida 本身，不是你写没写脚本。'
+      },
       {
         id: 'c21q1', depth: 1, threshold: 0.7,
         q: '自动化工具（objection / r0capture / r0tracer）到底帮你省掉了什么成本？' +

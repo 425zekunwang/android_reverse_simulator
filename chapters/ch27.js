@@ -30,7 +30,11 @@ window.CHAPTER = {
            '直接写进了自己的代码。libc 的那一层被整个跳过了，你的 hook 自然什么都看不到。</p></div>'
          ]) +
          '<p>要理解这件事，得先接受一个事实：<b>libc 不是系统调用的入口，它只是一个"帮你把寄存器摆好"的封装层</b>。' +
-         '真正把事情办成的是那条 <code>svc</code> 指令。谁写这条指令，谁就是在发起系统调用——封装层可以被任意替换或省略。</p>',
+         '真正把事情办成的是那条 <code>svc</code> 指令。谁写这条指令，谁就是在发起系统调用——封装层可以被任意替换或省略。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>内联 SVC 绕过 libc 的 hook ≈ 站点发现 fetch 被改写成 Proxy 后改用 WASM / 直连，让你的油猴 hook 抓不到</b>。</p>' +
+          '<p>具体差异: 这一章的「你的 hook 一次都没触发」在 Web 端完全同构——你 <code>Interceptor.attach(libc.open)</code> 等于给 <code>window.fetch</code> 包了一层 Proxy；对方却自己写了一条内联 SVC（不走 libc 封装），等于在代码里<b>绕开你改写的函数、直接发请求</b>。更一般地，整章的「检测 Frida / 检测 root / 环境伪造」对应 Web 的「检测 DevTools / 检测 <code>navigator.webdriver</code> / 伪造 <code>userAgent</code>」——两边都是风控在问「你是不是个真人或真浏览器」。</p>' +
+          '<p>Web 逆向里常见的位置: 当你用油猴给某站挂了 hook 却抓不到它的请求时，先怀疑它<b>检测到了你的 hook</b>（<code>toString</code> 变了、对象被 Proxy 包过）并换了路径，而不是直接怀疑脚本写错。</p>'),
 
        intuition: {
          tag: '直觉模型 · 正门摄像头与员工通道',
@@ -40,7 +44,15 @@ window.CHAPTER = {
            '<p>但目标人物压根不走正门——他有员工通道的钥匙（自己能写 <code>svc</code> 指令），从通道直接进楼。' +
            '摄像头一次都没拍到他，你却在反复检查摄像头是不是坏了。</p>' +
            '<p><b>本章的第一个认知跃迁就是：不要修摄像头，去找通往大楼的其他入口。</b>' +
-           '而"其他的入口"只有一条最终通道——<b>内核的系统调用分发表</b>。所有进楼的人，最后都得经过前台登记。</p>'
+           '而"其他的入口"只有一条最终通道——<b>内核的系统调用分发表</b>。所有进楼的人，最后都得经过前台登记。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 这一章的猫鼠游戏你早就在 Web 端打过：对方不想让你看，于是把看的入口藏起来——安卓里是「跳过 libc、直接写内联 SVC 绕过你的 hook」，Web 里是「发现 <code>fetch</code> / <code>XMLHttpRequest</code> 被你改写成 Proxy 后，改用 WASM 发请求或直连，让你的油猴 hook 抓不到」。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· 检测 Frida（端口 27042 / 读 <code>/proc/self/maps</code> 找 frida 库）≈ 检测 DevTools 是否开着（<code>__devtools</code> / <code>console._commandLineAPI</code> 残留）<br>' +
+            '· 检测 root（<code>su</code> / <code>magisk</code> 文件）≈ 检测 <code>navigator.webdriver</code> 为真<br>' +
+            '· 环境伪造（Xposed 改返回值）≈ 改 <code>navigator.userAgent</code> / 伪造 WebGL 让风控放行<br>' +
+            '· Frida 主动隐藏（改名 / 改端口）≈ <code>--remote-debugging-port=0</code> 隐蔽</p>' +
+            '<p><b>关键差异</b>: 安卓里「是否被检测」取决于进程内存里有没有 frida 的痕迹——这是内核 / 进程层的事，对手能直接读 <code>/proc</code>；Web 里「是否被检测」取决于 JS 运行时里对象被改的痕迹（<code>toString</code> 变了、Proxy 套了壳），你的 hook 和被 hook 的代码<b>在同一个 JS 引擎里互相窥探</b>，所以「检测 hook」在 Web 端更便宜、也更难完全隐藏。</p>')
        },
 
        after:
@@ -719,7 +731,8 @@ window.CHAPTER = {
              note: '<b>常见报错：模块还没加载。</b>如果目标 so 是延迟加载的（比如在 <code>JNI_OnLoad</code> 之后才 <code>dlopen</code>），' +
                    '注入时它根本不存在。<br><b>出问题往哪查：</b>① 用 <code>Process.enumerateModules()</code> 确认模块名拼写和加载时机；' +
                    '② 把扫描逻辑挂到 <code>dlopen</code> 之后；③ 注意 32/64 位——如果 App 同时加载 32 位和 64 位 so，' +
-                   '<b>两种特征字节都要搜</b>，用错了就是一个都扫不到。' }
+                   '<b>两种特征字节都要搜</b>，用错了就是一个都扫不到。' },
+          { t: 'o', s: '↔ Web 对位：Frida Memory.scan 搜 SVC 特征字节 ≈ 浏览器 Memory snapshot / heap dump 里搜特征字符串与字节序列（如风控检测里找 frida / DevTools 痕迹的特征）', note: '差异：Frida 扫的是进程原生代码段（ARM 指令字节），Web 端只能扫 JS 堆里的字符串/值；而且 Web 的"检测"常反过来——风控扫你的运行时看有没有被 hook 的痕迹。' }
          ]
        },
 
@@ -1417,9 +1430,27 @@ window.CHAPTER = {
        name: '追问老师 · 第 27 章',
        sub: '围绕 SVC 绕过、观测层选择、三种追踪技巧与硬件断点展开追问',
        intro: '<p style="margin:0">这一章我不问"<code>SVC</code> 是什么意思"，那种问题查手册就有。我只问一件事：<b>当你的观测点被架空时，你怎么知道？又该往哪一层退？</b>答不上来我会一层层往下逼，直到你说清楚"为什么这个方案在这一层是有效的、在另一层就失效了"。</p>',
-       questions: [
-         {
-           id: 'c13q1', depth: 1, threshold: 0.7,
+    questions: [
+      {
+        id: 'c27wq', depth: 2, threshold: 0.7,
+        q: '用你熟悉的 Web/JS 逆向里的「反检测 / 风控对抗」概念，解释这一章安卓侧的 Frida 检测与绕过。说出至少两个对位物和它们的关键差异。',
+        concepts: [
+          { label: '检测 Frida（端口 27042 / 读 /proc/self/maps 找 frida 库）≈ 检测 DevTools 是否开着', hint: '安卓端怎么判断"调试器在不在"，Web 端怎么判断？', any: ['Frida 检测', '27042', 'proc/self/maps', 'DevTools', '检测调试器', '反调试', '调试器在不在', 'frida 痕迹'] },
+          { label: '检测 root（su / magisk 文件）≈ 检测 navigator.webdriver 为真', hint: '环境被改造过的指纹，两边各长什么样？', any: ['root 检测', 'su', 'magisk', 'navigator.webdriver', 'webdriver', '环境指纹', '环境被改'] },
+          { label: '环境伪造（Xposed 改返回值）≈ 改 navigator.userAgent / 伪造 WebGL 让风控放行', hint: '安卓端怎么"返回假特征"，Web 端怎么做？', any: ['环境伪造', 'Xposed', '改返回值', 'userAgent', 'WebGL', '伪造指纹', '风控放行', '假特征'] },
+          { label: 'Frida 主动隐藏（改名/改端口）≈ --remote-debugging-port=0 隐蔽', hint: '两边都想"让自己藏起来"，手段各是什么？', any: ['隐藏', '改名', '改端口', 'remote-debugging-port', '隐蔽', '藏起来', '反检测'] }
+        ],
+        hints: [ '想想你做 Web 逆向时，站点是怎么发现"你不是真人 / 不是真浏览器"的', '安卓端"是否被检测"看的是进程内存里的 frida 痕迹，Web 端看的是 JS 运行时里对象被改的痕迹' ],
+        probes: [ '安卓端对手能直接读 /proc 来找 frida，Web 端风控只能扫 JS 堆——这两种"被检测面"的范围差在哪？', '为什么 Web 端"检测 hook"比安卓端更便宜、也更难完全隐藏？' ],
+        model: '<b>参考答案</b>：这一章的 Frida 检测与绕过，在 Web/JS 逆向里就是「反 webdriver / 指纹对抗」那一套，角色完全对应。<br><br>' +
+          '<b>对位物①：检测 Frida（端口 27042 / 读 <code>/proc/self/maps</code> 找 frida 库）≈ 检测 DevTools 是否开着。</b>两边都是「你的工具会被目标发现」的猫鼠游戏；差异在于安卓看的是进程内存 / 内核层，Web 看的是 JS 运行时里残留（<code>__devtools</code>、<code>console._commandLineAPI</code>）。<br>' +
+          '<b>对位物②：检测 root（<code>su</code> / <code>magisk</code> 文件）≈ 检测 <code>navigator.webdriver</code> 为真。</b>都是「环境被改造过的指纹」；但安卓要查文件系统里有没有某个文件，Web 只要读一个布尔属性。<br>' +
+          '<b>对位物③：环境伪造（Xposed 改返回值）≈ 改 <code>navigator.userAgent</code> / 伪造 WebGL 让风控放行。</b>都是「返回假的特征」骗过校验。<br>' +
+          '<b>对位物④：Frida 主动隐藏（改名 / 改端口）≈ <code>--remote-debugging-port=0</code> 隐蔽。</b>都是「我自己藏起来」。<br><br>' +
+          '<b>关键差异</b>：安卓里「是否被检测」取决于进程内存里有没有 frida 的痕迹——这是内核 / 进程层的事，对手能直接读 <code>/proc</code>；Web 里「是否被检测」取决于 JS 运行时里对象被改的痕迹（<code>toString</code> 变了、Proxy 套了壳），你的 hook 和被 hook 的代码<b>在同一个 JS 引擎里互相窥探</b>，所以「检测 hook」在 Web 端更便宜、也更难完全隐藏。'
+      },
+      {
+        id: 'c13q1', depth: 1, threshold: 0.7,
            q: '你的 Frida 脚本 hook 了 libc 的 <code>open</code>，运行目标 App 后<b>一次都没触发</b>，' +
               '但其他 hook 都正常工作。<b>请描述 App 绕过你的机制</b>——从它写下那行代码，到内核真正开始处理，中间经过了哪些步骤？',
            concepts: [

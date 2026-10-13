@@ -160,6 +160,7 @@
   function mountCodeTools() {
     $$('pre').forEach(pre => {
       if (pre.closest('.stepper-code')) return;
+      if (pre.closest('.hero-term')) return;   // 首页装饰终端：不注入复制按钮，避免遮挡
       if (pre.parentElement && pre.parentElement.classList.contains('code-wrap')) return;
 
       const box = doc.createElement('div');
@@ -451,12 +452,13 @@
     bar.classList.toggle('mode-full', mode === 'full');
   }
 
-  /* 让吸顶高度进入 CSS 变量，保证锚点跳转不被顶栏遮住 */
+  /* 让吸顶高度进入 CSS 变量，保证锚点跳转不被顶栏遮住。
+     位置条与小关地图已改为随文档流滚动（不吸顶），故 --sb-h 恒为 0。 */
   function measureBars() {
     const tb = $('.topbar');
     const root = doc.documentElement;
     if (tb) root.style.setProperty('--tb-h', Math.round(tb.getBoundingClientRect().height) + 'px');
-    if (bar) root.style.setProperty('--sb-h', Math.round(bar.getBoundingClientRect().height) + 'px');
+    root.style.setProperty('--sb-h', '0px');
     root.style.scrollPaddingTop =
       'calc(var(--tb-h, 52px) + var(--sb-h, 0px) + 14px)';
   }
@@ -1115,9 +1117,11 @@
     const gl = $$('h2').find(h => /名词表/.test(h.textContent || ''));
     if (gl && !gl.id) gl.id = 'glossary';
 
-    const heads = collectHeadings();
+    // 首页是仪表盘式紧凑布局，不做分节/目录/位置条（这些是为长文章章节页设计的）
+    const isHome = doc.body.classList.contains('home');
+    const heads = isHome ? [] : collectHeadings();
     buildSections(heads);
-    buildTOC(heads);
+    if (!isHome) buildTOC(heads);
 
     if (sections.length) {
       // 恢复模式偏好：章节页默认逐节，其他长页面默认整页

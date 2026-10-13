@@ -19,7 +19,11 @@ window.CHAPTER = {
       title: '为什么逆向工程师必须懂模拟器原理',
       intuition: {
         tag: '直觉模型 · 一场国际会议的同声传译',
-        body: '<p>会场里有两种极端的做法。<b>做法一</b>：所有参会者都只会说外语，于是<b>每一个人说的每一句话</b>都要经过同声传译——包括主持人念流程、念注意事项。传译员再快，会议也会被拖慢好几倍。这就是<b>全系统模拟</b>。<br><b>做法二</b>：会议主体改用中文进行，只有台上那位外宾发言时需要翻译。会场 95% 的交流是原生速度，只有外宾那几句要过一遍传译。这就是<b>应用级翻译</b>。<br>两者的差别不在「翻译质量」，而在<b>需要被翻译的代码占多大比例</b>。这一章所有的性能直觉，都从这个比例出发。</p>'
+        body: '<p>会场里有两种极端的做法。<b>做法一</b>：所有参会者都只会说外语，于是<b>每一个人说的每一句话</b>都要经过同声传译——包括主持人念流程、念注意事项。传译员再快，会议也会被拖慢好几倍。这就是<b>全系统模拟</b>。<br><b>做法二</b>：会议主体改用中文进行，只有台上那位外宾发言时需要翻译。会场 95% 的交流是原生速度，只有外宾那几句要过一遍传译。这就是<b>应用级翻译</b>。<br>两者的差别不在「翻译质量」，而在<b>需要被翻译的代码占多大比例</b>。这一章所有的性能直觉，都从这个比例出发。</p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> 安卓模拟器（Emulator / Genymotion 等）在你熟悉的 Web 逆向世界里，最贴近的对位物是<b>无头浏览器 / Playwright 伪装环境</b>。<br>' +
+          '它们的共同身份是：<b>一个"假的"运行环境，用来批量跑目标应用</b>。你用 Playwright 集群挂一堆无头 Chrome 去刷接口、跑自动化；逆向工程师用模拟器集群挂一堆安卓实例去跑 App、做批量风控对抗——都是"用可控的假环境替代真机/真人"。<br>' +
+          '<b>关键差异</b>：模拟器是<b>整个安卓系统的二进制翻译 / 虚拟化</b>（连内核都被翻译或虚拟），Playwright 是在真浏览器引擎上做<b>外层伪装</b>（你改不了 V8 内部，只能改 navigator / WebGL 返回值）。模拟器的"假"发生在指令层和系统层，更底层也更难被单点绕过。</p>')
       },
       html:
         T.note('key', '🔑 本章主线',
@@ -35,7 +39,11 @@ window.CHAPTER = {
           + '<p><b>③ 云手机的基础</b>——云手机本质就是<b>跑在服务器上的安卓虚拟设备</b>。理解了 Cuttlefish 的组成（宿主 Linux + KVM + 虚拟设备 + 编排），云手机就不再神秘：它把 Cuttlefish 这类方案做成了多租户、带串流和运维的服务。</p>'
           + '<p><b>④ KVM 是共同底座</b>——QEMU、Cuttlefish、crosvm 都依赖 KVM 做硬件虚拟化。所以「为什么模拟器只能在特定 CPU/系统上跑得快」，答案在 KVM 的可用性上。</p>')
         + T.note('warn', '⚠️ 两个容易混淆的词',
-          '<p><b>「模拟」（emulation）</b>：用软件解释另一套指令集，guest 架构可以 ≠ host 架构。<br><b>「虚拟化」（virtualization）</b>：CPU 硬件直接执行 guest 指令，要求 guest 架构 = host 架构（x86 上跑 x86）。<br>本章大部分性能结论，都来自「你到底在用哪一个」。</p>')
+          '<p><b>「模拟」（emulation）</b>：用软件解释另一套指令集，guest 架构可以 ≠ host 架构。<br><b>「虚拟化」（virtualization）</b>：CPU 硬件直接执行 guest 指令，要求 guest 架构 = host 架构（x86 上跑 x86）。<br>本章大部分性能结论，都来自「你到底在用哪一个」。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>检测模拟器 ≈ 检测无头浏览器指纹</b>。<br>' +
+          '本章 30.1 点名的那些痕迹——<code>ro.kernel.qemu</code>、<code>goldfish/ranchu</code>、SwiftShader 渲染器、<code>/dev/qemu_pipe</code>——在 Web 侧的对位物是 <code>navigator.webdriver</code>、WebGL 渲染器（headless 常暴露 SwiftShader 一类软件渲染）、异常的分辨率/时区、UA 与平台不一致。都是"设备/浏览器特征不像真人就拒绝"的逻辑。<br>' +
+          '<b>关键差异</b>：模拟器检测跑在<b>设备端 App 内</b>（你还能用 Frida 改返回值），无头检测跑在<b>服务端</b>（你改不了对方）；模拟器能定制内核/镜像从源头抹掉痕迹，而无头浏览器你改不了 V8 与渲染引擎内部，只能在外层伪造 UA、覆盖 navigator 字段、用 stealth 插件。</p>')
     },
 
     /* ================= 30.2 ================= */
@@ -155,7 +163,8 @@ window.CHAPTER = {
           { t: 'p', s: 'emulator -avd <你的AVD名> -no-snapshot',
             note: '<b>用编出来的产物启动。</b>前提是镜像路径被正确指向（通常靠 <span class="mono">ANDROID_PRODUCT_OUT</span> 或把镜像放进 SDK 的 system-images 目录）。<span class="mono">-no-snapshot</span> 跳过快照，确保你启动的是刚编出来的东西。' },
           { t: 'p', s: 'adb shell getprop ro.build.fingerprint',
-            note: '<b>验证。</b>确认跑起来的确实是你的构建产物。这一步不做，你可能会花一小时调试一个其实没被加载的镜像。' }
+            note: '<b>验证。</b>确认跑起来的确实是你的构建产物。这一步不做，你可能会花一小时调试一个其实没被加载的镜像。' },
+          { t: 'o', s: '↔ Web 对位：安卓模拟器（Emulator/Genymotion）≈ 无头浏览器 / Playwright 伪装环境——都是"可控的假运行环境"，用来批量跑目标应用', note: '差异：模拟器是整系统的指令翻译/虚拟化（连内核都被虚拟），Playwright 是在真浏览器引擎上做外层伪装（改不了 V8/渲染引擎内部，只能改 navigator 字段与 UA）。' }
         ]
       },
       after: T.note('', '对逆向的含义',
@@ -905,6 +914,37 @@ window.CHAPTER = {
     sub: '拷问模拟器的架构选择：你为什么选它、它为什么快、它坏在哪',
     intro: '<p style="margin:0">这一章的概念不难，难在<b>选型和归因</b>。我会一直追问「为什么」——为什么这条路径快、为什么这个特征会出现、为什么这个操作在你的环境里不成立。答不出机制，只说结论，是过不了的。</p>',
     questions: [
+      {
+        id: 'c30qWeb', depth: 2, threshold: 0.7,
+        q: '用 Web/JS 逆向里你熟悉的概念，解释"安卓模拟器（Emulator）"是什么、以及"怎么检测它"。说出至少两个对位物和它们的差异。',
+        concepts: [
+          { label: '安卓模拟器（Emulator/Genymotion）≈ 无头浏览器 / Playwright 伪装环境：都是"可控的假运行环境"，用来批量跑目标',
+            hint: '在 JS 里，用什么跑一堆"假的"浏览器去批量操作？',
+            any: ['无头浏览器','headless','playwright','puppeteer','stealth','自动化浏览器','批量','集群','假环境','可控环境','假浏览器'] },
+          { label: '检测模拟器（ro.kernel.qemu / goldfish / SwiftShader / qemu_pipe）≈ 检测无头浏览器指纹（navigator.webdriver / WebGL 渲染器 / UA / 时区异常）',
+            hint: '服务端怎么判断你用的是不是无头 Chrome？',
+            any: ['navigator.webdriver','webdriver','webgl 渲染器','swiftshader','ua','user-agent','时区','分辨率','指纹','检测无头','headless 检测','机器人'] },
+          { label: '模拟器用于批量跑 App ≈ Playwright 集群批量跑接口/自动化',
+            hint: '为什么要集群挂一堆环境？',
+            any: ['批量','集群','规模','多实例','并发','刷','规模化','批量注册','养号'] },
+          { label: '关键差异：模拟器是整系统指令翻译/虚拟化（连内核都虚拟），Playwright 只在真浏览器引擎上做外层伪装，改不了 V8 内部',
+            hint: '两者"造假"的层级一样深吗？',
+            any: ['指令翻译','虚拟化','内核','系统级','整系统','外层伪装','navigator','改不了 v8','改不了内部','只改外层','引擎内部'] }
+        ],
+        hints: [
+          '想想你用 Playwright / Puppeteer 挂一堆无头 Chrome 干嘛——再想想逆向工程师用模拟器集群干嘛',
+          '模拟器检测和无头检测，查的都是"环境特征不像真人就拒绝"，但一个在设备端、一个在服务端'
+        ],
+        probes: [
+          '模拟器能定制内核/镜像从源头抹掉检测痕迹，而无头浏览器你改不了 V8 和渲染引擎内部。这个"可定制深度"的差异，对对抗分别意味着什么？',
+          'Playwright 集群和模拟器集群都用于"批量"。从风控视角看，两者暴露出的"批量特征"（IP、标识复用）有何异同？'
+        ],
+        model: '<p><b>参考答案</b>：安卓模拟器（Emulator / Genymotion）在 Web/JS 逆向里最贴近的对位物是<b>无头浏览器 / Playwright 伪装环境</b>。</p>' +
+          '<p>① <b>模拟器 ≈ 无头浏览器</b>：都是"一个可控的假运行环境，用来批量跑目标应用"。你用 Playwright 集群挂一堆无头 Chrome 去刷接口、做自动化；逆向工程师用模拟器集群挂一堆安卓实例去跑 App、做批量风控对抗——都是"用可控的假环境替代真机/真人"。<br>' +
+          '② <b>检测模拟器 ≈ 检测无头浏览器指纹</b>：模拟器的痕迹（<code>ro.kernel.qemu</code>、<code>goldfish/ranchu</code>、SwiftShader 渲染器、<code>/dev/qemu_pipe</code>）对应无头的痕迹（<code>navigator.webdriver</code>、WebGL 软件渲染器、异常 UA/时区/分辨率）。都是"环境特征不像真人就拒绝"。<br>' +
+          '③ <b>模拟器批量 ≈ Playwright 集群批量</b>：都是为了规模化——多实例并发跑目标。</p>' +
+          '<p><b>关键差异</b>：模拟器是<b>整系统的指令翻译 / 虚拟化</b>（连内核都被虚拟或翻译），造假发生在指令层和系统层，因此能定制内核/镜像从源头抹掉痕迹；Playwright 是在<b>真浏览器引擎上做外层伪装</b>，你改不了 V8 与渲染引擎内部，只能改 <code>navigator</code> 字段、UA 或加 stealth 插件。前者更底层、更难被单点绕过，后者更轻量、但服务端指纹检测能捕捉到引擎内部的不一致。</p>'
+      },
       /* ---------- Q1 ---------- */
       {
         id: 'c16q1', depth: 1, threshold: 0.7,

@@ -31,7 +31,18 @@ window.CHAPTER = {
           '<p><strong>对称加密</strong>是同一把钥匙的锁——锁上和打开用同一把钥匙。快，但钥匙必须两边都有，于是「钥匙怎么送过去」成了新问题。</p>' +
           '<p><strong>非对称加密</strong>是一把<strong>只能锁、不能开</strong>的挂锁。你可以把这把锁挂在广场上让任何人拿走（这就是「公钥是公开的」），但只有你有开它的钥匙。</p>' +
           '<p><strong>密钥交换 / 派生</strong>不是锁，而是<strong>两个人各出一半、当场拼出一把新钥匙</strong>的仪式。这把新钥匙从不旅行，所以谁也没法在路上截住它。</p>' +
-          '<p>这一章的第一件事，就是让你看到一段东西时，先判断它属于这六种里的哪一种。<strong>判断错了类别，后面所有努力都是白费。</strong></p>'
+          '<p>这一章的第一件事，就是让你看到一段东西时，先判断它属于这六种里的哪一种。<strong>判断错了类别，后面所有努力都是白费。</strong></p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> 这张六类地图在 Web 端几乎一字不差地存在,只是名字略有差异。Web 工程师面对的也是这六类功能,使用的也是同一套底层库(Node `crypto` / Web Crypto / jsrsasign / node-forge)。</p>' +
+          '<p><b>对位</b>:<br>' +
+          '· 编码(Base64/Hex/URL) ≈ <code>atob</code> / <code>btoa</code> / <code>TextEncoder</code> / 自实现换表<br>' +
+          '· 摘要(MD5/SHA) ≈ <code>crypto.subtle.digest("SHA-256", data)</code> / <code>CryptoJS.SHA256</code><br>' +
+          '· MAC(HMAC) ≈ <code>crypto.createHmac("sha256", key)</code> / <code>crypto.subtle.sign("HMAC", key, data)</code><br>' +
+          '· 对称加密(AES/DES) ≈ <code>crypto.createCipheriv("aes-128-cbc", key, iv)</code> / Web Crypto AES-CBC/GCM<br>' +
+          '· 非对称加密(RSA/ECC) ≈ <code>crypto.publicEncrypt</code> / <code>crypto.sign</code> / Web Crypto RSA-PSS<br>' +
+          '· 密钥交换/派生(ECDHE/PBKDF2) ≈ <code>crypto.diffieHellman</code> / Web Crypto ECDH / HKDF</p>' +
+          '<p><b>关键差异</b>:Web 端的「编码」层远比移动端更厚 —— 几乎每个站都会对参数做至少一次 Base64,有些还会自定义字符表(第 22 章讲的换表变种在 Web 站里更常见)。</p>' +
+          '<p><b>逆向视角</b>:你看到一段 JS 里的加密代码时,先用「长度 + 字符集 + 熵」三件套做归类,再决定用什么 API 去复算 —— 这跟安卓的流程完全同构,只是 API 名字不同。</p>')
       },
       html:
         '<p>下面这张表是本章的骨架。请把「逆向时你盯什么」那一列读两遍——它才是你真正要背下来的东西。</p>' +
@@ -783,7 +794,11 @@ window.CHAPTER = {
           '或者用一次一密的会话密钥做 MAC，且密钥由服务端协商下发（6.13 / 6.14）。<br>' +
           '<span class="hit">对你的逆向工作来说，这条结论是极度有利的：如果签名确实在客户端做，那它一定可复现——' +
           '你不需要「破解」RSA，你只需要把私钥（或者产生签名的整段逻辑）拿过来照用。</span></p>') +
-        '<p>所以现场的正确判断顺序是：<strong>先看方向，再看密钥类型，最后才看算法细节。</strong>下面这个动画把两个方向摆在一起。</p>',
+        '<p>所以现场的正确判断顺序是：<strong>先看方向，再看密钥类型，最后才看算法细节。</strong>下面这个动画把两个方向摆在一起。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>RSA 方向 = Node 的 <code>crypto.publicEncrypt/privateDecrypt/sign/verify</code> 四件套</b>。<b>用公钥还是私钥</b>对应到 JS 里就是 <code>crypto.publicEncrypt(..., publicKey)</code> vs <code>crypto.privateDecrypt(..., privateKey)</code> —— 第一参数永远是 buffer,第二参数决定方向。</p>' +
+          '<p><b>JS 端的常见反模式</b>:Web 站把「私钥」写进前端 JS(类似 <code>const priv = "-----BEGIN PRIVATE KEY-----..."</code>)然后做签名 —— 这是 Web 端版本的「客户端持有私钥」,你直接 <code>copy(priv)</code> 走人就行,根本不需要 Hook。</p>' +
+          '<p><b>差异</b>:Web Crypto(<code>crypto.subtle</code>)是异步 Promise,Node <code>crypto</code> 是同步 —— 这影响你 hook 的方式(异步栈在 Chrome devtools 里要单独看 Promise 链),但加密学逻辑完全同构。</p>'),
       case: {
         source: 'github',
         title: 'Day 35: 逆向加密算法（MD5、AES、RSA）',
@@ -1067,7 +1082,11 @@ window.CHAPTER = {
         ]) +
         '<p>还有第三个后果值得一提：当明文很短、<span class="mono">m^e &lt; n</span> 时，取模根本没发生，' +
         '密文就是 <span class="mono">m^e</span> 本身——此时直接对密文开 e 次方就能得到明文，' +
-        '连分解 n 都不用。<strong>这是 e 取值很小时最直接的风险</strong>（6.5 提过）。</p>',
+        '连分解 n 都不用。<strong>这是 e 取值很小时最直接的风险</strong>（6.5 提过）。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>填充 ≈ Node <code>crypto.publicEncrypt</code> 的 <code>padding</code> 参数</b>。<code>RSA_PKCS1_PADDING</code>、<code>RSA_PKCS1_OAEP_PADDING</code>、<code>RSA_PKCS1_PSS_PADDING</code> 一一对应本章讲的 v1.5 / OAEP / PSS。</p>' +
+          '<p><b>JS 端实战经验</b>:「Hook 到了、参数也对、但结果就是不一样」在 Web 站里 90% 是 padding 没对上 —— <code>crypto.publicEncrypt</code> 默认是 <code>RSA_PKCS1_OAEP_PADDING</code>,而前端代码用 <code>jsencrypt</code>(JSEncrypt 默认 v1.5) 是另一种,两个混用结果就完全不同。<b>判定方式</b>:用私钥解一次看开头是不是 <code>00 02</code>(v1.5)或 <code>00</code>(OAEP 起始) —— 这条跟安卓完全一样。</p>' +
+          '<p><b>差异</b>:Web 端还有一个常见坑是 <code>jsencrypt</code> 库内部把字符串直接当 bytes 喂进 RSA(不做 hex/buffer 转换),而 Node <code>crypto</code> 默认要 Buffer —— 「同一段明文两种 padding 算出来不一样」在 Web 站里经常是 padding + buffer 编码两层错。</p>'),
       lab: {
         title: '实验三：填充识别器 —— 两条密文背后有没有随机填充',
         goal: '目标：用真的模幂判定填充，并亲手验证裸 RSA 的可乘性',
@@ -2015,7 +2034,16 @@ window.CHAPTER = {
           '<strong>旁听者拿到了 A 和 B，却算不出那个数</strong>，因为他不知道 a 或 b。</p>' +
           '<p>关键在于：<strong>这个最终的数从来没有在网络上出现过，也从来没有在任何一端「存」过很久</strong>。' +
           '它是双方各自在本地算出来的，用完就丢。所以——</p>' +
-          '<p style="margin-bottom:0"><b>「抓包抓不到会话密钥」不是你没找到，而是它压根没有以「一把钥匙」的形式旅行过。</b></p>'
+          '<p style="margin-bottom:0"><b>「抓包抓不到会话密钥」不是你没找到，而是它压根没有以「一把钥匙」的形式旅行过。</b></p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> 浏览器里 ECDHE 是「内置的黑盒」——你作为 JS 开发者完全看不见它,只看到 <code>fetch()</code> 出来就是 HTTPS 明文;但浏览器底层确实跑着跟你这里一模一样的 ECDH 数学(secp256r1 / X25519)。</p>' +
+          '<p><b>对位</b>:<br>' +
+          '· 临时密钥对 ≈ Web Crypto <code>crypto.subtle.generateKey({name:"ECDH",namedCurve:"P-256"}, true, ["deriveKey"])</code><br>' +
+          '· <code>KeyAgreement.generateSecret()</code> ≈ <code>crypto.subtle.deriveKey(ecdhParams, privKey, pubKey, ...)</code><br>' +
+          '· TLS 1.3 删 RSA 密钥交换 ≈ Chrome 拒绝一切非 forward-secure 的协商(攻击者拿到长期私钥也解不开历史)<br>' +
+          '· 抓包抓不到会话密钥 ≈ Charles / Fiddler 必须装 CA 装到「系统信任」+ 装到「应用信任」两层,否则 HTTPS 解不出 —— 这跟安卓的 r0capture 处境完全一样</p>' +
+          '<p><b>关键差异</b>:Web 端的 ECDH 永远跑在浏览器沙箱里,你从 JS 角度是「看不见」的;移动端你能直接看到 <code>KeyAgreement</code> 类的调用,甚至能 Hook —— 这是移动逆向的「特权」。</p>' +
+          '<p><b>逆向视角</b>:Web 站如果业务层自研 DH(不靠 TLS,自己跑 ECDH),那么 <code>SSLKEYLOGFILE</code> 这类技巧无效 —— 你必须 Hook 业务层 <code>deriveKey</code> 出口拿会话密钥,这跟安卓 <code>generateSecret</code> 完全对位。</p>')
       },
       html:
         '<p>这一类在六类地图里是第 6 格：<strong>密钥交换 / 派生</strong>。它与前面五类最大的不同是：' +
@@ -2316,7 +2344,11 @@ window.CHAPTER = {
     { t: 'PEM', d: '把 DER 用 Base64 编码、再加头尾标记（如 -----BEGIN PUBLIC KEY-----）的文本格式。头尾那四个英文词直接告诉你它是公钥、私钥还是证书，是判断方向的最快入口。' },
     { t: '会话密钥 / 前向安全', d: 'TLS 等协议中由双方临时协商出来的对称密钥，用完即弃。前向安全指：即使长期私钥泄露，也解不开历史流量——这正是「拿到服务端私钥也解不了录下来的流量」的原因。' },
     { t: '字节级香农熵', d: '统计 256 个字节值的出现频次，算 H = −Σ p·log₂p，单位 bit/字节，上限 8。它只能用来「排除低熵数据」，不能用来「确认某段是高熵密钥」——modulus、摘要、随机数的熵几乎一样。' },
-    { t: '白盒实现', d: '把标准算法用查找表 + 编码重新表达出来的实现，密钥被溶进表项里，从不以完整形态出现。第 14 章讲它的识别与 DFA 攻击；本章只负责在「密钥来源」表里给它定位。' }
+    { t: '白盒实现', d: '把标准算法用查找表 + 编码重新表达出来的实现，密钥被溶进表项里，从不以完整形态出现。第 14 章讲它的识别与 DFA 攻击；本章只负责在「密钥来源」表里给它定位。' },
+    { t: '↔ Web 对位 · Cipher.getInstance("RSA/ECB/PKCS1Padding") ≈ crypto.publicEncrypt + RSA_PKCS1_PADDING', d: '同一套算法同一套填充,只是 API 名字不同。Node 的 crypto.publicEncrypt 默认就是 RSA_PKCS1_OAEP_PADDING(注意不是 v1.5!),而前端最常用的 jsencrypt 默认是 v1.5 —— 两边混用是 Web 站对不上结果的头号原因。Web Crypto(crypto.subtle.encrypt)走异步 Promise,底层是 OAEP,但参数组织方式跟安卓 Cipher.init() 同构。' },
+    { t: '↔ Web 对位 · Java MessageDigest ≈ crypto.subtle.digest("SHA-256", data)', d: '完全同构的摘要 API,只是 Web 端是 Promise 异步、Java 是同步。RSA 签名里 "先 SHA 再私钥模幂" 在 JS 端就是 crypto.sign("RSA-SHA256", data, privateKey) 一行,在 Java 端是 Signature.getInstance("SHA256withRSA") + initSign + update + sign 三行 —— 数学一样,调用链形式不同。' },
+    { t: '↔ Web 对位 · AES+RSA 混合加密 ≈ 几乎所有 Web 站的通用做法', d: 'Web 站生成 AES key → 用 RSA 公钥加密这个 AES key 一起发 → 服务端用私钥解出 AES key → 再用 AES key 解业务数据。这套模式在 App 端和 Web 端一模一样,差别只在"key 怎么来":Web 端一般是前端 crypto.subtle.generateKey 生成,App 端常用 SecureRandom。两边逆向动作完全相同:用公钥解出 AES key,再解密。' },
+    { t: '↔ Web 对位 · BouncyCastle (Provider) ≈ jsrsasign / node-forge / Web Crypto', d: '三方加密库在两端的角色一致:当 Java/Android 自带的 JCE/SunJCE 满足不了需求(算法太新、国密、特殊 padding),开发者引入 BouncyCastle;Web 端同样的需求引入 jsrsasign 或 node-forge。逆向时看到陌生算法(OID)、国密 SM2/SM4、自定义 ASN.1 结构,90% 是接了第三方库 —— JS 端看 import 引用,Java 端看 Class.forName("org.bouncycastle...")。' }
   ],
 
   teacher: {
@@ -2327,6 +2359,29 @@ window.CHAPTER = {
       '答「我感觉它是 RSA」是过不了关的，我要听到<b>长度、首字节、结构、方向、填充、来源</b>这些词。' +
       '三次答不上来我会给出完整答案，但那时候你已经浪费了一次练习机会。</p>',
     questions: [
+      {
+        id: 'c06qWeb', depth: 2, threshold: 0.7,
+        q: '安卓里的 RSA/签名/密钥硬编码，是你做 Web 逆向时天天遇到的东西。说出至少两组对位，并各说一条关键差异。',
+        concepts: [
+          { label: 'dex 里的 RSA ≈ JS 里的 RSA', hint: '同一套算法在两边的出现方式。', any: ['RSA', 'PKCS', 'OAEP', '签名', '加密', '填充'] },
+          { label: '密钥硬编码在 dex ≈ 密钥硬编码在前端', hint: '都在客户端里藏 key。', any: ['硬编码', '常量', 'key', '密钥', '字符串'] },
+          { label: '签名校验 ≈ 完整性校验', hint: '防篡改。', any: ['签名', '校验', '完整性', 'hash', '指纹'] }
+        ],
+        hints: [
+          '先想算法本身：RSA/PKCS1 填充在 dex 的 Smali 里和在前端 JS 里，数学上完全一样。',
+          '再想密钥：客户端里的 key 天然可被读取，这正是「白盒密码」要解决的问题。'
+        ],
+        probes: [
+          '追问：为什么「密钥在客户端」两边都无解？白盒密码 / 前端 obfuscation 到底在防谁？',
+          '再追问：安卓的私钥可以放 Keystore/硬件（TEE），前端有什么等价物？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>dex 里的 RSA ≈ 前端 JS 里的 RSA</b>：算法本体（RSA + PKCS#1 v1.5 或 OAEP 填充、模指数运算）完全一样，' +
+          '逆向方法也一样——找到调用点、抠出参数、用 openssl/node 复现。差异：安卓有时把 RSA 放进 native(so)，前端也可能放进 WASM——这时工具要从「读代码」升级到「逆汇编」。<br>' +
+          '② <b>密钥硬编码在 dex ≈ 密钥硬编码在前端 JS</b>：都是「把秘密放在能被打开的文件里」。' +
+          '差异：安卓有机会把密钥放进 Keystore/TEE 硬件（取不出，只能调用），前端没有任何硬件保险箱——所以前端的 key 只能做「提高门槛」，不能做「保密」。<br>' +
+          '③ <b>签名校验 ≈ 完整性校验</b>：差异在于校验方——安卓常是 <b>App 自己校验自己或校验服务端下发的签名</b>，重打包后签名摘要变化导致校验失败；' +
+          '前端的完整性校验（SRI/自校验）同理，改了就崩。<b>结论一致：客户端里的校验都能被 hook 掉，所以真正的校验必须在服务端。</b>'
+      },
       {
         id: 'c31q1', depth: 1, threshold: 0.7,
         q: '请把本章六类功能按「<b>密钥</b>」这个维度分成两组，各说明分组的依据；并且指出<b>哪一类是唯一「密钥可以公开」的</b>，为什么这一条会彻底改变它的逆向方法。',

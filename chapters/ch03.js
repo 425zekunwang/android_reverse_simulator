@@ -435,7 +435,19 @@ window.CHAPTER = {
           '</ul>' +
           '<p>这个类比真正的用处，是它直接决定<b>你该去哪一层找答案</b>：想知道 App 有几个入口、有没有加固，看集装箱；' +
           '想改一行逻辑，动信纸（dex）；想找加密算法的实现，翻图纸（so）。' +
-          '<span class="hit">用错层，是这类工作里最浪费时间的错。</span></p>'
+          '<span class="hit">用错层，是这类工作里最浪费时间的错。</span></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 如果你习惯拆 SPA 站点：APK ≈ 整个站点部署包（HTML+JS+CSS+资源打成 zip），' +
+            'DEX ≈ 经过 babel/webpack 编译后的 main.js + chunks，so ≈ WASM 模块。三者都是「自包含、打开就能定位代码」的发布单位。</p>' +
+            '<p><b>对位</b>:<br>· <b>APK (zip 容器)</b> ≈ 整个 SPA dist 目录打包 — 都能 unzip 看文件清单<br>' +
+            '· <b>AndroidManifest.xml (AXML 二进制 XML)</b> ≈ 入口 HTML 的 <code>&lt;head&gt;</code> + <code>manifest.json</code> — 声明应用怎么被外部触发<br>' +
+            '· <b>resources.arsc (资源表)</b> ≈ Webpack 的 manifest.json (文件名↔hash 映射)<br>' +
+            '· <b>classes.dex 字符串表</b> ≈ Webpack 的 chunk filename 列表 — 都是"打包后所有字符串的索引"<br>' +
+            '· <b>.so (ELF)</b> ≈ WASM 模块 — 高级语言之外的"第二条指令世界"</p>' +
+            '<p><b>关键差异</b>:APK 是单一签名整体(改一字节就全废),而 SPA 站点是按文件粒度独立缓存的;' +
+            'DEX/ART 是带类型信息的字节码(可以靠类名反查),而 Webpack 后的 JS 通常已经被混淆成 _0xabcd。</p>' +
+            '<p><b>逆向视角</b>:看到 APK 时第一反应应该是"像拆 dist 包:列文件 → 看入口 → 顺着 chunk 找主逻辑";' +
+            '看到 so 时换思路:"这是 WASM,要从 wasm 视角看段/节,而非套 JS 经验"。</p>')
       },
       html:
         '<p>先把三者的分工摆清楚。这张表值得你先记住「谁生成、谁消费、逆向时在哪一步用」三列——' +
@@ -578,7 +590,14 @@ window.CHAPTER = {
           '② <b>不压缩的条目</b>：<code>resources.arsc</code>、「已经是压缩格式」的资源和某些 <code>classes.dex</code> 会以' +
           '<code>method = 0</code>（stored）方式存放，方便直接映射。<br>' +
           '③ <b>多出来的一块</b>：Android 7.0 之后，中央目录前面会多一个 <b>APK Signing Block</b>。' +
-          '它不在 zip 规范里，是 Android 自己加的「夹层」——下一节整节讲它。</p>'),
+          '它不在 zip 规范里，是 Android 自己加的「夹层」——下一节整节讲它。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:zip 的「从尾部倒着读」≈ <b>HTTP 协议头 + 尾部的 Content-Length 校验</b>。' +
+          '两者都靠"末尾的元数据"反向定位内容起点(EOCD ↔ Content-Length/EOT 帧),所以「<b>从文件头开始扫</b>」' +
+          '和「<b>从 TCP 第一个字节开始解 HTTP</b>」一样,会在数据里恰好出现签名字节的假阳性上翻车。</p>' +
+          '<p>对应到 Web 部署场景:<b>中央目录</b> ≈ Webpack manifest 的 chunk 清单;<b>EOCD</b> ≈ 站点 <code>index.html</code> 里' +
+          '用 <code>&lt;script&gt;</code> 标签列出的入口点;zip 的"追加写"特性,和 SPA 站点用 code splitting 按需加载 chunk 的思路是反的——' +
+          'zip 是"写完才知总条目",而 SPA 是"先列入口再按需补内容"。</p>'),
       quiz: {
         id: 'q28-1', chapter: 28, answer: 1,
         stem: '你要手工解析一个 APK 的 zip 结构。为什么第一步应该从文件<b>末尾</b>往前找 EOCD，而不是从文件开头往后扫？',
@@ -930,7 +949,20 @@ window.CHAPTER = {
           '先在书脊上读一个「长度」标签（因为书的长短不一）→ 再读书名。</p>' +
           '<p>dex 的六个索引区就是这排柜子，<code>data</code> 区就是书库。' +
           '<span class="hit">等宽抽屉换来 O(1) 定位，代价是每次都要多跳一次，而且书库里每本书必须自带长度标签。</span>' +
-          '这个设计取舍解释了你后面会遇到的几乎每一个 dex 细节。</p>'
+          '这个设计取舍解释了你后面会遇到的几乎每一个 dex 细节。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> dex 索引区 ≈ <b>Webpack 的 chunk filename 列表 + manifest</b>。' +
+            'Webpack 打包后输出的 <code>main.[hash].js</code>、<code>chunk.[hash].js</code> 列表,本质就是「所有 chunk 的定长索引」——' +
+            '你想要哪个 chunk,先去 manifest 查名字/编号,再去对应文件取内容。和 dex 走 string_ids → 字符串数据的两次跳转一模一样。</p>' +
+            '<p><b>对位</b>:<br>· <b>string_ids / type_ids / method_ids</b> ≈ Webpack manifest.json 的 chunk 列表<br>' +
+            '· <b>uleb128 长度前缀</b> ≈ JS 字符串前面的 <code>length</code> 字段(也是变长,但用定长字段存)— dex 是真变长,JS 通常是定长 2/4 字节<br>' +
+            '· <b>data 区的 MUTF-8 字符串</b> ≈ Webpack 抽离出的 <code>chunk-[hash].js</code> 里的所有字符串字面量<br>' +
+            '· <b>map_list(整份 dex 的目录)</b> ≈ Webpack 的 <code>stats.json</code> — 都是「索引的索引」,给反编译器优先读</p>' +
+            '<p><b>关键差异</b>:dex 索引走的是「下标 + 偏移」两步跳转(typed array),所以解析时必须用 DataView 按宽度读;' +
+            '而 Webpack manifest 在 JS 里就是普通对象,直接 <code>manifest[&quot;main&quot;]</code> 取值即可,不需要懂二进制。' +
+            '这就是"看 dex 像看 binary 协议"和"看 Webpack 像看 JSON"的最大区别。</p>' +
+            '<p><b>逆向视角</b>:遇到一份 dex 时,可以先去找 map_list(类比 Webpack 的 stats.json)——' +
+            '它把整份文件的"目录"列得最完整,反编译器(jadx/baksmali)也是先读它再扫全图。</p>')
       },
       html:
         '<p>第 16 章已经把 112 字节的 <code>header_item</code> 逐字段拆过一遍，这里不重复。' +
@@ -1320,7 +1352,21 @@ window.CHAPTER = {
           '里面的每一块叫<b>节（section）</b>。</p>' +
           '<p><span class="hit">「段」是运行时的真相，「节」是分析时的真相。</span>' +
           '很多困惑（比如「为什么抹掉节表程序还能跑」「为什么 strip 之后函数名没了但代码还在」）' +
-          '都是因为把这两套视角当成了一套。</p>'
+          '都是因为把这两套视角当成了一套。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> ELF 的"段 vs 节"双视角 ≈ <b>WASM 模块的 section</b> 与 <b>宿主 JS 运行时</b> 的关系。' +
+            'WASM 二进制里也有 section(data/code/export/import 等),它和宿主 JS 之间也有一道"运行时只看必要部分、分析时才看全貌"的边界——' +
+            '这和 ELF 段/节的分工如出一辙。</p>' +
+            '<p><b>对位</b>:<br>· <b>PT_LOAD (段,运行时)</b> ≈ WASM 的 memory section + code section — 都是"运行时要进内存、必须页对齐的那部分"<br>' +
+            '· <b>SHT (节,分析者)</b> ≈ WASM 的 export/import/symbol section — 都是"分析时看,不一定要加载进内存"<br>' +
+            '· <b>.dynsym / .dynstr (运行时必需的元数据)</b> ≈ WASM 的 export section — 宿主 JS 调 WASM 函数靠它,删了直接调不通<br>' +
+            '· <b>.symtab (不进内存,可被 strip 删)</b> ≈ WASM 的 name section(自定义调试段)— 删了 WASM 仍可跑,只是反编译看不到符号名<br>' +
+            '· <b>/proc/self/maps 里看到的 rwx 页</b> ≈ 浏览器 <code>performance.memory</code> — "进程里加载了哪些模块,占多大,什么权限"</p>' +
+            '<p><b>关键差异</b>:ELF 的段表是"装载器第一手读的",而 WASM 的 section 是"宿主 JS 主动去 instantiate 的";' +
+            'ELF 抹掉节表依然能跑(段表是真正的入口),而 WASM 如果 export section 被破坏,宿主 JS 拿不到函数引用,直接就调不通。' +
+            '所以 ELF 是"节表可选",WASM 是"export 强制"。</p>' +
+            '<p><b>逆向视角</b>:在浏览器里分析一个站点,看到 WASM 模块时,要先想"这是 so 的同类——段/节概念仍然适用";' +
+            '看到 <code>performance.memory</code> 里模块列表异常增长,马上联想到 <code>/proc/self/maps</code> 里的 rwx 页检测逻辑。</p>')
       },
       html:
         '<p>ELF 文件的开头永远是 <code>Elf64_Ehdr</code>（64 字节），它像一个总目录，' +
@@ -2751,7 +2797,10 @@ window.CHAPTER = {
     { t: 'R_AARCH64_GLOB_DAT / JUMP_SLOT', d: '值 0x401 / 0x402。分别用来往 GOT 里填数据符号和函数符号的地址，后者通常住在 .rela.plt 里。' },
     { t: 'PLT / GOT', d: 'PLT 是跳转桩（adrp / ldr / br 三条指令），GOT 是可写的地址表。首次调用时 GOT 槽指向解析器，linker 找到真实地址后回填。改写 GOT 就是最经典的 import hook。' },
     { t: '延迟绑定', d: 'lazy binding。外部函数的地址不在加载时全部解析，而在第一次被调用时才解析并回填 GOT。' },
-    { t: 'SO 修复', d: '把从内存 dump 出来的 so 重新整理成可加载文件的过程，核心工作包括重建节表、重算 RELATIVE 重定位、修正段偏移。' }
+    { t: 'SO 修复', d: '把从内存 dump 出来的 so 重新整理成可加载文件的过程，核心工作包括重建节表、重算 RELATIVE 重定位、修正段偏移。' },
+    { t: '↔ Web 对位 · APK ≈ SPA dist 部署包', d: 'APK 这个 zip 容器和"整个 SPA 站点打包后部署"在结构上几乎是一回事——HTML/JS/CSS/资源都按 zip 的中央目录索引,都能 unzip 看清单。关键差异是:APK 一次签名整体生效(改一字节全废),而 SPA 站点按文件粒度独立缓存(改 main.js 不影响其他 chunk)。逆向时把 APK 拆开就当 dist 目录用,先列条目再判断业务在哪一层。' },
+    { t: '↔ Web 对位 · dex 字符串表 ≈ Webpack chunk 清单', d: 'dex 的 string_ids / type_ids / method_ids 和 Webpack 输出的 main.[hash].js、chunk.[hash].js 列表是同一种东西:都是"打包产物里所有可命名单元的定长索引",真内容都在另一段变长区域里。逆向 dex 时第一反应应该是"找 map_list"(类比 Webpack 的 stats.json),它把整份文件的目录列得最完整,反编译器也是先读它。' },
+    { t: '↔ Web 对位 · ELF 段/节 ≈ WASM section', d: 'ELF 的程序头表(段,给装载器) ≈ WASM 的 memory/code section;节头表(节,给分析者) ≈ WASM 的 export/import/name section。/proc/self/maps 看到的 rwx 页 ≈ 浏览器 performance.memory 列出的模块详情,都是"进程里加载了哪些模块、占多大、什么权限"的可观察面。关键差异:ELF 抹掉节表照样能跑(段表是真正的入口),WASM 删了 export section 宿主 JS 直接调不通(export 是契约)。' }
   ],
 
   /* ============================================================== 严师 */
@@ -2765,6 +2814,32 @@ window.CHAPTER = {
       '含糊的回答我会追问，追问三次我直接给答案——但那不算你过关。' +
       '特别提醒：如果你说「大概是 0x…」这种话，我不会接受，你只能说「我确定」或者「这个我要去查规范」。</p>',
     questions: [
+      {
+        id: 'c03qWeb', depth: 2, threshold: 0.7,
+        q: '把 APK 的「自包含发布包 + 字节码 + 签名 + 资源 + 清单」这套文件结构，类比到你熟悉的 JS 世界。说出至少三个对位物，并各说一条关键差异。',
+        concepts: [
+          { label: 'APK ≈ 整个站点发布包', hint: '都是自包含、解压就能看的东西。', any: ['站点', '打包', '自包含', 'bundle', '发布包', 'HTML', 'zip'] },
+          { label: 'classes.dex ≈ 打包后的 main.js', hint: '线上真正跑的那份代码。', any: ['main.js', 'bundle', 'webpack', '编译后', '打包后', '压缩'] },
+          { label: 'AndroidManifest.xml ≈ 路由表/入口 head', hint: '「声明这个应用怎么被外部触发」。', any: ['路由表', '路由', '入口', 'head', 'manifest', '声明'] },
+          { label: '签名 ≈ SRI/CSP', hint: '防篡改的指纹。', any: ['SRI', 'CSP', '完整性', '签名', 'hash', '校验'] }
+        ],
+        hints: [
+          '先抓「自包含发布包」这个最大共同点：APK 和前端打包产物都是一个 zip/文件树，解压就能看到全部。',
+          '再想 dex 和 main.js 的关系：都是「人写的不是它，线上跑的是它，要逆向得先展开」。'
+        ],
+        probes: [
+          '追问：APK 有签名（v1/v2/v3 多版本共存），前端有 SRI/CSP——两者防的是同一个威胁吗？',
+          '再追问：资源 ID 在 dex 里是整数映射，Webpack 里是 module id——为什么两边都选择「把名字变数字」？'
+        ],
+        model: '<b>参考答案</b>：<br>① <b>APK ≈ 整个站点（HTML+JS+CSS+资源）</b>：都是自包含发布包，本质都是 zip，解压就能看到全部文件；' +
+          '差异：APK 里塞的是 dex/so/res/清单，前端是 js/css/图片，且 APK 必须签名才能装。<br>' +
+          '② <b>classes.dex ≈ 打包后的 main.js</b>：都是线上真正执行的代码本体，人写的不是它；' +
+          '差异：前端有 source map 能直接还原行号与变量名，dex 没有——所以改 dex 要回 Smali，而改 JS 有时能改回源码再重新打包。<br>' +
+          '③ <b>AndroidManifest.xml ≈ 路由表/入口 HTML 的 head</b>：都在声明「这个东西怎么被外部触发」（App 怎么被打开 vs 站点怎么被访问）；' +
+          '差异：清单是<b>二进制 XML</b>（aapt2 编译过），且它声明的四大组件是可被任意 App 拉起的攻击面，前端路由只被用户导航触发。<br>' +
+          '④ <b>签名（CERT.RSA，v1/v2/v3 共存）≈ SRI/CSP</b>：都是防篡改指纹，改了内容校验就对不上；' +
+          '差异：安卓签名同时是「身份」和「完整性」两件事的证据（重打包必然换签名），SRI 只保证子资源不被换。'
+      },
       {
         id: 'c28q1', depth: 1, threshold: 0.7,
         q: '一个 APK 里的 <code>AndroidManifest.xml</code>，用文本编辑器打开是乱码。' +

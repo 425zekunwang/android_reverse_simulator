@@ -61,7 +61,25 @@ window.CHAPTER = {
           '<p style="margin-bottom:0"><b>关键洞察：</b>面对第 ③ 种，你没法"把密码文字还原成中文"——' +
           '因为那不是加密，是<b>换了一套语言</b>。你能做的只有一件事：' +
           '<span class="hit">找到那本密码本，然后把整本书逐字翻译回来。</span>' +
-          '这就是为什么第 20 章所有技巧最终都指向同一个目标——<b>扒出映射表</b>。</p>'),
+          '这就是为什么第 20 章所有技巧最终都指向同一个目标——<b>扒出映射表</b>。</p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 你已经非常熟悉这件事——它就是<b>JSVMP</b>。' +
+            '顶象、瑞数、网易易盾、JSJiami、jsvmp.com 那一整套用 <code>while + switch</code> 执行自定义字节码的方案,就是安卓 VMP 在 JS 世界的<b>完全同构</b>实现。' +
+            '所以这章你会很顺手,只是主角从 so 换成了 .js。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· VMP(指令级虚拟化) ≈ JSVMP(JS Virtual Machine Protection)<br>' +
+            '· VMP 的 <code>while + switch</code> 分发器 ≈ JSVMP 的 <code>switch(opcode)</code> / eval 派发循环<br>' +
+            '· VMP 字节码流 ≈ JSVMP 字节码字符串(通常 base64 放在变量里)<br>' +
+            '· VMP handler 表 ≈ JSVMP 的 <code>{0x1A: fn1, 0x2B: fn2}</code> dispatch 对象<br>' +
+            '· VMProtect(商业 VMP) ≈ 瑞数 VMP / 顶象 VMP / JSJiami v6<br>' +
+            '· OLLVM + VMP 双层 ≈ OB 混淆 + JSVMP 双层(都很常见)<br>' +
+            '· 扒映射表 ≈ AST deobfuscate + 解释器 trace dump</p>' +
+            '<p><b>关键差异</b>:JSVMP 的解释器是 JS 自己(动态类型、字符串可拼接),' +
+            '调试时打印 <code>console.log(opcode, ctx)</code> 就能采——安卓 VMP 必须挂 native 调试器或上 EL2。' +
+            '所以 VMP 的工程量比 JSVMP 高一个数量级,但方法论是<b>完全一样</b>的。</p>' +
+            '<p><b>逆向视角</b>:看到 <code>while(true){op=*pc++;switch(op){...}}</code> 这种结构,' +
+            '先别管它跑在 V8 还是 ART,先做同一件事——<b>在分发器处记录 (opcode, 行为) 配对</b>。' +
+            '本章节讲的所有概念(分发器/handler/VMContext/映射表),你可以直接对位到 JSVMP 项目里,几乎不用翻译。</p>')),
 
       stage: {
         title: '保护阶梯：每一级都在拿掉分析者的一件武器',
@@ -209,7 +227,14 @@ window.CHAPTER = {
         T.note('', '🎯 这对逆向实战有什么用',
           '<p>它给了你一个极其明确的作战地图：<b>不要试图读代码，要试图读数据</b>。' +
           '把「理解一个函数在做什么」转化成一个可枚举的工程问题——建立 <b>自定义字节码 → 实际操作</b> 的映射表。' +
-          '映射表一旦建起来，剩下的就是把字节码流翻译回伪代码，这步甚至可以自动化。</p>'),
+          '映射表一旦建起来，剩下的就是把字节码流翻译回伪代码，这步甚至可以自动化。</p>' +
+          T.note('cool', '🌐 JS 视角批注',
+            '<p><span class="pill">JS 类比</span> 整章的内容 = <b>JSVMP 完全同构</b>。<code>while + switch(op)</code> + ' +
+            '<code>case 0x1A: ...</code> 这种结构,在 JS 逆向里就是 <code>while(true){op=vm[pc++];switch(op){case "0x1a":...}}</code>。' +
+            '差异只在执行环境:VMP 跑在 ARM 上,所以必须 native hook;JSVMP 跑在 V8 上,直接 <code>console.log</code> 就能采——但<b>方法论一字不改</b>。</p>' +
+            '<p>你在 JS 逆向里已经用过对应的招:<b>hook 派发函数</b>(如 <code>__dispath__</code>、<code>vm.run</code>)、' +
+            '<b>dump 字节码数组</b>(找那个大 base64/十六进制字符串)、<b>建 opcode→handler 映射</b>(对每个 case 跑一遍样本看行为)。' +
+            '本章把这些动作翻译成了 ARM 视角,但对你来说就是<b>老朋友穿了件新衣服</b>。</p>')),
 
       stage: {
         title: 'VMP 全景：原始 ARM → 自定义字节码 → 解释器循环',
@@ -313,7 +338,12 @@ window.CHAPTER = {
         T.note('key', '🔑 观察重点',
           '<p>盯住三个东西：<b>字节码指针（vm pc）怎么前进</b>、<b>opcode 怎么被取出来</b>、' +
           '<b>switch 怎么选中 handler</b>。这三个动作构成了一个可以被 hook 的「收窄点」——' +
-          '所有字节码都必须从这里经过，一条都逃不掉。</p>'),
+          '所有字节码都必须从这里经过，一条都逃不掉。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 这段 ARM 分发器 ≈ <b>JSVMP 解释器循环</b>。' +
+          'JS 里对应长这样:<code>while(1){op=bc[pc++];switch(op){case 0x1A:r0=r1;break;...}}</code>。' +
+          '结构完全一样:`opcode = *pc++` 读字节 → `switch(opcode)` 派发 → handler 执行 → `b dispatch_loop` 回边。' +
+          '你在 JS 逆向里 hook 的就是中间的 <code>switch</code> 和那个 <code>pc</code> 变量——和本章的方法论一字不改。</p>')),
 
       stepper: {
         title: 'VM dispatcher：取指 → 分发 → 执行 → 回边',
@@ -605,7 +635,16 @@ window.CHAPTER = {
           '<p>如果加固没有加密跳转表，你在分发器里能看到 <code>ldr x11, [x10, w9, uxtw #3]</code> 这样的查表指令，' +
           '顺着 <code>x10</code> 过去就是一张完整的「opcode → handler 地址」数组。把它整张 dump 出来，' +
           '<b>你就瞬间知道了 opcode 空间的全貌</b>——哪些值合法、每个值对应哪段代码。' +
-          '这让动态记录从「盲扫」变成「按图索骥」：你甚至可以直接反编译每一个 handler，逐个静态推断语义，再用动态验证。</p>'),
+          '这让动态记录从「盲扫」变成「按图索骥」：你甚至可以直接反编译每一个 handler，逐个静态推断语义，再用动态验证。</p>' +
+          T.note('cool', '🌐 JS 视角批注',
+            '<p><span class="pill">JS 类比</span> 建映射表 ≈ <b>JSVMP trace dump 还原</b>。' +
+            '你 hook VMP 分发器、记录 (opcode, 写入了什么 VMContext 字段、读走了什么、有没有访存)——' +
+            '这件事在 JS 逆向里就是用 Proxy/hook 拦 <code>vm.run</code>、<code>__dispath__</code>、' +
+            '在每次 opcode 进 handler 前后各 snap 一份 ctx、然后 diff 出哪条规则是 XOR、哪条是 SHIFT、哪条是 LOAD。' +
+            '工具链换一下(arm 调试器 → V8 debugger / <code>vm.run</code> hook),活是同一份活。</p>' +
+            '<p><b>变长字节码这个坑完全一样</b>。JSVMP 的 opcode 后通常紧跟变长操作数,' +
+            '忘了记"这条字节码吃掉了几个字节",离线翻译时整个流会从错位点开始全错——' +
+            '本章 20.4 那个"覆盖度收敛但翻译出来是垃圾"的诊断题,你在 JS 逆向里也踩过一模一样的。</p>')),
 
       stage: {
         title: '在分发器处 hook：一张映射表是怎么长出来的',
@@ -865,7 +904,20 @@ window.CHAPTER = {
           '或检测 hypervisor 必然留下的某些系统级痕迹来尝试发现异常。' +
           '具体哪些手段在特定设备上可行，取决于实现细节，<span class="pill warn">待核实</span>。' +
           '务实的态度是：<b>EL2 把「发现调试器」这件事的成本从「几行代码」抬高到了「需要专门针对 hypervisor 做检测」</b>——' +
-          '绝大多数商业加固根本不做这一步。</p>'),
+          '绝大多数商业加固根本不做这一步。</p>' +
+          T.note('cool', '🌐 JS 视角批注',
+            '<p><span class="pill">JS 类比</span> EL2 的核心思想 ≈ <b>把 hook 放在 V8 / 浏览器引擎里,而不是页面 JS 里</b>。' +
+            '你用 <code>console.log</code> / <code>debugger</code> 在 page context 拦代码 → 被反调试/反 hook 检测;' +
+            '但如果你用 CDP / V8 inspector / <code>%DebugGetLocalScope</code> 这种<b>引擎层</b> API 拦,目标 JS 看不到。' +
+            '本质上都是"调试器住得比目标更低一级"。</p>' +
+            '<p><b>三层层级对位</b>:<br>' +
+            '· EL0(frida/ptrace) ≈ 页面 JS 里的 hook(<code>hook document.cookie</code>、<code>XMLHttpRequest</code> 包装)<br>' +
+            '· EL1(定制内核) ≈ 改 V8 源码、patch 浏览器二进制(更强但仍可被检测)<br>' +
+            '· EL2(不改 Guest 内存) ≈ V8 Inspector / CDP 引擎层拦截 — ' +
+            '<b>因为 V8 解释器本身没动页面 JS 一个字节</b>,' +
+            '目标代码执行流看不出任何异常,JS 视角里"什么都没发生过",跟 stage-2 页表改权限是一个意思。</p>' +
+            '<p>所以 V8 Inspector / CDP 在现代反爬对抗里越来越受重视(类似 EL2 的角色),' +
+            '而 <code>debugger</code> 语句这种页面层 hook(<code>Function.prototype.constructor</code> 改写等)早已是反检测的"靶子"。</p>')),
 
       stage: {
         title: '同一件事，三个层级：反调试能看见什么',
@@ -1484,7 +1536,10 @@ window.CHAPTER = {
     { t: '抽取壳（二代壳）', d: 'dex 结构保留（类名、方法名、签名都在），但方法体 code_item 的 insns 被抽走（置空或填 nop），被调用前才回填。普通内存 dump 只能得到「空方法」，需靠主动调用把方法体逼出来。' },
     { t: 'Hypervisor（虚拟机监控器 VMM）', d: '运行在比操作系统内核更底层的软件层，通过 ARM 虚拟化扩展把整个 Guest OS 跑在虚拟机里。调试器住在这里时，Guest 无法观测到它的存在。' },
     { t: 'Exception Level（EL0 / EL1 / EL2 / EL3）', d: 'ARM 的特权层级：EL0 用户态应用、EL1 Guest OS 内核、EL2 Hypervisor、EL3 Secure Monitor（TrustZone）。调试层级每下沉一层，可观测的更多、被观测的更少。' },
-    { t: 'stage-2 页表', d: 'ARM 虚拟化下的第二级地址翻译，负责把 Guest 物理地址翻译成真实物理地址，每项附带访问权限位。Hypervisor 靠收紧权限实现内存断点——<b>命中时由 CPU 在翻译阶段陷入 EL2，Guest 内存一个字节都不改动</b>，因此所有内存完整性检测（代码段校验和、断点指令比对）都发现不了。' }
+    { t: 'stage-2 页表', d: 'ARM 虚拟化下的第二级地址翻译，负责把 Guest 物理地址翻译成真实物理地址，每项附带访问权限位。Hypervisor 靠收紧权限实现内存断点——<b>命中时由 CPU 在翻译阶段陷入 EL2，Guest 内存一个字节都不改动</b>，因此所有内存完整性检测（代码段校验和、断点指令比对）都发现不了。' },
+    { t: '↔ Web 对位 · VMP ≈ JSVMP(完全同构)', d: '安卓 VMP 和 JSVMP 是同一种保护思想的两份实现:都是把原始指令翻译成自定义字节码,由一个解释器(while+switch / switch(opcode))逐条执行,语义藏在"厂商私有编码约定"里。差异只在执行环境:VMP 跑在 ARM,必须 native hook;JSVMP 跑在 V8,直接 console.log 就能采。方法论一字不改——hook 派发器、dump 字节码、建 (opcode, 行为) 映射表,两边完全通用。代表:顶象 VMP、瑞数 VMP、JSJiami v6,基本都能用本章的框架来打。' },
+    { t: '↔ Web 对位 · 分发器 ≈ JSVMP dispatch 对象', d: 'VMP 分发器(`switch(opcode) + 跳转表 + 无条件回边`)在 JS 逆向里就是 JSVMP 的 dispatch 对象(`{0x1A: fn1, 0x2B: fn2, ...}`)或 `__dispath__` 函数。两者都是"每条字节码的唯一必经之路",是动态采集的同一个 hook 点。区别:JSVMP 的 dispatch 通常是一坨对象字面量,直接 dump 出来就是完整映射表;VMP 的跳转表可能被加密、可能被 OLLVM 打散,要靠结构特征(回边、热点、opcode 范围)识别。' },
+    { t: '↔ Web 对位 · EL2 不可见 ≈ V8 Inspector / CDP 引擎层拦截', d: 'Hypervisor 在 EL2 用 stage-2 页表做权限拦截,Guest 内存一个字节不动——这跟"V8 Inspector / CDP 在引擎层拦截、目标 JS 完全无感"是同一种思路。两者本质都是"调试器比目标更底层":V8 Inspector 走 CDP 协议不进 page context,目标 JS 看不到 inspector;EL2 hypervisor 不在 Guest 进程空间,Guest 检测不到。常见对位:EL0 frida ≈ 页面 hook(易被反);EL1 定制内核 ≈ patch 浏览器二进制;EL2 hypervisor ≈ V8 inspector / CDP(从原理上消除检测痕迹)。这是为什么现代反爬越来越重视"走引擎层而不是走页面层"。' }
   ],
 
   teacher: {
@@ -1497,6 +1552,30 @@ window.CHAPTER = {
            '答不上三次，我会给出完整答案；但那份答案你得当成教材读，不是当成答案背。</p>',
     questions: [
       /* ---------- Q1 ---------- */
+      {
+        id: 'c20qWeb', depth: 2, threshold: 0.7,
+        q: 'VMP 和 JSVMP 在概念上完全同构。请说出这组对位，并各说一条关键差异。',
+        concepts: [
+          { label: 'VMP ≈ JSVMP', hint: '把字节码转成自定义虚拟机指令。', any: ['JSVMP', 'vmp', '虚拟', '瑞数', '顶象', '指令'] },
+          { label: '解释器 loop ≈ eval-loop/switch-case', hint: '用一套指令模拟另一套。', any: ['eval', 'loop', 'switch', '解释器', 'dispatcher', '分发', 'case'] },
+          { label: 'handler 表', hint: '每个虚拟指令对应一段处理代码。', any: ['handler', '处理', '分支', '表', '映射'] }
+        ],
+        hints: [
+          '先抓核心思想：两者都不是「把代码藏起来」，而是「换一套指令系统」——原来的函数体变成了自定义虚拟机的字节码。',
+          '再想破法：两边都要么逆虚拟机指令集，要么在解释器的分发循环上下断点看真实参数。'
+        ],
+        probes: [
+          '追问：为什么说 VMP 之后「静态阅读基本失效」？',
+          '再追问：VMP 的执行速度代价是什么？这个代价给了逆向什么机会？'
+        ],
+        model: '<b>参考答案</b>：<br><b>对位</b>：<b>VMP（虚拟指令保护）≈ JSVMP（瑞数/顶象/极验的 vmp）</b>——' +
+          '都不是加密，而是把原始字节码翻译成一套自定义虚拟机的指令，运行时由解释器逐条模拟执行。' +
+          '<b>VMP 的解释器（dispatcher loop）≈ JSVMP 的 eval-loop / switch-case</b>：都是「取指 → 译码 → 跳到对应 handler → 更新虚拟机状态」的循环。<br>' +
+          '<b>关键差异</b>：① <b>被虚拟化的对象不同</b>——安卓 VMP 常把 dex 字节码甚至 native 代码虚拟化，JSVMP 虚拟化的是 JS 源码/字节码；' +
+          '② <b>可观测性不同</b>——JSVMP 的解释器就在 JS 里，你可以直接打印/改它（改 handler 表、跳过校验），' +
+          '安卓 VMP 的解释器常在 native(so) 里，要 hook 得先过 native 层；③ <b>破法一致</b>：逆虚拟机指令集，或在解释器分发循环上下断点观察真实数据流。<br>' +
+          '<b>机会点</b>：虚拟化必然带来巨大性能损耗（解释执行比原生慢几十倍），这个代价限制了它只能用于小段关键代码——其余部分仍是普通代码。'
+      },
       {
         id: 'c6q1', depth: 1, threshold: 0.7,
         q: '被 VMP 保护的关键函数，拖进 IDA 按 F5 之后，只剩一个 <code>while</code> + <code>switch</code>。' +

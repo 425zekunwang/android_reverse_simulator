@@ -540,12 +540,12 @@ strcmp(input, buf);</code></pre>
     lines: [
       {
         code: '<span class="c">// 第 1 步：等 VM 就绪 + attach 当前线程</span>',
-        note: '<b>Java.perform 是入口，不是装饰。</b>它做了两件事：等待 ART 虚拟机初始化完成；把 Frida 的注入线程 attach 到 VM 上，这样这个线程才有 JNIEnv。跳过它，后面所有 Java API 都会抛 "VM not ready" 或空指针。',
+        note: '<b>Java.perform 是入口，不是装饰。</b>它做了两件事：等待 ART 虚拟机初始化完成；把 Frida 的注入线程 attach 到 VM 上，这样这个线程才有 JNIEnv。跳过它，后面所有 Java API 都会抛 "VM not ready" 或空指针。' + '<div class="note cool"><div class="note-h">🌐 JS 视角</div><p><span class="pill">JS 视角</span> Frida（把一段 JS 注入到运行中的 App，再 RPC/hook 它的行为）≈ 浏览器 DevTools 的 Console 注入 / 油猴（Tampermonkey）用户脚本：都是"把代码拖进目标运行时里，改它原本的逻辑"。<br><b>关键差异</b>：DevTools 和油猴只活在 JS 这一层、改不了 native；Frida 能往下打到 .so 的机器码，这是它比浏览器工具狠的地方。</p></div>',
         state: { 'VM 状态': '未就绪 → 就绪', '当前线程': '已 attach', 'JNIEnv': '已获取' }
       },
       {
         code: 'Java.perform(<span class="k">function</span> () {',
-        note: '回调函数在 VM 就绪后执行。从现在开始，你可以自由调用 Java 层 API 了。注意：<b>如果 App 反调试导致 attach 失败，会卡在这一步</b>，表现为脚本无输出也不报错。',
+        note: '回调函数在 VM 就绪后执行。从现在开始，你可以自由调用 Java 层 API 了。注意：<b>如果 App 反调试导致 attach 失败，会卡在这一步</b>，表现为脚本无输出也不报错。' + '<div class="note cool"><div class="note-h">🌐 JS 视角</div><p><span class="pill">JS 视角</span> 反 Frida 检测（扫 27042 端口、读 /proc/self/maps 找 frida-agent 映射）≈ 网页里的反 DevTools 检测（探测 debugger 被接管 / 特有全局对象）。两边都是"你的工具会被目标发现"的猫鼠游戏。<br><b>关键差异</b>：安卓上 Frida 是系统级进程、能看整个 App 的内存；DevTools 检测只在单个页面上下文里生效，关掉这个 tab 就消失，影响面小得多。</p></div>',
         state: { 'VM 状态': '就绪', '当前线程': '已 attach', 'JNIEnv': '有效' }
       },
       {
@@ -560,7 +560,7 @@ strcmp(input, buf);</code></pre>
       },
       {
         code: '    .implementation = <span class="k">function</span> (input) {',
-        note: '<b>这里发生了真正的 Hook。</b>Frida 把目标方法的 ART 入口标记为 native，并注册了自己的 trampoline。同时，它<b>保存了原始方法的引用</b>——这就是下一步 this.encode() 不会无限递归的原因。',
+        note: '<b>这里发生了真正的 Hook。</b>Frida 把目标方法的 ART 入口标记为 native，并注册了自己的 trampoline。同时，它<b>保存了原始方法的引用</b>——这就是下一步 this.encode() 不会无限递归的原因。' + '<div class="note cool"><div class="note-h">🌐 JS 视角</div><p><span class="pill">JS 视角</span> Java.use 拿到类、再替换方法实现（Java 层 hook）≈ DevTools 给函数下断点观察或改参，或油猴用 Proxy 拦截某个对象的方法。两者都是"在调用发生的瞬间插入你的逻辑"。<br><b>关键差异</b>：DevTools/Proxy 只在 JS 层生效；Frida 这套机制同样能落到 native 的 .so 上，层次更深。</p></div>',
         state: { 'VM 状态': '就绪', '原方法': '已备份', '新实现': '已注册', 'Hook 状态': '✅ 生效' },
         mem: 'ART 方法结构体（简化）\n┌────────────────────────┐\n│ art::ArtMethod encode   │\n│  entry_point_ │─────────┼──▶ [Frida trampoline] ──▶ 你的 JS\n│  access_flags │ native  │\n└────────────────────────┘\n    原实现入口已保存 ◀────────┘'
       },
@@ -590,7 +590,7 @@ strcmp(input, buf);</code></pre>
       if (el) el.className = 'blk ' + (cls || '');
     };
     recurseSteps.push(
-      { run: () => { set('rc1', 'active'); }, note: '<b>App 调用 Sign.encode("hello")</b>。这是最外层的调用，来自正常业务代码。它并不知道自己被 Hook 了。' },
+      { run: () => { set('rc1', 'active'); }, note: '<b>App 调用 Sign.encode("hello")</b>。这是最外层的调用，来自正常业务代码。它并不知道自己被 Hook 了。' + '<div class="note cool"><div class="note-h">🌐 JS 视角</div><p><span class="pill">JS 视角</span> Frida 的 spawn 模式（进程启动、任何业务代码跑之前就把桩插好）≈ 给浏览器加启动参数注入脚本 / 油猴的 @run-at document-start（页面脚本执行前就运行）。<br><b>关键差异</b>：油猴的 document-start 仍是页面上下文里的脚本，spawn 是进程级、早于 App 自己的代码，连 Application.onCreate 之前都已经在场。</p></div>' },
       { run: () => { set('rc1', 'hot'); set('rc2', 'active'); }, note: '<b>调用进入 Frida trampoline。</b>ART 执行到 encode 的入口时，发现这里已经被改成 native 跳转，于是控制流转向 Frida 注入的代码。' },
       { run: () => { set('rc2', 'hot'); set('rc3', 'active'); }, note: '<b>控制流进入你的 JS implementation。</b>参数 input = "hello" 已经传进来。此刻你可以为所欲为：打印、改参数、直接返回。' },
       { run: () => { set('rc3', 'hot'); set('rc4', 'active'); }, note: '<b>你执行 this.encode(input)。</b>这是关键的一步：Frida 把它解析为「调用<em>被保存的原始方法</em>」，而不是「调用我刚替换掉的那个方法」。' },
@@ -633,7 +633,7 @@ strcmp(input, buf);</code></pre>
       },
       {
         code: 'Interceptor.attach(addr, {',
-        note: '<b>Interceptor.attach 执行 Inline Hook。</b>Frida 会：① 把目标地址所在内存页改成可写（mprotect）；② 保存开头几条指令；③ 写入跳转指令指向自己的 trampoline；④ 恢复内存权限。整个过程是原子的，避免其他线程看到半成品。',
+        note: '<b>Interceptor.attach 执行 Inline Hook。</b>Frida 会：① 把目标地址所在内存页改成可写（mprotect）；② 保存开头几条指令；③ 写入跳转指令指向自己的 trampoline；④ 恢复内存权限。整个过程是原子的，避免其他线程看到半成品。' + '<div class="note cool"><div class="note-h">🌐 JS 视角</div><p><span class="pill">JS 视角</span> Module.findBaseAddress 拿基址 + Interceptor.attach(so) 的 native 层 hook ≈ 浏览器里 hook 一段 WASM（Emscripten 编译出的 C 函数）：都是"绕过高级语言，直接改第二条指令世界里的函数"。<br><b>关键差异</b>：WASM 还在浏览器沙箱里、工具链相对规整；native .so 是真实 ARM 机器码，有 ASLR、Thumb 指令集、内存权限（mprotect）这些 JS 层根本没有的坑，比 JS 层难一档。</p></div>',
         state: { '目标地址': '0x7a3c5a4c', '内存权限': 'r-x → rwx → r-x', '原指令': '已备份', '跳转指令': '已写入' }
       },
       {

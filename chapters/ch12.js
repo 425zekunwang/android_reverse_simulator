@@ -36,7 +36,22 @@ window.CHAPTER = {
           '<p><b>对手的反制手段，本质上都是在说一句"你别站在这儿"。</b>' +
           '无代理模式把你从②赶走；证书固定让你在②里拆不开信封；双向认证让收发室不认你；' +
           '自编译 OpenSSL 把③的入口藏起来。</p>' +
-          '<p>所以本章的每一个问题，最终都会收敛成同一句话：<b>我该把观测点放在哪一层。</b></p>'
+          '<p>所以本章的每一个问题，最终都会收敛成同一句话：<b>我该把观测点放在哪一层。</b></p>' +
+          T.note('cool', '🌐 Web/JS 逆向视角',
+            '<p><span class="pill">JS 视角</span> 抓包这件事在 JS 世界里你早就做过了——' +
+            '<b>Charles / Reqable / Fiddler 当中间人看 HTTPS</b>，和安卓视角下的 Charles / mitmproxy 是<b>同一套动作</b>。</p>' +
+            '<p><b>对位</b>:<br>' +
+            '· Charles/Burp/mitmproxy 中间人 ≈ 完全一致（你手机上的 Charles 和你 PC 上的 Charles 是一个工具）<br>' +
+            '· App 的 SSL Pinning（只信自己的证书）≈ 浏览器 / Node 的证书校验、<code>mTLS</code> 双向证书<br>' +
+            '· JustTrustMe（绕过 pinning）≈ Node <code>--ignore-certificate-errors</code> / 浏览器证书替换<br>' +
+            '· <code>okhttp3.Interceptor</code> hook ≈ XHR/fetch hook<br>' +
+            '· sign / token 算法生成 ≈ 两边<b>完全一样</b>（这是协议还原的核心）</p>' +
+            '<p><b>关键差异</b>:在 Web 端，证书信任锚是<b>操作系统 / 浏览器</b>的（把根证书装进系统信任库就行）；' +
+            '在 Android 7.0+，App 默认<b>只信系统证书库、不信用户装的</b>，所以光装用户证书不够，得装进系统证书库（或 hook 校验）。' +
+            '另一差异：Web 的 sign 算法跑在 JS 里、DevTools 就能看；App 的 sign 算法可能跑在 native（so）里，' +
+            'DevTools 那套对你没用——这正是第 9、17、22、23 章要补的。</p>' +
+            '<p><b>读到这里你该想起</b>:你用 Reqable 抓自己网站的 WebSocket、看 WSS 握手失败的原因，' +
+            '和这章"代理装好了但 App 报证书错误"是同一个病——只是 App 多了一道"只信自己证书"的门槛。</p>')
       },
       html:
         '<p>先把一个事实说清楚：<b>现有课程里没有一章系统讲抓包</b>。' +
@@ -74,7 +89,17 @@ window.CHAPTER = {
             ['看到 body 就是看到明文了', '你看到的可能是<b>应用层加密后的密文</b>——传输层通得好好的，业务层自己又加了一层'],
             ['改包 = 改字段', '服务端校验的是<b>规范化之后的字节</b>。改字段不改签名，改一个字节都过不了'],
             ['抓包是"看一眼"的动作', '抓包是<b>选观测位置</b>的动作。位置选错，工具换十个也没用']
-          ]),
+          ]) +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>安卓抓包 ≈ 你 PC 上的 Charles/Reqable 抓 HTTPS</b>，中间人逻辑一模一样；' +
+          '差别全在"App 比浏览器多了一道证书固定"。</p>' +
+          '<p><b>具体差异</b>:WebView / 小程序 / 网页在手机上走的是和你 PC 一样的 TLS，Charles 直接能看；' +
+          '但原生 App 常做 SSL Pinning——只认自己内嵌的证书，你的代理根证书它不认。' +
+          '这对应 Web 端就是"浏览器拒绝自签证书"或 mTLS 双向校验。绕过思路也两边一样：' +
+          '要么把系统证书塞回去（JustTrustMe ≈ Node <code>--ignore-certificate-errors</code>），' +
+          '要么在发出请求前 hook 掉校验（<code>okhttp3.Interceptor</code> ≈ XHR/fetch hook）。' +
+          '<b>协议还原的核心</b>也在这一行：sign / token 算法在安卓和 Web 端<b>完全一样</b>——' +
+          '你抠出来的那个 HMAC/SM3，和网页里算 sign 的是同一种东西。</p>'),
       after: T.note('ok', '✅ 这一节的收获',
         '<p style="margin-bottom:0">记住四个观察位（连接 / 代理 / 进程内 / 内核），以及它们各自"怕什么"。' +
         '本章后面每讲一个对抗手段，你都可以问一句：<b>它是把我从哪个观察位上赶走的？</b></p>')
@@ -1117,7 +1142,13 @@ window.CHAPTER = {
             note: '绕过 App 直接握手。它回答的是"<b>是服务端/网络的问题，还是 App 的问题</b>"。' },
           { t: 'o', s: 'Verify return code: 0 (ok)',
             note: '证书链本身是好的。于是 App 连不上就只能是<b>客户端这一侧</b>的判断——' +
-                  '校验、pinning，或双向认证。<b>诊断方向到这里才被确定。</b>' }
+                  '校验、pinning，或双向认证。<b>诊断方向到这里才被确定。</b>' },
+          { t: 'w', s: '↔ Web 对位：安卓中间人抓包 ≈ Charles/Reqable 抓 HTTPS，SSL Pinning ≈ 证书校验/mTLS',
+            note: '<b>对位</b>:Charles/Burp/mitmproxy 中间人两边完全一致；App 的 SSL Pinning（只信自己的证书）' +
+              '≈ 浏览器/Node 的证书校验、mTLS 双向证书；JustTrustMe ≈ Node --ignore-certificate-errors / 浏览器证书替换；' +
+              'okhttp3.Interceptor hook ≈ XHR/fetch hook；sign/token 算法生成两边完全一样（协议还原核心）。<br>' +
+              '<b>差异</b>:Web 信任锚在系统/浏览器，装根证书即可；Android 7.0+ 默认只信系统证书库、不信用户证书，' +
+              '故需装进系统证书库或 hook 校验。Web 的 sign 跑在 JS 里 DevTools 可见，App 的 sign 可能跑在 native(so)，DevTools 没用。' }
         ]
       },
 
@@ -3090,6 +3121,53 @@ window.CHAPTER = {
       '<p style="margin:8px 0 0" class="small muted">提示：本关判分看的是<b>关键概念</b>，不看措辞。' +
       '说错了不要紧，我会追问到你补全为止。</p>',
     questions: [
+      {
+        id: 'c12qWeb', depth: 2, threshold: 0.7,
+        q: '用你在 Web/JS 逆向里熟悉的概念，解释「安卓 App 抓包」（中间人代理 + SSL Pinning + 证书信任）。' +
+          '请说出至少两个对位物，并讲清它们的关键差异。',
+        concepts: [
+          { label: '对位物：Charles / Burp / mitmproxy 中间人 ≈ 完全一致（和你 PC 上抓 HTTPS 是同一套动作）',
+            hint: '想想你平时怎么在 PC 上抓 HTTPS 流量的',
+            any: ['charles', 'burp', 'mitmproxy', 'reqable', '中间人', 'fiddler', '抓 https', '代理抓包', 'mitm'] },
+          { label: '对位物：SSL Pinning（App 只信自己的证书）≈ 浏览器/Node 证书校验、mTLS 双向证书',
+            hint: 'App "只信自己内嵌的证书"在 JS 世界里对应什么',
+            any: ['pinning', '证书固定', '只信自己的证书', '证书校验', 'mtls', '双向证书', '双向校验', '自签', 'ssl pin'] },
+          { label: '对位物：JustTrustMe 绕过 pinning ≈ Node --ignore-certificate-errors / 浏览器证书替换',
+            hint: '让 App 重新信任你的代理证书，在 Node 里怎么一行搞定',
+            any: ['justtrustme', 'ignore-certificate-errors', '忽略证书', '证书替换', '信任所有证书', '绕过 pinning', '不校验证书'] },
+          { label: '对位物：okhttp3.Interceptor hook ≈ XHR/fetch hook（在请求发出前/收到后改）',
+            hint: '在安卓层"拦住请求改一改"，JS 世界里是哪句',
+            any: ['interceptor', 'okhttp', 'xhr', 'fetch', 'hook 请求', '拦截请求', '请求发出前'] },
+          { label: '差异：Android 7.0+ 默认只信系统证书库、不信用户证书，故需装进系统库或 hook 校验',
+            hint: 'Web 你把根证书装进系统信任库就行；安卓 App 认不认你装的用户证书',
+            any: ['只信系统', '不信用户', '系统证书库', 'android 7', '7.0', '用户证书', '装进系统', 'network_security_config'] },
+          { label: '差异：sign/token 算法两边完全一样（协议还原核心），但 App 的常跑在 native(so)，DevTools 看不到',
+            hint: '你抠出来的那个 sign 函数，在网页里和 App 里是同一种东西吗',
+            any: ['sign', 'token', '完全一样', '协议还原', 'native', 'so', 'devtools 看不到', '算法一样', '同一种'] }
+        ],
+        hints: [
+          '把"手机上开 Charles 抓 App"想成"PC 上开 Charles 抓网页"——中间人那一步是一模一样的。',
+          '区别只在：原生 App 常做 SSL Pinning（只信自己证书），而网页一般信系统信任库。绕过思路两边也一样。'
+        ],
+        probes: [
+          '那我问：App 的 sign 算法和网页的 sign 算法，是不是同一种东西？为什么安卓这边 DevTools 帮不上忙？',
+          '再问：Android 7.0 之后，你装了用户证书为什么 App 还是报证书错误？Web 端有这个门槛吗？'
+        ],
+        model: '<b>参考答案</b>:<br>' +
+          '「安卓 App 抓包」在 JS 世界里就是<b>Charles / Reqable / Fiddler 当中间人看 HTTPS</b>——' +
+          '中间人那套动作（装根证书、代理转发、分别与两端建 TLS）和你 PC 上抓网页<b>完全一致</b>。<br>' +
+          '· <b>对位 1</b>:Charles/Burp/mitmproxy 中间人 ≈ 完全一致（手机上的 Charles 和 PC 上的 Charles 是一个工具）。<br>' +
+          '· <b>对位 2</b>:App 的 <b>SSL Pinning</b>（只信自己内嵌的证书）≈ 浏览器/Node 的证书校验、<code>mTLS</code> 双向证书——都是"它不信系统信任库、只认特定的证书"。<br>' +
+          '· <b>对位 3</b>:<b>JustTrustMe</b>（绕过 pinning）≈ Node <code>--ignore-certificate-errors</code> / 浏览器证书替换——都是"强行让它重新信任你的代理证书"。<br>' +
+          '· <b>对位 4</b>:<code>okhttp3.Interceptor</code> hook ≈ XHR/fetch hook——都是"在请求发出前/收到后拦截并改"。<br>' +
+          '· <b>对位 5</b>:sign / token 算法生成 ≈ 两边<b>完全一样</b>，这是协议还原的核心——你从 App 抠出来的 HMAC/SM3，和网页里算 sign 的是同种东西。<br><br>' +
+          '<b>关键差异（不要说"差不多"）</b>:<br>' +
+          '① <b>信任锚不同</b>:Web 端你把根证书装进系统/浏览器信任库，网页就信了；Android 7.0+ 起 App 默认<b>只信系统证书库、不信用户装的证书</b>，' +
+          '所以光装用户证书不够，得装进系统证书库（或 hook 校验函数）。这是安卓比 Web 多出来的那道门槛。<br>' +
+          '② <b>算法所在层不同</b>:Web 的 sign 跑在 JS 里，DevTools 直接能下断点看；App 的 sign 可能跑在 <b>native（so）</b> 里，' +
+          'DevTools 那套对你完全没用——这正是第 9、17、22、23 章补的"native / 算法还原"那一半。' +
+          '所以"抓包 + 协议还原"在安卓上= Web 的"抓包 + 抠 sign 函数"再加一层 native 逆向。'
+      },
       {
         id: 'c23q1', depth: 1, threshold: 0.7,
         q: '抓包工具为什么能让你看到 HTTPS 的明文？' +

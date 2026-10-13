@@ -24,7 +24,21 @@ window.CHAPTER = {
           '<li><strong>思路 A：撬保险柜</strong>（静态脱壳）——直接破解加密算法。问题是算法可能很强，或者密钥来自服务端。</li>' +
           '<li><strong>思路 B：等它自己打开</strong>（动态脱壳）——不碰保险柜，就蹲在办公室里，等文件摊在桌上的那一刻拍照。<em>这就是本章的全部技术路线。</em></li>' +
           '</ul>' +
-          '<p>而 FART 的贡献在于，它发现光蹲着还不够——有些文件被抽走了几页（抽取壳），你得<strong>主动要求翻阅每一页</strong>，逼对方把缺的页补回来。</p>'
+          '<p>而 FART 的贡献在于，它发现光蹲着还不够——有些文件被抽走了几页（抽取壳），你得<strong>主动要求翻阅每一页</strong>，逼对方把缺的页补回来。</p>' +
+        T.note('cool', '🌐 Web/JS 逆向视角',
+          '<p><span class="pill">JS 视角</span> "把内存里的真代码掏出来" 在 JS 逆向里几乎是<span class="hit">同一件事</span>。' +
+          '你 hook 一个加密函数，逼它跑一遍，回调里拿到的就是它"真正在算"的明文代码——和 FART 逼壳把方法体回填、再 dump code item 的逻辑完全一致。</p>' +
+          '<p><b>对位</b>:<br>' +
+          '· 一代壳（整体加密）≈ obfuscator.io 整段字符串 / 控制流加密 — 代码全是密文，只有运行时才解开<br>' +
+          '· 抽取壳（二代）≈ p.aencode / 函数粒度加密 — 函数签名可见、函数体被抽走<br>' +
+          '· VMP（三代）≈ JSVMP（瑞数） / WASM 整段编译 — 解释器自己的指令系统，没有"原始字节码"可 dump<br>' +
+          '· FART 主动调用所有类 ≈ 用 DevTools profiler 把页面里所有 lazy chunk / require 手动跑一遍<br>' +
+          '· dump 内存中的 dex ≈ 浏览器 export 整个模块 / Source Map 还原<br>' +
+          '· 脱壳后修复 dex ≈ 反混淆后修复依赖关系 / 原型链 — dump 出来的不完整，要补才能用</p>' +
+          '<p><b>关键差异</b>:JS 里函数就在页面里点 "go to definition" 就有；' +
+          '安卓里方法体可能在 so 里、可能在 ART 内存里、可能在没被调用的死分支里,所以必须"主动调用逼它出现"。</p>' +
+          '<p><b>逆向视角</b>:你看到 JS 文件 "部分函数没源码、但函数名都在" 时,就该想到抽取壳;' +
+          '看到加密函数 hook 后还能拿到明文,等价于 FART 主动调用让 code_item 落地。</p>')
       },
       html:
         T.note('key', '🔑 本章的主线',
@@ -79,7 +93,19 @@ window.CHAPTER = {
             '});'
           ) +
           '<p style="margin-bottom:0">切换之后，<code>Java.use</code> 就会用新加载器，业务类立刻可见。' +
-          '<b>这个技巧在第 16、18、24 章会反复用到。</b></p>')
+          '<b>这个技巧在第 16、18、24 章会反复用到。</b></p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> Android 双亲委派 ≈ <b>V8 module resolve / require 链</b>。' +
+          '浏览器里"看不到某个模块导出的函数"也常常不是名字写错,是你问错 realm 了——' +
+          '主世界 (main world) 的代码看不到 isolated world 里注入的内容,反过来也一样;' +
+          'Content Script 也调不到 Page Script 的闭包。常见的修法就是显式切 realm / 用 ' +
+          '<code>window.wrappedJSObject</code> 跨边界、或 DevTools 里 evaluate in target context。</p>' +
+          '<p><b>关键差异</b>:JS 的 realm 隔离是语言层 (Realm API) + 浏览器扩展架构决定的;' +
+          'Android 的 ClassLoader 隔离是<b>运行时容器</b>决定的。位置不同 (语言 vs 运行时),' +
+          '但"换个加载器 / realm 就能看见" 的修法逻辑一模一样。</p>' +
+          '<p><b>逆向视角</b>:遇到 "X is not defined" / "Cannot read property of undefined" 时,' +
+          '先怀疑作用域/realm,而不是先怀疑拼写——和加固 App 上 <code>Java.use</code> 报 ' +
+          '<code>ClassNotFoundException</code> 是同一种直觉。</p>')
     },
 
     /* ============================================================ 16.3 动画 */
@@ -161,7 +187,18 @@ window.CHAPTER = {
               ['方法体不全，只有部分方法有内容', '抽取壳 + 只跑了部分功能', '<b>把 App 所有功能点一遍再脱</b>']
             ]) +
           '<p style="margin-bottom:0">最后一行是一个很实用的实战技巧：<b>抽取壳只回填"被调用过"的方法</b>。' +
-          '所以脱壳前把 App 的每个界面、每个按钮都点一遍，能显著提高脱壳完整度。</p>')
+          '所以脱壳前把 App 的每个界面、每个按钮都点一遍，能显著提高脱壳完整度。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一代壳 ≈ obfuscator.io <b>整段加密</b>,抽取壳 ≈ <b>函数粒度加密</b> (p.aencode / sojson.v5) ' +
+          '/ 部分代码被抽走,只留函数名。' +
+          '<b>关键差异</b>:JS 函数粒度加密后,你在 DevTools 里点进函数体能直接看到混淆后的代码——' +
+          '因为它本来就在那里,只是看不懂;' +
+          '安卓抽取壳是 <b>code_item 直接置空</b>,你点进去是 <code>return;</code> 都没有,' +
+          '必须主动调用逼壳把真指令回填进内存,才能 dump 到。</p>' +
+          '<p><b>逆向视角</b>:看到"函数名都在,函数体是空/一行 return"——立刻想到抽取壳;' +
+          '看到"函数体是密文/控制流打乱"——想到一代壳的等价物 (整段混淆)。' +
+          '应对策略也对应:抽取壳要主动触发每个方法 (遍历 export 列表挨个调一次),' +
+          '一代壳要等一个 hook 点把密文吐出来。</p>')
     },
 
     /* ============================================================ 16.4L 动手实验 */
@@ -748,6 +785,7 @@ window.CHAPTER = {
 
   /* ============================================================== 名词表 */
   glossary: [
+    { t: '↔ Web 对位 · FART 主动调用 = 触发懒加载函数后导出 module', d: '两边都是「逼加密函数自己跑一遍，把解密后的真身拿出来」。差异：dump 出来的 dex 文件头校验和还是旧的（jadx 打开报 checksum 错误，必须修复后才能用），而前端导出的已加载 module 通常能直接跑；另外安卓要把 dex 重新汇编成 smali 才可读，前端导出的往往就是可读 JS。' },
     { t: 'ClassLoader', d: '类加载器。把 dex 里的类定义加载成运行时可用的 Class 对象。加固壳用自定义 ClassLoader 加载真 dex，导致默认加载器看不到业务类。' },
     { t: '双亲委派', d: 'ClassLoader 收到加载请求时先委托父加载器，父加载器加载不了才自己加载。保证核心类库唯一性。' },
     { t: 'PathClassLoader', d: 'Android App 的<b>默认</b>类加载器，加载已安装 APK 的 dex。' },
@@ -771,6 +809,29 @@ window.CHAPTER = {
            '为什么拿到的是空方法？看到某个现象你能推出什么？</b><br>' +
            '下面每道题都要用自己的话说全关键点。含糊我会追问，追问三次我直接给答案——但那不算你过关。</p>',
     questions: [
+      {
+        id: 'c16qWeb', depth: 2, threshold: 0.7,
+        q: 'FART 脱壳的本质是「逼加密函数自己跑一遍，把解密后的代码 dump 出来」。说出这个思路在 Web 逆向里的对位物，并说出一条关键差异。',
+        concepts: [
+          { label: '主动调用 dump ≈ 导出已加载 module', hint: '运行时把真身拿出来。', any: ['module', '导出', 'console.log', 'dump', '导出模块'] },
+          { label: '抽取壳 ≈ 懒加载/按需解密', hint: '原代码部分被抽走。', any: ['懒加载', '解密', '运行时', '抽取', '填充', '按需'] },
+          { label: '修复 dump ≈ 修复依赖/原型链', hint: 'dump 出来的不完整。', any: ['依赖', '原型链', '修复', '补全', 'checksum'] },
+          { label: '脱壳时机', hint: '什么时候动手最好？', any: ['加载时', 'ClassLoader', 'DexFile', '内存', '时机'] }
+        ],
+        hints: [
+          '先抓共同点：代码要执行就必须在内存里完整存在——抓住这一刻 dump，两边都一样。',
+          '再想「逼它自己跑」：FART 主动调用方法，前端是触发懒加载函数让它自己解密。'
+        ],
+        probes: [
+          '追问：为什么 dump 出来的 dex 用 jadx 打开会报 checksum 错误？前端导出的 module 会遇到什么类似问题？',
+          '再追问：安卓要在 ClassLinker/DexFile::Open 那一刻截，前端对应的「那一刻」是什么？'
+        ],
+        model: '<b>参考答案</b>：<br><b>对位</b>：FART 主动调用脱壳 dump ≈ <b>hook 后把整个已加载 module 导出</b>；' +
+          '抽取壳（方法体被抽走、用到才回填）≈ 前端<b>懒加载/按需解密</b>的函数；脱壳点（ClassLinker / DexFile::Open 加载字节码那一瞬）≈ <b>V8 的 module resolve 阶段</b>。<br>' +
+          '<b>关键差异</b>：① <b>安卓 dump 出来的东西是「坏的」</b>——从内存/vdex 抢救出来的 dex，文件头校验和还是旧的，jadx 会报 checksum 错误，必须修复后才能用；' +
+          '前端导出的 module 通常能直接跑，最多是依赖/原型链要补。② <b>安卓要「重新汇编」才能还原可读代码</b>（dex→smali），前端导出的往往就是可读 JS。<br>' +
+          '<b>共同本质</b>：代码要执行，就必须在内存里完整存在一次——两边抓的都是这一刻。'
+      },
       {
         id: 'c2q1', depth: 1, threshold: 0.7,
         q: '请解释：为什么在加固 App 上直接用 <code>Java.use</code> 会报 <code>ClassNotFoundException</code>？' +
