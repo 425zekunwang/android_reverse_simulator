@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第 19.3 节 · 控制流平坦化(低认知负荷版)</title>
+<style>
+  /* 一切动效 = 0。单纯靠位置 + 颜色区分,降低 ADHD/记忆负荷 */
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+
+  /* 颜色高对比、低饱和度;文字 16-19px 不再小 */
+  :root {
+    --bg:     #fafaf7;
+    --ink:    #1a1a1a;
+    --soft:   #5a5a5a;
+    --box:    #ffffff;
+    --line:   #d8d8d8;
+    --warm:   #fff3d6;   /* 类比盒背景 */
+    --warm2:  #ffe5b3;   /* 类比盒强调 */
+    --cool:   #e8f1ff;   /* 代码盒背景 */
+    --good:   #d8f0d4;   /* 步骤推进 */
+    --bad:    #ffe0db;   /* 警告/陷阱 */
+    --anchor: #c2dfff;   /* 当前正讲到的地方 */
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    margin: 0;
+    padding: 0;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    font-size: 18px;
+    line-height: 1.85;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 20px 96px; }
+
+  /* 大标题单一,不再分多级 */
+  h1 { font-size: 30px; margin: 0 0 4px; line-height: 1.3; }
+  .crumbs { color: var(--soft); font-size: 14px; margin-bottom: 28px; }
+  .crumbs b { color: var(--ink); }
+
+  h2 { font-size: 22px; margin: 56px 0 14px; padding-top: 18px; border-top: 2px solid var(--line); }
+  h2 .num { display: inline-block; min-width: 28px; color: var(--soft); }
+
+  /* 类比盒 = 暖色调,告诉大脑"这是轻松的生活类比,不要紧张" */
+  .analogy {
+    background: var(--warm);
+    border-left: 6px solid var(--warm2);
+    padding: 16px 20px;
+    margin: 18px 0 22px;
+    border-radius: 4px;
+  }
+  .analogy h3 {
+    margin: 0 0 8px;
+    font-size: 17px;
+    color: #6a4a00;
+  }
+  .analogy p { margin: 8px 0; }
+  .analogy .tag {
+    display: inline-block;
+    background: var(--warm2);
+    color: #5a3a00;
+    padding: 2px 10px;
+    border-radius: 10px;
+    font-size: 13px;
+    margin-right: 6px;
+  }
+
+  /* "现在讲到哪了"路标 — 类比 Apple 地图的当前位置 */
+  .you-are-here {
+    background: var(--anchor);
+    color: #06264a;
+    padding: 10px 16px;
+    border-radius: 4px;
+    margin: 32px 0 12px;
+    font-weight: 600;
+  }
+  .you-are-here::before { content: "📍 "; }
+
+  /* 关键事实盒 = 冷色调,这是"技术事实" */
+  .fact {
+    background: var(--cool);
+    border-left: 6px solid #95b8e8;
+    padding: 14px 18px;
+    margin: 18px 0;
+    border-radius: 4px;
+    font-size: 17px;
+  }
+  .fact b { color: #0c3b7a; }
+
+  /* 警告盒 */
+  .warn {
+    background: var(--bad);
+    border-left: 6px solid #d8867d;
+    padding: 14px 18px;
+    margin: 18px 0;
+    border-radius: 4px;
+  }
+  .warn::before { content: "⚠️ "; font-weight: 700; }
+
+  /* 代码块 — 等宽字体,白底黑字,极简框 */
+  pre {
+    background: var(--box);
+    border: 1px solid var(--line);
+    padding: 14px 16px;
+    border-radius: 4px;
+    font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+    font-size: 14px;
+    line-height: 1.65;
+    white-space: pre;
+    overflow-x: auto;
+    margin: 14px 0;
+  }
+  code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; background: #f1f1ed; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  /* ASCII 艺术盒:在白底框里展示字符画流程图 */
+  .ascii-art {
+    background: var(--box);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 18px;
+    margin: 16px 0;
+    overflow-x: auto;
+  }
+  .ascii-art pre {
+    background: none;
+    border: none;
+    margin: 0;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: #2a2a2a;
+  }
+
+  /* 步骤卡片:每个步骤一张小卡片,避免视觉堆叠 */
+  .step-card {
+    background: var(--box);
+    border: 2px solid var(--good);
+    border-radius: 6px;
+    padding: 14px 18px;
+    margin: 14px 0;
+  }
+  .step-card .num {
+    display: inline-block;
+    background: var(--good);
+    color: #1a4a0c;
+    padding: 2px 12px;
+    border-radius: 12px;
+    font-weight: 700;
+    margin-right: 10px;
+  }
+  .step-card h4 { margin: 0; display: inline-block; font-size: 17px; }
+
+  /* "记住一句话"卡片:每节结尾一句固定锚句,便于日后回忆 */
+  .one-liner {
+    background: #f5f0e0;
+    border-top: 3px solid #6a4a00;
+    border-bottom: 3px solid #6a4a00;
+    padding: 14px 20px;
+    margin: 22px 0;
+    text-align: center;
+    font-size: 19px;
+    font-weight: 600;
+    color: #3a2a00;
+  }
+
+  /* 顶部大进度条:告诉读者走到哪里了 */
+  .progress {
+    display: flex;
+    gap: 6px;
+    margin: 24px 0 36px;
+  }
+  .progress span {
+    flex: 1;
+    height: 10px;
+    background: #e6e6e0;
+    border-radius: 5px;
+  }
+  .progress span.on { background: #5a8c3a; }
+  .progress span.now { background: var(--anchor); }
+
+  /* 一个温和的"再来一次"按钮,不分页、不用进度条制造焦虑 */
+  .controls {
+    display: flex; justify-content: space-between;
+    margin-top: 40px; padding-top: 20px;
+    border-top: 1px solid var(--line);
+    font-size: 15px;
+  }
+  .controls a {
+    display: inline-block;
+    padding: 10px 18px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    color: var(--ink);
+    text-decoration: none;
+    background: var(--box);
+  }
+  .controls a:hover { background: #f0f0eb; }
+
+  /* 颜色词汇表:把所有色块对应到术语,避免"图里那一团黄是啥?" */
+  .color-key {
+    margin: 18px 0;
+    font-size: 14px;
+    color: var(--soft);
+  }
+  .color-key span { display: inline-block; margin-right: 14px; }
+  .color-key i {
+    display: inline-block; width: 14px; height: 14px;
+    vertical-align: -3px; margin-right: 4px;
+    border: 1px solid #00000022;
+  }
+</style>
+</head>
+<body>
+<main>
+  <p class="crumbs">第 19 章 · 彻底搞懂 OLLVM &nbsp;›&nbsp; <b>19.3 节 控制流平坦化(降级讲义)</b></p>
+  <h1>控制流平坦化,一节学不会就分两次</h1>
+
+  <div class="color-key" aria-label="色块含义速查">
+    <span><i style="background:var(--warm2)"></i>生活类比 / 放松阅读</span>
+    <span><i style="background:var(--cool)"></i>技术事实(要记)</span>
+    <span><i style="background:var(--good)"></i>操作步骤(按顺序做)</span>
+    <span><i style="background:var(--bad)"></i>坑 / 不要这样想</span>
+  </div>
+
+  <div class="progress" aria-label="进度 1/8">
+    <span class="on"></span><span class="on"></span><span class="on"></span><span class="on"></span>
+    <span class="on"></span><span class="on"></span><span class="on"></span><span class="now"></span>
+  </div>
+
+  <p style="font-size:16px;color:var(--soft);">
+    这份讲义只讲 <b>OLLVM 控制流平坦化</b>这一件事,什么都不引入。如果读到一半脑子开始糊,
+    就关掉去喝水,第二天从"进度条"上你看过的最后一块接着看。<br>
+    <b>不需要一次看懂。</b>看懂 60% 就已经足够你接下来去用其他工具。
+  </p>
+
+  <!-- ============= 块 1:你需要先知道的事 ============= -->
+  <div class="you-are-here">块 1 / 8 · 一件必须先知道的事</div>
+  <h2><span class="num">①</span>它没动你的代码,它动的是图纸</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>装修队里混进一个恶作剧设计师</h3>
+    <p>编译 C/C++ 成安卓能跑的程序,过程像"装修一栋房子":</p>
+    <p>
+      · <b>量房出图纸的师傅</b>(叫做"前端")—— 把源码变成一张图纸<br>
+      · <b>设计师</b>(叫做"中端")—— 在图纸上反复改,优化、改动<br>
+      · <b>施工的工人</b>(叫做"后端")—— 按图纸造出真实机器码
+    </p>
+    <p>OLLVM 就是混进<b>设计师</b>群里的一个恶作剧——他<b>不换材料、不改房间数</b>,
+      就是把图纸上的<b>走廊全画成迷宫</b>。</p>
+    <p>完工后房子住起来一模一样(程序跑起来行为不变),但拿到图纸的工人看得一脸懵——
+      这就是为什么你拿 IDA 反编译会看到一坨像迷宫一样的 switch。</p>
+  </div>
+
+  <div class="fact">
+    <b>一句话建立坐标:</b> OLLVM 在"图纸"那一层动手,不动你的源码,<b>也不在最终机器码层动手</b>。
+    你看到的迷宫,在图纸阶段就被定型了。
+  </div>
+
+  <!-- ============= 块 2:老实的代码长什么样 ============= -->
+  <div class="you-are-here">块 2 / 8 · 老实的代码长什么样</div>
+  <h2><span class="num">②</span>先看一份"老老实实"的代码</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>一间房子的正常户型图</h3>
+    <p>下面是<b>混淆前</b>的代码(伪代码,不必会写):</p>
+  </div>
+
+<pre><code>int 老老实实(int x) {
+    int r = 0;
+    if (x &amp; 1) {           // ← 如果 x 是奇数
+        r = x * 3;
+    } else {              // ← 否则
+        r = x / 2;
+    }
+    return r;
+}</code></pre>
+
+  <p>这段代码的<b>流程图</b>(阅读顺序)是:</p>
+
+  <div class="ascii-art"><pre>开始
+  │
+  ▼
+判断 x&amp;1(奇/偶)
+  │
+  ├── 真 ──▶ 算 x*3 ──┐
+  │                    │
+  └── 假 ──▶ 算 x/2 ──┤
+                       │
+                       ▼
+                      返回 r</pre></div>
+
+  <p>人眼一秒钟就能看出来:<b>进去、判断、走两条路中的一条、出门</b>。这就是"好理解的代码"。</p>
+
+  <div class="fact">
+    <b>技术词(混个脸熟就行):</b><br>
+    · 这张图就叫 <b>CFG</b>(控制流图);<br>
+    · 每一个方框就叫一个 <b>基本块</b>。<br>
+    后面我们反复用这两个词。
+  </div>
+
+  <!-- ============= 块 3:OLLVM 的脑回路 ============= -->
+  <div class="you-are-here">块 3 / 8 · OLLVM 想搞成什么样</div>
+  <h2><span class="num">③</span>OLLVM 的目标:让流程图变怪</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>把户型图重画,但房间数量不变</h3>
+    <p>OLLVM 想把刚才那种"清晰的两条路",改造成<b>一个怪物</b>:</p>
+  </div>
+
+  <p><b>改造前</b>(图 ②):一条主干 + 一个分叉 → 两条小岔路。</p>
+  <p><b>改造后</b>:</p>
+
+  <div class="ascii-art"><pre>       ┌─────────────────────┐
+       ▼                     │
+    [ 分诊机器 ] ◀──────────┐ │
+       │                   │ │
+       ▼                   │ │
+     算 x*3  ─────────┐     │ │
+                      │     │ │
+                      ▼     │ │
+                写"下一步" ─┘ │
+                      │       │
+                      └──────┘</pre></div>
+
+  <p>变成了一团:中间有个<b>分诊机器</b>在不停转,每块工作做完了都"回去"报告下一站。</p>
+
+  <div class="warn">
+    看上去很乱对吧?<b>但房间数没变</b>。还是刚才那几个工作:
+    "判断 x 奇偶"、"算 x*3"、"算 x/2"、"返回"。
+    OLLVM 没给你加任何新功能,只是把<b>它们怎么互相跳转</b>这件事搞得面目全非。
+  </div>
+
+  <div class="one-liner">记住一句话:OLLVM 控制流平坦化 = 用一台"分诊机器 + 一个计数器",把"分叉走路"换成"绕圈查表"。</div>
+
+  <!-- ============= 块 4:步骤①:拍照存底 ============= -->
+  <div class="you-are-here">块 4 / 8 · 操作第一步 · 给房间拍个照</div>
+  <h2><span class="num">④</span>第一步:先把所有基本块收进来</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>装修队进场,先拍照存底</h3>
+    <p>改造之前,工人先要把<b>当前所有基本块</b>记下来,顺序照原本摆的样子来。
+      后面的步骤都要查这张表,所以这步不做,后面全乱套。</p>
+  </div>
+
+<pre><code>for (BasicBlock &amp;BB : 函数F) {
+    origBB.push_back(&amp;BB);  // 全收进来
+}</code></pre>
+
+  <div class="step-card">
+    <span class="num">①</span><h4>做完以后是啥样?</h4>
+    <p>列表 <code>origBB</code> 里躺着你函数<b>所有</b>基本块,<b>顺序就是原本的顺序</b>。
+       这就是接下来一切动作的"底盘"。</p>
+  </div>
+
+  <div class="fact">
+    <b>这步是只读</b>,没动图纸,只是在内存里做了个备份。
+    后面 5 步才是真改。
+  </div>
+
+  <!-- ============= 块 5:步骤②③:分诊机器 + 计数器 ============= -->
+  <div class="you-are-here">块 5 / 8 · 操作二&三 · 搭出"分诊台"和"叫号屏"</div>
+  <h2><span class="num">⑤</span>第二步 + 第三步:分诊机器 + 计数器</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>医院入口设一台分诊台,挂一个叫号屏</h3>
+    <p>现在动工。我们要在函数最前面<b>塞一块新的基本块</b>,叫它 <b>分诊台</b>;<br>
+       然后在它里面,准备一张<b>叫号屏</b>(其实就是个小计数器),叫它 <code>switchVar</code>。</p>
+  </div>
+
+  <div class="step-card">
+    <span class="num">②</span><h4>塞一个叫"disp"的新基本块,放到函数入口的<b>前面</b></h4>
+<pre><code>BasicBlock *disp = BasicBlock::Create(
+    F.getContext(), "disp", &amp;F, &amp;F.getEntryBlock());
+//                           ^^^^^^^^ 最后这个参数是"插在谁之前"
+//                           插到了入口块前面 → 它成了全函数的"总枢纽"</code></pre>
+  </div>
+
+  <div class="step-card">
+    <span class="num">③</span><h4>放一个小计数器,叫 <code>switchVar</code>(初始值还没设)</h4>
+<pre><code>IRBuilder&lt;&gt; B(&amp;F.getEntryBlock());
+Value *switchVar = B.CreateAlloca(Int32Ty);
+// 它只是个普通的栈上变量,功能上却是"全函数的唯一真相":
+//   下一步去哪儿,全看它当前值。</code></pre>
+  </div>
+
+  <div class="warn">
+    <b>不要被"switchVar"三个字吓到。</b>它就是个普通的整数变量,
+    初值不重要,后面那条 switch 指令会让它有意义的。
+  </div>
+
+  <div class="fact">
+    <b>对应到 IDA 里你看到啥?</b><br>
+    · <code>disp</code> 这个块 → IDA 那个<b>巨大的 switch</b> 语句;<br>
+    · <code>switchVar</code> → IDA 那个<b>switch 括号里的变量</b>。<br>
+    反混淆的核心,就是要<b>追这一个变量的值变化</b>。
+  </div>
+
+  <!-- ============= 块 6:步骤④⑤:建 switch + 配编号 ============= -->
+  <div class="you-are-here">块 6 / 8 · 操作四&五 · 装好叫号台,给每个房间发号码牌</div>
+  <h2><span class="num">⑥</span>第四步 + 第五步:建 switch,每个基本块办张号码牌</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>挂号时给每个人发一张小牌子</h3>
+    <p>分诊台有了,接下来:</p>
+    <p>
+      · 在分诊台里装一台 <b>"看号码叫人"的机器</b>(C++ 这边叫 <code>switch</code> 指令);<br>
+      · 给刚才备份的每个基本块,按拍照存底时的顺序,办一张<b>号码牌</b>。
+    </p>
+    <p>办完以后,原来的"判断→走两条路"就消失了,变成了一张"号码 → 工作"的对应表。</p>
+  </div>
+
+  <div class="step-card">
+    <span class="num">④</span><h4>在 disp 里装"看号码叫人"的 switch 指令</h4>
+<pre><code>SwitchInst *sw = SwitchInst::Create(
+    switchVar, disp, 0, disp);
+//              ^^^^ ^^^^^^^ 默认目标也指向 disp
+//              ↓
+//            在 case 填好之前,这是个"空转死循环"</code></pre>
+</div>
+
+  <div class="step-card">
+    <span class="num">⑤</span><h4>给每个备份里的基本块发号码牌</h4>
+<pre><code>for (unsigned i = 0; i &lt; origBB.size(); i++) {
+    sw-&gt;addCase(ConstantInt::get(Int32Ty, i), origBB[i]);
+}
+// 即:块 0 = case 0、块 1 = case 1……</code></pre>
+  </div>
+
+  <div class="warn">
+    <b>这一步做完,"原来的 if/while 关系就死了。</b>
+    只剩"号码 → 块"的对应表。所有"接下来去哪儿"的信息,
+    都被 OLLVM 从<b>跳转指令</b>里抠出来,挪到了<b>计数器变量</b>里。
+    这是 IDA 看到一坨 switch 的根本原因。
+  </div>
+
+  <!-- ============= 块 7:步骤⑥:走廊中点塞刷卡器 ============= -->
+  <div class="you-are-here">块 7 / 8 · 操作六 · 在走廊中间塞一台状态写入器</div>
+  <h2><span class="num">⑦</span>第六步(最关键的一刀):每条走廊中间塞个序言块</h2>
+
+  <div class="analogy">
+    <h3><span class="tag">类比</span>每条走廊中点装一台刷卡器,刷完告诉你下一步去哪</h3>
+    <p>现在房子布局是这样:大家都得绕回 <b>分诊台</b>,分诊台才能告诉你下一站。
+      但屋里原来那些"走廊"还是老样子——每条走廊的尾巴,还连着原本的房间。</p>
+    <p>OLLVM 的最后一步:<b>把每条走廊拦腰切断</b>,塞一台"小机器",只做两件事:</p>
+  </div>
+
+  <div class="step-card">
+    <span class="num">⑥</span><h4>把每条原始边切成两段,中间塞"序言块"</h4>
+<pre><code>for (每条原始边 from → to) {
+    BasicBlock *pro = SplitEdge(from, to);
+    new StoreInst(nextState, switchVar, pro);
+    //                       ↑ 把"下一站"写进计数器
+    //                                    ↑ 这个序言块最终跳回 disp
+}</code></pre>
+  </div>
+
+  <p>塞好之后,格局变成下面这样:</p>
+
+  <div class="ascii-art"><pre>     ┌───────────┐
+     │   disp    │ &lt;── 全函数唯一公共枢纽
+     │  switch   │
+     └─────┬─────┘
+           │
+     ┌─────┼─────┐─────┐─────┐
+     ▼     ▼     ▼     ▼     ▼
+   case0 case1 case2 case3 case4  ← 原本那些基本块(顺序与拍照时一致)
+     │     │     │     │     │
+     ▼     ▼     ▼     ▼     ▼
+  [序言块][序言块][序言块][序言块][序言块]  ← 新插入的小机器
+     │     │     │     │     │
+     └─────┴─────┴─────┴─────┘
+                  │
+                  ▼
+              写"下一状态" → 跳回 disp</pre></div>
+
+  <div class="one-liner">记住:每个序言块 = 写一次 switchVar + 跳回 disp。这就是 IDA 反编译出的 switch{} case{} break; 结构的来源。</div>
+
+  <!-- ============= 块 8:跑一遍 ============= -->
+  <div class="you-are-here">块 8 / 8 · 跑一遍看看 · 给大脑最后一个画面</div>
+  <h2><span class="num">⑧</span>我们跟着计数器走一遭,看它怎么用</h2>
+
+  <p>假设 <code>x = 5</code>(奇数),我们想看 <code>x*3 = 15</code> 这条路径会发生什么。</p>
+
+  <div class="ascii-art"><pre>① 进入 disp
+   switchVar 还是 0
+   ↓
+② switch(0) → 跳到 case 0(就当它是初始化块)开始
+   ↓
+③ case 0 做完,走到它末尾的"序言块"
+   序言块:switchVar = 1 → 跳回 disp
+   ↓
+④ 回到 disp
+   switch(1) → 跳到 case 1(假设 case 1 是"判断奇偶"块)
+   ↓
+⑤ case 1 判断 x&1 = 1(奇数),走到末尾的"序言块"
+   序言块:switchVar = 2(因为奇数要算 x*3)→ 跳回 disp
+   ↓
+⑥ 回到 disp
+   switch(2) → 跳到 case 2("算 x*3"块)
+   ↓
+⑦ case 2 把结果 r = 15 算出来,走到末尾"序言块"
+   序言块:switchVar = 4(代表"返回"块)→ 跳回 disp
+   ↓
+⑧ 回到 disp
+   switch(4) → 跳到 case 4("返回"块),函数结束</pre></div>
+
+  <p>看到了吗?<b>程序实际做的事情没变</b>,但它<b>不再"顺序往下走"</b>,
+     而是"每做一步就回到分诊台请它再叫我下一站"。</p>
+
+  <div class="fact">
+    <b>反混淆的关键就是追 <code>switchVar</code>。</b><br>
+    · 在 IDA 里,这个变量是 switch 圆括号里的那个名字;<br>
+    · 它每变一次值,就说明程序"准备去下一个 case";<br>
+    · 把每次"变到什么值"连起来,你就拿到了<b>真实的执行路径</b>。<br>
+    这就是为什么反混淆的核心做法是"动态 Trace",而不是"静态读 switch"。
+  </div>
+
+  <div class="one-liner">OLLVM 控制流平坦化做的全部事,就两件:① 设一台分诊台 ② 在每条走廊中点装一台"刷写下一站"的小机器。其余一切都是这两件事的自然结果。</div>
+
+  <div class="controls">
+    <a href="ch19-ollvm.html">← 返回第 19 章完整版</a>
+  </div>
+
+  <p style="margin-top:60px;color:var(--soft);font-size:14px;text-align:center;">
+    这份讲义的 8 块,对应原始第 19.3 节"控制流平坦化"。<br>
+    读完这份,请回到 <a href="ch19-ollvm.html">第 19 章</a>看完整版的动画推演 —— 那部分对加深印象极有帮助。
+  </p>
+</main>
+</body>
+</html>
