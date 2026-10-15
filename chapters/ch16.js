@@ -797,7 +797,8 @@ window.CHAPTER = {
     { t: '主动调用', d: 'Active Call。FART 的核心：遍历所有类与所有方法逐个强制调用，触发抽取壳回填，再 dump code item。' },
     { t: 'FART', d: 'ART 环境下基于主动调用的自动化脱壳方案。基于 Android 6.0，可移植到其他 ART 版本。产物在 /sdcard/fart/&lt;包名&gt;/。' },
     { t: 'checksum / signature', d: 'dex 文件头的两种校验值（Adler-32 / SHA-1）。内存 dump 后必然失配，需要修复或放宽校验。' },
-    { t: 'fart run over', d: 'FART 完成脱壳时在 logcat 中打印的标志（tag 为 ActivityThread），看到它表示主动调用流程结束。' }
+    { t: 'fart run over', d: 'FART 完成脱壳时在 logcat 中打印的标志（tag 为 ActivityThread），看到它表示主动调用流程结束。' },
+    { t: '↔ Web 对位 · 自定义 ClassLoader 隐藏真 dex ≈ 前端 webpack runtime 隐藏真 chunk', d: '两边都是「把真正要执行的代码挪到运行时再加载」，壳/loader 是这个机制的载体。差异：安卓 ClassLoader 必须能加载字节码（dex），而前端 webpack runtime 要解决的是 chunk 路径 + 缓存失效问题；前者比后者多一个 dex 校验修复层（前者 dump 完还得修 checksum/signature），后者通常导出的 JS 直接可读。' }
   ],
 
   /* ============================================================== 严师 */

@@ -1014,6 +1014,19 @@ window.CHAPTER = {
       h: '29.12',
       title: '把这一章收束成一句话',
       html:
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>云真机 / 云手机跑目标 App ≈ Puppeteer / Playwright 在 headless 云端浏览器跑目标站点</b>——两边都是"在云端拿一个干净、可重置的环境执行代码、抓结果回本地"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· 云真机的 "远程 root 后的干净环境" ≈ Browserless / BrowserStack 的"每次新建的隔离 context"<br>' +
+        '· 批量跑多个云真机测不同加固版本 ≈ Puppeteer Cluster 并行跑多个页面的同一个 URL<br>' +
+        '· 截屏回传到本地分析 ≈ DevTools 的 screencast 协议<br>' +
+        '· 远程 ADB 操控云真机 ≈ Chrome DevTools Protocol 远程控制浏览器</p>' +
+        '<p><b>关键差异</b>:云真机跑的是<b>真 ARM 指令 + 真 ART 虚拟机</b>，所有 native 加密、OLLVM、VMP 都在真实环境下跑；' +
+        '云浏览器跑的是<b>JS / WASM + 沙箱化</b>，即使目标站点用了 WASM 加密，浏览器内的沙箱也能保护它不被逆向。' +
+        '另外云真机的"按分钟计费"成本远高于云浏览器（云真机 0.5-2 元/分钟 vs Browserless 0.1 元/次），所以云真机只在"必须用真机行为"（签名、native 加固、检测对抗）时才用，' +
+        '云浏览器跑大量"普通站点 JS 分析"划算得多。<b>两者选择标准看"任务是否必须用真 ARM 环境"</b>。</p>') +
+        
+        // WS-CLOUD-MACHINE-MARKER-M5N1 (cool)
         T.note('key', '🔑 本章主线回顾',
           '<p><b>云手机 = 跑在服务器上的安卓虚拟机。</b>所以它同时受两套规律的支配：<b>虚拟化的规律</b>（分层、陷入-模拟、Stage-2、virtio、NAT）决定了它<b>会留下什么痕迹</b>；<b>安卓的规律</b>（传感器、电池、GPU、基带、设备标识）决定了它<b>该有什么却常常没有</b>。</p>' +
           '<p>于是，<b>云手机检测 = 在应用层提问，看下层的答案像不像真机</b>；<b>云手机伪装 = 在下层动手，让应用层拿到的答案符合真机的统计规律</b>。<b>两件事是同一枚硬币的两面，理解了任何一面，另一面都能推出来。</b></p>') +
@@ -1046,7 +1059,10 @@ window.CHAPTER = {
        { t: 'initramfs', d: '内存中展开的临时根文件系统，含挂载真实根文件系统所需的驱动。内核先挂载它，加载驱动后 switch_root 切换。Android 的 boot.img 里的 ramdisk 即其精简版。' },
        { t: 'SLIRP', d: 'QEMU 内置的用户态 TCP/IP 协议栈实现，在 QEMU 进程内完成 NAT 转换，使 NAT 模式无需 root 权限即可工作。' },
        { t: 'hostfwd', d: 'QEMU user-mode networking 的端口转发参数，把宿主机端口静态映射到 Guest 端口。是 NAT 模式下外部访问 Guest 的唯一通路，也是 adb 连接云手机的底层机制。' },
-       { t: 'virtio', d: '一组半虚拟化 I/O 驱动规范，Guest 通过共享内存环形队列与 Hypervisor 通信而非模拟真实硬件寄存器。性能好，但出现在 Guest 中即是明确的虚拟化痕迹。' }
+       { t: 'virtio', d: '一组半虚拟化 I/O 驱动规范，Guest 通过共享内存环形队列与 Hypervisor 通信而非模拟真实硬件寄存器。性能好，但出现在 Guest 中即是明确的虚拟化痕迹。' },
+    { t: '↔ Web 对位 · 云真机 = Puppeteer Cluster / BrowserStack 的真机版本', d: '都是"云端拿干净可重置环境跑代码抓结果回本地"。差异:云真机跑真 ARM + 真 ART（native 加密 / OLLVM / VMP 必须在这种环境跑），云浏览器只跑 JS / WASM + 沙箱；按分钟计费成本：云真机 0.5-2 元/分钟 vs 云浏览器 0.1 元/次；选谁看"任务是否必须用真 ARM 环境"。云真机还可控性更高（可 root、可装 Frida、Xposed），云浏览器常受到站点反爬的 fingerprint 限制。' },
+
+    // WS-CLOUD-MACHINE-MARKER-M5N1 (glossary)
      ],
      teacher: { id:'ch15', chapter:15, name:'追问老师 · 第 29 章', sub:'把"云手机在哪一层"追问到底', intro:'<p style="margin:0">本章概念密度高、但每一个都能推导。我会从分层模型开始，一层层往下压，直到你说清"为什么 App 问不出自己在不在虚拟机里"。<b>答不出概念不要紧，答不出因果我会继续追。</b></p>', questions: [
        {

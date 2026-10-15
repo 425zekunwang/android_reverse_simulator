@@ -1323,7 +1323,8 @@ window.CHAPTER = {
     { t: '分发器 (Dispatcher)', d: '平坦化后全函数唯一的跳转枢纽基本块，内部包含根据状态变量做多路选择的 switch。所有 case 执行完毕都回到它。是识别 -fla 的首要结构特征。' },
     { t: '状态变量 (switchVar)', d: '平坦化引入的栈上局部变量，其取值决定分发器下一步跳转到哪个 case。真实执行路径被完整编码为它的一串取值，因此是反混淆（Trace 或静态追踪）的核心目标。' },
     { t: '不透明谓词 (Opaque Predicate)', d: '结果恒定（恒真或恒假）但静态难以化简的表达式，是 -bcf 的核心构造。经典例子：x*(x+1) % 2 == 0（连续整数乘积必为偶数）。破解不靠证明它，而靠动态执行观察实际走哪条路。' },
-    { t: '函数注解 (Functions annotations)', d: 'OLLVM 官方特性之一，用于指定哪些函数参与混淆，未标注的函数原样保留。因此同一个 so 里可能只有一部分函数被混淆 —— 这也是定位关键函数的突破口。' }
+    { t: '函数注解 (Functions annotations)', d: 'OLLVM 官方特性之一，用于指定哪些函数参与混淆，未标注的函数原样保留。因此同一个 so 里可能只有一部分函数被混淆 —— 这也是定位关键函数的突破口。' },
+    { t: '↔ Web 对位 · OLLVM IR 级混淆 vs 前端 vmp 字节码级混淆', d: 'OLLVM 改的是 LLVM IR（中间表示层），所以无论原代码是 C/C++/Swift/ObjC 都能拦；前端 vmp（如 jsjiami / obfuscator.io vmp 模式）改的是 JS 字节码层。两者都让静态分析看到「无意义序列」，但 OLLVM 的反混淆要在 IR/汇编层做（用 emu / sym-emu / 手写 deflat 插件），前端要在 JS AST + 字节码层做（用 AST 折叠、opcode trace）。' }
   ],
 
   teacher: {

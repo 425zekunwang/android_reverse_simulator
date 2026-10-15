@@ -648,6 +648,16 @@ window.CHAPTER = {
           '<p>Android 系统本身就把 eBPF 用于<b>网络统计</b>（例如按 UID 统计流量、<code>trafficController</code> 相关的模块）。' +
           '这件事有两层含义：<b>①</b> 它证明了在真机上跑 eBPF 是可行的——不是纸上谈兵；<b>②</b> 但这些程序由<b>系统进程</b>在开机时加载，普通 App 既没权限、也看不到它们。</p>' +
           '<p>所以当你在设备上执行 <code>bpftool prog show</code> 看到一堆已有程序时，不要误以为「这台机器对我开放了」——那大概率是系统自己的。</p>') +
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>eBPF 内核态只读观测 ≈ Node.js 里的 perf_hooks + async_hooks，但「在操作系统之外再开一条观测通道」</b>——绕过目标进程自身的检测，看它看不见的调用。</p>' +
+          '<p><b>对照</b>:<br>' +
+          '· uprobe 挂到 .so 的加密函数 ≈ Node 的 <code>v8 --inspect-brk</code> 在某个 JS 函数上挂断点，但<strong>目标进程感知不到</strong>（V8 暴露的 debug 协议是用户态的，目标代码能检测 <code>--inspect</code> 端口）<br>' +
+          '· BPF Map ≈ 跨进程共享的 <code>SharedArrayBuffer</code>（eBPF 程序写、用户态读）<br>' +
+          '· ringbuf ≈ Node 的 <code>diagnostics_channel</code>，单生产者单消费者无锁<br>' +
+          '· 验证器（Verifier）静态证明不会崩内核 ≈ V8 的逃逸分析与类型证明，确保 JIT 编译后不会越界</p>' +
+          '<p><b>关键差异</b>:JS 端 Node 的 <code>--inspect</code> / <code>perf_hooks</code> 都在<b>用户态</b>，目标进程能通过读 <code>process.env.NODE_OPTIONS</code> / 列端口 / 查 <code>globalThis.process</code> 的 hooks 数组来自检；' +
+          '安卓 eBPF 在<b>内核态</b>，目标进程的 /proc 自检看不到它的存在（这是「在操作系统之外开通道」的核心优势）。但代价是：eBPF 受四重限制（版本/裁剪/SELinux/root），JS 端的能力探测只需 typeof 一行。' +
+          '<b>所以 eBPF 在安卓上是「在更难搞的地方，搞到了更隐蔽的观测」</b>，对应到 JS 端大概相当于「绕过 chrome devtools 检测、用 wasm 写一段在 worker 里跑的 hook 脚本」——代价大、收益也大、不是日常手段。</p>') +
         T.note('warn', '⚠️ 时效性再强调一次',
           '<p>「哪些机型支持、哪些配置默认开启」这个问题，<b>每一年、每个厂商、每个机型、每个内核版本的答案都不一样</b>，而且厂商会随系统更新调整策略。' +
           '本章表格里的判断是<b>2023 年前后的普遍经验</b>，不是对你的设备的结论。' +
@@ -922,7 +932,8 @@ window.CHAPTER = {
     { t: 'tracepoint', d: '内核预先定义的静态追踪点（如系统调用的 sys_enter/sys_exit）。相比 kprobe 更稳定，不依赖内核内部函数名，是<b>推荐优先使用</b>的钩子类型。' },
     { t: 'BTF', d: 'BPF Type Format，内核的调试类型信息，暴露在 <code>/sys/kernel/btf/vmlinux</code>。它是 CO-RE 的基础——没有它，libbpf 无法在加载时做类型重定位。' },
     { t: 'CO-RE', d: 'Compile Once – Run Everywhere。借助 BTF 类型信息，让同一份 eBPF 目标文件适配不同内核版本。重定位发生在<b>加载时</b>（libbpf 读目标机的 BTF），因此目标机没有 BTF 时无法使用。' },
-    { t: 'XDP', d: 'eXpress Data Path，网络驱动层最早的数据包处理点。在协议栈之前执行，性能极高，常用于高性能包处理、负载均衡和 DDoS 防护。' }
+    { t: 'XDP', d: 'eXpress Data Path，网络驱动层最早的数据包处理点。在协议栈之前执行，性能极高，常用于高性能包处理、负载均衡和 DDoS 防护。' },
+    { t: '↔ Web 对位 · eBPF 内核态只读观测 ≈ Node --inspect 的目标不可见版本', d: '两者都是「在运行时插入观察点」。差异:eBPF 在<b>内核态</b>，目标进程读 /proc 列端口 / 列模块都看不到 eBPF 程序的存在（这是隐蔽性来源）；Node --inspect 在<b>用户态</b>，目标代码能通过 process.env.NODE_OPTIONS / 列端口 / 查 globalThis.process 自检。代价:eBPF 受内核版本/裁剪/SELinux/root 四重限制；Node 只需 typeof 一行就知道能力。结论:eBPF 在安卓上 = 绕开用户态检测的「隐蔽版 hook」；JS 端类似物是 wasm in worker + 避开全局对象检测。' }
   ],
 
   teacher: {

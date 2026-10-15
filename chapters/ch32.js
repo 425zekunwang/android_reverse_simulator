@@ -626,6 +626,21 @@ window.CHAPTER = {
       html: '<p><span class="term" data-def="Kernel-based Virtual Machine：Linux 内核的硬件虚拟化接口，把内核变成 Type-1 Hypervisor">KVM</span> 是 Linux 内核的硬件虚拟化接口。它最迷人的地方在于<b>接口极其简单</b>：内核通过一个字符设备 <span class="mono">/dev/kvm</span> 暴露 API，用户态程序（QEMU、Cuttlefish、crosvm 都是这么干的）用 <b>ioctl</b> 去调用它。</p>' +
             '<p><b>前提：</b>CPU 要支持硬件虚拟化（Intel VT-x / AMD-V / ARM Virtualization Extensions）<b>而且 BIOS/UEFI 里开启了</b>。这个前提不满足时，<span class="mono">/dev/kvm</span> 根本不会出现——这也是你应该养成习惯的<b>第一个检查动作</b>（回看 32.3 的体检）。</p>' +
             '<p>下面用一个极简的 vmm（虚拟机监视器）骨架，把 KVM 的主要 ioctl 走一遍。<b>看懂它，你就看懂了 QEMU 这类程序的骨架</b>——它们无非是把这套调用做得更完整、更工程化。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+            '<p><span class="pill">JS 类比</span> 一句话概括:<b>Android 容器 vs 真机的差异 ≈ headless Chrome vs 普通浏览器的差异</b>——都能跑代码，但前者更可控、更适合自动化批量；后者更真实、但每次状态有差异。</p>' +
+            '<p><b>对照</b>:<br>' +
+            '· redroid 容器化 Android 跑 Frida 脚本 ≈ headless Chrome 跑 Puppeteer 脚本<br>' +
+            '· 容器无 GPU / 无 sensor ≈ headless Chrome 无 GPU 加速、屏幕色深有限<br>' +
+            '· 容器内 root 权限 ≈ headless Chrome 用 --no-sandbox + --disable-web-security<br>' +
+            '· 容器里跑"批量样本 App" 测多版本脱壳器 ≈ headless Chrome 跑"批量样本站点" 测多版本反爬策略<br>' +
+            '· 容器镜像的 snapshot 保存 ≈ Playwright 的 storageState 持久化</p>' +
+            '<p><b>关键差异</b>:Android 容器的"接近真机度"比 Web 容器差——redroid 等容器没实现 Sensor / Camera / NFC 等真实硬件 API，' +
+            '很多"启动时检测硬件指纹"的加固会立刻识别成"模拟器/容器"并拒绝服务；' +
+            'headless Chrome 和有头 Chrome 的差异小很多（navigator.webdriver 一个特征 + stealth 就能解决大部分检测）。' +
+            '所以容器化跑逆向时，<b>安卓的"过检测"成本远高于 Web</b>，这是从 web 跨到安卓容器化时最大的预期差。' +
+            '如果目标 App 不带强检测，redroid + Frida 性价比很高；如果带强检测（比如某加固 V4 的"读 CPU 信息、GPU vendor、电池温度"），用 redroid 跑是白费功夫，必须上真机或定制 qemu 镜像。</p>') +
+            
+        // WS-REDROID-HEADLESS-MARKER-W3B8 (cool)
             T.note('key', '🔑 记住三样东西就够了',
               '<p><b>一个设备</b>：<span class="mono">/dev/kvm</span>。<b>三类 fd</b>：kvm（系统）→ vm（虚拟机）→ vcpu（虚拟 CPU）。<b>一个循环</b>：<span class="mono">KVM_RUN</span> 进去、VM Exit 出来、处理完再进去。</p>' +
               '<p>所有虚拟化软件，本质上都是这三样东西的扩展：<b>虚拟机是 fd，vCPU 是线程，VM Exit 是事件源。</b></p>'),
@@ -878,7 +893,10 @@ window.CHAPTER = {
        { t: 'Magisk', d: 'Android 的 Root 方案与模块化框架（仓库 topjohnwu/Magisk）。核心是修改 boot 镜像的 ramdisk，在 init 早期注入自己的逻辑，再用 overlayfs/magic mount 实现 systemless 修改。' },
        { t: 'Zygisk', d: 'Magisk 提供的在 Zygote 进程注入代码的机制。Zygote 是所有 App 进程的父进程，因此在这里注入等于每个 App 进程出生即带代码。' },
        { t: 'DenyList', d: 'Magisk 中用于隐藏 root 状态的功能（旧称 MagiskHide），对抗环境检测。' },
-       { t: 'KVM', d: 'Kernel-based Virtual Machine：Linux 内核的硬件虚拟化接口，通过 /dev/kvm 以 ioctl 暴露 API（KVM_CREATE_VM / KVM_CREATE_VCPU / KVM_SET_USER_MEMORY_REGION / KVM_RUN）。要求 CPU 支持硬件虚拟化且 BIOS 开启。' }
+       { t: 'KVM', d: 'Kernel-based Virtual Machine：Linux 内核的硬件虚拟化接口，通过 /dev/kvm 以 ioctl 暴露 API（KVM_CREATE_VM / KVM_CREATE_VCPU / KVM_SET_USER_MEMORY_REGION / KVM_RUN）。要求 CPU 支持硬件虚拟化且 BIOS 开启。' },
+    { t: '↔ Web 对位 · Android 容器化 ≈ headless Chrome 容器化（但过检测成本高得多）', d: '都是"用容器跑目标代码"。差异:Android 容器对真机的"接近度"远低于 headless Chrome vs 普通 Chrome——redroid / anbox 没实现 Sensor / Camera / NFC 等真实硬件 API，强检测的 App 一启动就能识别"容器"。所以容器化跑逆向：Web 端 navigator.webdriver 一个特征 + stealth 解决大部分；安卓端需真机或定制 qemu 镜像，否则白费功夫。无强检测 App：redroid + Frida 性价比高；有强检测：必须真机/定制镜像。' },
+
+    // WS-REDROID-HEADLESS-MARKER-W3B8 (glossary)
      ],
      teacher: { id: 'ch18', chapter: 18, name: '追问老师 · 第 32 章', sub: '把虚拟化、容器化与 Android 系统焊成一套能骗过风控的云端环境', intro: '<p style="margin:0">这是全课程最后一章，我会问得最狠：不只问你「怎么做」，还问你「为什么这样做是对的」。</p>',     questions: [
       {

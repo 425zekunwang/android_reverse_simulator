@@ -1155,7 +1155,8 @@ window.CHAPTER = {
     { t: 'RAII', d: 'Resource Acquisition Is Initialization。构造时获取资源、析构时释放，把「配对操作」绑定到栈对象的生命周期上。ART 中用 ScopedObjectAccess、MutexLock 等保证异常与提前返回时也不泄漏。' },
     { t: 'Handle&lt;T&gt; / ObjPtr&lt;T&gt;', d: 'ART 的 GC 安全句柄。GC 会移动对象，裸指针会失效；句柄让 GC 知道这里还有一个引用并帮忙更新。类型 T 由模板参数在编译期确定，运行时零额外开销。' },
     { t: 'inline（内联）', d: '编译器把函数体展开到每个调用处以消除调用开销。关键字只是建议，真正决定的是优化决策（函数体小 + -O2/-O3）。后果：断点打不上、局部变量显示 optimized out、调用栈缺帧。' },
-    { t: '动态分析沙箱', d: '一套你自己掌控、能记录一切关键事件的 Android 运行环境。虚拟机是你自己编译的，想记录什么就插桩记录什么，不依赖外部 hook 框架。' }
+    { t: '动态分析沙箱', d: '一套你自己掌控、能记录一切关键事件的 Android 运行环境。虚拟机是你自己编译的，想记录什么就插桩记录什么，不依赖外部 hook 框架。' },
+    { t: '↔ Web 对位 · JNI 动态注册 = webpack 动态 chunk 注入', d: '两边都是「运行时把名字映射到函数/模块地址」的机制：RegisterNatives 把 {name, signature, fnPtr} 喂给 ART，webpack runtime 把 {chunkId, moduleFactory} 喂给模块表。差异在于 hook 面：ART 要改虚拟机的 C++ 实现（需要 AOSP 源码 + 自己编 so），前端只需 hook require / __webpack_require__.r（JS 层一行代码）。' }
   ],
   teacher: {
     id: 'ch4', chapter: 4,

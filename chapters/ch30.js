@@ -303,6 +303,21 @@ window.CHAPTER = {
           '② 关键词是"<b>性能尽量接近原生</b>"——哪种方案的翻译面积最小？<br>' +
           '③ 这个需求<b>假设 GKI 能解决架构问题</b>。先问自己：GKI 到底解决什么问题？',
         after:
+        T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>Android 模拟器（qemu / Android Studio AVD）≈ Node.js + jsdom 在本地模拟一个完整运行环境</b>——两边都是"不用真环境就能跑目标代码并 hook"。</p>' +
+          '<p><b>对照</b>:<br>' +
+          '· qemu 模拟 ARM 指令 ≈ Node VM 模拟 JS 字节码<br>' +
+          '· 模拟器自带的 Magisk / Frida-server ≈ Node 项目里 require 的 hook 库（frida-companion / jsdom）<br>' +
+          '· 检测脚本（查 ro.build.fingerprint）≈ 浏览器里 navigator.webdriver / runtime 检测<br>' +
+          '· 模拟器多开（每开一个独立模拟器实例）≈ Puppeteer 多 context（每个 context 独立 cookie / 指纹）<br>' +
+          '· Android Studio AVD 的快照保存 ≈ Puppeteer 的 storageState 持久化</p>' +
+          '<p><b>关键差异</b>:qemu 模拟的是<b>完整操作系统 + ARM 指令集</b>，跑的是真 native 代码；' +
+          'Node + jsdom 模拟的是<b>DOM API + JS 引擎</b>，native 加密/OLLVM 在这里完全跑不起来，只能处理纯 JS / WASM。' +
+          '另外模拟器"被检测"的特征（ro.product.model 含 sdk_gphone / ro.kernel.qemu=1）≈ Puppeteer 一打开就被 navigator.webdriver=true 标记，' +
+          '所以两边都需要配合 stealth patch（xposed 改 Build props vs Puppeteer-extra-plugin-stealth）。' +
+          '<b>最终目的不一样</b>:Node + jsdom 是为了在 CI 里跑端到端测试（自动化），模拟器是为了批量脱壳（人工分析）——量级和目的都不同。</p>') +
+          
+        // WS-EMULATOR-QEMU-MARKER-R8J3 (cool)
           T.note('key', '🔑 这个实验训练的是"概念分层"能力',
             '<p style="margin-bottom:0">很多人把 GKI 和翻译模式混为一谈，是因为它们<b>都出现在"模拟器"这个话题里</b>。<br>' +
             '但出现在同一章 ≠ 属于同一层。<br><br>' +
@@ -905,7 +920,10 @@ window.CHAPTER = {
     { t: 'Cuttlefish', d: 'Google 的 android-cuttlefish 项目，一个可配置的安卓虚拟设备（AVD），面向本地 Linux x86/arm64 与远程 GCE 实例，而非物理硬件。主要服务 AOSP 开发与 CI/CD，依赖 KVM。' },
     { t: 'cvdnetwork', d: 'Cuttlefish 安装时要求用户加入的系统组之一，用于访问其虚拟网络。另两个是 kvm（访问 /dev/kvm）与 render（GPU 渲染设备）。加组后需重启生效。' },
     { t: 'Goldfish / ranchu', d: 'Android 模拟器的虚拟硬件平台代号。Goldfish 是早期平台，ranchu 是其后续实现。它们决定了设备树、驱动名与一系列模拟器特征字符串，是风控检测「是否模拟器」的重要依据。' },
-    { t: 'Waydroid', d: '基于容器（共享宿主内核）在 Linux 上运行安卓的方案。不是虚拟机，因此架构必须与宿主一致，但开销极小、启动快。与 Cuttlefish/模拟器走的是根本不同的技术路线。' }
+    { t: 'Waydroid', d: '基于容器（共享宿主内核）在 Linux 上运行安卓的方案。不是虚拟机，因此架构必须与宿主一致，但开销极小、启动快。与 Cuttlefish/模拟器走的是根本不同的技术路线。' },
+    { t: '↔ Web 对位 · Android 模拟器 ≈ Node + jsdom 模拟完整运行环境', d: '都是"不用真环境跑目标代码 + hook"。差异:qemu 模拟真 ARM + 真 OS + 真 ART，native 加密/OLLVM 都能跑；Node + jsdom 只模拟 DOM + JS 引擎，跑不了 native。检测对抗也同构:模拟器被 ro.product.model/sdk_gphone 标记 ≈ Puppeteer 被 navigator.webdriver=true 标记，都需 stealth patch。目的不同:Node + jsdom 多用于 CI 端到端测试，模拟器多用于批量脱壳 / 人工分析。' },
+
+    // WS-EMULATOR-QEMU-MARKER-R8J3 (glossary)
   ],
 
   teacher: {

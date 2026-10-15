@@ -1242,6 +1242,18 @@ window.CHAPTER = {
          ]),
 
        after:
+        T.note('cool', '🌐 JS 视角批注',
+         '<p><span class="pill">JS 类比</span> 一句话概括:<b>Frida Memory.scan 搜 SVC 特征字节 ≈ 浏览器 DevTools Memory 面板的 16 进制字节搜索</b>——两者都是「用特征模式定位代码位置」。</p>' +
+         '<p><b>对照</b>:<br>' +
+         '· <code>Memory.scanSync(base, size, "01 00 00 d4")</code> ≈ DevTools → Memory → 在 heap snapshot 里搜 16 进制模式（用双引号避开外层单引号）<br>' +
+         '· 「必须落在 r-x 段才保留命中」≈ Web 端必须从可执行 script 范围里查（不能去查 CSS / 文本字节）<br>' +
+         '· 32/64 位都要搜 ≈ V8 / WASM 的两种字长（指令编码不同）<br>' +
+         '· 命中点聚在一起 = 同一批封装函数 ≈ 一个 JS bundle 的某段函数聚拢</p>' +
+         '<p><b>关键差异</b>:JS 端 Memory snapshot 通常是「<strong>数据</strong>的快照」（对象/字符串/TypedArray），你要找的是「某个值或对象」；' +
+         'Frida 扫的是「<strong>代码</strong>的字节序列」，你要找的是「代码段里的某条指令」。两者都叫 Memory.scan，但<strong>目标域不同</strong>。' +
+         '另外 Web 端「风控」是检测你的浏览器里有没有 DevTools / frida 痕迹，安卓「检测」是查自身代码段是否被改写——<b>扫描方向是反的</b>，注意区分。</p>') +
+         
+        // WS-FRIDA-MEMSCAN-MARKER-X9Q7 (cool)
          T.note('key', '🔑 这一章真正要你带走的',
            '<p>把全章压缩成三句话：</p>' +
            '<p><b>① 观测点必须高于对手的绕过点。</b>' +
@@ -1423,7 +1435,10 @@ window.CHAPTER = {
                                   '常规做法是在 <code>JNI_OnLoad</code> 里一次性注册全部方法，因而极易被 hook 一网打尽；' +
                                   '防追踪做法包括延迟注册、分次注册、动态计算地址、反复注册注销，以及绕过该接口直接改方法入口。' },
        { t: '0r0env 调试 ROM', d: '课程作者提供的整套定制调试环境（定制 ROM / 内核），把内核级对抗能力打包成开箱即用的工具。' +
-                                  '<b>具体内容、支持范围与使用方式待核实，以作者发布为准，本章不做推测。</b>' }
+                                  '<b>具体内容、支持范围与使用方式待核实，以作者发布为准，本章不做推测。</b>' },
+    { t: '↔ Web 对位 · Frida Memory.scan 搜指令字节 ≈ DevTools Memory 面板搜数据字节', d: '都叫"扫内存"，但本质不同：Frida 扫代码段里的指令字节序列（找某条 SVC / BRK 指令位置），Web 端 Memory 面板扫堆里的对象/字符串（找某个值/对象）。方向也不同：Web 风控角色是检测你的浏览器里有没有 hook 痕迹（防御侧），安卓检测是查自身代码段是否被改（自查侧）。共同点：都要先定特征序列，再用 16 进制扫描 API 命中目标。' },
+
+    // WS-FRIDA-MEMSCAN-MARKER-X9Q7 (glossary)
      ],
      teacher: {
        id: 'ch13', chapter: 13,

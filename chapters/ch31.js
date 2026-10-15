@@ -228,6 +228,22 @@ window.CHAPTER = {
         explain: '<b>判据必须来自机制本身，而不是经验观察。</b><code>/proc/1/cgroup</code> 之所以可靠，是因为它直接读出了「1 号进程属于哪个 cgroup」这个内核事实 —— 而 Docker/K8s/LXC 都会为容器主进程建立专属的 cgroup 层级，路径名就是证据。<br><br>其他几条佐证（组合起来更硬）：<code>uname -r</code> 返回宿主内核版本、<code>/.dockerenv</code> 文件存在、网卡名带 <code>@ifN</code> 后缀、IP 落在 172.17/172.18 网段、主机名是随机十六进制。<b>注意 <code>/.dockerenv</code> 是「有则可疑，无则不能证明不是」</b> —— 它可以被删掉。<br><br>把能力用在本章上：判断底座决定了你后续能用哪些调试手段（容器里通常没有内核模块权限），所以这应该是接手任何云环境时的<b>第一步</b>。'
       },
       after:
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>Docker / 容器化跑 Android 实例 ≈ Docker 跑 headless Chrome 集群</b>——两边都"用容器隔离环境、把可复现的状态打包成镜像、CI 里批量跑"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· Docker + Android image ≈ Puppeteer 的 chromium docker 镜像（browserless/chrome）<br>' +
+        '· 容器化跑 Frida hook 脚本 ≈ 容器化跑 Puppeteer 测试脚本<br>' +
+        '· docker-compose 起一套（emulator + frida + 目标 App）≈ docker-compose 起一套（chrome + mock server + 测试代码）<br>' +
+        '· 容器内 "无头" 的目标 App 跑出脱壳数据 ≈ 容器内 headless 浏览器跑出截图 / 数据<br>' +
+        '· CI 里每天凌晨跑一遍测新版本 App ≈ CI 里每天凌晨跑一遍前端回归测试</p>' +
+        '<p><b>关键差异</b>:Android 容器需要模拟 ARM 指令（qemu-system-aarch64），每跑一个实例吃 GB 级内存，' +
+        'Web 容器只需要 headless Chrome 跑 x86 指令，每个实例百 MB 级内存。' +
+        '所以一台 CI 服务器上能并行跑几十个 headless Chrome 浏览器，' +
+        '但只能跑 2-3 个 Android 模拟器实例。' +
+        '<b>实际工程上的差异</b>:Web 端容器化已经成熟（browserless / headless-chrome-alpine 等都现成），' +
+        '安卓端容器化还在演进（redroid / anbox / waydroid 各有坑）——所以从 web 跨到安卓容器化时，<strong>不要照搬 Web 的 "一个 instance 几秒起" 预期</strong>，要给"单个实例 30 秒起"留心理准备。</p>') +
+        
+        // WS-DOCKER-ANDROID-MARKER-T6V2 (cool)
         T.note('key', '🔑 这对逆向 / 环境伪装有什么用', '<p>① <b>判断自己在哪：</b>拿到一台「云手机」或「云真机」，第一件事就是确定底座是容器还是虚拟机 —— <code>uname -r</code>、<code>/.dockerenv</code>、<code>/proc/1/cgroup</code> 三连就能定性，这决定了你后续能用哪些提权/调试手段。</p>'
           + '<p>② <b>利用共享内核：</b>容器共享宿主内核意味着<b>宿主上装了什么模块，容器里就可能用得上</b>（取决于权限和 seccomp）——<code>ebpf</code> 抓包、<code>perf</code>、某些内核接口在虚拟机里根本不存在，在容器里却可能可用（第 25 章 eBPF 与这一章合起来看会很有感觉）。</p>'
           + '<p>③ <b>反检测意识：</b>风控识别模拟器/云手机时，容器特征（挂载表、cgroup 路径、网络握手特征）是重要证据链之一。你要先知道「特征从哪来」，才谈得上伪装。</p>'
@@ -1024,7 +1040,10 @@ window.CHAPTER = {
        { t: 'docker0', d: 'Docker 安装时自动创建的<b>虚拟网桥</b>，本质是一个二层交换机，接在宿主机的网络栈里。所有 bridge 模式容器的 veth 宿主端都插在它上面，同网段容器互通靠它直接转发，出网则交给 NAT。' },
        { t: 'binfmt_misc', d: 'Linux 内核功能：让内核<b>识别任意二进制格式并交给指定解释器执行</b>。配合 QEMU user-mode 可在 x86_64 上透明运行 ARM64 程序。<b>坑：解释器路径经 chroot 后会在 rootfs 内解析，所以 qemu-aarch64-static 必须复制进 rootfs。</b>' },
        { t: 'QEMU user-mode / system-mode', d: '<b>user-mode</b>（qemu-aarch64-static）只模拟 CPU 并把系统调用转发给宿主内核，跑单个程序、轻量快速；<b>system-mode</b>（qemu-system-aarch64）模拟整个系统（CPU + 设备 + 内存），能跑完整 OS，重。容器场景用 user-mode。' },
-       { t: 'debootstrap', d: 'Debian/Ubuntu 的引导工具，可在指定目录构建最小根文件系统。<code>--arch=arm64</code> 指定架构，<code>--foreign</code> 只做下载解包、配置留给 chroot 内的 second-stage。<b>ARM 架构要用 ports.ubuntu.com/ubuntu-ports/，不是 archive.ubuntu.com。</b>' }
+       { t: 'debootstrap', d: 'Debian/Ubuntu 的引导工具，可在指定目录构建最小根文件系统。<code>--arch=arm64</code> 指定架构，<code>--foreign</code> 只做下载解包、配置留给 chroot 内的 second-stage。<b>ARM 架构要用 ports.ubuntu.com/ubuntu-ports/，不是 archive.ubuntu.com。</b>' },
+    { t: '↔ Web 对位 · Android 容器化 ≈ headless Chrome 容器化', d: '都是"用容器隔离环境、打包镜像、CI 批量跑"。差异:Android 容器吃 GB 级内存（要 qemu 模拟 ARM），Web 容器只需百 MB（headless Chrome 跑 x86）。一台 CI 上能并行几十个 Chrome 实例，但只能跑 2-3 个 Android 模拟器实例。Web 容器化已成熟（browserless / headless-chrome-alpine），安卓容器化还在演进（redroid / anbox / waydroid 各有坑），从 web 跨到安卓时"单个实例 30 秒起"是正常预期，不能照搬 web 的"秒起"。' },
+
+    // WS-DOCKER-ANDROID-MARKER-T6V2 (glossary)
      ],
 
   teacher: {

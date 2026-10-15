@@ -222,6 +222,14 @@ window.CHAPTER = {
           + '<span class="c">// 4) 记录下来的方法集合 = 回填已经发生的集合 = 可以安全 dump 的集合</span>')
         + T.note('key', '🔑 解释器 Trace 在脱壳里的真正价值', '<p>抽取壳的方法体是在<b>首次执行时</b>回填的。所以你在解释器入口记录“哪些方法被执行过”，等价于拿到了<b>一份“已回填清单”</b>。<br>它直接解释了一个实战技巧：<b>跑一遍 App 的所有功能（点遍所有按钮、进所有二级页面），能让 FART 的回填覆盖更全。</b>这不是经验之谈——每一功能点击都在把新方法推进解释器，每一次进解释器都在触发一次回填。<b>你的点击覆盖率，就是脱壳完整度的上界。</b></p>')
         + T.note('warn', '⚠️ 性能警告：这是最热的代码路径', '<p>解释器入口被执行的频率是“每条字节码一次”。<b>挂上 hook 会让 App 慢几十倍，甚至直接卡死（ANR）。</b>三条纪律：<b>①</b> 只挂很短时间，采完样本立刻 detach；<b>②</b> 加条件判断，只记录你关心的类或包名；<b>③</b> 绝不在回调里做重活（字符串拼接、写文件、console.log 都要少做），先塞进内存缓冲区，最后统一导出。</p>')
+        + T.note('cool', '🌐 JS 视角批注',
+          '<p><span class="pill">JS 类比</span> 一句话概括:<b>Hook ART 解释器入口 ≈ 在 V8 / SpiderMonkey 的字节码解释器入口下断点</b>——两者都让你看到「哪条字节码被执行」、只是宿主一个跑 dex、一个跑 JS 字节码。</p>' +
+          '<p><b>对照</b>:<br>' +
+          '· Mterp 每条字节码一个 handler ≈ V8 Ignition 的 <code>BytecodeHandler</code> 表（每条字节码一个 handler）<br>' +
+          '· <code>dexPC</code> / 当前方法指针 ≈ V8 里的 <code>InterpretedFrame</code> + <code>bytecode_offset()</code><br>' +
+          '· 去重 Map（避免日志爆炸） ≈ devtools 里「不要 print 每条字节码，只 print 行/函数级入口」<br>' +
+          '· 性能警告（卡死 / ANR） ≈ 同样在 V8 解释器入口下条件断点会拖慢 JS 几十倍，DevTools 也会变卡</p>' +
+          '<p><b>关键差异</b>:JS 端 V8 Ignition 解释器入口是<b>稳定公开的</b>(<code>v8::internal::Interpreter::Dispatch</code> 等符号跨版本变化小)，所以你 hook 一次脚本基本能跨大版本复用；<b>安卓 ART 解释器入口是版本敏感的</b>（Mterp 在 Android 7 改了一次结构、10 又改了、14 又改了），同一个 hook 脚本可能要改 5-6 次才能覆盖 6.0 → 14 全档。这是「适配成本」的具体差距，也是为什么第 26 章要做移植专题。</p>')
         + T.note('', '📌 出问题往哪查', '<p>Hook 完全没触发 → 先确认解释器实现是 Mterp 还是 SwitchImpl，入口定位错了；<br>App 一挂就崩 → 参数读取方式与该版本调用约定不符，或符号定位到了相邻函数；<br>日志量大到卡死 → 没做去重，或没做条件过滤。</p>'),
       after: '<p>解释器 Trace 是“从执行侧看壳”的手段。接下来换到“从绑定侧看 native”——JNI 动态注册的对抗。</p>'
     },
@@ -896,9 +904,9 @@ window.CHAPTER = {
        { t: 'Mterp', d: 'ART 的汇编解释器实现，为每种字节码生成独立的汇编 handler，性能高于 C++ 解释器，是默认实现。因入口是汇编，hook 时需要按符号或偏移定位。' },
        { t: 'RegisterNatives', d: 'JNI 中用于动态注册的函数，通过 JNINativeMethod 数组把 Java 方法与 native 函数地址关联起来，使 so 中不出现 Java_ 前缀的导出符号。' },
        { t: 'frida-gadget', d: '注入进目标进程内部的一个 so，不需要额外的 server 进程即可加载脚本。因此没有默认端口的监听，也没有 frida-server 进程名，是规避端口与进程名检测的架构级手段。' },
-       { t: '观察管道篡改', d: '不隐藏自己的存在，而是 Hook open/read、strstr 等函数，让目标程序读到被处理过的内容。比隐藏自身更可靠，是 Frida 对抗中使用频率最高的一类思路。' }
+       { t: '观察管道篡改', d: '不隐藏自己的存在，而是 Hook open/read、strstr 等函数，让目标程序读到被处理过的内容。比隐藏自身更可靠，是 Frida 对抗中使用频率最高的一类思路。' },
+       { t: '\u2194 Web \u5BF9\u4F4D \u00B7 ART \u89E3\u91CA\u5668 Trace \u2248 V8 Ignition \u89E3\u91CA\u5668 Trace', d: '\u90FD\u662F\u300C\u5728\u5B57\u8282\u7801\u89E3\u91CA\u5668\u5165\u53E3\u4E0B\u65AD\u70B9\uFF0C\u770B\u54EA\u6761\u5B57\u8282\u7801\u88AB\u6267\u884C\u300D\u3002\u5DEE\u5F02:ART Mterp \u5165\u53E3\u662F<b>\u7248\u672C\u654F\u611F</b>\u7684\uFF08Android 6/7/10/14 \u5404\u4E0D\u540C\uFF09\uFF0C\u540C\u4E00\u811A\u672C\u8981\u6539 5-6 \u6B21\u8986\u76D6\u5168\u6863\uFF1BV8 Ignition \u5165\u53E3 <code>Interpreter::Dispatch</code> \u8DE8\u5927\u7248\u672C\u76F8\u5BF9\u7A33\u5B9A\u3002Web \u7AEF\u4F60\u80FD\u5728 DevTools \u76F4\u63A5\u770B\u300C\u54EA\u884C JS \u88AB\u6267\u884C\u300D\uFF0C\u5B89\u5353\u53EA\u80FD\u81EA\u5DF1\u5199 hook \u811A\u672C\u8BFB dexPC/\u65B9\u6CD5\u6307\u9488\u3002' },
      ],
-
   teacher: {
     id: 'ch10',
     chapter: 10,

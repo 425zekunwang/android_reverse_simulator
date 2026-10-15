@@ -856,6 +856,19 @@ window.CHAPTER = {
        html:
          '<p>28.4 已经把砸壳的一句话讲完了：<b>dump 内存里的明文，把 <code>cryptid</code> 改成 0</b>。但真正动手写一遍，你会发现最难的既不是 dump 也不是改标记，而是<b>「重建」</b>。这一节拆开看为什么。</p>' +
 
+        T.note('cool', '🌐 JS 视角批注',
+         '<p><span class="pill">JS 类比</span> 一句话概括:<b>iOS 的 method swizzling (OC) / method exchange (Swift) ≈ JavaScript 的 Object.defineProperty / Proxy 拦截方法</b>——两边都是「不改源码的前提下，换掉某个方法的实现」。</p>' +
+         '<p><b>对照</b>:<br>' +
+         '· OC <code>method_exchangeImplementations</code> ≈ JS 里 <code>const orig = obj.method; obj.method = function(...args){ /* your code */ return orig.apply(this, args); }</code><br>' +
+         '· OC <code>method_setImplementation</code> ≈ JS Proxy 的 <code>get</code> trap 拦截函数引用<br>' +
+         '· Swift method exchange ≈ ES6 class decorator 或运行时 Reflect.defineMetadata<br>' +
+         '· iOS runtime 检测（防 swizzle）≈ JS 自检 <code>Function.prototype.toString</code>、hook 检测 debugger</p>' +
+         '<p><b>关键差异</b>:OC/Swift swizzling 改的是<b>Objective-C runtime 里的 IMP 指针</b>，影响整个进程的所有对象实例；' +
+         'JS 改 <code>obj.method</code> 只影响<b>这个对象的引用</b>（同一 class 的其他对象不受影响，要影响所有实例得改 prototype）。' +
+         'iOS 的 swizzling 比 JS 改方法狠——它真的把整个类的 dispatch table 改了。<b>但优势是 swizzle 后用 class-dump 还能看到原实现地址</b>，' +
+         '而 JS 改完后 <code>obj.method.toString()</code> 直接显示你的代码，没有"原实现"这个概念可查。</p>') +
+         
+        // WS-SWIZZLING-MARKER-K2P4 (cool)
          T.note('key', '🔑 一句话原理', '<p><b>App Store 应用被 FairPlay DRM 加密，磁盘上的 <code>__TEXT</code> 是密文；进程运行时内核已把它解密到内存。Frida-iOS-dump 就是在运行时从内存 dump 解密后的二进制，并把它修回一个可用的 Mach-O。</b></p>') +
 
          '<h4>① 为什么要遍历「已加载的镜像」</h4>' +
@@ -952,7 +965,10 @@ window.CHAPTER = {
      { t: 'ptrace(PT_DENY_ATTACH)', d: '最经典的 iOS 反调试手法：调用后调试器无法附着；若已被附着则进程直接退出。绕过方式是 hook ptrace 让它直接返回；升级版会用 syscall(SYS_ptrace, 31, 0, 0, 0) 直接发起系统调用绕过符号 hook。' },
      { t: 'P_TRACED', d: 'kinfo_proc 中 kp_proc.p_flag 的一个标志位，通过 sysctl 查询。被置位说明进程正在被调试。绕法是 hook sysctl，在返回前清掉该位。' },
      { t: 'CS_DEBUGGED', d: '代码签名标志之一，通过 csops 系统调用查询，表示进程被调试器附加过。绕法是 hook csops 并清掉该标志。' },
-     { t: 'SSL Pinning', d: '证书绑定：App 不信任系统证书库，而是内置服务端证书或公钥（或其哈希）并在 TLS 握手时比对，因此安装 Charles/mitmproxy 根证书也无法抓包。iOS 上常见实现有 NSURLSession delegate 回调、AFNetworking 的 SSLPinningMode、NSURLConnection 回调，以及 native 层 OpenSSL/BoringSSL。' }
+     { t: 'SSL Pinning', d: '证书绑定：App 不信任系统证书库，而是内置服务端证书或公钥（或其哈希）并在 TLS 握手时比对，因此安装 Charles/mitmproxy 根证书也无法抓包。iOS 上常见实现有 NSURLSession delegate 回调、AFNetworking 的 SSLPinningMode、NSURLConnection 回调，以及 native 层 OpenSSL/BoringSSL。' },
+    { t: '↔ Web 对位 · iOS method swizzling ≈ JS 改 obj.method / Proxy trap', d: '两边都是"不改源码的前提下换掉方法实现"。差异:iOS swizzle 改的是 Objective-C runtime 的 IMP 指针，影响整个 class 的 dispatch table（所有实例都生效）；JS 改 obj.method 只影响这一个对象引用，要影响所有实例得改 prototype。OC 的 method_exchangeImplementations 交换两个方法的实现，JS 没有直接对应物（要么 A→B→原A，要么保存原函数引用手动 restore）。iOS 还能 class-dump 看到原实现地址，JS 改完用 toString() 看就是你的代码。' },
+
+    // WS-SWIZZLING-MARKER-K2P4 (glossary)
    ],
 
    teacher: {
