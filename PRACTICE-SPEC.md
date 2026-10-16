@@ -223,6 +223,9 @@ Artifact = {
 
 ### 5.2 SimVM —— DEX 子集解释器（核心）
 
+> **实现状态：尚未动手（M1b）。** 原因见 §11.1 —— MVP 那一关不经过 DEX，
+> 先写会得到无法被验证的推测代码。契约先定在这里。
+
 自造一套**Dalvik 子集**，但**真的执行**。
 
 ```
@@ -608,14 +611,36 @@ C 类保留现有 `decision` / `lab` 形态不动。
 | 里程碑 | 交付 | 验收 |
 |---|---|---|
 | **M0** ✅ | 本文档定稿（六条未决问题已全部定案） | 已完成 |
-| **M1** | `assets/sim/` 四个纯逻辑模块：`forge.js` / `simvm.js` / `simelf.js` / `simdevice.js`。**无 UI** | `validate-missions.mjs` 能在 Node 里 boot 一关、跑参考解法通关 |
+| **M1** ✅ | `assets/sim/`：`simelf.js` / `simnative.js` / `simdevice.js` / `forge.js` + `missions.js`。**无 UI** | `validate-missions.mjs` 能在 Node 里 boot 一关、跑参考解法通关（已达成） |
+| **M1b** | `assets/sim/simvm.js`（DEX 子集解释器） | 见下方说明 —— 等第一个真消费者出现再做 |
 | **M2** | `assets/sim/tools.js` + 实战区 UI（`practice.html` + `Workbench` 组件 + 交接卡） | 一关能在浏览器里手动通关 |
 | **M3** | `Objective`（三种）+ `Scoring` 三轴 + 工单/复盘/进度 | 第 22 章实验一完全迁移 |
 | **M4** | 依 §7.2 清单横向迁移剩余 17 关 | 每关迁移后 `validate-chapters.mjs` 零错误 + `validate-missions.mjs` 参考解法通关 |
 
 **M1 是关键路径**：先证明"引擎在 Node 里能跑通"，再谈 UI。这也符合本仓"校验器会真的执行你的代码"的既有文化。
 
-### 11.1 对 `CHAPTER-SPEC.md` 的必要修改
+### 11.1 M1 实际交付与计划偏差
+
+M1 完成了，但**组成与初版计划不同**，这里如实记下：
+
+| 计划 | 实际 | 说明 |
+|---|---|---|
+| `simelf.js` | ✅ 做了 | 真 ELF64 生成 + 解析 |
+| — | ✅ **新增** `simnative.js` | 算子白名单 + 映像读/改/调用。§5.3 的契约需要有个落点 |
+| `simdevice.js` | ✅ 做了 | VFS / 进程 / logcat / 受控 shell |
+| `forge.js` | ✅ 做了 | 确定性 PRNG + 派生器 + 产物装配 |
+| — | ✅ **新增** `missions.js` | 关卡定义（spec / objective / 参考解法）。M3 会挪进 `chapters/chNN.js` |
+| `simvm.js` | ⏸ **延后到 M1b** | 见下 |
+
+**为什么延后 `simvm.js`：** MVP 那一关（M22-1）的问题**全部在 native 侧** ——
+ELF 结构、`.rodata` 里的常量、真算法执行。它完全不经过 DEX。
+在还没有第一个真消费者的情况下先把一套 DEX 子集解释器写出来，
+会得到一堆无法被任何关卡验证的推测代码 ——
+这违背本仓「删掉这一段，读者会少知道什么？」的既有纪律。
+第一个消费者是 ch02 / ch03 / ch16 / ch21 那几关，它们在 M4。
+**到那时再做，且边做边验。**
+
+### 11.2 对 `CHAPTER-SPEC.md` 的必要修改
 
 新分支必须打破现有规范的两条禁令：
 
