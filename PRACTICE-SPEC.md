@@ -1,6 +1,9 @@
 # 实战模式设计规范（Practice Spec）
 
-> **状态**：设计阶段，尚无实现。本文是 `feat/practice-simulator` 分支的设计契约。
+> **状态**：M0 ✅（本文档定稿）、M1 ✅（`validate-missions.mjs` 能在 Node 里 boot 一关、跑参考解法通关）已交付。
+> M2 / M3 的产物已按 §11.2 落地一部分（`practice.html` / `assets/practice.js` / `assets/practice.css` / 交接卡 / `chapters/ch22.js` 的 `mission` 字段），
+> 但 §11 里程碑表尚未把 M2、M3 标为完成 —— M2 计划里的 `assets/sim/tools.js` 还不存在（设备 / 映像 / Hook 面板目前内联在 `assets/practice.js`）。
+> M1b（`assets/sim/simvm.js`）与 M4 未开工。本文是 `feat/practice-simulator` 分支的设计契约。
 > **目标**：把现有 **52 个 `lab`**（填空题）升级为**实战关卡**（上岗作业）。
 > **设计母版**：《深圳 I/O》（Zachtronics, 2016）—— 一款"电子工程师上班模拟器"。
 > **第一优先约束**：**仿真保真度**。宁可少做几关，也要保证做出来的那几关"里面的东西是真的"。
@@ -87,7 +90,7 @@ lab: {
 
 **③ 三轴评分 + 可重玩。**
 成本 / 功耗 / 代码行数三条轴，通关后可以回头优化。
-本站对应：**注入面 / 风控值 / 脚本行数**（见 §5.8）。这是把"一关只能过一次"变成"一关可以玩很多次"的关键。
+本站对应：**注入面 / 风控值 / 步数**（见 §5.8）。这是把"一关只能过一次"变成"一关可以玩很多次"的关键。
 
 **④ 引脚 ↔ Hook 点。**
 这是全篇最重要的一个映射。游戏里你在网格上**接线**，信号从引脚流进来。
@@ -111,7 +114,7 @@ lab: {
 | 电路图网格 | **工作台**（设备 / 反编译 / 终端 / Hook 多窗格） | L1（纯 UI） |
 | 成本 | **注入面**：挂了多少 Hook、改了多少字节 | L2 |
 | 功耗 | **风控值**：检测触发程度（已有雏形） | L2 |
-| 代码行数 | **脚本行数** | L3 |
+| 代码行数 | **步数**：你在工作台里动了几下（脚本行数留给 M3+ 脚本类关卡，见 §5.8） | L2 |
 | 老板邮件 | 工单 / 交接邮件 | L1 |
 | 元件产品目录 | 待分析的目标 App 清单 | L1 |
 | 通关后的直方图 | **只显示你自己的三轴 + 官方参考解法的三轴（真测得）** | L2 |
@@ -141,7 +144,7 @@ lab: {
 | 子系统 | 目标 | 理由 |
 |---|---|---|
 | 密码学算法 | **L3** | 已有的 `CRYPTO` 就是真实现，白拿 |
-| ELF 文件（`libtarget.so`） | **L3** | 真生成 ELF64 头 + 段表 + `.rodata` + `.dynsym`。`readelf` 能读。成本可控 |
+| ELF 文件（`libtarget.so`） | **L3** | 真生成 ELF64 头 + 段表 + `.rodata` + `.dynsym`。结构合法 —— 但本机没有 `readelf`，这条是用仓库内逐字段断言验的，见 §8 验收 2。成本可控 |
 | DEX 文件 | **L2** | 真生成 header + string_ids + method_ids + code_item 的**子集**。不追求完整 DEX 规范 |
 | 字节码执行 | **L3** | 自造 DEX 子集，真解释器。**这是整个设计的核心** |
 | 反编译视图 | **L3** | 从真字节码反汇编出 smali 风格文本，**不允许手写**（手写必然与产物不一致） |
@@ -217,8 +220,8 @@ Artifact = {
 硬要求：
 
 1. **纯函数**。同 `seed` + 同 `spec` ⇒ 逐字节相同的 `images`。随机数只能来自 seed 驱动的 PRNG（自实现，如 mulberry32），**禁止 `Math.random()`**。
-2. **`truth` 不进 DOM**。答案只通过 `Objective` 的比较函数间接使用。
-3. **`images` 必须真**。`libtarget.so` 的字节要能被 `readelf -h` 正常读出。
+2. **`truth` 只在通关后的复盘里渲染。** 它唯一的 DOM 出口是 `assets/practice.js` 的 `Workbench.prototype.onSolved` —— 全篇对 `truth` 的访问点只有 3 处（`art.truth.ivWords` / `art.truth.mutatedIndex` / `art.truth.constOffset`，核对于 `ad0af54` 第 555–557 行），入口是 `check()` 里的 `if (r.ok) this.onSolved()`（同版第 532 行）。渲染、日志、提示、评分等其余任何路径都不得让 `truth` 进入 UI；对外公开的量一律走 `artifact.public`（`assets/sim/forge.js:159–167`）。判定路径上它仍只通过 `Objective` 的比较函数间接使用（`assets/sim/missions.js:88–102` 的 `objective.run` 读 `art.truth`，但只返回 `ok` / `detail`）。这不禁止玩家自己挖 —— 映像字节、logcat 摘要本来就是该挖的原始材料。
+3. **`images` 必须真**。`libtarget.so` 的字节必须结构合法 —— 用仓库内逐字段断言验证（为什么不是 `readelf`，见 §8 验收 2）。
 4. 单一实现来源：**同一份真相（`truth`）驱动产物生成和答案校验**，二者不可能不一致。
 
 ### 5.2 SimVM —— DEX 子集解释器（核心）
@@ -256,10 +259,14 @@ Artifact = {
 ### 5.3 SimNative —— ELF 映像
 
 ```js
-SIMELF.buildImage(spec, rng)  -> Uint8Array        // 真 ELF64
-SIMELF.parse(bytes)           -> { header, sections, symbols, strtab }
-SIMELF.readAt(image, addr, n) -> Uint8Array         // Hook 读内存
-SIMELF.patch(image, addr, bytes) -> image           // 改内存（会对不上 checksum）
+SIMELF.build(spec)            -> Uint8Array        // 真 ELF64；spec = { text, rodata, symbols[] }（assets/sim/simelf.js:52）
+SIMELF.parse(bytes)           -> { ok, bytes, header, phdrs, sections, dynsyms, syms, read(addr,n), section(name) }
+                                                   // read 按文件偏移取字节 / section(name) 找节（assets/sim/simelf.js:182、284–285）
+SIMNATIVE.load(bytes)         -> img               // 解析 + 装载 .text 算子表（assets/sim/simnative.js:91）
+img.read(addr, n)             -> Uint8Array        // Hook 读内存（assets/sim/simnative.js:132）
+img.readRo(rodataOff, n)      -> Uint8Array        // 按 .rodata 节内偏移读（assets/sim/simnative.js:134）
+img.patch(addr, data)         -> true | false      // 越界返回 false；成功则累计 stats.patchCount / patchBytes（assets/sim/simnative.js:137–143）
+img.call(opName, input, opts) -> string            // 只跑白名单算子；opts.instrumented 才计入注入面（assets/sim/simnative.js:155–162）
 ```
 
 - 真 ELF64 头：`e_ident` / `e_type` / `e_machine(0xB7 = AArch64)` / `e_shoff` / `e_shnum` …
@@ -275,7 +282,9 @@ SIM_NATIVE_OPS = {
   'aes-ecb':    { in: ['bytes','key'],  out: 'bytes',    run: (d, k) => ... },
   'rc4':        { in: ['bytes','key'],  out: 'bytes',    run: (d, k) => CRYPTO.rc4(k, d) },
   'crc32-poly': { in: ['bytes','poly'], out: 'u32',      run: (d, p) => CRYPTO.crc32(d, { poly: p }) },
-  ...
+  'b64-custom': { in: ['bytes','alphabet'], out: 'str',  run: (d, a) => CRYPTO.base64Encode(d, a) },
+  /* 白名单共这 5 条，与 assets/sim/simnative.js:55–86 一致；实现里每条的实际字段是
+     constSize / desc / run(K, input) —— 上表的 in / out 是契约示意。 */
 }
 ```
 
@@ -406,13 +415,43 @@ objective: {
 
 ### 5.8 Scoring —— 三轴评分
 
-对应《深圳 I/O》的成本 / 功耗 / 代码行数：
+对应《深圳 I/O》的成本 / 功耗 / 代码行数。**已落地**（`assets/sim/simscore.js`）：
 
-| 轴 | 本站定义 | 怎么测 |
-|---|---|---|
-| **注入面** | 挂了多少 Hook + 改了多少字节 + 丢了几个文件 | `SimFrida` 计数 + `SimNative.patch` 计数 |
-| **风控值** | 检测触发程度（已有雏形，见 `app.js:1364`） | 复用现有 `risk` 机制，扩展为跨步骤累计 |
-| **脚本行数** | 玩家提交的脚本行数（非空行） | 直接数 |
+| 轴 | 本站定义 | 怎么测 | 状态 |
+|---|---|---|---|
+| **注入面** | 从**外部**插进目标多少次、改了它多少字节 | `img.stats.hookCount` + `img.stats.patchBytes × 10`（`assets/sim/simnative.js`），由 `SIMSCORE` 换算 | ✅ 已落地 |
+| **风控值** | 试错与破坏目标的代价：改写目标文件 +25 / 提交错一次 +34，累计到 100 被拦 | `SIMSCORE.Ledger` | ✅ 已落地 |
+| **步数** | 工作台里发起的**工具操作**次数（终端命令 + 映像面板查询 + Hook 命令） | `SIMSCORE.Ledger`，每个动作记一次 | ✅ 已落地 |
+| ~~脚本行数~~ | 玩家提交的脚本行数（非空行） | 直接数 | ⏸ **未落地** —— 见下 |
+
+**为什么第三轴落地成「步数」而不是「脚本行数」**：初版设想第三轴是脚本行数，但工作台里**没有脚本编辑器**，
+这一关的解法是"用工具去挖"，不是"写一段代码"。对这类关卡行数无从测起，而"你动了几下"才是
+对应《深圳 I/O》行数的那个量 —— 它同样衡量**解法的紧凑度**：同样的结论，动得越少说明路线越直。
+脚本行数保留给 M3+ 的脚本类关卡，**但两条轴如何共处尚未决定，见 §13 第 7 条。**
+
+#### 三轴规则只有一份实现
+
+规则与计数全在 `assets/sim/simscore.js`（无 DOM）。工作台只读结果，不自己算。
+**这不是洁癖**：规则写在界面里的话，校验器就只能"相信界面报的数"，那是自证不是验证。
+
+#### 「作者基线」是算出来的，不是写下来的
+
+每关的 `reference.route` 是一张**可执行的操作表**（`{op, …}`），不是一段描述文字。
+`SIMSCORE.replay(mission)` 把它真的走一遍并计数，得到作者三轴：
+
+```js
+{ op:'image.hexdump', addr:0x1000, len:128, label:'…' }   // 记 1 步
+{ op:'note',                            label:'…' }       // 人在脑子里的判断，不记步
+{ op:'submit',                          label:'…' }       // 提交不记步
+```
+
+`validate-missions.mjs` 的 **⑧ 组**复核这件事：路线必须可执行、关卡里不许出现手写基线、
+重放必须含一次**通过的提交**（于是"这条路线确实解得开"本身也成了被验证的事）、
+并用一条**独立的算术路径**（不走账本，直接从操作表数）复算三轴与账本对账。
+
+> 这条规矩是被一次真实事故逼出来的：作者基线原先是 `route.length` —— 数的是**文案行数**。
+> 界面显示"作者 3"，但玩家照着那条路线走一遍只能得 1 步；**那个 3 没有任何一次真实操作能产生它**。
+> 它长得太像一个合理的小整数，所以藏了很久才被发现。
 
 通关后在工单底部显示三轴数值 + **官方参考解法的三轴数值**（由 `validate-missions.mjs` 真实跑出）。
 
@@ -478,7 +517,7 @@ lab: {
 
 ### 7.1 只做 18 关，不是 52 关
 
-把 50 个 `lab` 全量分类后，结论很清楚：**数量最大的那一类，恰恰最不该做成工作台。**
+把 52 个 `lab`（口径：`node validate-chapters.mjs` 合计里的「实验」列）全量分类后，结论很清楚：**数量最大的那一类，恰恰最不该做成工作台。**
 
 | 类 | 数量 | 本质 | 结论 |
 |---|---|---|---|
@@ -542,7 +581,7 @@ C 类保留现有 `decision` / `lab` 形态不动。
 | **未写 `mission`** | 与今天**逐字节一致** | 原样 | 零 |
 | **写了 `mission`** | 「交接卡」+ 进入实战区按钮（见 §5.6） | `expected` 退化为 `objective.kind === 'value'` 的语法糖 | 仅该关 |
 
-**关键：剩下 32 个未入选的 lab 永远不需要迁移。**
+**关键：剩下 34 个未入选的 lab 永远不需要迁移。**（52 − 18 = 34；原先写 32 是从更早的"50 个 lab"口径残留下来的）
 也就是说这 18 关是一条**有终点的改造**，不是无底洞。这是本设计能被完成的前提。
 
 ---
@@ -558,13 +597,13 @@ C 类保留现有 `decision` / `lab` 形态不动。
 | **设备** | 一个 `com.example.vault`，启动时调 native `check()`，`logcat` 打印校验结果 |
 | **工具** | `elfinfo`（找到 `.rodata` 偏移）→ `hexview`（读出 16 字节）→ `frida`（hook 确认） |
 | **判定** | `differential`：提交 4 个 32 位字，用 8 组随机向量对拍 |
-| **评分** | 注入面（你挂了几次 Hook）/ 风控值 / 脚本行数 |
+| **评分** | 注入面（你从外部动了几次目标）/ 风控值 / 步数 |
 | **不做** | ARM 反汇编、真 APK、网络、UI 皮肤 |
 
 **验收标准**（必须全部满足）：
 
 1. `FORGE.build(spec, seed)` 跑两次，`images` 逐字节相同
-2. `libtarget.so` 能被外部 `readelf -h` / `readelf -S` 正常读出
+2. `libtarget.so` 结构合法。**本条未经外部工具交叉验证** —— 本机没有 `readelf` / `objdump` / `llvm-readobj`（实测 `Get-Command` 全部找不到），当前用**仓库内逐字段结构断言**替代外部工具验证：`validate-missions.mjs` 的 `assertElf()`（第 50–178 行）逐字段核对 `readelf -h / -S / -s` 会读的字段（文件头与表越界、程序头 `p_offset/p_vaddr` 对齐与 `p_filesz ≤ p_memsz`、节头对齐与 `sh_addr === sh_offset`、符号表链接与 `st_value` 落在所属节内）。产物可用 `--dump <dir>` 落盘，留待有外部工具的机器复核。
 3. `validate-missions.mjs` 用官方参考解法脚本**自动通关**，三轴数值可复现
 4. 手动改 seed，关卡仍然可解（答案跟着变，不是写死的）
 5. 关掉 JS，工单仍然可读（渐进增强，与全站一致）
@@ -613,9 +652,13 @@ C 类保留现有 `decision` / `lab` 形态不动。
 | **M0** ✅ | 本文档定稿（六条未决问题已全部定案） | 已完成 |
 | **M1** ✅ | `assets/sim/`：`simelf.js` / `simnative.js` / `simdevice.js` / `forge.js` + `missions.js`。**无 UI** | `validate-missions.mjs` 能在 Node 里 boot 一关、跑参考解法通关（已达成） |
 | **M1b** | `assets/sim/simvm.js`（DEX 子集解释器） | 见下方说明 —— 等第一个真消费者出现再做 |
-| **M2** | `assets/sim/tools.js` + 实战区 UI（`practice.html` + `Workbench` 组件 + 交接卡） | 一关能在浏览器里手动通关 |
-| **M3** | `Objective`（三种）+ `Scoring` 三轴 + 工单/复盘/进度 | 第 22 章实验一完全迁移 |
+| **M2** ✅ | 实战区 UI（`practice.html` + `Workbench` 六面板 + 交接卡）+ `simscore.js`。**没有 `tools.js`** | 一关能在浏览器里手动通关（已达成） |
+| **M3** 🔶 | `Objective` 🔶 1/3（只有 `differential`）+ `Scoring` 三轴 ✅ + 工单 / 复盘 / 进度 ✅ | 第 22 章实验一完全迁移 |
 | **M4** | 依 §7.2 清单横向迁移剩余 17 关 | 每关迁移后 `validate-chapters.mjs` 零错误 + `validate-missions.mjs` 参考解法通关 |
+
+**M2 计划里的 `tools.js` 去哪了**：设备 / 映像 / Hook 三个面板内联在 `assets/practice.js` 里，
+受控命令表在 `assets/sim/simdevice.js`。**没有单独抽出 `tools.js`** —— 目前只有一个消费者，
+抽出来只会得到一层没有第二个人用的间接。等 M4 的第二套工具（`disasm` / `frida`）出现时再拆。
 
 **M1 是关键路径**：先证明"引擎在 Node 里能跑通"，再谈 UI。这也符合本仓"校验器会真的执行你的代码"的既有文化。
 
@@ -656,6 +699,7 @@ ELF 结构、`.rodata` 里的常量、真算法执行。它完全不经过 DEX�
 | 文件 | 改动 | 是否符合新规则 |
 |---|---|---|
 | `assets/sim/`（`simelf` / `simnative` / `simdevice` / `forge` / `missions`） | 新增 | ✅ 新增 |
+| `assets/sim/simscore.js`（M2 补入，见 §5.8） | 新增 —— 三轴规则与计数的唯一来源 | ✅ 新增 |
 | `assets/practice.js`、`assets/practice.css`、`practice.html` | 新增 | ✅ 新增 |
 | `validate-missions.mjs` | 新增 | ✅ 新增 |
 | `assets/app.js` | `Lab` 在 `cfg.mission` 存在时渲染交接卡；`mountTopbar` 加「🎯 实战区」入口 | ✅ 增量扩展，未重写既有组件 |
@@ -722,3 +766,11 @@ ELF 结构、`.rodata` 里的常量、真算法执行。它完全不经过 DEX�
 
 6. **`validate-missions.mjs` 怎么进日常流程？**
    仓库目前没有 CI。是做成提交前手动跑，还是加一个 GitHub Actions？
+
+7. **`步数` 与 `脚本行数` 两条轴怎么共处？**
+   当前落地的第三轴是 `步数`（见 §5.8），它适配"用工具去挖"的关卡。
+   但 §7.2 里那 4 关动态 Hook 的关卡，玩家的产出会是一段 Frida 脚本 ——
+   那时 `脚本行数` 才是真正对应《深圳 I/O》行数的量。
+   三条路：① 脚本类关卡把第三轴换成脚本行数；② 两条轴同时计（变成四轴）；
+   ③ 坚持步数，用"发起了几次脚本执行"代替"写了几行"。
+   **未定 —— 等 M4 拆第一关动态关卡时再定，届时才有真实的脚本来量。**
