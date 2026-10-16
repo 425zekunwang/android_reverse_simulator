@@ -72,6 +72,8 @@
        { op:'image.hexdump', addr, len }   映像面板转储一段
        { op:'image.strings' }              映像面板看字符串
        { op:'image.elf' }                  映像面板看节表
+       { op:'hook.read',    addr, len }    Hook 读一段内存
+       { op:'hook.list' }                  Hook 列出算子与符号
        { op:'hook.call',    name }         Hook 调一次算子
        { op:'hook.patch',   addr, hex }    Hook 改写映像
        { op:'submit' }                     提交（提交本身不算步数）
@@ -132,6 +134,24 @@
           const e = global.SIMELF.parse(art.images[soPath]);
           note = e.ok ? (e.sections.length + ' 个节') : ('解析失败：' + e.err);
           if (!e.ok) { ok = false; detail = at + '的 ELF 解析失败了'; }
+          break;
+        }
+
+        case 'hook.read': {
+          led.toolStep();
+          const b = img.read(s.addr, s.len);
+          if (b.length) {
+            note = b.length + ' 字节 @ 0x' + (s.addr >>> 0).toString(16);
+          } else {
+            note = '越界'; ok = false; detail = at + '的读取越界了';
+          }
+          break;
+        }
+
+        case 'hook.list': {
+          led.toolStep();
+          const e = global.SIMELF.parse(art.images[soPath]);
+          note = img.ops.length + ' 个算子 / ' + e.dynsyms.length + ' 个导出符号';
           break;
         }
 

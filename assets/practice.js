@@ -72,7 +72,6 @@
     /* 三轴的计数与加法全在 SIMSCORE 里 —— 界面只负责显示，不负责定规则。
        否则校验器就只能"相信界面报的数"，那是自证。 */
     this.led = new global.SIMSCORE.Ledger();
-    this.tries = 0;
     this.locked = false;
     this.solved = false;
     this.best = progressOf(m.id);
@@ -489,7 +488,8 @@
       row('注入面', s.inject, a.inject) +
       row('风控值', s.risk, a.risk) +
       row('步数', s.steps, a.steps) +
-      '<div class="pr-dim pr-score-note">「注入面」= 从外部调用算子次数 + 改写字节数×10；' +
+      '<div class="pr-dim pr-score-note">「注入面」= 从外部调用算子次数 + 改写字节数×' +
+      global.SIMSCORE.RULES.INJECT_PER_PATCH_BYTE + '；' +
       '应用自己跑自己的例行不算。作者路线：' + esc((this.author.route || []).join(' → ')) +
       '，一次都不碰目标，重放出来是 ' + a.inject + ' / ' + a.risk + ' / ' + a.steps + '。' +
       '这不是难度，是取向 —— 真实环境里动得越少越安全。</div>';
@@ -522,7 +522,6 @@
     this.root.querySelectorAll('[data-obj]').forEach(el => { vals[el.dataset.obj] = el.value; });
 
     const words = this.m.objective.parse(vals);
-    this.tries++;
     let r;
     try { r = this.m.objective.run(words, this.art); }
     catch (e) { r = { ok: false, detail: '检查时出错：' + e.message }; }

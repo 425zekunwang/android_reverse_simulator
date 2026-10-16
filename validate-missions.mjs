@@ -525,13 +525,34 @@ try {
    界面上会写着"作者 3"，但这个 3 没有任何一次真实操作能产生它，
    玩家照着作者路线走一遍永远得不到那个数。
 
-   这里做四件事：
+   这里做五件事：
      ① 作者路线必须是**可执行的操作表**，不是一段描述文字
+     ①b 路线用到的面板必须真的开着 —— 否则基线描述的是玩家点不到的路线
      ② 关卡里不许出现手写的基线数字 —— 基线只能由重放产出
      ③ 重放这条路线，确认它真的能通关（含提交，且提交通过）
      ④ 用一条**独立的算术路径**复算三轴，与账本对账；并重放两次确认逐项一致
 
-   ④ 是关键：两条互不相干的路径得出同一个数，才叫可交叉验证。 */
+   ④ 是关键：两条互不相干的路径得出同一个数，才叫可交叉验证。
+   而"一致"这句话**只在真的全对上时才打** —— 失败时报了红却又先说一句一致，
+   正是我们要消灭的那种"看着合理的断言"。 */
+
+/* 路线里的 op 需要哪个工具面板才做得到。
+   note / submit 用 null —— 工单与提交面板永远在。
+   这张表是「作者基线玩家可达」的判据：op 需要某个面板、而本关 tools 没开它，
+   那这条路线玩家就走不出来，算出来的基线再准也没有意义。 */
+const OP_TOOL = {
+  'shell': 'shell',
+  'image.hexdump': 'image',
+  'image.strings': 'image',
+  'image.elf': 'image',
+  'hook.read': 'hook',
+  'hook.list': 'hook',
+  'hook.call': 'hook',
+  'hook.patch': 'hook',
+  'note': null,
+  'submit': null
+};
+
 try {
   if (!sb.SIMSCORE || typeof sb.SIMSCORE.replay !== 'function') {
     err('SIMSCORE', '⑧ 没有加载到 SIMSCORE —— 作者基线无法复算');
@@ -546,6 +567,16 @@ try {
         err(mission.id, '⑧ 作者路线里有 ' + prose.length + ' 项不是可执行操作（缺 op）—— ' +
           '写成叙述的步骤表没法被重放，也就产不出可复算的基线');
         continue;
+      }
+
+      /* ①b 路线用到的面板必须真的开着 —— 否则基线描述的是玩家点不到的路线 */
+      const unreachable = route
+        .filter(s => (s.op in OP_TOOL) && OP_TOOL[s.op] !== null &&
+                     (mission.tools || []).indexOf(OP_TOOL[s.op]) < 0)
+        .map(s => s.op + ' 需要「' + OP_TOOL[s.op] + '」面板');
+      if (unreachable.length) {
+        err(mission.id, '⑧ 作者路线用到了本关没开的工具：' + unreachable.join('、') +
+          ' —— 玩家点不到那个面板，这条基线就不可能是他走出来的');
       }
 
       /* ② 关卡不许自带基线数字 */
@@ -573,21 +604,30 @@ try {
       const wantInject = route.filter(s => s.op === 'hook.call').length + patchBytes * RULES.INJECT_PER_PATCH_BYTE;
       const wantRisk = Math.min(RULES.RISK_LOCK_AT, patches.length * RULES.RISK_PER_PATCH);
 
-      if (r1.steps !== toolOps) {
+      const agreeSteps = r1.steps === toolOps;
+      const agreeInject = r1.inject === wantInject;
+      const agreeRisk = r1.risk === wantRisk;
+
+      if (!agreeSteps) {
         err(mission.id, '⑧ 步数对不上：账本记了 ' + r1.steps + '，按路线表独立数出来是 ' + toolOps +
           '（note / submit 不产生工具操作）');
       }
-      if (r1.inject !== wantInject) {
+      if (!agreeInject) {
         err(mission.id, '⑧ 注入面对不上：账本记了 ' + r1.inject + '，按路线表独立算出来是 ' + wantInject);
       }
-      if (r1.risk !== wantRisk) {
+      if (!agreeRisk) {
         err(mission.id, '⑧ 风控值对不上：账本记了 ' + r1.risk + '，按路线表独立算出来是 ' + wantRisk);
       }
 
-      note('⑧ 作者基线（重放 ' + route.length + ' 步路线，含提交且提交通过）：注入面 ' + r1.inject +
-        ' / 风控 ' + r1.risk + ' / 步数 ' + r1.steps + ' —— 与按路线表独立复算的结果一致');
+      /* 只有真的全对上了才说"一致"。
+         这里刻意不用无条件 note —— 失败时报了红、却又先打一句"与独立复算一致"，
+         正是我们要消灭的那种"看着合理的断言"。 */
+      if (agreeSteps && agreeInject && agreeRisk && !unreachable.length) {
+        note('⑧ 作者基线（重放 ' + route.length + ' 步路线，含提交且提交通过）：注入面 ' + r1.inject +
+          ' / 风控 ' + r1.risk + ' / 步数 ' + r1.steps + ' —— 与按路线表独立复算的结果一致');
+      }
 
-      /* 失败信息里带上每步实际做了什么，方便定位是哪一步没走通 */
+      /* 每步实际做了什么。失败时尤其需要 —— 所以这条无条件打（--quiet 除外）。 */
       if (!QUIET) r1.log.forEach(s => console.log('     · 第 ' + s.i + ' 步 ' + s.op + '：' + s.label));
     }
   }
