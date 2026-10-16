@@ -23,7 +23,7 @@
 | 文件 | 你要从中学会什么 |
 |---|---|
 | `assets/chapter.js` | 数据 → 页面的渲染规则；`T` 助手、`S/CLS/SET` 助手 |
-| `assets/app.js` **第 236–1160 行** | 9 个组件的**精确配置字段**（Lab / Stage / Decision / Quiz / Case / Term / Stepper / Teacher / Deck） |
+| `assets/app.js` **第 306–1567 行**（搜 `function CodeStepper(` 起，到 `function Case(` 收尾） | 9 个组件的**精确配置字段**（Lab / Stage / Decision / Quiz / Case / Term / Stepper / Teacher / Deck） |
 | `chapters/ch02.js` | 标杆范例：一节一节看它怎么起标题、怎么给类比、怎么收尾 |
 | `chapters/ch04.js` | 标杆范例：技术密度最高的一章，看它怎么讲 ART 源码 |
 | `assets/labs.js` | `window.CRYPTO` 全部可用的真实算法实现 |
@@ -296,7 +296,9 @@ node validate-chapters.mjs <章号>
 ## 6. 禁止事项
 
 - ❌ 修改 `assets/` 下任何文件（基础设施已就绪，改它会连带影响现有 25 章）
+  —— **默认规则（main 分支），不放松**；实战模式分支 `feat/practice-simulator` 的放开范围见 6.1
 - ❌ 修改现有 `chapters/ch01.js`–`ch25.js`
+  —— **默认规则（main 分支），不放松**；迁移期按章放开的范围见 6.1
 - ❌ 修改 `index.html` / `README.md` / `slides.html` / `toolbox.html`（由主控统一更新）
 - ❌ 使用 `require` / `import` / `fetch` / 任何外部依赖 —— 数据文件必须是纯 `window.CHAPTER = {…}` 赋值
   （例外：为了**验证案例链接**可以临时写 `.mjs` 脚本，但必须跑完即删，不要留在仓库里）
@@ -304,3 +306,40 @@ node validate-chapters.mjs <章号>
 - ❌ 用 `async` / `await` / Promise
 - ❌ 编造案例链接
 - ❌ 留下临时文件（自检脚本、`.json` 中间产物等）——交付前清干净
+
+### 6.1 实战模式分支（`feat/practice-simulator`）的放开范围
+
+实战模式（工单模式）需要仿真引擎、交接卡与独立实战区，`assets/`、`chapters/` 都要动到——
+但**只在 `feat/practice-simulator` 分支上**开这组有边界的例外。
+**默认规则不松：新章节仍然不许改 `assets/` 下已有文件、不许改别的章节文件**；回到 main 分支时，本节不适用，上面两条禁令原样执行。
+
+| 对象 | 允许的程度 |
+|---|---|
+| **新增** `assets/sim/*`、`assets/practice.js`、`assets/practice.css`、`practice.html`、`validate-missions.mjs` | 只许**新增**（`assets/` 既有文件的可动范围见下面两行） |
+| `assets/app.js` | 只许**增量扩展**：在 `Lab` 组件与 `mountTopbar` 内加分支；**不许重写既有组件** |
+| `assets/style.css` | 只许**追加新规则块**；**不许改动既有规则** |
+| `chapters/chNN.js` | 按章放开**迁移**：一次只改正在迁移的那一章、不许动别的章节；**每章迁移必须单独提交**，且迁移后 `validate-chapters.mjs` 仍须零错误 |
+
+**边界精神：只许新增与增量扩展，不许重写、不许顺手改。** 依据：`PRACTICE-SPEC.md` §11.2，修订经过见文末「修订记录」。
+
+---
+
+## 7. 修订记录
+
+| 日期 | 修订 | 说明 |
+|---|---|---|
+| 2026-10-16 | 为实战模式分支（`feat/practice-simulator`）放开两条禁令（`assets/`、`chapters/chNN.js`） | 默认（main）仍一律禁止；放开范围见 6.1 |
+| 2026-10-16 | 更正 §1「必读文件」里 `assets/app.js` 的行号区间：**236–1160 → 306–1567** | 见下方说明。这是**既有错误**，不是本次改动引入的漂移 |
+
+**关于 §1 那处行号的更正**：原文指向 `assets/app.js` 第 236–1160 行，但 9 个组件实际从
+`function CodeStepper`（第 306 行）排到 `function Case` 收尾（第 1567 行）。
+按原区间去读，会**整个漏掉 `Lab`（动手实验）和 `Case`（实战案例）** —— 而这两个恰恰是章节作者最常打交道的组件。
+改成行号 + 函数名双锚点：行号方便跳，函数名保证下次漂移时还能自己找回来。
+
+**2026-10-16 · 本次已发生的实际改动清单**（均符合 6.1）：
+
+- **新增**：`assets/sim/simelf.js`、`assets/sim/simnative.js`、`assets/sim/simdevice.js`、`assets/sim/forge.js`、`assets/sim/missions.js`、`assets/practice.js`、`assets/practice.css`、`practice.html`、`validate-missions.mjs`
+- **`assets/app.js` 两处增量**：`Lab` 组件在 `cfg.mission` 存在时渲染「交接卡」；`mountTopbar` 增加「🎯 实战区」入口
+- **`assets/style.css`**：追加一个 `.handoff` 样式块（纯新增）
+- **`chapters/ch22.js`**：实验一增加 `mission` 数据字段
+- **`PRACTICE-SPEC.md` §11.1**：记录了 M1 的交付与偏差

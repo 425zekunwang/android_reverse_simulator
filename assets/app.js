@@ -228,6 +228,7 @@
         (meta && meta.no < COURSE.chapters.length ? '<a class="tb-link" href="' + COURSE.chapters[meta.no].file + '">下一章</a>' : '') +
         '<a class="tb-link" href="slides.html">📊 演示稿</a>' +
         '<a class="tb-link" href="toolbox.html">🧰 工具箱</a>' +
+        '<a class="tb-link" href="practice.html">🎯 实战区</a>' +
         '<a class="tb-link primary" href="index.html#progress">学习进度</a>' +
       '</nav>';
     document.body.insertBefore(bar, document.body.firstChild);
@@ -1233,7 +1234,21 @@
     this.tries = 0;
 
     root.classList.add('lab');
-    let h =
+    let h = '';
+
+    /* ---- 交接卡：这个实验在实战区有对应工单 ----
+       章节负责建立能力，实战区负责把"前提已经给你了"这件事收回去。
+       卡片放在最前面：读者还没开始做实验，就该知道有地方可以真刀真枪练。 */
+    if (cfg.mission) {
+      h += '<a class="handoff" href="practice.html#' + esc(cfg.mission.id) + '">' +
+        '<span class="ho-badge">🧰 实战工单</span>' +
+        '<span class="ho-main"><b>' + esc(cfg.mission.title || cfg.title || '') + '</b>' +
+          '<span class="ho-line">' + (cfg.mission.line || '') + '</span></span>' +
+        '<span class="ho-go">' + esc(String(cfg.mission.id).toUpperCase()) + ' →</span>' +
+      '</a>';
+    }
+
+    h +=
       '<div class="lab-head">' +
         '<span class="lab-badge">🧪 动手实验</span>' +
         '<span class="lab-title">' + (cfg.title || '') + '</span>' +
