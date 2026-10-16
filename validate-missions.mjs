@@ -357,15 +357,69 @@ for (const mission of targets) {
       else note('③ 设备端到端：' + mission.reference.walkthrough.length + ' 条命令全部执行，logcat 摘要经独立复算一致（真执行，非回放）');
     }
 
-    /* ★ 改映像必须真的改变结果（证明执行是真读内存的） */
+    /* ★ 改映像必须真的改变结果（证明执行是真读内存的），
+       但**不许漏到原始映像上** —— 这两件事必须同时成立。
+
+       为什么两件都要验：设备读的是工作副本，所以 patch 在设备上看得见；
+       而"生成产物"和参考解法读的是原始映像，必须一个字节都不变。
+       它们曾经是同一个数组（SIMNATIVE.load 拿到的就是 images 里那个数组，
+       patch 做的是 bytes.set(...)）。后果是实测出来的（2026-10-16）：
+         img.patch(0x1020, 'deadbeef') 之后
+           art.images[soPath] 里的常量也成了 de ad be ef
+           reference.solve(art).words 从 0x6080c1ea 变成了 0xefbeadde
+       于是"官方答案"成了**路线历史的函数**，不再是 (关卡, seed) 的函数；
+       而 art.images 还要落盘供外部 readelf 复核 —— 那会复核到另一个文件。 */
     const art2 = sb.FORGE.build(mission.spec, 2201);
-    const img2 = art2.imgs[art2.public.soPath];
+    const so2 = art2.public.soPath;
+    const img2 = art2.imgs[so2];
     const constAddr = img2.rodataAddr + art2.truth.constOffset;
+
+    const hexAt = (arr, o, n) => Array.prototype.slice.call(arr, o, o + n)
+      .map(x => x.toString(16).padStart(2, '0')).join(' ');
+    const snap = hexAt(art2.images[so2], constAddr, 4);
+    const solBefore = mission.reference.solve(art2).words.slice();
+
     const before = img2.call(art2.truth.op, art2.truth.appInput);
     ok(img2.patch(constAddr, new Uint8Array([0xde, 0xad, 0xbe, 0xef])));
     const after = img2.call(art2.truth.op, art2.truth.appInput);
     if (before === after) err(mission.id, '③ patch .rodata 之后结果没变 —— 说明样例是写死的，不是真算');
     else note('   · 改 4 字节 .rodata → 摘要跟着变，确认执行路径真读内存');
+
+    if (art2.imgs[so2].bytes === art2.images[so2]) {
+      err(mission.id, '③ 工作副本与原始映像是同一个数组 —— 改写会漏到生成产物上，' +
+        '"原始映像"就不再是原始的（它在 Hook 控制台里是玩家能改的东西）');
+    }
+    const snapAfter = hexAt(art2.images[so2], constAddr, 4);
+    if (snapAfter !== snap) {
+      err(mission.id, '③ 改写漏到了原始映像上：0x' + constAddr.toString(16) +
+        ' 处从 ' + snap + ' 变成了 ' + snapAfter);
+    }
+    const solAfter = mission.reference.solve(art2).words;
+    if (JSON.stringify(solAfter) !== JSON.stringify(solBefore)) {
+      err(mission.id, '③ 参考解法的答案随改写变了（' +
+        solBefore.map(w => '0x' + (w >>> 0).toString(16)).join(' ') + ' → ' +
+        solAfter.map(w => '0x' + (w >>> 0).toString(16)).join(' ') +
+        '）—— 那"官方答案"就不是 (关卡, seed) 的函数，而是路线历史的函数');
+    } else {
+      note('   · 改写只落在工作副本上：原始映像与参考解法一个字节都没动');
+    }
+
+    /* ★ 同时，改写必须**在设备上看得见** —— 这一条与上一条是一对：
+         生成产物不受影响，而设备上那个文件确实变了。
+       终端里的 hexdump / strings 读的就是设备上那个文件，读出来必须是改过的。
+       界面上明写着"改一个字节，输出就会变，可以在终端里自己验证"。
+
+       （这条是浏览器实测打出来的回归：只把两份数据分开、没把设备接到工作副本上，
+         改写就"看不见"了 —— 而当时 Node 侧的检查全是绿的。） */
+    const dev2 = sb.SIMDEVICE.boot(art2.world, art2.imgs);
+    const hdPatch = dev2.shell('hexdump ' + so2 + ' 0x' + constAddr.toString(16) + ' 4');
+    if (hdPatch.code !== 0 || hdPatch.out.indexOf('de ad be ef') < 0) {
+      err(mission.id, '③ 改写之后设备侧看不见：hexdump 0x' + constAddr.toString(16) +
+        ' 得到 ' + JSON.stringify(hdPatch.out.trim().slice(0, 70)) +
+        ' —— 界面上写着"改一个字节，输出就会变"，那就得真的会变');
+    } else {
+      note('   · 改写设备侧看得见：hexdump 出来是 de ad be ef（与 Hook 控制台读同一份工作副本）');
+    }
 
     /* 落盘，供外部 readelf 复核 */
     if (DUMP) {
@@ -525,10 +579,12 @@ try {
    界面上会写着"作者 3"，但这个 3 没有任何一次真实操作能产生它，
    玩家照着作者路线走一遍永远得不到那个数。
 
-   这里做五件事：
+   这里做七件事：
      ① 作者路线必须是**可执行的操作表**，不是一段描述文字
-     ①b 路线用到的面板必须真的开着 —— 否则基线描述的是玩家点不到的路线
+     ①b 路线里每个 op 都要登记在词汇表里，且用到的面板必须真的开着
+     ①c 词汇表里的每条 op 都必须真的执行得动（登记了 = 实现了）
      ② 关卡里不许出现手写的基线数字 —— 基线只能由重放产出
+     ②b 提交路径必须闭合：parse(format(作者答案)) === 作者答案
      ③ 重放这条路线，确认它真的能通关（含提交，且提交通过）
      ④ 用一条**独立的算术路径**复算三轴，与账本对账；并重放两次确认逐项一致
 
@@ -626,6 +682,38 @@ try {
         err(mission.id, '⑧ 关卡里出现了手写的作者基线 —— 基线只能由 SIMSCORE.replay 算出');
       }
 
+      /* ②b 提交路径必须闭合：parse(format(作者答案)) === 作者答案。
+         玩家走的是一条文本路径 —— 界面上把答案敲进表单，parse 解析它。
+         而引擎的 submit 原先**绕过 parse**，直接把数字交给 run：
+         于是 parse 写坏了也一路绿灯，只有真玩家会撞上（"数字能过、敲进去说格式错"）。
+         这里把那条路的两头接起来，validate-ui 再用这条往返去填真表单。 */
+      const obj = mission.objective || {};
+      if (typeof obj.parse === 'function') {
+        if (typeof obj.format !== 'function') {
+          err(mission.id, '⑧ 本关有 objective.parse 却没有 objective.format —— ' +
+            '提交路径没法闭合：玩家得把答案敲成某种文本，而这里不知道那是什么形状');
+        } else {
+          const art = sb.FORGE.build(mission.spec, mission.seed);
+          let words = null;
+          try { words = mission.reference.solve(art).words; }
+          catch (e) { err(mission.id, '⑧ 参考解法抛错：' + e.message); }
+          if (words) {
+            const round = obj.parse(obj.format(words));
+            const closed = round && round.length === words.length &&
+              round.every((w, i) => w === (words[i] >>> 0));
+            if (!closed) {
+              err(mission.id, '⑧ 提交路径不闭合：parse(format(作者答案)) ≠ 作者答案（' +
+                JSON.stringify(round) + ' vs ' + JSON.stringify(words) + '）—— ' +
+                '数字直接送进 run 能过，但玩家照这个格式敲进表单会被判格式错');
+            } else if (obj.parse({}) !== null) {
+              err(mission.id, '⑧ 空表单没有被 parse 拒绝 —— 格式校验形同虚设');
+            }
+          }
+        }
+      } else if (typeof obj.format === 'function') {
+        warn(mission.id, '⑧ 本关有 objective.format 却没有 parse —— 那这个 format 是给谁用的？');
+      }
+
       /* ③ 路线真的走得通吗 */
       const r1 = sb.SIMSCORE.replay(mission);
       if (!r1.ok) { err(mission.id, '⑧ 作者路线走不通：' + r1.detail); continue; }
@@ -638,7 +726,9 @@ try {
         continue;
       }
 
-      /* ④b 独立复算：不经过账本，直接从路线表数出来 */
+      /* ④b 独立复算：不经过账本，直接从路线表数出来。
+         这条公式只对"提交通过"的路线成立 —— 提交错一次会另记风控，
+         而 ③ 在提交不通过时已经 continue 了，所以到这里的 wrongTry 必然是 0。 */
       const toolOps = route.filter(s => s.op !== 'note' && s.op !== 'submit').length;
       const patches = route.filter(s => s.op === 'hook.patch');
       const patchBytes = patches.reduce(

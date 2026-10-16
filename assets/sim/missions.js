@@ -26,6 +26,10 @@
      两处各写一个 8 的话，改了一处、另一处就变成对玩家说谎。 */
   const VECTORS = 8;
 
+  /* 本关提交表单的字段名。fields / parse / format 三处共用这一份 ——
+     各抄一遍的话，改了一步漏一步，作者答案就填不回去了。 */
+  const OBJ_FIELDS = ['w0', 'w1', 'w2', 'w3'];
+
   /* ======================================================================
      M22-1 · 从 libtarget.so 还原摘要算法 IV
      ----------------------------------------------------------------------
@@ -84,13 +88,13 @@
 
     objective: {
       kind: 'differential',
-      prompt: '提交 4 个 32 位初始状态字（十六进制，各 8 位）',
-      fields: ['w0', 'w1', 'w2', 'w3'],
+      prompt: '提交 4 个 32 位初始状态字（十六进制，每个 1–8 位）',
+      fields: OBJ_FIELDS,
 
       /* 玩家提交的表单 → 4 个字。格式不对返回 null */
       parse: submit => {
         const out = [];
-        for (const k of ['w0', 'w1', 'w2', 'w3']) {
+        for (const k of OBJ_FIELDS) {
           const s = String((submit || {})[k] || '').trim().replace(/^0[xX]/, '');
           if (!/^[0-9a-fA-F]{1,8}$/.test(s)) return null;
           out.push(parseInt(s, 16) >>> 0);
@@ -98,9 +102,22 @@
         return out;
       },
 
+      /* parse 的逆：把 4 个字写成**提示里承诺的那种形式**。
+         为什么非有它不可：校验器得把作者答案变成"玩家会敲的样子"再送进 parse。
+         没有它，校验器只能把数字直接交给 run —— 那就**绕过了 parse**：
+         parse 写坏了也一路绿灯，只有真玩家会撞上。
+         validate-missions 会核对 parse(format(x)) 就是 x，validate-ui 用它填表单。 */
+      format: words => {
+        const out = {};
+        OBJ_FIELDS.forEach((k, i) => {
+          out[k] = (words[i] >>> 0).toString(16).padStart(8, '0');
+        });
+        return out;
+      },
+
       /* ★ 真的对拍：拿玩家的 IV 与真相的 IV，跑同一批随机消息 */
       run: (words, art) => {
-        if (!words) return { ok: false, detail: '四个字都要填，且必须是 1–8 位十六进制' };
+        if (!words) return { ok: false, detail: '四个字都要填，且每个都是 1–8 位十六进制' };
         const truth = art.truth.ivWords;
         const rng = global.FORGE.makeRng((art.seed ^ 0x5eed1234) >>> 0);
         const N = VECTORS;

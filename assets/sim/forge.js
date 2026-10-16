@@ -60,10 +60,28 @@
     })
   };
 
-  /* ---------------- 内部：装载映像 ---------------- */
+  /* ---------------- 内部：装载映像 ----------------
+     ★ 必须**拷一份**再交给 SIMNATIVE.load。
+
+     原因：SIMNATIVE.load 拿到的那个数组，就是它 patch 时直接改的那个数组
+     （simmative.js 的 `bytes` 字段是 `elf.bytes` 本身，patch 做的是 `bytes.set(...)`）。
+     不拷的话 `imgs[p].bytes` 与 `images[p]` **是同一个数组** ——
+     玩家在 Hook 控制台 patch 一下，就同时改掉了「原始映像」。
+
+     这不是理论风险，是实测出来的（2026-10-16）：
+       img.patch(0x1020, 'deadbeef') 之后
+         art.images[soPath][0x1020] = de ad be ef   ← 原始映像被改了
+         reference.solve(art).words = 0xefbeadde …   ← "官方答案"跟着变了
+     于是作者答案成了**路线历史的函数**，不再是 (关卡, seed) 的函数；
+     而 art.images 还被用来落盘供外部 readelf 复核 —— 那会复核到另一个文件。
+
+     拷了之后两边各司其职：
+       images = 生成产物（只读、真相、参考解法、落盘复核）
+       imgs   = 可变工作副本（设备读它，所以 patch 在设备上看得见）
+     注意 truth.constant / truth.rodata 当初就做了 .slice()，唯独这里漏了。 */
   function loadImages(images) {
     const out = {};
-    for (const [p, bytes] of Object.entries(images)) out[p] = global.SIMNATIVE.load(bytes);
+    for (const [p, bytes] of Object.entries(images)) out[p] = global.SIMNATIVE.load(bytes.slice());
     return out;
   }
 
@@ -122,6 +140,19 @@
     const images = {};
     images[soPath] = elfBytes;
     const imgs = loadImages(images);
+
+    /* ★ 设备侧（终端里的 strings / hexdump / cat）读的必须是**工作副本**，
+       而不是生成产物：玩家在 Hook 控制台改写的是"设备上那个文件"，
+       读文件就得看得见改写。两份数据各司其职：
+         images  生成产物：参考解法、ELF 布局、落盘供外部复核 —— 只读
+         imgs    工作副本：Hook 控制台改写它、设备读它、am start 用它真算
+
+       两边接错的样子都出现过，且都是实测打出来的：
+         · 指向同一个数组（原来的写法）→ 改一下原始映像也变了，
+           reference.solve 给出的"官方答案"跟着变（成了路线历史的函数）
+         · 拷了但没把设备接过来 → 改了之后终端里 hexdump 出来还是原样，
+           而界面上明写着"改一个字节，输出就会变，可以在终端里自己验证" */
+    files[soPath] = imgs[soPath].bytes;
 
     const artifact = {
       missionId: id,

@@ -194,15 +194,43 @@
       tool: null,
       desc: '提交',
       probe: () => ({}),
-      run: ctx => {
-        /* 提交不算工具操作（界面里也是这么算的）。
-           这里用作者解法算出答案再走一遍**真实判定** ——
-           于是"这条路线确实能通关"本身也成了被验证的事。 */
-        const sol = ctx.mission.reference.solve(ctx.art);
-        const r = ctx.mission.objective.run(sol.words, ctx.art);
-        return r.ok
-          ? { note: '通过', submitted: true }
-          : { note: '未通过：' + r.detail, fail: '提交未通过：' + r.detail, submitted: true };
+      /* 可以带 answer（表单形状的文本，走 parse 那一套）。不带就用作者解法算出来的答案。
+         ★ 为什么允许带：得能在引擎里表达**一次错误的提交**，否则
+           "界面和引擎对同一次提交的处理一样吗"就不是个能被真的执行的问题 ——
+           而这两条路在这一点上确实曾经不一致。
+         （与 probe 同理：词汇表里有几个字段就是专供校验器用的。） */
+      run: (ctx, s) => {
+        /* 提交不算工具操作（界面里也是这么算的）。 */
+        const obj = ctx.mission.objective;
+        let words;
+
+        if (s.answer) {
+          words = obj.parse(s.answer);
+          if (words === null || words === undefined) {
+            return { note: '提交的表单没通过 parse', fail: '提交的内容没通过本关的格式校验', submitted: true };
+          }
+        } else {
+          /* ★ 走玩家走过的那整条路：format → parse → run。
+             原先直接把 reference.solve 的数字喂给 run，**绕过了 parse** ——
+             于是 parse 写坏了校验器也看不见（⑧③ 照样绿），只有真玩家会撞上。
+             现在作者答案必须先过一遍格式校验，才算"这条路线能通关"。 */
+          const sol = ctx.mission.reference.solve(ctx.art);
+          words = typeof obj.format === 'function' ? obj.parse(obj.format(sol.words)) : sol.words;
+          if (words === null || words === undefined) {
+            return {
+              note: '作者答案过不了本关的 parse',
+              fail: '作者自己算出的答案没能通过本关的格式校验 —— 解题与判定不自洽',
+              submitted: true
+            };
+          }
+        }
+
+        const r = obj.run(words, ctx.art);
+        if (r.ok) return { note: '通过（format → parse → run 全路径）', submitted: true };
+        /* 提交错了就是一次试错。界面上的「提交并检查」也是这么记的 ——
+           两边必须一致，否则"屏幕上显示的三个数"和引擎算的就不是同一件事。 */
+        ctx.led.wrongTry();
+        return { note: '未通过：' + r.detail, fail: '提交未通过：' + r.detail, submitted: true };
       }
     }
   };
