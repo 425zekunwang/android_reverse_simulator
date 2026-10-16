@@ -52,6 +52,7 @@ function makeSandbox() {
   run('assets/sim/simdevice.js');              // window.SIMDEVICE
   run('assets/sim/forge.js');                  // window.FORGE
   run('assets/sim/missions.js');               // window.SIM_MISSIONS
+  run('assets/sim/simscore.js');               // window.SIMSCORE（三轴规则 + 路线重放）
   return sb;
 }
 
@@ -518,6 +519,79 @@ try {
     note('⑦ 章节交接卡：' + MISSIONS.length + ' 个工单，' + cards.length + ' 张卡片，id 与标题全部对得上');
   }
 } catch (e) { err('chapters', '⑦ 章节交接卡检查失败：' + e.message); }
+
+/* ------------------------------------------------- ⑧ 作者基线必须真的算得出来 */
+/* 三轴里的「作者基线」如果只是个手写常量，那它就是文案，不是证据 ——
+   界面上会写着"作者 3"，但这个 3 没有任何一次真实操作能产生它，
+   玩家照着作者路线走一遍永远得不到那个数。
+
+   这里做四件事：
+     ① 作者路线必须是**可执行的操作表**，不是一段描述文字
+     ② 关卡里不许出现手写的基线数字 —— 基线只能由重放产出
+     ③ 重放这条路线，确认它真的能通关（含提交，且提交通过）
+     ④ 用一条**独立的算术路径**复算三轴，与账本对账；并重放两次确认逐项一致
+
+   ④ 是关键：两条互不相干的路径得出同一个数，才叫可交叉验证。 */
+try {
+  if (!sb.SIMSCORE || typeof sb.SIMSCORE.replay !== 'function') {
+    err('SIMSCORE', '⑧ 没有加载到 SIMSCORE —— 作者基线无法复算');
+  } else {
+    const RULES = sb.SIMSCORE.RULES;
+    for (const mission of MISSIONS) {
+      const route = (mission.reference && mission.reference.route) || [];
+
+      /* ① 路线必须是操作，不能是描述 */
+      const prose = route.filter(s => !s || typeof s !== 'object' || !s.op);
+      if (prose.length) {
+        err(mission.id, '⑧ 作者路线里有 ' + prose.length + ' 项不是可执行操作（缺 op）—— ' +
+          '写成叙述的步骤表没法被重放，也就产不出可复算的基线');
+        continue;
+      }
+
+      /* ② 关卡不许自带基线数字 */
+      if (mission.authorBaseline || (mission.reference && mission.reference.baseline)) {
+        err(mission.id, '⑧ 关卡里出现了手写的作者基线 —— 基线只能由 SIMSCORE.replay 算出');
+      }
+
+      /* ③ 路线真的走得通吗 */
+      const r1 = sb.SIMSCORE.replay(mission);
+      if (!r1.ok) { err(mission.id, '⑧ 作者路线走不通：' + r1.detail); continue; }
+
+      /* ④a 重放两次必须逐项一致（靶场是现场生成的，必须确定） */
+      const r2 = sb.SIMSCORE.replay(mission);
+      if (r1.inject !== r2.inject || r1.risk !== r2.risk || r1.steps !== r2.steps) {
+        err(mission.id, '⑧ 作者基线两次重放不一致：' + r1.inject + '/' + r1.risk + '/' + r1.steps +
+          ' vs ' + r2.inject + '/' + r2.risk + '/' + r2.steps + ' —— 现场生成的靶场必须确定');
+        continue;
+      }
+
+      /* ④b 独立复算：不经过账本，直接从路线表数出来 */
+      const toolOps = route.filter(s => s.op !== 'note' && s.op !== 'submit').length;
+      const patches = route.filter(s => s.op === 'hook.patch');
+      const patchBytes = patches.reduce(
+        (n, s) => n + String(s.hex || '').replace(/[^0-9a-fA-F]/g, '').length / 2, 0);
+      const wantInject = route.filter(s => s.op === 'hook.call').length + patchBytes * RULES.INJECT_PER_PATCH_BYTE;
+      const wantRisk = Math.min(RULES.RISK_LOCK_AT, patches.length * RULES.RISK_PER_PATCH);
+
+      if (r1.steps !== toolOps) {
+        err(mission.id, '⑧ 步数对不上：账本记了 ' + r1.steps + '，按路线表独立数出来是 ' + toolOps +
+          '（note / submit 不产生工具操作）');
+      }
+      if (r1.inject !== wantInject) {
+        err(mission.id, '⑧ 注入面对不上：账本记了 ' + r1.inject + '，按路线表独立算出来是 ' + wantInject);
+      }
+      if (r1.risk !== wantRisk) {
+        err(mission.id, '⑧ 风控值对不上：账本记了 ' + r1.risk + '，按路线表独立算出来是 ' + wantRisk);
+      }
+
+      note('⑧ 作者基线（重放 ' + route.length + ' 步路线，含提交且提交通过）：注入面 ' + r1.inject +
+        ' / 风控 ' + r1.risk + ' / 步数 ' + r1.steps + ' —— 与按路线表独立复算的结果一致');
+
+      /* 失败信息里带上每步实际做了什么，方便定位是哪一步没走通 */
+      if (!QUIET) r1.log.forEach(s => console.log('     · 第 ' + s.i + ' 步 ' + s.op + '：' + s.label));
+    }
+  }
+} catch (e) { err('SIMSCORE', '⑧ 作者基线检查失败：' + e.message); }
 
 /* ---------------------------------------------------------------- 汇总 */
 if (!QUIET) console.log('');

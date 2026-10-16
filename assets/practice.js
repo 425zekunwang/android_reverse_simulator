@@ -65,18 +65,13 @@
     this.img = this.art.imgs[this.soPath];
     this.elf = global.SIMELF.parse(this.art.images[this.soPath]);
 
-    /* 作者解法只跑一次。它是纯静态的 —— 不碰目标，所以产物不会变。 */
-    const sol = m.reference.solve(this.art);
-    this.author = {
-      inject: 0,
-      risk: 0,
-      steps: (m.reference.route || []).length,
-      route: m.reference.route || [],
-      sol: sol
-    };
+    /* 作者基线不是写死的数字：让 SIMSCORE 把作者路线**真的走一遍**算出来。
+       它自己建一套靶场，不会碰玩家这台设备。 */
+    this.author = global.SIMSCORE.replay(m);
 
-    this.steps = 0;
-    this.risk = 0;
+    /* 三轴的计数与加法全在 SIMSCORE 里 —— 界面只负责显示，不负责定规则。
+       否则校验器就只能"相信界面报的数"，那是自证。 */
+    this.led = new global.SIMSCORE.Ledger();
     this.tries = 0;
     this.locked = false;
     this.solved = false;
@@ -282,16 +277,20 @@
     this.logcatBox.scrollTop = this.logcatBox.scrollHeight;
   };
 
+  /* 「启动应用」按钮 == 终端里敲 am start —— 同一个动作必须同样记一步，
+     否则换个入口就能白嫖步数。 */
   Workbench.prototype.launch = function (pkg) {
+    this.led.toolStep();
     const r = this.dev.shell('am start ' + pkg);
     this.term.push('<span class="pr-prompt">$</span> am start ' + pkg);
     this.term.push(r.code === 0 ? r.out : '<span class="pr-err">' + r.err + '</span>');
     this.refreshDevice();
+    this.paintScores();
   };
 
   /* ------------------------------------------------------------ 终端 */
   Workbench.prototype.runShell = function (line) {
-    this.steps++;
+    this.led.toolStep();
     this.term.push('<span class="pr-prompt">$</span> ' + esc(line));
     const r = this.dev.shell(line);
     if (r.out) this.term.push('<pre class="pr-pre">' + esc(r.out) + '</pre>');
@@ -315,7 +314,7 @@
   Workbench.prototype.showHex = function () {
     const off = this.root.querySelector('[data-cmd="hxoff"]').value.trim();
     const len = this.root.querySelector('[data-cmd="hxlen"]').value.trim();
-    this.steps++;
+    this.led.toolStep();
     const r = this.dev.shell('hexdump ' + this.soPath + ' ' + off + ' ' + len);
     this.imgLog.hr();
     this.imgLog.push('<span class="pr-prompt">hexdump</span> ' +
@@ -325,7 +324,7 @@
   };
 
   Workbench.prototype.showStrings = function () {
-    this.steps++;
+    this.led.toolStep();
     const r = this.dev.shell('strings ' + this.soPath);
     this.imgLog.hr();
     this.imgLog.push('<span class="pr-prompt">strings</span> <span class="mono">' + esc(this.soPath) + '</span>');
@@ -335,7 +334,7 @@
 
   Workbench.prototype.showElf = function () {
     const e = this.elf;
-    this.steps++;
+    this.led.toolStep();
     this.imgLog.hr();
     this.imgLog.push('<b>ELF 头</b> — ' +
       e.header.machineName + ' · ' + e.header.typeName +
@@ -369,10 +368,12 @@
   /* ------------------------------------------------------------ Hook 控制台 */
   /* 命令集刻意做小：只有四种动作。阅读类的是安全的，动手类计入注入面。 */
   Workbench.prototype.runHook = function (line) {
-    this.steps++;
+    this.led.toolStep();
     this.hook.push('<span class="pr-prompt">▶</span> ' + esc(line));
     this.hookExec(line);
-    /* 每敲一条都要重绘分数 —— 否则「步数」会停在最后一次动手命令上（help / list 提前 return） */
+    /* 每敲一条都要重绘 —— 否则「步数」会停在最后一次动手命令上（help / list 提前 return），
+       风控条也会停在改写之前。 */
+    this.paintRisk();
     this.paintScores();
   };
 
@@ -449,9 +450,9 @@
       const bytes = new Uint8Array(hx.length / 2);
       for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hx.substr(i * 2, 2), 16);
       if (!img.patch(addr, bytes)) { this.hook.push('<span class="pr-err">越界，写不进去</span>'); return; }
-      this.risk = Math.min(100, this.risk + 25);
+      this.led.patch();
       this.hook.push('<span class="pr-warn">已改写 ' + bytes.length + ' 字节 @ ' + hex(addr) +
-        ' —— 目标文件完整性被破坏，风控 +25</span>');
+        ' —— 目标文件完整性被破坏，风控 +' + global.SIMSCORE.RULES.RISK_PER_PATCH + '</span>');
       this.refreshImage();
       return;
     }
@@ -460,20 +461,17 @@
   };
 
   /* ------------------------------------------------------------ 评分三轴 */
-  /* 对应深圳 I/O 的成本 / 功耗 / 行数（PRACTICE-SPEC §5.8）
+  /* 规则与计数都在 SIMSCORE（assets/sim/simscore.js）里 —— 这里只读结果。
+     对应深圳 I/O 的成本 / 功耗 / 行数（PRACTICE-SPEC §5.8）：
        注入面 —— 你从外部插进目标多少次、改了它多少字节
        风控值 —— 试错与破坏目标的代价
        步数   —— 你在工作台里发起的工具操作次数 */
   Workbench.prototype.scores = function () {
-    const st = this.img.stats;
-    return {
-      inject: st.hookCount + st.patchBytes * 10,
-      risk: this.risk,
-      steps: this.steps
-    };
+    return this.led.snapshot(this.img);
   };
 
-  /* 作者解法：只做静态分析，一次都不碰目标（数值在 reset() 里算好，避免每次重绘都重扫 .rodata） */
+  /* 作者基线：由 SIMSCORE.replay 把 reference.route 真的执行一遍得出，
+     在 reset() 里算好（重放一次约 0.1 ms，但没必要每次重绘都重放）。 */
 
   Workbench.prototype.paintScores = function () {
     const box = this.root.querySelector('#pr-scores');
@@ -493,19 +491,20 @@
       row('步数', s.steps, a.steps) +
       '<div class="pr-dim pr-score-note">「注入面」= 从外部调用算子次数 + 改写字节数×10；' +
       '应用自己跑自己的例行不算。作者路线：' + esc((this.author.route || []).join(' → ')) +
-      '，一次都不碰目标，所以是 0 / 0 / ' + this.author.steps + '。' +
+      '，一次都不碰目标，重放出来是 ' + a.inject + ' / ' + a.risk + ' / ' + a.steps + '。' +
       '这不是难度，是取向 —— 真实环境里动得越少越安全。</div>';
   };
 
   Workbench.prototype.paintRisk = function () {
     const el = this.root.querySelector('.pr-risk');
     if (!el) return;
+    const risk = this.led.risk;
     const bar = el.querySelector('.lr-bar i');
     const val = el.querySelector('.pr-risk-val');
-    if (bar) bar.style.width = this.risk + '%';
-    if (val) val.textContent = this.risk + '%';
-    el.classList.toggle('warn', this.risk >= 40 && this.risk < 80);
-    el.classList.toggle('danger', this.risk >= 80);
+    if (bar) bar.style.width = risk + '%';
+    if (val) val.textContent = risk + '%';
+    el.classList.toggle('warn', risk >= 40 && risk < 80);
+    el.classList.toggle('danger', risk >= 80);
   };
 
   Workbench.prototype.showHint = function () {
@@ -530,9 +529,9 @@
 
     if (r.ok) { this.solved = true; }
     else {
-      this.risk = Math.min(100, this.risk + 34);
+      this.led.wrongTry();
       this.paintRisk();
-      if (this.risk >= 100) this.lock();
+      if (this.led.locked()) this.lock();
     }
 
     out.innerHTML = '<div class="pr-msg ' + (r.ok ? 'pass' : 'fail') + '">' +
@@ -599,7 +598,7 @@
         clearInterval(it);
         self.lockIt = null;
         self.locked = false;
-        self.risk = 45;
+        self.led.unlock();
         self.paintRisk();
         out.innerHTML = '<div class="pr-msg warn"><b>🔓 解锁了</b>' +
           '<div class="pr-note">想清楚再提交。静态分析一遍通常比猜十次快。</div></div>';
