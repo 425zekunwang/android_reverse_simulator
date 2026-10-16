@@ -536,28 +536,57 @@ try {
    而"一致"这句话**只在真的全对上时才打** —— 失败时报了红却又先说一句一致，
    正是我们要消灭的那种"看着合理的断言"。 */
 
-/* 路线里的 op 需要哪个工具面板才做得到。
-   note / submit 用 null —— 工单与提交面板永远在。
-   这张表是「作者基线玩家可达」的判据：op 需要某个面板、而本关 tools 没开它，
-   那这条路线玩家就走不出来，算出来的基线再准也没有意义。 */
-const OP_TOOL = {
-  'shell': 'shell',
-  'image.hexdump': 'image',
-  'image.strings': 'image',
-  'image.elf': 'image',
-  'hook.read': 'hook',
-  'hook.list': 'hook',
-  'hook.call': 'hook',
-  'hook.patch': 'hook',
-  'note': null,
-  'submit': null
-};
+/* 路线里的 op 需要哪个工具面板才做得到 —— 这张表**不在校验器里**，它属于引擎
+   （`assets/sim/simscore.js` 的 `ROUTE_OPS`）。校验器直接读它，不另抄一份。
+
+   为什么要这样：这一轮的教训。原先 op 分散在 `replay()` 的 switch 里、工具映射写在
+   这里，两张表各自演化，谁也不知道对方少了哪一条 —— 和"作者 3"是同一个病根。
+   现在只有一份，而且下面的 ①c 会**逐个把它真跑一遍**：
+   于是"登记在表里"和"引擎真的实现了"不可能不是同一件事。 */
 
 try {
   if (!sb.SIMSCORE || typeof sb.SIMSCORE.replay !== 'function') {
     err('SIMSCORE', '⑧ 没有加载到 SIMSCORE —— 作者基线无法复算');
   } else {
     const RULES = sb.SIMSCORE.RULES;
+    const ROUTE_OPS = sb.SIMSCORE.ROUTE_OPS;
+
+    /* ①c 词汇表自检：ROUTE_OPS 声称覆盖引擎的全部路线 op。
+       这里给每个 op 合成一条"只含这一步"的路线并真的重放它，
+       看引擎是答出了实际结果，还是答"未知操作" —— 后者说明表在吹牛。
+       （判据刻意不看 ok：单步路线本来就没有提交，本来就该不 ok。） */
+    for (const opName of Object.keys(ROUTE_OPS || {}).sort()) {
+      const spec = ROUTE_OPS[opName];
+      if (typeof spec.run !== 'function') {
+        err('ROUTE_OPS', '⑧ 词汇表里的「' + opName + '」没有 run —— 登记了却没实现');
+        continue;
+      }
+      if (typeof spec.probe !== 'function') {
+        err('ROUTE_OPS', '⑧ 词汇表里的「' + opName + '」没有 probe —— ' +
+          '校验器没法真的执行它，也就没法证明它存在');
+        continue;
+      }
+      if (!MISSIONS.length) continue;
+
+      let probeArgs;
+      try {
+        probeArgs = spec.probe(MISSIONS[0]);   /* 参数从关卡派生（算子名取自 spec.so.op） */
+      } catch (e) {
+        err('ROUTE_OPS', '⑧ 词汇表「' + opName + '」的 probe 抛错：' + e.message);
+        continue;
+      }
+      const probeMission = Object.assign({}, MISSIONS[0], {
+        reference: Object.assign({}, MISSIONS[0].reference, {
+          route: [Object.assign({ op: opName }, probeArgs, { label: '词汇表自检' })]
+        })
+      });
+      const pr = sb.SIMSCORE.replay(probeMission);
+      if (pr.log[0] && pr.log[0].note === '未知操作') {
+        err('ROUTE_OPS', '⑧ 词汇表里的「' + opName + '」引擎并不认识 —— ' +
+          '表里登记了但 replay 没实现，路线写它会被判成描述文字');
+      }
+    }
+
     for (const mission of MISSIONS) {
       const route = (mission.reference && mission.reference.route) || [];
 
@@ -569,13 +598,26 @@ try {
         continue;
       }
 
-      /* ①b 路线用到的面板必须真的开着 —— 否则基线描述的是玩家点不到的路线 */
-      const unreachable = route
-        .filter(s => (s.op in OP_TOOL) && OP_TOOL[s.op] !== null &&
-                     (mission.tools || []).indexOf(OP_TOOL[s.op]) < 0)
-        .map(s => s.op + ' 需要「' + OP_TOOL[s.op] + '」面板');
-      if (unreachable.length) {
-        err(mission.id, '⑧ 作者路线用到了本关没开的工具：' + unreachable.join('、') +
+      /* ①b 每个 op 都要登记在词汇表里，且用到的面板必须真的开着。
+         前半句兜住"路线写了个引擎没实现的 op"；
+         后半句兜住"基线描述了一条玩家点不到的路线"—— 后者是对抗验证打出来的：
+         把 'image' 从 tools 里删掉而路线照用 image.hexdump，本组当初绿灯放过。
+
+         变量名刻意不叫 problems：那个名字是模块级的错误清单（err/warn 往它推），
+         遮蔽它会让这里读起来像"错误已经被记录了"，其实没有。 */
+      const routeIssues = [];
+      for (const s of route) {
+        if (!(s.op in (ROUTE_OPS || {}))) {
+          routeIssues.push(s.op + '（词汇表里没有这个 op）');
+          continue;
+        }
+        const need = ROUTE_OPS[s.op].tool;
+        if (need !== null && (mission.tools || []).indexOf(need) < 0) {
+          routeIssues.push(s.op + ' 需要「' + need + '」面板');
+        }
+      }
+      if (routeIssues.length) {
+        err(mission.id, '⑧ 作者路线走不通：' + routeIssues.join('、') +
           ' —— 玩家点不到那个面板，这条基线就不可能是他走出来的');
       }
 
@@ -622,7 +664,7 @@ try {
       /* 只有真的全对上了才说"一致"。
          这里刻意不用无条件 note —— 失败时报了红、却又先打一句"与独立复算一致"，
          正是我们要消灭的那种"看着合理的断言"。 */
-      if (agreeSteps && agreeInject && agreeRisk && !unreachable.length) {
+      if (agreeSteps && agreeInject && agreeRisk && !routeIssues.length) {
         note('⑧ 作者基线（重放 ' + route.length + ' 步路线，含提交且提交通过）：注入面 ' + r1.inject +
           ' / 风控 ' + r1.risk + ' / 步数 ' + r1.steps + ' —— 与按路线表独立复算的结果一致');
       }
