@@ -1368,10 +1368,12 @@ window.CHAPTER = {
           '<p>系统会把你的改动套进这段指令流，然后分别用"<b>isVip() 返回 false</b>"和"<b>返回 true</b>"两种状态各跑一遍——' +
           '只有<b>两种状态都走到第 6 行</b>，才算真正改对了。</p>',
         inputs: [
-          { key: 'line', label: '① 你要改第几行？', hint: '填 3–10 之间的行号', value: '4' },
+          /* 两个框都**不预填**：原来预填的就是一个能通过的组合，什么都不想、点一下就过。
+             题面只给语法，不给答案。 */
+          { key: 'line', label: '① 你要改第几行？', hint: '填 3–10 之间的行号', ph: '填行号', value: '' },
           { key: 'newins', label: '② 改成什么？（写替换后的整行；写 # 表示把这一行注释掉）',
-            hint: '例如 const/4 v0, 0x1 或 # 或 if-nez v0, :cond_notvip',
-            value: 'const/4 v0, 0x1' }
+            hint: '本实验支持 const/4 vN, 0xN；if-*z vN, :label；goto :label；invoke-*；return-void；或 #（注释掉）',
+            ph: '写替换后的整行', value: '' }
         ],
         runLabel: '🔍 套用改动并模拟两种状态',
         autorun: true,
@@ -1552,13 +1554,16 @@ window.CHAPTER = {
           const lnRaw = String(v.line || '').replace(/[^0-9]/g, '');
           const ln = lnRaw ? Number(lnRaw) : NaN;
           const t = String(v.newins || '').trim();
-          const isDelete = !t || /^#/.test(t);
+          /* 注释掉这一行必须**显式写 #**。原来"空着也算删除"，
+             于是 ① 填对行号、② 留空就能过 —— 等于白送一半答案。 */
+          const isDelete = /^#/.test(t);
           const isConst1 = /^const\/4\s+v0\s*,\s*(0x1|1)\b/i.test(t);
           const isIfNez = /^if-nez\s+v0\s*,\s*:cond_notvip/i.test(t);
           const isInvokeBad = /^invoke-static/i.test(t);
           const isReturn = /^return/i.test(t);
 
           if (!isFinite(ln)) return { ok: false, detail: '❌ 先在①里填一个行号（3–10）。' };
+          if (!t) return { ok: false, detail: '❌ ②还是空的：写你替换后的整行 Smali（写 <code>#</code> 表示把这一行注释掉）。' };
           if (!/^(#|const\/4|if-|goto|invoke-|return|move-result)/i.test(t)) {
             return { ok: false, detail: '❌ ②里写的不是本实验能解释的 Smali 指令：<code>' +
               String(t).replace(/</g, '&lt;') + '</code><br>' +
@@ -1589,7 +1594,8 @@ window.CHAPTER = {
               '· 会员（v0=1）→ 跳转 → 落到付费弹窗 ❌<br>' +
               '<span class="hit">你只是把"会员被拦、非会员放行"倒了过来，逻辑依然是反的。</span>' +
               '如果你测试时恰好是非会员状态，<b>你会以为成功了</b>——这就是"改包改出玄学"的经典成因。<br>' +
-              '想达到"恒真"，要么改事实（第 4 行 <code>const/4 v0, 0x1</code>），要么删掉分支（第 5 行注释掉）。' };
+              '把"取反"和"恒成立"区分开：恒成立要求<b>在任何状态下都走同一条路</b>，而不是"把两条路对调"。' +
+              '回到那段代码上想 —— 改哪一行、写成什么。' };
           }
           if (ln === 3) {
             return { ok: false, detail: '❌ 第 3 行是<b>发起调用</b>那一步，它只负责"去问 isVip 是真是假"。' +
@@ -1611,9 +1617,8 @@ window.CHAPTER = {
               '这类改动的结果是<b>回编译可能过、运行时崩</b>——比语法错误更难查。' };
           }
           return { ok: false, detail: '❌ 这个组合还不是"恒成立"的改法。' +
-            '回到这段代码的语义上想：<b>要么让 v0 这个"事实"永远是 1，要么让那条跳转永不发生。</b><br>' +
-            '可用的写法：把第 4 行换成 <code>const/4 v0, 0x1</code>（在源头上改事实）；' +
-            '或者把第 5 行注释掉（去掉跳转）。' };
+            '回到这段代码的语义上想：<b>要么让 v0 这个"事实"在任何状态下都一样，要么让那条跳转永不发生。</b><br>' +
+            '哪一行、写成什么，你自己定 —— 这正是本实验要练的判断。（写错了我会告诉你"在哪种情况下错"。）' };
         },
         showAnswer:
           '【推荐改法（最稳、只动一行）】\n' +

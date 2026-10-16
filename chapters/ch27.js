@@ -400,15 +400,28 @@ window.CHAPTER = {
                       : /arm32|arm|32/i.test(String(v.arch || '')) ? 'arm32' : null;
            const name = String(v.name || '').trim().toLowerCase().replace(/[^a-z]/g, '');
            const ok = arch === 'a64' && name === 'openat';
+           /* ③ 也必须判：题面三问里 ①② 是查表题，③ 才是"读懂了这段汇编"的证据。
+              修前 expected 只读 v.arch / v.name —— ③ 空着也能过。 */
+           const reason = String(v.reason || '').trim();
+           const hitWhat = window.AKKC_hasConcept(reason, ['maps', '内存映射', '映射表']);
+           const hitWhy = window.AKKC_hasConcept(reason, ['反调试', '检测', 'frida', '扫描', '查找', '内联', 'inline', 'svc', 'libc', '直接']);
+           if (!ok) return {
+             ok: false,
+             detail: arch !== 'a64'
+               ? '① 架构还不对。判断依据只有一条：<b>系统调用号放在哪个寄存器里</b> —— 点「💡 提示」看那一条。'
+               : '② 调用名还不对。<code>0x38</code> 是十进制多少？拿这个号去查 AArch64 的系统调用表，' +
+                 '再点「🔍 校验我的解码」核对（注意：这里有个"最像的那个名字其实不存在"的坑）。'
+           };
+           if (!(hitWhat && hitWhy)) return {
+             ok: false,
+             detail: '①② 对了。③ 还要答完整：这段代码<b>读的是哪个文件</b>？<b>为什么要读它</b>、' +
+               '以及它<b>绕过了什么</b>（想想它有没有经过 libc）。<span class="muted">（这一问才是本实验的重点。）</span>'
+           };
            return {
-             ok,
-             detail: ok
-               ? '<b>全对。</b>架构 AArch64（号在 X8），调用 <code>openat</code>（nr=56），目标是 <code>/proc/self/maps</code>。' +
-                 '<br>你已经具备"读裸 SVC"的能力了 —— 这正是定位反调试代码的核心技能。'
-               : (arch !== 'a64'
-                   ? '<b>架构判断错了。</b>号放在 <code>X8</code> 而不是 <code>R7</code>，所以是 AArch64。'
-                   : '<b>调用名不对。</b>AArch64 下 0x38=56 是 <code>openat</code>，' +
-                     '而且 <b>AArch64 没有 <code>open</code></b> —— 这是最容易踩的坑。')
+             ok: true,
+             detail: '<b>三问全对。</b>架构 AArch64（号在 X8）、调用 <code>openat</code>（nr=56）、' +
+               '目标是 <code>/proc/self/maps</code>；它用<b>内联 SVC</b> 绕过 libc，所以常规 hook 看不到它。<br>' +
+               '这套读法就是定位反调试代码的核心技能。'
            };
          },
          showAnswer:

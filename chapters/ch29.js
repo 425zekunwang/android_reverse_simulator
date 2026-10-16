@@ -1,5 +1,35 @@
 /* 第 29 章 · 云手机核心原理与检测 —— 数据文件
    结构规范见 BRIEF.md；组件助手 T / S / CLS / SET 由 assets/chapter.js 提供。 */
+/* 29.8L 审计表：run 与 expected 共用这一份 —— "几处破绽"这个数字只在这里出现一次，
+   两边不可能各写一个、然后对不上。 */
+var CH29_AUDIT_ITEMS = [
+            { f: 'CPU 型号 = Intel Xeon', cat: '标识一致性',
+              why: 'Build.MODEL 说是 Redmi K60（ARM 手机），CPU 却是 Intel 服务器芯片 —— <b>两个字段直接矛盾</b>。' +
+                   '而且 <code>ro.product.cpu.abi</code> 自称 arm64-v8a，更说明 cpuinfo 是假的。' },
+            { f: 'GL_RENDERER = Google SwiftShader', cat: '存在性',
+              why: 'SwiftShader 是<b>软件渲染器</b>，意味着没有可用 GPU 硬件。真机一定是 Adreno / Mali / PowerVR。' +
+                   '这一项<b>改字符串会被实际渲染行为戳穿</b>，必须真上 GPU 加速。' },
+            { f: '传感器列表为空', cat: '存在性',
+              why: '真机必有加速度计、陀螺仪等。没有任何传感器 = 不是手机。' +
+                   '注意：补的时候要有<b>合理噪声与变化</b>，恒定值同样会被识破。' },
+            { f: '电池 100% / 25.0℃ 连续 8 小时不变', cat: '统计特征',
+              why: '真机的电量会降、温度会随负载变化。连续 8 小时完全不变是<b>统计上的不可能</b>。' },
+            { f: 'MAC = 52:54:00:…', cat: '标识一致性',
+              why: '<code>52:54:00</code> 是 <b>QEMU 虚拟网卡的固定 OUI 前缀</b>，一个非常经典的特征。' },
+            { f: '开机 42 秒', cat: '统计特征',
+              why: '云手机常被反复重置，开机时长异常短。真机用户上报时通常已运行数小时以上。' +
+                   '（单独看不致命，但配合其他项就是佐证。）' },
+            { f: 'androidboot.hardware=ranchu', cat: '存在性',
+              why: '<code>ranchu</code> 是 <b>Android 模拟器的虚拟硬件名</b>（旧版是 goldfish）。' +
+                   '直接暴露在 <code>/proc/cmdline</code> 里，属于"盖章承认自己是模拟器"。' },
+            { f: '无 SIM 卡 / 无 MCC-MNC', cat: '存在性',
+              why: '真机通常有 SIM。没有基带是虚拟环境的典型特征。' +
+                   '（但也要注意：真机也可能没插卡，所以这条<b>单独看区分度不够</b>。）' },
+            { f: '出口 IP 属数据中心段', cat: '标识一致性',
+              why: '住宅宽带 IP 与云服务商 IP 段在公开的 IP 归属库里可查。' +
+                   '这条<b>最难补</b>——需要在外部资源层面解决，不是改代码能搞定的。' }
+          ];
+
 window.CHAPTER = {
   no: 29,
   title: '云手机核心原理与检测',
@@ -682,42 +712,15 @@ window.CHAPTER = {
           '<tr><td>运营商 / MCC-MNC</td><td><b>（无 SIM 卡）</b></td></tr>' +
           '<tr><td>出口 IP 归属</td><td>某云服务商数据中心段</td></tr>' +
           '</tbody></table></div>' +
-          '<p><b>任务：找出至少 4 处破绽，并说出每一处属于哪一类（存在性 / 统计特征 / 标识一致性）。</b></p>',
+          '<p><b>任务：</b>把这份快照里的破绽<b>全部</b>找出来（填数量），并指出<b>哪一处最难靠"改返回值"补上</b>、为什么。</p>',
         inputs: [
-          { key: 'count', label: '① 你找到了几处破绽？（填数字）', hint: '表里至少埋了 7 处', ph: '例如 5' },
+          { key: 'count', label: '① 你找到了几处破绽？（填数字）', hint: '三类都扫一遍：存在性 / 统计特征 / 标识一致性', ph: '填数字' },
           { key: 'worst', label: '② 哪一处最难靠"改返回值"补上？为什么？',
             hint: '想想哪些需要真实硬件或外部资源', ph: '我认为是……因为……', type: 'textarea', rows: 2 }
         ],
         runLabel: '🔍 对照审计结果',
         run: (v) => {
-          const items = [
-            { f: 'CPU 型号 = Intel Xeon', cat: '标识一致性',
-              why: 'Build.MODEL 说是 Redmi K60（ARM 手机），CPU 却是 Intel 服务器芯片 —— <b>两个字段直接矛盾</b>。' +
-                   '而且 <code>ro.product.cpu.abi</code> 自称 arm64-v8a，更说明 cpuinfo 是假的。' },
-            { f: 'GL_RENDERER = Google SwiftShader', cat: '存在性',
-              why: 'SwiftShader 是<b>软件渲染器</b>，意味着没有可用 GPU 硬件。真机一定是 Adreno / Mali / PowerVR。' +
-                   '这一项<b>改字符串会被实际渲染行为戳穿</b>，必须真上 GPU 加速。' },
-            { f: '传感器列表为空', cat: '存在性',
-              why: '真机必有加速度计、陀螺仪等。没有任何传感器 = 不是手机。' +
-                   '注意：补的时候要有<b>合理噪声与变化</b>，恒定值同样会被识破。' },
-            { f: '电池 100% / 25.0℃ 连续 8 小时不变', cat: '统计特征',
-              why: '真机的电量会降、温度会随负载变化。连续 8 小时完全不变是<b>统计上的不可能</b>。' },
-            { f: 'MAC = 52:54:00:…', cat: '标识一致性',
-              why: '<code>52:54:00</code> 是 <b>QEMU 虚拟网卡的固定 OUI 前缀</b>，一个非常经典的特征。' },
-            { f: '开机 42 秒', cat: '统计特征',
-              why: '云手机常被反复重置，开机时长异常短。真机用户上报时通常已运行数小时以上。' +
-                   '（单独看不致命，但配合其他项就是佐证。）' },
-            { f: 'androidboot.hardware=ranchu', cat: '存在性',
-              why: '<code>ranchu</code> 是 <b>Android 模拟器的虚拟硬件名</b>（旧版是 goldfish）。' +
-                   '直接暴露在 <code>/proc/cmdline</code> 里，属于"盖章承认自己是模拟器"。' },
-            { f: '无 SIM 卡 / 无 MCC-MNC', cat: '存在性',
-              why: '真机通常有 SIM。没有基带是虚拟环境的典型特征。' +
-                   '（但也要注意：真机也可能没插卡，所以这条<b>单独看区分度不够</b>。）' },
-            { f: '出口 IP 属数据中心段', cat: '标识一致性',
-              why: '住宅宽带 IP 与云服务商 IP 段在公开的 IP 归属库里可查。' +
-                   '这条<b>最难补</b>——需要在外部资源层面解决，不是改代码能搞定的。' }
-          ];
-
+          const items = CH29_AUDIT_ITEMS;
           let html = '<div class="lab-kv"><span>埋设破绽 <b>' + items.length + '</b> 处</span>'
             + '<span>存在性 <b>' + items.filter(x => x.cat === '存在性').length + '</b></span>'
             + '<span>统计特征 <b>' + items.filter(x => x.cat === '统计特征').length + '</b></span>'
@@ -755,7 +758,7 @@ window.CHAPTER = {
                 '对比：GPU 渲染器虽然难，但<b>把渲染真的落到 GPU 上</b>（GPU 直通 / virtio-gpu）就能解决，' +
                 '属于工程问题而非资源问题。</div></div>';
             } else if (hitGPU) {
-              html += '<div class="lab-msg pass"><b>✅ 有道理：GPU 渲染器确实很难"伪造"</b><div class="lab-note">' +
+              html += '<div class="lab-msg warn"><b>🟡 有道理，但还有更难的一处</b><div class="lab-note">' +
                 '因为改字符串会被后续的实际渲染行为戳穿 —— 你得真的让渲染走 GPU。<br>' +
                 '不过从"能不能靠自己解决"的角度看，<b>出口 IP 更难</b>：' +
                 'GPU 是工程问题（加硬件加速），IP 是资源问题（得买住宅代理）。</div></div>';
@@ -774,21 +777,29 @@ window.CHAPTER = {
           return html;
         },
         expected: (v) => {
-          const ans = parseInt(String(v.count || '').trim(), 10);
-          const ok = !isNaN(ans) && ans >= 4;
-          return {
-            ok,
-            detail: ok
-              ? '<b>达标（≥4 处）。</b>比数量更重要的是你用的方法：' +
-                '<b>不是逐个字段问"这个值对不对"，而是问"这些字段之间互相矛盾吗"。</b><br>' +
-                '前者只能抓明显的假值，后者能抓住精心伪造里的破绽 —— 比如把 MODEL 改成了 Redmi，' +
-                '却忘了 CPU 型号还写着 Intel。'
-              : '<b>数量不足。</b>表里一共埋了 9 处破绽。<br>' +
-                '建议按三类逐个扫：<br>' +
-                '• <b>存在性</b>：真机一定有的东西，这里有没有？（传感器、GPU、SIM）<br>' +
-                '• <b>统计特征</b>：数值像不像真实物理世界的？（电池恒定、开机 42 秒）<br>' +
-                '• <b>标识一致性</b>：字段之间对得上吗？（MODEL 说小米，CPU 是 Intel；MAC 是 QEMU 前缀）'
-          };
+          /* "表里到底几处"以 run 那张审计表的条目数为准 —— 这个数字只有一处来源，
+             不会出现"判分器写 9、表格里 8 条"这种两边各写一个的情况。 */
+          const TOTAL = CH29_AUDIT_ITEMS.length;
+          const cnt = parseInt(String(v.count || '').trim(), 10);
+          const worst = String(v.worst || '').trim();
+          const worstOk = window.AKKC_hasConcept(worst, ['ip', '出口', '代理', '数据中心', '住宅', '网络']);
+          if (isNaN(cnt)) return { ok: false, detail: '① 先填一个数字：你在快照里数出了几处破绽。' };
+          if (cnt !== TOTAL) {
+            return { ok: false, detail: '<b>数量不对。</b>把三类都扫一遍再数一次：<br>' +
+              '• <b>存在性</b>：真机一定有的东西，这里有没有？<br>' +
+              '• <b>统计特征</b>：数值像不像真实物理世界的？<br>' +
+              '• <b>标识一致性</b>：字段之间对得上吗？<br>' +
+              '<span class="muted">差几处这次不告诉你 —— 数对了这一问才有意义。</span>' };
+          }
+          if (!worstOk) {
+            return { ok: false, detail: '数量对了。但 ② 再想想：问的是"最难靠<b>改返回值</b>补上"的那一处 —— ' +
+              '有一处的问题<b>根本不在你的系统里</b>，代码怎么写都补不了。' };
+          }
+          return { ok: true, detail: '✅ 数量和方法都对了（' + TOTAL + ' 处）。比数量更重要的是你用的方法：' +
+            '<b>不是逐个字段问"这个值对不对"，而是问"这些字段之间互相矛盾吗"。</b><br>' +
+            '前者只能抓明显的假值，后者能抓住精心伪造里的破绽 —— 比如把 MODEL 改成了 Redmi，' +
+            '却忘了 CPU 型号还写着 Intel。<br>' +
+            '② 那一处（出口 IP 归属）是唯一的<b>外部资源</b>问题：改代码改不了别人数据库里的 IP 记录。' };
         },
         showAnswer:
           '共埋了 9 处破绽，按三类分：\n\n' +

@@ -339,7 +339,7 @@ window.CHAPTER = {
           '</code></pre>',
         inputs: [
           { key: 'reject', label: '① 哪两段会被验证器拒绝？（填字母）',
-            hint: '格式：B、C 或 B C', ph: '例如 B、C' },
+            hint: '格式：两个字母，用、或空格隔开（如 A、D）', ph: '填两个字母' },
           { key: 'reason', label: '② 验证器拒绝它们的共同理由是什么？',
             hint: '它不做运行时测试，只在加载时做什么？', ph: '因为……', type: 'textarea', rows: 3 }
         ],
@@ -414,17 +414,27 @@ window.CHAPTER = {
         expected: (v) => {
           const picked = [...new Set(String(v.reject || '').toUpperCase().replace(/[^A-E]/g, '').split(''))].sort();
           const ok = picked.length === 2 && picked[0] === 'B' && picked[1] === 'C';
+          /* ② 也必须判：修前 expected 只读 v.reject —— ②（共同理由）一个字都不看就通过。
+             判据沿用 run 里那两把尺子（"静态可判定" + "具体的安全性质"），两把都够到才算答对。 */
+          const reason = String(v.reason || '').trim();
+          const hitStatic = window.AKKC_hasConcept(reason, ['静态', '加载时', '证明', '可证明', '不运行', '编译时', '事先', '不可判定']);
+          const hitSafe = window.AKKC_hasConcept(reason, ['安全', '越界', '死循环', '终止', '崩溃', '内存']);
+          if (!ok) return {
+            ok: false,
+            detail: '<b>不是这两个。</b>把五段逐段过一遍，问自己：这几行代码里，有没有什么东西是<b>光看代码</b>' +
+              '就能确定"一定不会出事"的？<span class="muted">（是哪两段这次不告诉你 —— 想不出来就点「🔍 对照验证器判定」，' +
+              '那张表逐段给出判定。）</span>'
+          };
+          if (!(hitStatic && hitSafe)) return {
+            ok: false,
+            detail: '两个片段对了。② 还要说出<b>共同理由</b>：验证器凭什么敢拒绝它们？<br>' +
+              '<span class="muted">（一句话就够，但必须写出它"在什么时候、靠什么"做判断。）</span>'
+          };
           return {
-            ok,
-            detail: ok
-              ? '<b>完全正确：B 和 C。</b><br>' +
-                '验证器要静态证明两件事：<b>内存安全</b>（B 违反：可能越界）和<b>一定终止</b>（C 违反：可能死循环）。<br>' +
-                'A / D / E 分别靠"范围检查""循环展开""判空"给出了可证的保证。'
-              : '<b>不是这两个。</b>正确答案是 <b>B</b> 和 <b>C</b>。<br>' +
-                '判断方法：逐段问自己"验证器能不能<b>静态证明</b>它安全？"<br>' +
-                '• A 有范围检查 → 能证明<br>• D 循环被展开成直线代码 → 能证明<br>• E 判空后解引用 → 能证明<br>' +
-                '• <b>B</b> 直接用不可信输入索引 → <b>证明不了</b><br>' +
-                '• <b>C</b> 无条件死循环 → <b>证明不了会终止</b>'
+            ok: true,
+            detail: '<b>完整答对。</b>验证器不做运行时测试 —— 它在加载时静态证明"这段程序在任何输入下都不会出事"，' +
+              '证明不了就直接拒绝（B 可能越界、C 可能不终止）。<br>' +
+              '这就是"凭什么允许用户代码进内核"的答案。'
           };
         },
         showAnswer:

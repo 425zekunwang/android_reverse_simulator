@@ -246,7 +246,7 @@ window.CHAPTER = {
               '00 00 00 00 00 00 00 00 ' +           // data_size (8 字节)
               '00 00 00 00'                          // data_off
           },
-          { key: 'ver', label: '① 这是哪个 Android 版本的 dex？', hint: '看 magic 的版本号', ph: '例如 Android 9.0+' },
+          { key: 'ver', label: '① 这是哪个 Android 版本的 dex？', hint: '看 magic 的版本号', ph: '例如 Android X.Y' },
           { key: 'why', label: '② 如果这份 dex 是内存 dump 出来的，jadx 为什么可能报 checksum 错误？',
             hint: '想想 dump 时内容变了、但哪个字段没跟着更新', ph: '因为……', type: 'textarea', rows: 2 }
         ],
@@ -300,16 +300,43 @@ window.CHAPTER = {
         expected: (v) => {
           const ver = String(v.ver || '').trim();
           const why = String(v.why || '').trim();
-          const verOk = window.AKKC_hasConcept(ver, ['23.0', '9', '039', '安卓9', 'android 9']);
-          const whyOk = window.AKKC_hasConcept(why, ['checksum', '校验', '没更新', '失配', '不对', '内容变了', '回填', 'adler', 'signature']);
+
+          /* 第①问的答案必须**从读者手里那份文件头里读出来**，不能对着写死的关键词表算。
+             原来那张表里收了裸数字 '9' —— 敲一个 9 就算对，读没读 magic 完全看不出来，
+             这一问就废了。现在：先解 magic，再拿解出来的版本号去对答案。 */
+          const bytes = String(v.hex || '').replace(/0x/gi, ' ').match(/[0-9a-fA-F]{2}/g) || [];
+          const magicVer = bytes.length >= 8
+            ? String.fromCharCode(...bytes.slice(4, 7).map(b => parseInt(b, 16))) : null;
+          /* 版本号 → 可接受的写法。注意**不接受裸数字**：
+             从 "039" 走到 "Android 9" 这一步必须由读者自己走完（"9" 只是猜的）。 */
+          const VER_MAP = {
+            '035': ['2.3', '安卓2.3', 'android 2.3'],
+            '037': ['5.0', '6.0', '安卓5', '安卓6', 'android 5', 'android 6'],
+            '038': ['7.0', '8.0', '安卓7', '安卓8', 'android 7', 'android 8'],
+            '039': ['9.0', '安卓9', 'android 9'],
+            '040': ['10', '10.0', '安卓10', 'android 10']
+          };
+          const VER_LABEL = { '035': '2.3', '037': '5.0–6.0', '038': '7.0–8.0', '039': '9.0+', '040': '10+' };
+          const verOk = magicVer !== null && /^[0-9]{3}$/.test(magicVer)
+            && window.AKKC_hasConcept(ver, [magicVer].concat(VER_MAP[magicVer] || []));
+          /* 第②问是个复合判断：既要指出**哪个字段**在管校验，也要说清**它为什么对不上**。
+             任选一个词就能过的那种判分，等于没有判分。 */
+          const whyOk = window.AKKC_hasConcept(why, ['checksum', 'signature', 'adler', '校验', '摘要', 'sha-1', 'sha1'])
+                     && window.AKKC_hasConcept(why, ['没更新', '未更新', '没有更新', '没跟着', '没重算', '未重算', '没变', '未变',
+                                                    '还是旧', '旧值', '原始值', '原来的值', '失配', '对不上', '内容变了']);
           return {
             ok: verOk && whyOk,
-            detail: (verOk ? '✅ 版本正确：magic 结尾是 <code>039</code> → Android 9.0+。'
-                           : '❌ 版本看错了。看 magic 的<b>倒数第 2 位数字</b>：<code>dex\\n039\\0</code> 里的 <code>039</code>。')
+            detail: (magicVer === null
+                        ? '❌ 先把文件头贴回来：第①问的答案要从 magic 里读（前 8 个字节就够）。'
+                        : verOk
+                          ? '✅ 版本正确：magic 里的 <code>' + magicVer + '</code> 对应 Android ' +
+                            (VER_LABEL[magicVer] || '（本实验未收录的版本号）') + '。'
+                          : '❌ 版本看错了。magic 是 <code>dex\\n' + magicVer + '\\0</code>：' +
+                            '把第 5–7 个字节按 ASCII 表念出来，再看这三个数字对应哪个 Android 版本。')
               + '<br>'
-              + (whyOk ? '✅ 原因说对了：dump 后内容变了，但 checksum/signature 字段没跟着更新。'
-                        : '❌ 原因还差一点。关键：<code>checksum</code> 和 <code>signature</code> 是'
-                          + '<b>文件头里存的固定值</b>，dump 时内容变了、它们没变 → 校验失败。')
+              + (whyOk ? '✅ 原因说对了：dump 后内容变了，但文件头里那两个校验字段还是旧值，没跟着更新 → 校验必然失配。'
+                       : '❌ 原因还差一点。这一问问的是"为什么会对不上"，所以要同时说清两件事：' +
+                         '<b>哪个字段在管校验</b>（文件头里有两个），以及<b>它为什么与当前内容不一致</b>。')
           };
         },
         showAnswer:

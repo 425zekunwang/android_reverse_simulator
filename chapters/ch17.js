@@ -271,12 +271,23 @@ window.CHAPTER = {
           const a = L.thumbDecode(v.arm, 'arm32'), b = L.thumbDecode(v.a64, 'a64');
           // 注意 !!：thumbDecode 在输入为空时返回 null，直接 && 串起来会让 ok 变成 null
           const ok = !!(a && b && a.value === 0x1A4D && b.value === 0x1A4C);
-          return {
-            ok,
-            detail: ok
-              ? '完全正确。ARM32 要 +1（Thumb 标记），AArch64 原样。'
-              : '再想一遍：ARM32 的 Thumb 函数，地址最低位必须是 <b>1</b>；AArch64 没有这个约定。'
+          /* ③ 也必须判：①② 是"照着提示改一位"就能填对的，③ 才是"你真的知道为什么"的证据。
+             修前 expected 只读 v.arm / v.a64 —— ③ 空着也能过（run 里判了 ③，但 run 不是判分器）。 */
+          const why = String(v.why || '').trim();
+          const whyOk = !!why
+            && window.AKKC_hasConcept(why, ['最低位', '最低 bit', 'bit0', 'bit 0', '末位'])
+            && window.AKKC_hasConcept(why, ['aarch64', 'arm64', '64', '定长']);
+          if (!ok) return {
+            ok: false,
+            detail: '①② 还不对。把两个偏移填进「🔍 验证我的答案」—— 那张对照表会把 IDA 偏移、你填的值、' +
+              '真正的 Frida 实参并排放出来，差在哪儿一眼就能看到。'
           };
+          if (!whyOk) return {
+            ok: false,
+            detail: '①② 对了。③ 还要说清"为什么"：CPU 取指的时候，靠什么判断该按哪种指令集解码？' +
+              'AArch64 为什么不需要这一步？<span class="muted">（说不清的话，①② 很可能是照着提示凑出来的。）</span>'
+          };
+          return { ok: true, detail: '完全正确：ARM32 要 +1（Thumb 标记），AArch64 原样 —— 而且你能说清为什么。' };
         },
         showAnswer:
           'ARM32（armeabi-v7a）：\n' +

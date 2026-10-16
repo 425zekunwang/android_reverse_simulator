@@ -616,7 +616,7 @@ window.CHAPTER = {
           { key: 'q', label: '质数 q', hint: '默认 53', value: '53' },
           { key: 'e', label: '公钥指数 e', hint: '必须与 φ(n) 互质', value: '17' },
           { key: 'm', label: '明文 m（整数）', hint: '必须小于 n；支持 0x 前缀', value: '65' },
-          { key: 'd', label: '★ 你自己算出的私钥指数 d', hint: '用扩展欧几里得解 e·d ≡ 1 (mod φ(n))', ph: '例如 2753', value: '' }
+          { key: 'd', label: '★ 你自己算出的私钥指数 d', hint: '用扩展欧几里得解 e·d ≡ 1 (mod φ(n))', ph: '填你算出的 d', value: '' }
         ],
         runLabel: '🔍 用我的参数真算一遍',
         run: function (v) {
@@ -720,16 +720,26 @@ window.CHAPTER = {
           }
           var n = p * q, phi = (p - 1n) * (q - 1n), mm = m % n;
           var c = mp(mm, e, n);
-          var back = mp(c, d, n);
-          if (back === mm) {
-            return { ok: true, detail: '✅ 正确。用你的 d 解出的明文是 <b>' + back + '</b>，与原始明文一致。' +
-              '<br>密文 c = <span class="mono">' + mm + '^' + e + ' mod ' + n + ' = ' + c + '</span>，' +
-              '解密 <span class="mono">' + c + '^' + d + ' mod ' + n + ' = ' + back + '</span>。' +
-              '你算出的 d 与 φ(n) = ' + phi + ' 是配套的。<br>' +
-              '<span class="hit">换个参数再算一遍</span>——比如 p=7、q=11（n=77, φ=60），取 e=13，明文 m=42，再解一次 d。' };
+
+          /* 判据必须是 d 的**定义**（e 的模逆元），不能用"解密往返"。
+             往返检验有个洞：m = 0 时 c = 0，任何 d 都能把 0 解回 0 ——
+             读者把明文填成 0、随便写个 d 就能通过，实验白做。
+             模逆元是 d 成立的充要条件，且与明文无关，没有这种退化路径。 */
+          var dN = ((d % phi) + phi) % phi;      // 归一到 [0, φ(n))：-367 与 2753 是同一个逆元
+          var de = (e * dN) % phi;
+          var back = mp(c, dN, n);
+          var norm = (dN === d) ? ''
+            : '<br><span class="muted">你填的 d 归一到 [0, φ(n)) 后是 ' + dN + ' —— 同一个逆元的不同写法，都对。</span>';
+          if (dN !== 0n && de === 1n) {
+            return { ok: true, detail: '✅ 正确。你的 d 满足它的定义 <span class="mono">e × d ≡ 1 (mod φ(n))</span>：' +
+              '<br><span class="mono">' + e + ' × ' + dN + ' mod ' + phi + ' = ' + de + '</span>（φ(n) = ' + phi + '）。' +
+              '<br>再拿它真的解一次密：<span class="mono">' + c + '^' + dN + ' mod ' + n + ' = <b>' + back + '</b></span>，' +
+              '回到明文 <b>' + mm + '</b>。' + norm +
+              '<br><span class="hit">换个参数再算一遍</span>——比如 p=7、q=11（n=77, φ=60），取 e=13，明文 m=42，再解一次 d。' };
           }
-          return { ok: false, detail: '❌ 用 <span class="mono">c^d mod n</span> 解出来是 <b>' + back + '</b>，期望是 <b>' + mm + '</b>。' +
-            '<br>先自查两件事：① 你算的 <span class="mono">d × e mod φ(n)</span> 等于 1 吗？（φ(n) = ' + phi + '）' +
+          return { ok: false, detail: '❌ 把 d 代回定义式检验：<span class="mono">' + e + ' × ' + dN + ' mod ' + phi +
+            ' = <b>' + de + '</b></span>，它必须是 <b>1</b>（φ(n) = ' + phi + '）。' +
+            '<br>先自查两件事：① 你算的 <span class="mono">d × e mod φ(n)</span> 等于 1 吗？' +
             '② p、q 都是质数吗？φ(n) 的公式只在质数下成立。' };
         },
         showAnswer:
