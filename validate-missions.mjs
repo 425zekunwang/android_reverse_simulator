@@ -429,6 +429,96 @@ for (const mission of targets) {
   } catch (e) { err(mission.id, '⑥ 跨 seed 检查失败：' + e.message); }
 }
 
+/* ------------------------------------------------- ⑦ 章节交接卡 ↔ 关卡定义 */
+/* 章节里的 lab.mission 是工单的"正门"，missions.js 里的定义是工单本体。
+   两边靠 id 对齐、靠 title 保持一致；任何一边改了另一边没跟上，玩家就会
+   看到一张指向不存在工单的卡片，或者一个谁也找不到入口的孤儿工单。
+
+   ★ 章节文件依赖 DOM，不能丢进 vm 执行 —— 这里只扫源码文本。
+     块用带字符串状态的括号配对切出来，免得 line 文案里的花括号把块切歪。 */
+const DEFS = sb.SIM_MISSIONS || {};
+const cards = [];             // { file, line, id, title }
+let crossBad = 0;             // 本组问题数：为 0 才敢说"全部对得上"
+
+function scanCards(file, src) {
+  const head = /mission\s*:\s*/g;
+  let hit;
+  while ((hit = head.exec(src))) {
+    let i = head.lastIndex;
+    while (i < src.length && /\s/.test(src[i])) i++;
+    if (src[i] !== '{') continue;                 /* 注释里提到 mission: 的不算卡片 */
+    let depth = 0, end = -1, q = null;
+    for (let j = i; j < src.length; j++) {
+      const c = src[j];
+      if (q) {
+        if (c === '\\') { j++; continue; }        /* 跳过字符串里的转义字符 */
+        if (c === q) q = null;
+      } else if (c === '"' || c === "'" || c === '`') q = c;
+      else if (c === '{') depth++;
+      else if (c === '}' && --depth === 0) { end = j; break; }
+    }
+    if (end < 0) { err(file, 'mission: 的花括号没有配对，交接卡被截断'); crossBad++; break; }
+    head.lastIndex = end + 1;
+
+    const block = src.slice(i, end + 1);
+    /* id / title 取块里最先出现的那一次 —— 约定写在 line 文案之前 */
+    const im = /\bid\s*:\s*(['"])([\s\S]*?)\1/.exec(block);
+    const tm = /\btitle\s*:\s*(['"])([\s\S]*?)\1/.exec(block);
+    if (!im) { err(file, 'mission 块里没有 id，交接卡不知道该指向哪张工单'); crossBad++; continue; }
+    cards.push({ file, line: src.slice(0, i).split('\n').length, id: im[2], title: tm ? tm[2] : null });
+  }
+}
+
+try {
+  const dir = path.join(ROOT, 'chapters');
+  for (const f of fs.readdirSync(dir).filter(f => /\.js$/.test(f)).sort()) {
+    scanCards('chapters/' + f, fs.readFileSync(path.join(dir, f), 'utf8'));
+  }
+
+  /* ① 卡片 → 工单：引用的 id 必须真的存在 */
+  const refs = {};                              // id → [卡片, ...]
+  for (const c of cards) (refs[c.id] = refs[c.id] || []).push(c);
+  const where = c => c.file + ':' + c.line;
+  for (const id of Object.keys(refs)) {
+    if (DEFS[id]) continue;
+    err(refs[id][0].file, '第 ' + refs[id][0].line + ' 行的交接卡引用的工单 id「' + id + '」在 SIM_MISSIONS 里不存在（打错字，或工单被删了）');
+    crossBad++;
+  }
+
+  /* ② 一个工单只能有一张交接卡（一个正门） */
+  for (const id of Object.keys(refs)) {
+    if (refs[id].length < 2) continue;
+    for (let i = 1; i < refs[id].length; i++) {
+      const dup = refs[id][i];
+      err(dup.file, '第 ' + dup.line + ' 行的交接卡和 ' + refs[id].slice(0, i).map(where).join('、') +
+          ' 引用了同一个工单「' + id + '」—— 一个工单只能有一个正门');
+      crossBad++;
+    }
+  }
+
+  /* ③ 工单 → 卡片：没人引用的工单等于没有入口 */
+  for (const m of MISSIONS) {
+    if (refs[m.id]) continue;
+    err(m.id, '没有任何章节交接卡指向「' + m.title + '」—— 玩家找不到入口（孤儿工单）');
+    crossBad++;
+  }
+
+  /* ④ 标题漂移：两边文案不一致，玩家会看到两个名字 */
+  for (const c of cards) {
+    const def = DEFS[c.id];
+    if (!def) continue;                          /* id 不存在已由 ① 报过 */
+    if (c.title === null) { warn(c.file, '第 ' + c.line + ' 行的交接卡没写 title，无法与工单定义核对'); crossBad++; continue; }
+    if (c.title !== def.title) {
+      warn(c.file, '第 ' + c.line + ' 行的交接卡标题「' + c.title + '」与工单定义「' + def.title + '」不一致 —— 两边文案会漂移');
+      crossBad++;
+    }
+  }
+
+  if (!crossBad) {
+    note('⑦ 章节交接卡：' + MISSIONS.length + ' 个工单，' + cards.length + ' 张卡片，id 与标题全部对得上');
+  }
+} catch (e) { err('chapters', '⑦ 章节交接卡检查失败：' + e.message); }
+
 /* ---------------------------------------------------------------- 汇总 */
 if (!QUIET) console.log('');
 const errors = problems.filter(p => p.level === 'error');
@@ -438,5 +528,8 @@ for (const p of problems) {
 }
 console.log('校验 ' + targets.length + ' 个关卡，' + checks + ' 条断言：' +
             errors.length + ' 个错误，' + warns.length + ' 个警告');
+const cardIds = new Set(cards.map(c => c.id));
+const covered = MISSIONS.filter(m => cardIds.has(m.id)).length;
+console.log('交接卡覆盖率：' + covered + '/' + MISSIONS.length + ' 个工单有章节入口（' + cards.length + ' 张卡片）');
 if (DUMP) console.log('产物已落盘：' + DUMP + '（可用 readelf -h / -S / -s 复核）');
 process.exit(errors.length ? 1 : 0);
