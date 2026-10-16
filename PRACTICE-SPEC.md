@@ -640,14 +640,41 @@ ELF 结构、`.rodata` 里的常量、真算法执行。它完全不经过 DEX�
 第一个消费者是 ch02 / ch03 / ch16 / ch21 那几关，它们在 M4。
 **到那时再做，且边做边验。**
 
-### 11.2 对 `CHAPTER-SPEC.md` 的必要修改
+### 11.2 对 `CHAPTER-SPEC.md` 的必要修改（已执行）
 
-新分支必须打破现有规范的两条禁令：
+原来的两条禁令是**一律禁止**。新分支把它们改成**分支作用域**的规则 —— 而且这份修改本身不能悄悄绕过。
 
-- 「❌ 修改 `assets/` 下任何文件」→ 改为允许**新增** `assets/sim/*`，修改 `assets/app.js` 仅在 `Lab` 组件内增量扩展
-- 「❌ 修改现有 `chapters/ch01.js`–`ch25.js`」→ 迁移期按章放开，且每章迁移必须单独提交
+| 原禁令（默认，仍适用于 `main` 分支） | 实战模式分支（`feat/practice-simulator`） |
+|---|---|
+| ❌ 修改 `assets/` 下任何文件 | ✅ 允许**新增** `assets/sim/*`、`assets/practice.js`、`assets/practice.css`、`practice.html`、`validate-missions.mjs`；`assets/app.js` 只允许**增量扩展**（`Lab` 组件内加分支、`mountTopbar` 加入口）；`assets/style.css` 只允许**追加新规则块** |
+| ❌ 修改现有 `chapters/ch01.js`–`ch25.js` | ✅ 迁移期按章放开；每章迁移必须**单独提交**，且迁移后 `validate-chapters.mjs` 仍须零错误 |
 
-**这两条修改本身要写进 `CHAPTER-SPEC.md` 的修订记录，不能悄悄绕过。**
+**默认规则不松。** 新章节仍然不许改 `assets/` 下已有文件、不许改别的章节文件 —— 放开只针对这一个分支。
+
+#### 已经发生的改动（逐条对照）
+
+| 文件 | 改动 | 是否符合新规则 |
+|---|---|---|
+| `assets/sim/`（`simelf` / `simnative` / `simdevice` / `forge` / `missions`） | 新增 | ✅ 新增 |
+| `assets/practice.js`、`assets/practice.css`、`practice.html` | 新增 | ✅ 新增 |
+| `validate-missions.mjs` | 新增 | ✅ 新增 |
+| `assets/app.js` | `Lab` 在 `cfg.mission` 存在时渲染交接卡；`mountTopbar` 加「🎯 实战区」入口 | ✅ 增量扩展，未重写既有组件 |
+| `assets/style.css` | 追加 `.handoff` 规则块 | ✅ 纯追加，未改既有规则 |
+| `chapters/ch22.js` | 实验一增加 `mission` 数据字段 | ✅ 按章放开，单独提交 |
+
+**这两条修改本身已写进 `CHAPTER-SPEC.md` 的修订记录（2026-10-16 条目）。**
+
+#### 交接卡的引用完整性由校验器兜底
+
+交接卡把"章节"和"工单"连起来，这条连线最容易悄悄断（id 打错字、工单被删、同一关被两个章节认领）。
+`validate-missions.mjs` 的 **⑦ 组**会扫描 `chapters/*.js` 源码，把每个 `mission: {}` 块的 `id` / `title` 抽出来交叉核对：
+
+- 引用不存在的 id → **错误**
+- 工单没有任何章节引用（孤儿）→ **错误**
+- 同一 id 被两张卡认领 → **错误**
+- 卡片标题与工单标题漂移 → **警告**
+
+这样"工单入口"这件事不再靠人记得，而是靠验证。
 
 ---
 
