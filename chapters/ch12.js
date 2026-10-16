@@ -3063,6 +3063,24 @@ window.CHAPTER = {
               '自带 TLS 实现层',
               '按 字符串 → 常量 → 调用图 定位它自带的 TLS；或退到 syscall / 内核']
           ]) +
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>mitmproxy 中间人代理抓 HTTPS 包 ≈ Charles / Fiddler / Burp 抓浏览器 HTTPS 流</b>——两边都是"在客户端和服务器之间插一刀，看明文"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· mitmproxy 安装 CA 证书到手机系统信任区 ≈ Burp 安装 CA 证书到浏览器（Firefox 自己信任区 / 系统区）<br>' +
+        '· mitmproxy 的 <code>script.py</code> 改请求/响应 ≈ Burp 的 Match & Replace 规则 + Postman pre-request script<br>' +
+        '· mitmproxy 抓 WebSocket 帧 ≈ Chrome DevTools Network → WS 标签<br>' +
+        '· mitmproxy 的 flow record ≈ Reqable / Charles 的 session save（HAR 格式）<br>' +
+        '· <code>ctx.log.info</code> 输出 ≈ DevTools Console.log</p>' +
+        '<p><b>关键差异</b>:mitmproxy 装 CA 是<b>装到系统信任区</b>（/system/etc/security/cacerts）需要 root，' +
+        'Burp 装到 Firefox 是装到<b>浏览器自己的证书库</b>（about:preferences#privacy），普通用户就能装。' +
+        '另外移动 App 经常做 <b>SSL Pinning</b>（校验服务器证书的 fingerprint，硬编码在 app 里），' +
+        'mitmproxy 即使装了 CA 也会被 pinning 拦截——必须配合 Frida hook 证书校验函数才能看明文；' +
+        'Web 端的<a href="https://httptoolkit.com">HTTP Toolkit</a> 或 Chrome 的 <code>--ignore-certificate-errors</code> ' +
+        '也能解决部分 pinning，但 App 的 native 校验是更强的锁。' +
+        '<b>另外</b>:mitmproxy 走的是<b>OS 层 VPN 接口</b>（不是单纯改 hosts），整个设备所有 App 的流量都过它，' +
+        'Burp 走的是浏览器代理（仅浏览器流量），隔离性不一样。</p>') +
+        
+        // WS-CH12-MITM-MARKER-E5F6 (cool)
         T.note('key', '🔑 全章三句话',
           '<p><b>① 抓包不是"装个证书"，是"选一个观测位置"。</b>' +
           '代理、进程内、内核是三个不同的位置，各自能看到的东西和各自的代价完全不同。' +
@@ -3107,7 +3125,10 @@ window.CHAPTER = {
     { t: '定界（framing）', d: '在字节流里划出"一条完整消息"的边界。常见方式：定长头 + 长度字段、分隔符、固定长度、自描述（TLV）。TCP 不保证消息边界，所以定界是自定义协议分析的第一步，也是后面所有字段解读的前提。' },
     { t: '字段溯源', d: '从"这个字节是什么"追到"它从哪个变量、哪一层算出来的"，最终追到算法与密钥。链条：报文字节 → 写入它的函数 → 它的输入 → 输入的来源 → 算法。追不到算法就等于没溯源。' },
     { t: '应用层加密', d: '传输层完全正常（握手成功、headers 可读），但业务自己把 body 加密了。典型指纹是"headers 可读 + body 是 Base64/定长十六进制乱码 + 有自定义加密标记头"。与抓包配置无关，属于算法还原范畴。' },
-    { t: '自编译 OpenSSL', d: 'App 自带一份 OpenSSL/BoringSSL 并静态链接进自己的 so。动机通常是版本可控、绕过系统校验、隐藏特征。符号可能被剥，定位手段依次为：导入/导出表 → 特征字符串 → 常量表指纹（S 盒、SHA 常量）→ 调用图。' }
+    { t: '自编译 OpenSSL', d: 'App 自带一份 OpenSSL/BoringSSL 并静态链接进自己的 so。动机通常是版本可控、绕过系统校验、隐藏特征。符号可能被剥，定位手段依次为：导入/导出表 → 特征字符串 → 常量表指纹（S 盒、SHA 常量）→ 调用图。' },
+    { t: '↔ Web 对位 · mitmproxy 中间人抓 HTTPS ≈ Burp / Charles 抓浏览器 HTTPS', d: '都是"在客户端和服务器之间插一刀看明文"。差异:mitmproxy 装 CA 需 root（/system/etc/security/cacerts），Burp 装到 Firefox 是装到浏览器自己的证书库，普通用户就能装。App 经常 SSL Pinning 校验服务器证书 fingerprint（硬编码在 app 里），即使 mitmproxy 装了 CA 也会被拦截，必须配合 Frida hook 证书校验函数；Web 端用 HTTP Toolkit 或 --ignore-certificate-errors 也能解决部分。mitmproxy 走 OS 层 VPN 接口（所有 App 流量过它），Burp 走浏览器代理（仅浏览器流量）。' },
+
+    // WS-CH12-MITM-MARKER-E5F6 (glossary)
   ],
 
   teacher: {

@@ -1735,6 +1735,23 @@ window.CHAPTER = {
       html:
         '<p>这一节专门考第三个坑：<b>分块更新的拼接顺序</b>。它是自吐沙箱里最隐蔽的错误——' +
         '因为日志看起来完全正常，只是你<b>读错了顺序</b>。</p>' +
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>反调试 / 反 Frida 检测 ≈ 浏览器里检测 devtools / debugger / headless / WebDriver 痕迹</b>——两边都是"在运行时探测环境里有没有分析工具"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· 查 TracerPid / ptrace ≈ 浏览器里 navigator.webdriver / window.__nightmare 检测<br>' +
+        '· 扫 frida-agent-64.so / frida-gadget ≈ 浏览器里检查 Object.entries(window).length 异常 / 已知 hook 工具的全局变量名<br>' +
+        '· 查 /proc/self/maps 看是否有 frida 注入的 so ≈ 浏览器里 Performance.getEntries() 看异常 timing<br>' +
+        '· 检查端口（D-Bus 27042 等）≈ 检查 Chrome DevTools Protocol 9222 端口<br>' +
+        '· 校验函数序言字节（防 inline hook）≈ 浏览器里 toString() 检测函数被改写</p>' +
+        '<p><b>关键差异</b>:安卓反调试的检测点是<b>native 层</b>（读 /proc、查 maps、看 ptrace、校验 ELF 头），' +
+        '而且检测时常常是 native 代码自身在做（不在 ART 解释层），所以 Frida hook Java 层没用——必须 hook native。' +
+        'Web 端反调试检测点是<b>JS 栈内</b>（查 navigator / debugger / document.hidden / console.log 检测栈），' +
+        '改个 user agent / 装个 stealth 插件就能绕大部分。' +
+        '<b>另外</b>:安卓检测会看 <strong>运行环境指纹</strong>（ro.build.fingerprint / 电池温度 / 陀螺仪噪声）——纯软件 patch 难；' +
+        'Web 端检测主要看 <strong>DOM/JS 行为</strong>（鼠标轨迹、点击模式、键盘节奏）——更容易伪装。' +
+        '所以安卓反调试的"对抗深度"普遍高于 Web 端，但 Web 端的"对抗广度"（每个站点一套指纹）远高于安卓。</p>') +
+        
+        // WS-CH13-ANTIDEBUG-MARKER-G7H8 (cool)
         T.note('key', '🔑 为什么这个坑特别隐蔽',
           '<p>哈希和分组密码都是<b>顺序敏感</b>的：输入字节换一个位置，输出就完全不同。' +
           '而日志是<b>流式追加</b>写下来的，写入顺序和调用顺序在两种情况下会不一致：' +
@@ -1968,7 +1985,10 @@ window.CHAPTER = {
     { t: '内联 SVC', d: '不经过 libc 封装函数、直接在代码里写 <span class="mono">SVC #0</span> 发起系统调用。它让 PLT/GOT hook 与 inline hook libc 完全失效（执行路径不经过 libc 的函数入口），<b>只有内核层的 seccomp-bpf 能拦截</b>。是「用户态函数级观测点被绕过」的极端形态。' },
     { t: 'seccomp-bpf', d: '内核级系统调用过滤机制，在 syscall 进入内核时拦截，与用户态调用方式无关，因此能拦住内联 SVC。<b>但它本身会留下痕迹</b>：<span class="mono">/proc/self/status</span> 的 <span class="mono">Seccomp:</span> 字段（正常应用 0、装了过滤器 2）可被目标反过来用来识别沙箱。' },
     { t: 'KAT（已知答案测试向量）', d: 'Known Answer Test。自吐日志里真实业务产生的那组明文/密文，就是一组现成的 KAT。<b>用它先校准主动调用的链路，再批量生产</b>——否则你无法判断批量结果是真是假。这是自吐与主动调用配合中最实用的一环。' },
-    { t: '版本绑定', d: '改 AOSP 源码做沙箱的最大代价：插桩点、所在模块、打包方式都随版本变化，每换一个目标版本就要重新适配。Android 12 起 ART 成为可独立升级的 APEX 模块，<b>系统版本不再等于 ART 版本</b>。' }
+    { t: '版本绑定', d: '改 AOSP 源码做沙箱的最大代价：插桩点、所在模块、打包方式都随版本变化，每换一个目标版本就要重新适配。Android 12 起 ART 成为可独立升级的 APEX 模块，<b>系统版本不再等于 ART 版本</b>。' },
+    { t: '↔ Web 对位 · 安卓反调试 / 反 Frida ≈ 浏览器反 devtools / debugger / WebDriver', d: '都是"在运行时探测环境里有没有分析工具"。差异:安卓检测点全在 native 层（读 /proc、查 maps、看 ptrace、校验 ELF 头），常常是 native 代码自身在做（不在 ART 解释层），Frida hook Java 层没用，必须 hook native。Web 端检测点全在 JS 栈内（navigator.webdriver / debugger / document.hidden / console.log 检测栈），装 stealth 插件就能绕。安卓还看运行环境指纹（ro.build.fingerprint / 电池温度 / 陀螺仪噪声）纯软件 patch 难；Web 主要看 DOM/JS 行为（鼠标轨迹、键盘节奏）容易伪装。安卓对抗深度高于 Web，Web 对抗广度高于安卓。' },
+
+    // WS-CH13-ANTIDEBUG-MARKER-G7H8 (glossary)
   ],
 
   teacher: {

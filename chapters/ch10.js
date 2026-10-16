@@ -2302,6 +2302,21 @@ window.CHAPTER = {
         ]
       },
       after:
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>Frida Java.perform 拦截 Java 方法 ≈ JS 里用 Object.defineProperty 重写方法 / 用 Proxy 拦截调用</b>——两边都是"不改原始类的前提下，替换方法实现"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· <code>Java.perform(() => { Foo.bar.implementation = function(x){ /* your code */ return this._bar_orig(x); }})</code> ≈ JS 里给 obj.method 包一层<br>' +
+        '· <code>Java.use("Foo").bar.overload("int").implementation = ...</code> ≈ JS 里按参数签名区分重载<br>' +
+        '· Frida 的 <code>this</code> 上下文 ≈ JS Proxy 的 receiver<br>' +
+        '· <code>Java.choose("com.target.Obj", { onMatch: ... })</code> ≈ JS 里遍历 Array 找匹配实例<br>' +
+        '· Native Function hook（Interceptor.attach）≈ JS 拦截普通函数（hook 一个纯函数不能改 this）</p>' +
+        '<p><b>关键差异</b>:Frida hook Java 方法直接走 ART runtime 的 method table 替换，<strong>影响该 class 的所有实例</strong>；' +
+        'JS 改 obj.method 只影响那一个对象的引用（同 class 的其他对象不受影响，要全局改得改 prototype）。' +
+        '另外 Frida 拦截 native（so）函数靠 Interceptor.attach，原理类似 gdb 的断点 hook——会<b>短暂改写指令</b>，目标可检测；' +
+        'JS 改方法是<b>纯用户态</b>，目标代码若不查 Object.isFrozen / Proxy trap 是看不出来的。' +
+        '<b>另外 Frida hook 可以拿到 native 内存地址</b>，JS 端要拿内存地址得用 ArrayBuffer / DataView 自己切字节，难度高一档。</p>') +
+        
+        // WS-CH10-FRIDA-JAVA-MARKER-A1B2 (cool)
         T.note('key', '🔑 一张必须记住的四步决策顺序',
           '<p style="margin-bottom:0"><b>① 改自己</b>（文件名 / 端口 / 路径——成本最低，先做完）<br>' +
           '<b>② 改对方的观察管道</b>（maps 过滤 / 字符串过滤——覆盖面比第 1 步大，成本中等）<br>' +
@@ -2593,7 +2608,10 @@ window.CHAPTER = {
     { t: 'TracerPid', d: '/proc/self/status 里的一个字段。进程被 ptrace 附加（常见的注入方式）时该字段非 0，' +
         '因此它既是检测点，也是"我用什么方式注入"的暴露面。' },
     { t: '特征暴露面审计', d: '本章实验 A 的方法：列出暴露点 → 标注权重 → 逐项评估各对抗手段的覆盖度（允许部分覆盖）→ ' +
-        '算残余风险 → 按覆盖面优劣排序 → 找出不可替代项。它的价值在于结构（分层 + 加权 + 覆盖不均），不在具体数字。' }
+        '算残余风险 → 按覆盖面优劣排序 → 找出不可替代项。它的价值在于结构（分层 + 加权 + 覆盖不均），不在具体数字。' },
+    { t: '↔ Web 对位 · Java.perform 拦截 Java 方法 ≈ JS Object.defineProperty / Proxy 拦截', d: '都是"不改原始类的前提下替换方法实现"。差异:Frida hook Java 改的是 ART runtime 的 method table（影响该 class 所有实例），JS 改 obj.method 只影响这一个对象引用（同 class 其他对象不受影响）。Frida 拦截 native 函数靠 Interceptor.attach（断点 hook，会短暂改写指令，目标可检测）；JS 改方法是纯用户态，目标若不查 Object.isFrozen / Proxy trap 是看不出的。Frida 能拿 native 内存地址，JS 端要拿内存地址得用 ArrayBuffer / DataView 自己切字节。' },
+
+    // WS-CH10-FRIDA-JAVA-MARKER-A1B2 (glossary)
   ],
 
   /* ============================================================ 严师 */

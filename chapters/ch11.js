@@ -1936,6 +1936,21 @@ window.CHAPTER = {
             ['要长期监控全部加密调用', '目标会做环境检测吗？暴露面允许常驻吗？', '11.1 / 11.11'],
             ['要脱一个抽取壳', '类级别还是方法级别？迭代成本重要还是能力上限重要？', '11.12 / 11.8C']
           ]) +
+        T.note('cool', '🌐 JS 视角批注',
+        '<p><span class="pill">JS 类比</span> 一句话概括:<b>Frida 的 RPC export（让被 hook 端主动调外部） ≈ Node.js 里的 process.send / parentPort.postMessage</b>——两边都是"在子进程/被 hook 进程里暴露一个调用入口给主进程"。</p>' +
+        '<p><b>对照</b>:<br>' +
+        '· <code>rpc.exports = { getflag: function(){ return someValue; } }</code> ≈ Node worker_threads 的 <code>parentPort.on("message", ...)</code> + <code>parentPort.postMessage(...)</code><br>' +
+        '· Python 端 <code>script.post({"type":"getflag"})</code> ≈ Web 端 <code>worker.postMessage(...)</code> + <code>worker.onmessage = ...</code><br>' +
+        '· Frida 的 <code>recv</code> / <code>send</code> 事件 ≈ Browser 的 <code>postMessage</code> / <code>onmessage</code><br>' +
+        '· <code>script.messageQueue</code> 异步消息队列 ≈ Web 的 MessageChannel（双工）</p>' +
+        '<p><b>关键差异</b>:Frida 的 RPC 是<b>进程间</b>通信（agent 进程 ↔ Python 主机），主进程可任意时间发起调用、agent 也可主动回调；' +
+        'JS 的 postMessage 是同源页面之间的通信（页面 ↔ Worker / iframe）。' +
+        '另外 Frida agent 里跑的是<b>V8 引擎的 JS 子集</b>（不支持 ES6 完整特性，不能 import 模块，' +
+        'console.log 输出要绕行 <code>send()</code> 才能被 Python 收），Node.js 里跑的是完整 V8，几乎所有现代 JS 语法都支持。' +
+        '<b>另外</b>:Frida 的 RPC 是阻塞调用（Python 端 await 返回），Node worker.postMessage 是非阻塞事件（要 await Promise）。' +
+        '这是设计取向差异——Frida 偏"远程调用"语义，Node Worker 偏"事件流"语义。</p>') +
+        
+        // WS-CH11-RPC-MARKER-C3D4 (cool)
         T.note('key', '🔑 三句最该记住的话',
           '<p>① <b>Frida 管一个进程，LSPosed 管一套环境。</b>' +
           '进程模型决定了注入时机、作用域、可持久性，也决定了检测面在哪一侧。</p>' +
@@ -2032,7 +2047,10 @@ window.CHAPTER = {
         '这是"批量主动调用必须支持分轮与跳过"的根因。' },
     { t: 'libxposed（现代 API）', d: 'LSPosed 推进的新一代 API（<code>io.github.libxposed.api</code>）。' +
         '入口改 <code>META-INF/xposed/java_init.list</code>、元数据改 <code>module.prop</code>、' +
-        'Hook 改为 <code>Hooker&lt;T&gt;</code> 拦截器链，并且框架不再提供 <code>XposedHelpers</code>。' }
+        'Hook 改为 <code>Hooker&lt;T&gt;</code> 拦截器链，并且框架不再提供 <code>XposedHelpers</code>。' },
+    { t: '↔ Web 对位 · Frida RPC export ≈ Node worker_threads parentPort.postMessage', d: '都是"在子进程/被 hook 进程里暴露调用入口给主进程"。差异:Frida RPC 是进程间通信（agent ↔ Python 主机），阻塞调用语义；postMessage 是同源页面之间通信（页面 ↔ Worker），非阻塞事件流。Frida agent 跑的是 V8 的 JS 子集（不支持 ES6 完整特性、不能 import、console.log 要绕行 send() 才能被 Python 收），Node worker 跑的是完整 V8。两者都能双向通信，但 API 设计取向不同。' },
+
+    // WS-CH11-RPC-MARKER-C3D4 (glossary)
   ],
 
   /* ============================================================== 严师 */
