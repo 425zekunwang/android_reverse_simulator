@@ -906,6 +906,8 @@ window.CHAPTER = {
        { t: 'frida-gadget', d: '注入进目标进程内部的一个 so，不需要额外的 server 进程即可加载脚本。因此没有默认端口的监听，也没有 frida-server 进程名，是规避端口与进程名检测的架构级手段。' },
        { t: '观察管道篡改', d: '不隐藏自己的存在，而是 Hook open/read、strstr 等函数，让目标程序读到被处理过的内容。比隐藏自身更可靠，是 Frida 对抗中使用频率最高的一类思路。' },
        { t: '\u2194 Web \u5BF9\u4F4D \u00B7 ART \u89E3\u91CA\u5668 Trace \u2248 V8 Ignition \u89E3\u91CA\u5668 Trace', d: '\u90FD\u662F\u300C\u5728\u5B57\u8282\u7801\u89E3\u91CA\u5668\u5165\u53E3\u4E0B\u65AD\u70B9\uFF0C\u770B\u54EA\u6761\u5B57\u8282\u7801\u88AB\u6267\u884C\u300D\u3002\u5DEE\u5F02:ART Mterp \u5165\u53E3\u662F<b>\u7248\u672C\u654F\u611F</b>\u7684\uFF08Android 6/7/10/14 \u5404\u4E0D\u540C\uFF09\uFF0C\u540C\u4E00\u811A\u672C\u8981\u6539 5-6 \u6B21\u8986\u76D6\u5168\u6863\uFF1BV8 Ignition \u5165\u53E3 <code>Interpreter::Dispatch</code> \u8DE8\u5927\u7248\u672C\u76F8\u5BF9\u7A33\u5B9A\u3002Web \u7AEF\u4F60\u80FD\u5728 DevTools \u76F4\u63A5\u770B\u300C\u54EA\u884C JS \u88AB\u6267\u884C\u300D\uFF0C\u5B89\u5353\u53EA\u80FD\u81EA\u5DF1\u5199 hook \u811A\u672C\u8BFB dexPC/\u65B9\u6CD5\u6307\u9488\u3002' },
+      { t: 'o', s: '↔ Web 对位：JNI / .so 调用栈 ≈ Web 端 WASM 调用栈（混合 native + 解释型栈帧）', note: '本质同构：都是 native 函数和解释型 VM 混在一起的栈。差异:JNI 栈帧是 ARM 指令（NativeFunction 真实执行），WASM 栈帧是 WASM 字节码（沙箱内执行，不能直接调系统调用）；JNI 调用栈回溯靠 libunwind / FP 寄存器链，WASM 调用栈是 VM 显式维护的 stack pointer（更易读但不能反推 host 函数）。两者都有一个共性:hook native 边界能看到 VM 看不到的入参（但 hook native 也更容易被检测）。' },
+      // WS-CH24-JNI-WASM-MARKER-M3N4 (glossary)
      ],
   teacher: {
     id: 'ch10',
