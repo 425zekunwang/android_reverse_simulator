@@ -34,7 +34,10 @@
   const M22_1 = {
     id: 'm22-1',
     chapter: 22,
+    seed: 2201,                       // 决定靶场产物；换 seed 则答案跟着变（见 validate-missions ⑥）
     title: '从 libtarget.so 还原摘要算法 IV',
+    /* 本关开放哪些面板。工单与提交面板永远在。 */
+    tools: ['device', 'shell', 'image', 'hook'],
     brief: [
       '目标设备：Pixel 6 / Android 12 / arm64-v8a',
       '涉事应用：com.example.vault（保险箱）',
@@ -43,6 +46,9 @@
       '你的任务：把这 4 个 32 位初始状态字还原出来。'
     ],
     acceptance: '提交 4 个 32 位初始状态字（各 8 位十六进制）。系统会用 8 组随机向量做功能对拍 —— 只有行为完全等价才算过。',
+    hint: '先在 <b>映像</b> 面板把 <code>.rodata</code> 转储出来。里面有一个 16 字节的常量藏在噪声里，' +
+          '和标准 MD5 的初始状态字（<code>67452301 efcdab89 98badcfe 10325476</code>）逐字比一比，' +
+          '你会发现只有一个字不一样。',
 
     spec: {
       id: 'm22-1',
@@ -119,6 +125,14 @@
         'ls /data/app/com.example.vault/lib/arm64',
         'strings /data/app/com.example.vault/lib/arm64/libtarget.so',
         'hexdump /data/app/com.example.vault/lib/arm64/libtarget.so 0x1000 80'
+      ],
+
+      /* 作者在工作台里的路线。用于「步数」的基线对照 ——
+         它是纯静态的：只查一次映像，一次都不碰目标。 */
+      route: [
+        '映像 · 转储 .rodata（0x1000 起 128 字节）',
+        '把 0x1020 起 16 字节与标准 MD5 IV 逐字比对',
+        '提交 4 个状态字'
       ],
 
       /* ★ 解法：常量扫描。只读映像字节，不碰 art.truth。 */

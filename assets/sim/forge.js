@@ -165,6 +165,7 @@
       op: spec.so.op,
       soPath,
       appPkg: pkg,
+      appInput,                      // 应用喂给 native 例行的那串输入，本来就写在 App 里
       device: dev,
       rodataSize: rodata.length,
       textSize: table.length,

@@ -159,13 +159,15 @@
         return { op, bytes: this.readRo(op.rodataOff, n) };
       },
 
-      /* 真调用：真的跑算法，不是查表 */
-      call(opName, input) {
+      /* 真调用：真的跑算法，不是查表。
+         opts.instrumented = true 表示"这是你从外部插进去的调用"（Hook 控制台），
+         只有这种才计入「注入面」。应用自己跑自己的例行不算注入 —— 那是它本来就会做的事。 */
+      call(opName, input, opts) {
         const spec = SIM_NATIVE_OPS[opName];
         if (!spec) throw new Error('算子「' + opName + '」不在白名单里，拒绝执行');
         const got = this.constOf(opName);
         if (!got) throw new Error('映像里没有算子「' + opName + '」');
-        this.stats.hookCount++;
+        if (opts && opts.instrumented) this.stats.hookCount++;
         return spec.run(got.bytes, input);
       }
     };
