@@ -616,7 +616,7 @@ window.CHAPTER = {
           { key: 'q', label: '质数 q', hint: '默认 53', value: '53' },
           { key: 'e', label: '公钥指数 e', hint: '必须与 φ(n) 互质', value: '17' },
           { key: 'm', label: '明文 m（整数）', hint: '必须小于 n；支持 0x 前缀', value: '65' },
-          { key: 'd', label: '★ 你自己算出的私钥指数 d', hint: '用扩展欧几里得解 e·d ≡ 1 (mod φ(n))', ph: '例如 2753', value: '' }
+          { key: 'd', label: '★ 你自己算出的私钥指数 d', hint: '用扩展欧几里得解 e·d ≡ 1 (mod φ(n))', ph: '填你算出的 d', value: '' }
         ],
         runLabel: '🔍 用我的参数真算一遍',
         run: function (v) {
@@ -720,16 +720,26 @@ window.CHAPTER = {
           }
           var n = p * q, phi = (p - 1n) * (q - 1n), mm = m % n;
           var c = mp(mm, e, n);
-          var back = mp(c, d, n);
-          if (back === mm) {
-            return { ok: true, detail: '✅ 正确。用你的 d 解出的明文是 <b>' + back + '</b>，与原始明文一致。' +
-              '<br>密文 c = <span class="mono">' + mm + '^' + e + ' mod ' + n + ' = ' + c + '</span>，' +
-              '解密 <span class="mono">' + c + '^' + d + ' mod ' + n + ' = ' + back + '</span>。' +
-              '你算出的 d 与 φ(n) = ' + phi + ' 是配套的。<br>' +
-              '<span class="hit">换个参数再算一遍</span>——比如 p=7、q=11（n=77, φ=60），取 e=13，明文 m=42，再解一次 d。' };
+
+          /* 判据必须是 d 的**定义**（e 的模逆元），不能用"解密往返"。
+             往返检验有个洞：m = 0 时 c = 0，任何 d 都能把 0 解回 0 ——
+             读者把明文填成 0、随便写个 d 就能通过，实验白做。
+             模逆元是 d 成立的充要条件，且与明文无关，没有这种退化路径。 */
+          var dN = ((d % phi) + phi) % phi;      // 归一到 [0, φ(n))：-367 与 2753 是同一个逆元
+          var de = (e * dN) % phi;
+          var back = mp(c, dN, n);
+          var norm = (dN === d) ? ''
+            : '<br><span class="muted">你填的 d 归一到 [0, φ(n)) 后是 ' + dN + ' —— 同一个逆元的不同写法，都对。</span>';
+          if (dN !== 0n && de === 1n) {
+            return { ok: true, detail: '✅ 正确。你的 d 满足它的定义 <span class="mono">e × d ≡ 1 (mod φ(n))</span>：' +
+              '<br><span class="mono">' + e + ' × ' + dN + ' mod ' + phi + ' = ' + de + '</span>（φ(n) = ' + phi + '）。' +
+              '<br>再拿它真的解一次密：<span class="mono">' + c + '^' + dN + ' mod ' + n + ' = <b>' + back + '</b></span>，' +
+              '回到明文 <b>' + mm + '</b>。' + norm +
+              '<br><span class="hit">换个参数再算一遍</span>——比如 p=7、q=11（n=77, φ=60），取 e=13，明文 m=42，再解一次 d。' };
           }
-          return { ok: false, detail: '❌ 用 <span class="mono">c^d mod n</span> 解出来是 <b>' + back + '</b>，期望是 <b>' + mm + '</b>。' +
-            '<br>先自查两件事：① 你算的 <span class="mono">d × e mod φ(n)</span> 等于 1 吗？（φ(n) = ' + phi + '）' +
+          return { ok: false, detail: '❌ 把 d 代回定义式检验：<span class="mono">' + e + ' × ' + dN + ' mod ' + phi +
+            ' = <b>' + de + '</b></span>，它必须是 <b>1</b>（φ(n) = ' + phi + '）。' +
+            '<br>先自查两件事：① 你算的 <span class="mono">d × e mod φ(n)</span> 等于 1 吗？' +
             '② p、q 都是质数吗？φ(n) 的公式只在质数下成立。' };
         },
         showAnswer:
@@ -1207,9 +1217,12 @@ window.CHAPTER = {
           if (!hv.trim()) return { ok: false, detail: '还没写判断。先跑一次上面的计算，把「有没有填充」和「为什么两次不同」说清楚。' };
           return {
             ok: ok,
-            detail: (ok ? '✅ 判断到位。' : '❌ 还差一点：至少要点明<b>有填充</b>，并且解释<b>两次密文不同</b>背后的原因。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">再追问自己一句：如果没有填充，密文会变成什么样？</span>答案见下一段的解析。' : '')
+            detail: ok
+              ? '✅ 判断到位。<br>' + list +
+                '<br><span class="hit">再追问自己一句：如果没有填充，密文会变成什么样？</span>答案见下一段的解析。'
+              : '❌ 还差一点（' + hits.filter(Boolean).length + '/3 个要点）。三句话各检查一遍：' +
+                '① 两条密文一样吗？② 解密出来的开头/结尾是什么形状？③ 裸 RSA 加密同一个明文，两次会得到一样的结果吗？' +
+                '<br>卡住了点「💡 提示」，或重跑上面的计算。'
           };
         },
         showAnswer:
@@ -1696,10 +1709,11 @@ window.CHAPTER = {
           var list = groups.map(function (g, i) { return (hits[i] ? '<span class="hit">✔</span> ' : '<span class="miss">?</span> ') + g.n; }).join('<br>');
           return {
             ok: ok,
-            detail: (ok ? '✅ 说到 ' + cnt + '/6 组，判断到位。' : '❌ 只说到 ' + cnt + '/6 组，还差一些。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">最关键的一条依据是「DER 长度自洽 + 含 rsaEncryption OID」——它把 A 和 E（同样 256 字节、同样高熵）区分开了。</span>'
-                  : '<br>提示：<b>A 和 E 字节数接近、熵都高，靠熵分不开</b>，必须用结构（30 开头 + 长度自洽 + OID）区分。')
+            detail: ok
+              ? '✅ 说到 ' + cnt + '/6 组，判断到位。<br>' + list +
+                '<br><span class="hit">最关键的一条依据是「DER 长度自洽 + 含 rsaEncryption OID」——它把 A 和 E（同样 256 字节、同样高熵）区分开了。</span>'
+              : '❌ 只说到 ' + cnt + '/6 组，还差一些。逐条写「是什么 + 依据」：先按长度分组，' +
+                '再用结构区分长度接近的那几条——有两组字节数和熵都接近，<b>光靠熵分不开</b>。<br>卡住了点「💡 提示」。'
           };
         },
         showAnswer:

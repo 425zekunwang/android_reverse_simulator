@@ -1642,15 +1642,15 @@ window.CHAPTER = {
           const okWhy = hits.length >= 2;
           const ok = okB && okW && okF && okWhy;
           let detail = '<b>逐项核对</b><ul style="margin:6px 0 0 18px">' +
-            '<li>① 业务边界：你填 ' + (b === null ? '（空）' : '#' + b) + '，规则算出 ' +
-              (wantBoundary === null ? '（这条栈里没有业务帧）' : '#' + wantBoundary + ' <span class="mono small">' + j.boundary.name + '</span>') +
-              (okB ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
-            '<li>② 无业务语义帧：你填 ' + (w === null ? '（空）' : '#' + w) + '，规则算出 ' +
-              (wrapOk.length ? wrapOk.map(function (x) { return '#' + x; }).join(' 或 ') : '（这条栈里没有，应填 0）') +
-              (okW ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
-            '<li>③ 业务入口：你填 ' + (f === null ? '（空）' : '#' + f) + '，规则算出 ' +
-              (wantEntry === null ? '（无）' : '#' + wantEntry + ' <span class="mono small">' + j.entry.name + '</span>') +
-              (okF ? ' <span class="hit">✔</span>' : ' <span class="miss">?</span>') + '</li>' +
+            '<li>① 业务边界：你填 ' + (b === null ? '（空）' : '#' + b) +
+              (okB ? ' <span class="hit">✔</span>（规则算出 #' + wantBoundary + (wantBoundary === null ? '' : ' <span class="mono small">' + j.boundary.name + '</span>') + '）'
+                   : ' <span class="miss">?</span>（按分层规则从 #1 往下数，第一帧业务帧）') + '</li>' +
+            '<li>② 无业务语义帧：你填 ' + (w === null ? '（空）' : '#' + w) +
+              (okW ? ' <span class="hit">✔</span>（规则算出 ' + (wrapOk.length ? wrapOk.map(function (x) { return '#' + x; }).join(' 或 ') : '应填 0') + '）'
+                   : ' <span class="miss">?</span>（找代理/反射/合成帧；一条都没有就填 0）') + '</li>' +
+            '<li>③ 业务入口：你填 ' + (f === null ? '（空）' : '#' + f) +
+              (okF ? ' <span class="hit">✔</span>（规则算出 #' + wantEntry + '）'
+                   : ' <span class="miss">?</span>（从最后一帧往上数，第一帧业务帧）') + '</li>' +
             '<li>理由：命中 ' + hits.length + ' 个判据点' + (okWhy ? ' <span class="hit">✔</span>' : '（至少要说两点）') + '</li>' +
             '</ul>';
           if (j.degraded) {
@@ -2104,8 +2104,9 @@ window.CHAPTER = {
             ['失败', '搜不到', '不命中', '没有命中', '得不到', '后果', '代价', '下一步', '换一条', '换线索', '退一步', '出局', '排除']);
           const ok = okPick && reasonOk && failOk;
           const want = acceptable.map(c => '#' + c.no + ' ' + c.name).join(' 或 ');
-          let detail = '<b>规则算出的首选：</b>' + (want || '（无）') +
-                       '<span class="muted small">（效益 ' + best + '；并列的任何一条都算对）</span><br>' +
+          let detail = (okPick ? '<b>规则算出的首选：</b>' + (want || '（无）') +
+                       '<span class="muted small">（效益 ' + best + '；并列的任何一条都算对）</span><br>'
+                     : '<b>选型还没对上。</b>「运行」输出里有这张规则表（每条线索的效益分与是否出局），照着它对。<br>') +
                        '<b>你选的是：</b>' + (picked ? ('#' + picked.no + ' ' + picked.name) : '（没填或没认出来）') +
                        (okPick ? ' <span class="hit">✔ 在并列集合里</span>' : ' <span class="miss">✘ 不是效益最高的那一条</span>') + '<br>' +
                        '<b>理由：</b>' + (reasonOk ? '<span class="hit">✔ 说到了这条线索的适用判据</span>' : '<span class="miss">✘ 还没说清「为什么是它」</span>') + '<br>' +

@@ -427,17 +427,26 @@ window.CHAPTER = {
           const extra = picked.filter(p => !want.includes(p));
           const miss = want.filter(w => !picked.includes(w));
           const ok = extra.length === 0 && miss.length === 0;
+          /* ② 也必须判：题面写了"并说明⑤⑥分别属于什么机制"，修前 expected 只读 v.flags —— ② 空着也能过。 */
+          const fb = String(v.forkbomb || '').trim();
+          const fbOk = window.AKKC_hasConcept(fb, ['cgroup', '控制组', 'pids']);
+          if (!ok) return {
+            ok: false,
+            detail: '① 还不对。把六个需求逐条翻译成"要隔离的是<b>哪一类</b>共享资源"（进程表 / 挂载表 / 主机名 / ' +
+              '网络栈 …），每一类去找对应的 namespace。<br>' +
+              '<span class="muted">点「🔍 校验我的方案」，那张表会逐项告诉你哪里不一致。</span>'
+          };
+          if (!fbOk) return {
+            ok: false,
+            detail: '① 对了：不多不少四个。② 还没答 —— 需求⑤要的是"限制数量"，这在 Linux 里不归 namespace 管，' +
+              '去 31.3 节找那套机制的名字，写清它靠哪个"控制器"限制进程数。'
+          };
           return {
-            ok,
-            detail: ok
-              ? '<b>完全正确：PID + MNT + UTS + NET。</b><br>' +
-                '前四个需求恰好一一对应这四个标志 —— 这不是巧合，' +
-                '而是因为<b>每个 namespace 都对应一类"共享资源"</b>：进程表、挂载表、主机名、网络栈。<br>' +
-                '需求⑤（进程数）不属于隔离而是<b>限制</b>，归 cgroup 的 <code>pids</code> 控制器。'
-              : (miss.length ? '<b>漏了：' + miss.join('、') + '</b><br>' : '')
-                + (extra.length ? '<b>多选了：' + extra.join('、') + '</b>（不是错，但按"最小必要"原则可以不选）<br>' : '')
-                + '正确答案是 <b>PID + MNT + UTS + NET</b>。<br>' +
-                '对照需求：① 看不到别的进程→PID；② 不污染文件系统→MNT；③ 不改主机名→UTS；④ 不占端口→NET。'
+            ok: true,
+            detail: '<b>两问全对：PID + MNT + UTS + NET，进程数限制归 cgroup 的 pids 控制器。</b><br>' +
+              '前四个需求恰好一一对应这四个标志，因为<b>每个 namespace 都对应一类"共享资源"</b>：' +
+              '进程表、挂载表、主机名、网络栈。<br>' +
+              '需求⑤属于<b>限制</b>而不是隔离 —— namespace 管"看不看得见"，cgroup 管"能用多少"。'
           };
         },
         showAnswer:

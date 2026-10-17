@@ -338,6 +338,13 @@ window.CHAPTER = {
       lab: {
         title: '实验一：从一段 16 字节常量认出算法家族',
         goal: '目标：说出这是哪个算法 + 改了什么',
+        /* 交接卡：这个实验在实战区有对应的工单。正文负责讲清楚"你已经会了什么"，
+           实战区负责把"数据已经在手里"这个前提收回去。 */
+        mission: {
+          id: 'm22-1',
+          title: '从 libtarget.so 还原摘要算法 IV',
+          line: '这里由正文把那段常量直接喂给你。实战区把前提收走了——常量藏在真 ELF 的 .rodata 段里，得你自己 dump 出来，而且提交后要经功能对拍才算过。'
+        },
         intro:
           '<p>你从目标 so 的 <code>.rodata</code> 段里 dump 出下面这 16 个字节。' +
           '<b>任务：判断它是哪个摘要算法，以及是否被魔改。</b></p>' +
@@ -443,8 +450,7 @@ window.CHAPTER = {
             ok,
             detail: ok
               ? '完全正确。3 个字与 MD5 标准 IV 一致，第 1 个被改成了 <code>0xa12b8f3e</code>。'
-              : '还不对。注意：<b>小端还原</b>要把每 4 个字节<b>反序</b>拼成 32 位字 —— ' +
-                '<code>3e 8f 2b a1</code> → <code>0xa12b8f3e</code>（不是 <code>0x3e8f2ba1</code>）。'
+              : '还不对。注意：<b>小端还原</b>要把每 4 个字节<b>反序</b>拼成 32 位字（不是按原顺序读）。'
           };
         },
         showAnswer:
@@ -531,23 +537,11 @@ window.CHAPTER = {
             '用 <code>base64.b64decode(s.translate(str.maketrans(shifted, STD)))</code> 这类一行代码就能转回标准表再解。</div></div>';
           return html;
         },
-        expected: (v) => {
-          const C = window.CRYPTO;
-          const text = v.text || '';
-          if (!text) return { ok: false, detail: '先输入明文再检查。' };
-          const STD = C.B64_STD;
-          const shifted = STD.slice(13) + STD.slice(0, 13);
-          const a = C.base64Encode(C.toBytes(text), STD);
-          const b = C.base64Encode(C.toBytes(text), shifted);
-          const same = [...a].filter((c, i) => c === b[i]).length;
-          return {
-            ok: true,
-            detail: '<b>实验做完了，结论自己就得出来了：</b>「' + text + '」在两张表下分别是 ' +
-              '<code>' + a + '</code> 与 <code>' + b + '</code>，' + a.length + ' 个字符里只有 ' + same +
-              ' 个位置碰巧相同。<br><br><b>这说明换表型魔改的本质是"同一份数据、不同的符号映射"——' +
-              '算法结构完全没变，所以拿到表就能还原，不需要读一行汇编。</b>'
-          };
-        },
+        /* 这里**故意没有 expected**。
+           原来挂着一个"✓ 检查我的答案"按钮，但它的实现是"输入非空即通过" ——
+           那不是判分，是形式。本实验的任务是"输入任意明文，观察两张表的输出差异"（观察型），
+           结论由 run 的输出直接给出；再挂一个无条件通过的判分器，只会让读者以为它是考核。
+           真需要考核的同类任务在实战区 —— 那里不给你答案。 */
         after:
           T.note('ok', '✅ 实验二的收获',
             '<p style="margin-bottom:0">你现在应该能回答一个关键问题：<b>"我看到一段像 Base64 但不是 Base64 的字符串，该怎么办？"</b><br>' +

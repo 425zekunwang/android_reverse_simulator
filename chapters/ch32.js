@@ -387,14 +387,29 @@ window.CHAPTER = {
           const skip = [...new Set(String(v.skip || '').toUpperCase().match(/[A-G]/g) || [])];
           const okOrder = letters.length === 7 && letters.every((c, i) => c === CORRECT[i]);
           const okSkip = skip.length === 2 && skip.includes('D') && skip.includes('F');
+          /* ③ 也必须判：题面三问，①② 是排序/勾选，③ 才是"为什么"。修前 expected 只读 v.order / v.skip。 */
+          const why = String(v.why || '').trim();
+          const whyOk = window.AKKC_hasConcept(why, ['容器运行时', 'runtime', 'docker', 'runc', '迷你 init', '精简 init', '自己'])
+            || window.AKKC_hasConcept(why, ['pid 1', 'pid1', '第一个进程', '一号进程']);
+          if (!okOrder) return {
+            ok: false,
+            detail: '① 顺序还不对。从最底层硬件开始排，一直排到"应用可被拉起"，一共七步。<br>' +
+              '<span class="muted">把顺序填进「🔍 校验顺序」，那张表会逐位标出对错。</span>'
+          };
+          if (!okSkip) return {
+            ok: false,
+            detail: '① 顺序对了。② 还没选对：容器<b>共用宿主内核</b>，所以"必须真实硬件才能发生"的那几步在容器里根本不存在。' +
+              '<span class="muted">（注意别把"内核已经启动过了"当成"不存在"。）</span>'
+          };
+          if (!whyOk) return {
+            ok: false,
+            detail: '①② 都对了。③ 还没答：容器里<b>谁</b>承担了 PID 1？<span class="muted">（提示：Android 自己的 init 体系并没有消失。）</span>'
+          };
           return {
-            ok: okOrder && okSkip,
-            detail: (okOrder ? '✅ 顺序正确：D→F→G→B→A→E→C。'
-                             : '❌ 顺序应为 <b>D → F → G → B → A → E → C</b>。' +
-                               '注意 <code>init</code> 进程先于 <code>init.rc</code> 解析。')
-              + '<br>'
-              + (okSkip ? '✅ 跳过项正确：D（BootROM）和 F（Bootloader）在容器里根本不存在。'
-                        : '❌ 跳过项应为 <b>D 和 F</b>。注意 G（内核启动）不是"不存在"，而是宿主机早就完成了。')
+            ok: true,
+            detail: '<b>三问全对。</b>顺序 D→F→G→B→A→E→C；容器化跳过 D（BootROM）和 F（Bootloader）—— ' +
+              '它们是"上电"才有的动作；③ 里 PID 1 由容器运行时（或精简 init）承担，' +
+              '而 Android 自己的 init 体系通常被保留、挂进容器的 PID 命名空间。'
           };
         },
         showAnswer:

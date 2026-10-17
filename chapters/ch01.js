@@ -784,13 +784,10 @@ window.CHAPTER = {
             detail:
               (ok1 ? '✅ 顺序正确：<code>' + S.order.join(' → ') + '</code>'
                    : '❌ 顺序不对。<br>你写的：<code>' + (v.guess || '（空）') + '</code><br>' +
-                     '正确是：<code>' + S.order.join(' → ') + '</code><br>' +
-                     '对照上面的表格看 <code>when</code> 列：<b>执行顺序就是 when 从小到大；' +
-                     '<code>front</code> 是强制 -1，所以永远第一。</b>') +
+                     '排法：按 <code>when</code> 从小到大；<code>when</code> 相同时按投递先后；<code>front</code> 不参与排序——它是「插队」。排完点「运行」对照推演表。') +
               '<br>' +
               (ok2 ? '✅ 语义说对了：<b>front 就是"插到队首"</b>，它绕过正常的 when 排序。'
-                   : '❌ 语义还没说清。<b>要点是"插到队首/链表头"，而不是"设了个更小的 when"</b>——' +
-                     '虽然效果相似，但它的实现是入队时直接插头，<b>因此能抢在同样 when 的消息之前</b>。'),
+                   : '❌ 语义还没说清。想一想：<code>front</code> 是「算了一个更小的 <code>when</code>」，还是「换了一种插入位置」？把这两种说法的差别讲清楚。'),
           };
         },
         showAnswer:

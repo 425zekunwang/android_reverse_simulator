@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实战区 · 工单收件箱 | 安卓高级研修班模拟器</title>
+<link rel="stylesheet" href="assets/style.css">
+<link rel="stylesheet" href="assets/practice.css">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<meta name="description" content="《安卓高级研修班》实战区：把若干「动手实验」升级成上岗作业——给你一台模拟设备、一套工具和一条验收标准，数据自己挖，结论自己验。">
+<meta name="theme-color" content="#0b0f14">
+</head>
+<body class="practice" data-no-badge="1">
+<div class="wrap wide" id="practice-root"></div>
+
+<!-- 真算法库必须最先加载：simnative.js 在装载时就要取 window.CRYPTO -->
+<script src="assets/labs.js"></script>
+<script src="assets/labx.js"></script>
+<script src="assets/sim/simelf.js"></script>
+<script src="assets/sim/simnative.js"></script>
+<script src="assets/sim/simdevice.js"></script>
+<script src="assets/sim/forge.js"></script>
+<script src="assets/sim/missions.js"></script>
+<script src="assets/sim/simscore.js"></script>
+<!-- 共享运行时（顶栏 / 进度 / 样式变量）；boot() 会先跑 -->
+<script src="assets/app.js"></script>
+<script src="assets/practice.js"></script>
+</body>
+</html>

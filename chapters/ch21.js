@@ -317,7 +317,7 @@ window.CHAPTER = {
           'GetStringUTFChars  NewStringUTF  RegisterNatives</code></pre>' +
           '<p><b>任务：把它们分类，然后判断这个 so 的补环境难度。</b></p>',
         inputs: [
-          { key: 'jni', label: '① 其中有几个函数属于「JNI 接口」这一类？（填数字）', hint: '含 JavaVM 侧的调用', ph: '例如 7' },
+          { key: 'jni', label: '① 其中有几个函数属于「JNI 接口」这一类？（填数字）', hint: '含 JavaVM 侧的调用', ph: '填数字' },
           { key: 'verdict', label: '② 结论：这个 so 用 unidbg 补环境，难度如何？为什么？', hint: '提示：看 JNI 类占比', ph: '难度……因为……', type: 'textarea', rows: 3 }
         ],
         runLabel: '🔍 分类并评估',
@@ -368,19 +368,9 @@ window.CHAPTER = {
           html += '<div class="lab-msg ' + cls + '"><b>评估结论：' + level + '</b>'
             + '<div class="lab-note">' + advice + '</div></div>';
 
-          // 用户答案校验
-          const ans = parseInt(String(v.jni || '').trim(), 10);
-          if (!isNaN(ans)) {
-            const ok = ans === jni.length;
-            html += '<div class="lab-msg ' + (ok ? 'pass' : 'fail') + '"><b>'
-              + (ok ? '✅ JNI 计数正确（' + jni.length + ' 个）' : '❌ JNI 计数不对')
-              + '</b><div class="lab-note">' + (ok
-                ? '你正确识别出了：' + jni.map(x => x.n).join('、')
-                : '正确答案是 <b>' + jni.length + '</b> 个：' + jni.map(x => x.n).join('、')
-                  + '。<br><b>识别要点：</b>凡是以 <code>Get/New/Call/Find/Register</code> 开头、'
-                  + '或明确是 <code>JavaVM</code> 侧（<code>GetEnv</code>）的，都走 JNI 函数表。')
-              + '</div></div>';
-          }
+          /* 这里不再自查答案。原来的版本会在计数错误时印出
+             "正确答案是 7 个：GetEnv、FindClass、…" —— 判分器在**失败**时把答案说出去，
+             等于这个实验不用做。运行 = 工具（给出分类结果），检查 = 判分（由 expected 负责）。 */
           return html;
         },
         expected: (v) => {
@@ -389,20 +379,27 @@ window.CHAPTER = {
             'GetStringUTFChars','NewStringUTF','RegisterNatives']
             .filter(n => L.classifyImport(n).cat.startsWith('★')).length;
           const ans = parseInt(String(v.jni || '').trim(), 10);
-          const ok = ans === jniCount;
-          return {
-            ok,
-            detail: ok
-              ? '<b>完全正确。</b>这 7 个都走 JNI 函数表，占比 ' + Math.round(jniCount / 21 * 100) +
-                '% —— 这个 so <b>与 Java 层耦合很深</b>，补环境成本高。<br>' +
-                '<b>工程判断：优先考虑 Frida RPC</b>，而不是硬啃 unidbg 补环境。'
-              : '再数一遍。JNI 类一共 <b>' + jniCount + '</b> 个：' +
-                '<code>GetEnv</code>、<code>FindClass</code>、<code>GetMethodID</code>、' +
-                '<code>CallObjectMethod</code>、<code>GetStringUTFChars</code>、<code>NewStringUTF</code>、' +
-                '<code>RegisterNatives</code>。<br>' +
-                '注意 <code>__android_log_print</code> 是 liblog 不是 JNI；' +
-                '<code>pthread_*</code> 是线程原语。'
-          };
+          const verdict = String(v.verdict || '').trim();
+          const countOk = ans === jniCount;
+          /* ② 必须也判：题面问的是"难度如何、为什么"。只填① 就能过，等于第二问不存在。
+             散文没法逐字判，但可以判"有没有说到点子上"：占比/耦合 + 工具选择 + 不是敷衍两个字。 */
+          const sawReason = window.AKKC_hasConcept(verdict, ['jni', '占比', '耦合', '函数表', '回调', 'java']);
+          const sawTool = window.AKKC_hasConcept(verdict, ['frida', 'rpc', 'unidbg', '补环境']);
+          const verdictOk = verdict.length >= 12 && sawReason && sawTool;
+          if (!countOk) {
+            return { ok: false, detail: '再数一遍。<b>识别要点：</b>凡是以 <code>Get/New/Call/Find/Register</code> 开头、' +
+              '或明确是 <code>JavaVM</code> 侧（<code>GetEnv</code>）的，都走 JNI 函数表；' +
+              '而 <code>__android_log_print</code> 是 liblog、<code>pthread_*</code> 是线程原语 —— 不要算进去。<br>' +
+              '<span class="muted">具体几个这次不告诉你：数对了才有意义。</span>' };
+          }
+          if (!verdictOk) {
+            return { ok: false, detail: '① 数对了。② 还差一点：这一问要的是<b>判断 + 依据</b> —— ' +
+              '先看 JNI 类在导入总数里占多大比例，再说这个比例意味着什么（native 与 Java 层的耦合程度），' +
+              '最后给出工具选择（继续补环境，还是换一条路）。' };
+          }
+          return { ok: true, detail: '<b>完全正确。</b>这 ' + jniCount + ' 个都走 JNI 函数表，占比 ' +
+            Math.round(jniCount / 21 * 100) + '% —— 这个 so <b>与 Java 层耦合很深</b>，补环境成本高。<br>' +
+            '<b>工程判断：优先考虑 Frida RPC</b>，而不是硬啃 unidbg 补环境。' };
         },
         showAnswer:
           '分类结果（共 21 个导入）：\n\n' +
