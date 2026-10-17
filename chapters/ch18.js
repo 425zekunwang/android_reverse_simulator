@@ -248,10 +248,8 @@ window.CHAPTER = {
                 '因为双亲委派保证的是"向上委托"，而<b>平级加载器之间互相不可见</b>。<br>' +
                 '解法：<code>Java.enumerateClassLoaders</code> 遍历找对的那一个，再设 <code>Java.classFactory.loader</code>。'
               : (!saysNo
-                  ? '<b>结论错了：默认加载器找不到它。</b>' +
-                    '因为真 dex 不是 APK 里那个，而是壳运行时用自定义 DexClassLoader 加载的。'
-                  : '<b>结论对，但理由不够。</b>补上关键机制：<b>双亲委派只向上委托，平级加载器互不可见</b>。' +
-                    '所以 PathClassLoader 看不到 DexClassLoader 加载的类。')
+                  ? '<b>结论不对。</b>把委派链从头走一遍：它先问谁要类？谁又去实际加载？壳的 dex 走的是这条链吗？'
+                  : '<b>结论对，但理由不够。</b>补上关键机制：<b>双亲委派的方向性</b>——它保证的是什么，又没规定什么？')
           };
         },
         showAnswer:

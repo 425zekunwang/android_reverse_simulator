@@ -883,14 +883,13 @@ window.CHAPTER = {
             detail:
               one(sizeOk, '文件大小对', '文件大小应是 <b>' + r.fileSize + '</b>（题面已给）') + '<br>' +
               one(eocdOk, 'EOCD 偏移对：' + r.eocdOff + '（' + FF28.hexN(r.eocdOff, 8) + '）',
-                'EOCD 偏移 = 文件大小 − 22 − 注释长度 = ' + r.fileSize + ' − 22 − ' + r.commentLen + ' = <b>' + r.eocdOff + '</b>') + '<br>' +
+                'EOCD 偏移不对：从片段末尾往前找 <code>50 4b 05 06</code>，再用「片段内偏移 + 片段起点」换算（点「运行」有逐字段解析）') + '<br>' +
               one(cdOk, '中央目录偏移对：' + r.cdOff + '（' + FF28.hexN(r.cdOff, 8) + '）',
-                '中央目录偏移在 EOCD 的 +0x10 处，应读成 <b>' + r.cdOff + '</b>（' + FF28.hexN(r.cdOff, 8) + '）') + '<br>' +
+                '中央目录偏移不对：它在 EOCD 的 +0x10 处（u4 小端），按这个位置自己读一遍') + '<br>' +
               one(signOk, '签名块起点对：' + r.blockStart + '（' + FF28.hexN(r.blockStart, 8) + '）',
-                '签名块起点 = 中央目录偏移 − 8 − 末尾 size = ' + r.cdOff + ' − 8 − ' + r.blockSize + ' = <b>' + r.blockStart + '</b>') + '<br>' +
+                '签名块起点不对：末尾固定是 16 字节魔数 + 8 字节 size，起点 = 中央目录偏移 − 8 − size，自己算') + '<br>' +
               one(whyOk, '原因说到了关键：全文件摘要 + 重打包改变了中央目录/EOCD',
-                '原因要说到：v2/v3 是对「entry 数据 + 中央目录 + EOCD」做<b>全文件摘要</b>，改内容或重新打包都会让摘要变，' +
-                '签名随之失效，必须重新签。')
+                '原因要说到点上：v2/v3 的签名保护范围<b>不只是那几个文件</b>——它对什么做摘要？改了哪一层会让摘要变？')
           };
         },
         showAnswer:
@@ -1287,9 +1286,10 @@ window.CHAPTER = {
               one(nameOk, '① 方法名对：<code>' + r.name.s + '</code>', '① 方法名不对。method_ids[0] 的 name_idx = ' + r.mids[0].name + '，去 string_ids 里取第 ' + r.mids[0].name + ' 项，得到偏移 ' + FF28.hexN(r.strings[r.mids[0].name].off, 4) + '，在那里解出字符串。') + '<br>' +
               one(clsOk, '② 类描述符对：<code>' + r.cls.s + '</code>', '② 类描述符不对。要经过 <b>class_idx → type_ids → string_ids</b> 两次跳转，别只跳一次。') + '<br>' +
               one(retOk, '③ 返回类型对：<code>' + r.ret.s + '</code>', '③ 返回类型不对。proto_id_item 的三个 u4 依次是 shorty_idx、<b>return_type_idx</b>、parameters_off；返回类型是第二个。') + '<br>' +
-              one(ulenOk, '④ 两字节 uleb128 解对了：' + r.strings[4].utf16, '④ 不对。这个长度前缀是 2 字节：<code>82 01</code> → (0x02) + (0x01 × 128) = <b>' + r.strings[4].utf16 + '</b>。') + '<br>' +
+              one(ulenOk, '④ 两字节 uleb128 解对了：' + r.strings[4].utf16, '④ 不对。这个长度前缀是 2 字节：<code>82 01</code> 要用 uleb128 的规则自己解（第 2 个字节的数据位左移 7 位）。') + '<br>' +
               one(diffOk, '⑤ 码元数与字节数都对了：' + r.strings[5].utf16 + ' 个码元 / ' + r.strings[5].byteLen + ' 字节',
-                '⑤ 不对。第 6 条字符串是中文，uleb128 存的是 UTF-16 码元数（' + r.strings[5].utf16 + '），实际字节数是 ' + r.strings[5].byteLen + '。')
+                '⑤ 不对。第 6 条字符串是中文——uleb128 存的是 UTF-16 码元数，而实际字节数是另一回事。' +
+                '从长度标签之后数到 00 之前，两个数各写一遍。')
           };
         },
         showAnswer:
@@ -1623,12 +1623,12 @@ window.CHAPTER = {
           return {
             ok: mOk && eOk && nOk && szOk && tOk,
             detail:
-              one(mOk, '① e_machine = ' + r.eh.machine + '（EM_AARCH64，0xB7）', '① 不对。e_machine 在偏移 <b>0x12</b>，u2 小端，应为 <b>' + r.eh.machine + '</b>。') + '<br>' +
-              one(eOk, '② e_entry = ' + H(r.eh.entry) + '（共享库的入口通常为 0）', '② 不对。e_entry 在偏移 <b>0x18</b>，u8，本样本是 <b>' + H(r.eh.entry) + '</b>。') + '<br>' +
-              one(nOk, '③ PT_LOAD 段数 = ' + r.loads.length, '③ 不对。程序头表在 0x40，每条 56 字节，<code>p_type == 1</code> 的才是 PT_LOAD，本样本有 <b>' + r.loads.length + '</b> 个。') + '<br>' +
-              one(szOk, '④ .bss 的来源：p_memsz − p_filesz = ' + H(r.bssGap), '④ 不对。第 2 个 PT_LOAD 的 memsz − filesz = <b>' + H(r.bssGap) + '</b>。') + '<br>' +
+              one(mOk, '① e_machine = ' + r.eh.machine + '（EM_AARCH64，0xB7）', '① 不对。e_machine 在偏移 <b>0x12</b>（u2 小端）——按这个位置自己读一遍。') + '<br>' +
+              one(eOk, '② e_entry = ' + H(r.eh.entry) + '（共享库的入口通常为 0）', '② 不对。e_entry 在偏移 <b>0x18</b>（u8）——自己读这个 8 字节。') + '<br>' +
+              one(nOk, '③ PT_LOAD 段数 = ' + r.loads.length, '③ 不对。程序头表在 0x40，每条 56 字节——数一数 <code>p_type == 1</code> 的有几条。') + '<br>' +
+              one(szOk, '④ .bss 的来源：p_memsz − p_filesz = ' + H(r.bssGap), '④ 不对。.bss 的来源是第 2 个 PT_LOAD 的 <code>p_memsz − p_filesz</code>——自己算这个差。') + '<br>' +
               one(tOk, '⑤ 代码节：sh_offset = ' + H(r.text.off) + '，sh_size = ' + H(r.text.size),
-                '⑤ 不对。带 <code>SHF_EXECINSTR</code>(0x4) 的节 sh_offset = <b>' + H(r.text.off) + '</b>，sh_size = <b>' + H(r.text.size) + '</b>。')
+                '⑤ 不对。不要找名字——带 <code>SHF_EXECINSTR</code>(0x4) 的那个节就是代码节，读出它的 sh_offset 与 sh_size。')
           };
         },
         showAnswer:

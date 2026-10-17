@@ -450,8 +450,7 @@ window.CHAPTER = {
             ok,
             detail: ok
               ? '完全正确。3 个字与 MD5 标准 IV 一致，第 1 个被改成了 <code>0xa12b8f3e</code>。'
-              : '还不对。注意：<b>小端还原</b>要把每 4 个字节<b>反序</b>拼成 32 位字 —— ' +
-                '<code>3e 8f 2b a1</code> → <code>0xa12b8f3e</code>（不是 <code>0x3e8f2ba1</code>）。'
+              : '还不对。注意：<b>小端还原</b>要把每 4 个字节<b>反序</b>拼成 32 位字（不是按原顺序读）。'
           };
         },
         showAnswer:

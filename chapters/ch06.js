@@ -1217,9 +1217,12 @@ window.CHAPTER = {
           if (!hv.trim()) return { ok: false, detail: '还没写判断。先跑一次上面的计算，把「有没有填充」和「为什么两次不同」说清楚。' };
           return {
             ok: ok,
-            detail: (ok ? '✅ 判断到位。' : '❌ 还差一点：至少要点明<b>有填充</b>，并且解释<b>两次密文不同</b>背后的原因。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">再追问自己一句：如果没有填充，密文会变成什么样？</span>答案见下一段的解析。' : '')
+            detail: ok
+              ? '✅ 判断到位。<br>' + list +
+                '<br><span class="hit">再追问自己一句：如果没有填充，密文会变成什么样？</span>答案见下一段的解析。'
+              : '❌ 还差一点（' + hits.filter(Boolean).length + '/3 个要点）。三句话各检查一遍：' +
+                '① 两条密文一样吗？② 解密出来的开头/结尾是什么形状？③ 裸 RSA 加密同一个明文，两次会得到一样的结果吗？' +
+                '<br>卡住了点「💡 提示」，或重跑上面的计算。'
           };
         },
         showAnswer:
@@ -1706,10 +1709,11 @@ window.CHAPTER = {
           var list = groups.map(function (g, i) { return (hits[i] ? '<span class="hit">✔</span> ' : '<span class="miss">?</span> ') + g.n; }).join('<br>');
           return {
             ok: ok,
-            detail: (ok ? '✅ 说到 ' + cnt + '/6 组，判断到位。' : '❌ 只说到 ' + cnt + '/6 组，还差一些。') +
-              '<br>' + list +
-              (ok ? '<br><span class="hit">最关键的一条依据是「DER 长度自洽 + 含 rsaEncryption OID」——它把 A 和 E（同样 256 字节、同样高熵）区分开了。</span>'
-                  : '<br>提示：<b>A 和 E 字节数接近、熵都高，靠熵分不开</b>，必须用结构（30 开头 + 长度自洽 + OID）区分。')
+            detail: ok
+              ? '✅ 说到 ' + cnt + '/6 组，判断到位。<br>' + list +
+                '<br><span class="hit">最关键的一条依据是「DER 长度自洽 + 含 rsaEncryption OID」——它把 A 和 E（同样 256 字节、同样高熵）区分开了。</span>'
+              : '❌ 只说到 ' + cnt + '/6 组，还差一些。逐条写「是什么 + 依据」：先按长度分组，' +
+                '再用结构区分长度接近的那几条——有两组字节数和熵都接近，<b>光靠熵分不开</b>。<br>卡住了点「💡 提示」。'
           };
         },
         showAnswer:

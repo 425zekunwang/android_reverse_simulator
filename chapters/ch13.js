@@ -1603,8 +1603,9 @@ window.CHAPTER = {
           const ok = okLen && algos && reason;
           let detail = '';
           if (!okLen) {
-            detail = '密文对不上。真实值是 <code>' + want + '</code>。注意这条记录的 <code>key</code> 是 ' +
-              '<b>' + i4.keyLen + ' 字节</b>，必须用 AES-256（14 轮）的密钥扩展，而不是 AES-128。';
+            detail = '密文对不上。注意这条记录的 <code>key</code> 是 <b>' + i4.keyLen + ' 字节</b>——' +
+              'AES 的变体由密钥长度决定（16 / 24 / 32 各对应哪个变体？），轮数选错结果就完全对不上。' +
+              '算完点「运行」，真实复算结果就在输出里。';
           } else if (!algos) {
             detail = '密文<b>完全正确</b>（这就是真实复算结果）。但第 ③ 问还差算法判断：' +
               '请写出四条记录分别是什么算法、什么模式、什么填充。';

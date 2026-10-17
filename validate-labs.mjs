@@ -21,6 +21,10 @@
      ③ 逐条钉死的回归断言（每个被修过的洞一条）
         机械扫描只能发现"构造得出来"的白嫖手法。已经修过的洞要单独钉住：
         手法必须继续失败、而正确答案必须继续通过（后半句是防"修过头"）。
+        · 失败详情不许印答案（2026-10 批次，35 个 lab，kind: 'noLeakAny'）：
+          把"通用三种提交"（全空 / 原样预填 / 每个作答字段填 X）都喂一遍，
+          失败详情里不得出现答案值 / 答案清单 / 逐项判定。
+          为什么要三种提交：不同 lab 的提前返回不一样，一种提交到不了所有分支。
      ④ 覆盖自检
         逐章 lab 数与 validate-chapters.mjs 的「实验」列对账；expected 抛错的 lab 单独列出。
         抛错必须报出来 —— 那等于这一章没被验到。
@@ -388,7 +392,122 @@ const PINS = [
   { no: 32, lab: '实验：Android 启动链路排序 + 容器化差异', want: true,
     vals: { order: 'D F G B A E C', skip: 'D F',
       why: '容器里 PID 1 由容器运行时承担，Android 自己的 init 体系被挂进 PID 命名空间' },
-    why: '①② 对 + ③ 说清谁当 PID 1 —— 正确答案必须通过' }
+    why: '①② 对 + ③ 说清谁当 PID 1 —— 正确答案必须通过' },
+
+  /* ================== 2026-10-16 批次：失败详情不许把答案印出来 ==================
+     同一类洞，35 个 lab：判分器**失败时**的详情里直接写着答案值 / 答案清单 / 逐项判定。
+     守卫方式：把"通用三种提交"（全空 / 原样预填 / 每个作答字段填 X）都喂一遍，
+     再断言失败详情里不出现这些"答案痕迹"（比较时忽略空白）。
+     修前这些痕迹都在详情里印刷过；痕迹取自实测（dump-details.mjs + leakdiff.mjs）。
+     没有钉的例外：CH07 §7.13 —— 它漏的是"表格里每行的规则判定列"，是结构不是字面量，
+     机械断言钉不住（改动本身在 leakdiff 里有证据）。 */
+  { no: 1, lab: '实验二：消息循环执行顺序推演器', kind: 'noLeakAny',
+    notInDetail: ['正确是', '插到队首', '抢在同样 when 的消息之前'],
+    why: '修前：顺序分支直接写"正确是：C → A → E → D → B"，语义分支把"插到队首"这个答案说满' },
+  { no: 2, lab: '实验：从方法签名算出寄存器布局', kind: 'noLeakAny',
+    notInDetail: ['p0 应该是', '.registers 4'],
+    why: '修前：失败时把 locals 代进公式直接给出 p0 与总槽位的答案' },
+  { no: 2, lab: '实验：读 Smali 说人话', kind: 'noLeakAny',
+    notInDetail: ['p0 = v2', 'p1 = v3', '没有虚方法表条目'],
+    why: '修前：① 的算式写到底（locals=2 → p0=v2），③ 直接把"构造器不能被重写、没有虚方法表条目"这个答案写出来' },
+  { no: 3, lab: '实验：只用一段末尾字节，定位 APK Signing Block', kind: 'noLeakDemo',
+    vals: { size: '16384', eocd: 'X', cd: 'X', sign: 'X' },
+    notInDetail: ['16362', '16305', '16201', '全文件摘要'],
+    why: '修前：①②③ 把算出来的三个偏移原样报出（16362 / 16305 / 16201），④ 把原因整句给出' },
+  { no: 3, lab: '实验：解出 method_ids[0] 指向的方法名与签名', kind: 'noLeakAny',
+    notInDetail: ['= 130'],
+    why: '修前：④ 把 uleb128 的算式算到底（= 130）' },
+  { no: 3, lab: '实验：手写一个 ELF 头 / 程序头 / 节表解析器', kind: 'noLeakAny',
+    notInDetail: ['183', '0x00001A10', '0x00000120', '0x00000800'],
+    why: '修前：五问的答案值（e_machine=183、e_entry、.bss 差、代码节 offset/size）全在失败详情里' },
+  { no: 4, lab: '实验：Manifest 攻击面判定器', kind: 'noLeakAny',
+    notInDetail: ['PayConfirmActivity', 'AdminPanelActivity', 'DebugReceiver'],
+    why: '修前：详情开头就打印判定器算出的完整清单，还点出 ②③ 的答案组件名' },
+  { no: 4, lab: '实验：ContentProvider 路径穿越判定器', kind: 'noLeakAny',
+    notInDetail: ['getCanonicalPath', 'realpath', 'FileProvider', '分隔符边界'],
+    why: '修前：详情开头打印越权清单，② 还差哪几个修复要点也直接列出来' },
+  { no: 4, lab: '实验：畸形 Intent 参数字典（哪一行真的会崩）', kind: 'noLeakAny',
+    notInDetail: ['，实际 ', '应该是第', 'getter 捕获了类型异常'],
+    why: '修前：直接把会崩行数（实际 N）、② 的答案行号、③ 的原因都写出来' },
+  { no: 5, lab: '实验：调用栈判读器（真实解析 + 分层 + 三坐标定位）', kind: 'noLeakAny',
+    notInDetail: ['规则算出', 'CryptoBridge', 'PayActivity$2.onClick'],
+    why: '修前：三行对照表把"规则算出 #N 名字"全列出来（三个坐标的答案 + 类名）' },
+  { no: 5, lab: '实验：七条线索的选型器（真实成本-收益规则表）', kind: 'noLeakAny',
+    notInDetail: ['规则算出的首选'],
+    why: '修前：失败时先报"规则算出的首选：<线索名>"（= 选型的答案）' },
+  { no: 6, lab: '实验三：填充识别器 —— 两条密文背后有没有随机填充', kind: 'noLeakAny',
+    notInDetail: ['指出了「有填充」', '推断出存在随机成分'],
+    why: '修前：失败详情把三要点清单逐个 ✔/✘ 打印，条目名本身就是答案（"指出了「有填充」"）' },
+  { no: 6, lab: '实验二：公钥常量识别器（长度 + 结构 + 熵，全部真算）', kind: 'noLeakAny',
+    notInDetail: ['rsaEncryption', 'DER 长度自洽', 'A 和 E 字节数接近'],
+    why: '修前：六要点清单把 A～F 每组的判定（DER/RSA/OID/2048/AES/Base64）都报出来' },
+  { no: 7, lab: '实验一：常量比对审校器（256 字节 vs 标准 AES S 盒）', kind: 'noLeakAny',
+    notInDetail: ['0x2b', '0x63', '它有两个字节与标准值不同'],
+    why: '修前：② 直接给出两个偏移（0x2b / 0x63），③ 把"两个字节不同"这个结论写出来' },
+  { no: 8, lab: '实验：逐行判定 maps 片段（4 条可疑 + 3 条误报陷阱）', kind: 'noLeakAny',
+    notInDetail: ['(deleted)', 'memfd', '自定义 linker'],
+    why: '修前：① 漏了哪几行、② 的两个标记、③ 的关键词方向全列出来' },
+  { no: 9, lab: '实验一：JNI 签名生成器（把 Java 声明翻成描述符）', kind: 'noLeakAny',
+    notInDetail: ['Java_com_example_app_Crypto_sign', 'Ljava/lang/String;'],
+    why: '修前：把正确描述符与短符号名原样打出来（"应该是 <code>…</code>"）' },
+  { no: 9, lab: '实验二：从一份注册日志还原完整的 JNI 映射', kind: 'noLeakAny',
+    notInDetail: ['正确答案是'],
+    why: '修前：③ 直接写"正确答案是 N 条"' },
+  { no: 9, lab: '实验二：从一份注册日志还原完整的 JNI 映射', kind: 'noLeakDemo',
+    vals: { cnt: 'check' },
+    notInDetail: ['check()Z', 'nativeGetTime()J', '编码与加密本体'],
+    why: '修前：选了"在表里但不最优"的方法名时，详情顺手把排序判据（返回布尔/返回时间/编码本体）讲成答案' },
+  { no: 10, lab: '实验 A：特征暴露面审计器', kind: 'noLeakAny',
+    notInDetail: ['改编译', '编译期写死'],
+    why: '修前：② 的提示直接指向"补法里写着改编译或内核"的那一栏，理由里还给"编译期写死"这个答案' },
+  { no: 11, lab: '实验：loadClass 日志分层推演 —— 哪一层能看到最多的类加载', kind: 'noLeakAny',
+    notInDetail: ['L1 看到', 'java.*'],
+    why: '修前：① 的失败文案把"L1 看到全部"讲出来，② 直接列 java.* / android.* 这类噪音源' },
+  { no: 11, lab: '实验：Hook 点选择器 / 时机推演器', kind: 'noLeakAny',
+    notInDetail: ['这一题要说到', 'loadClass'],
+    why: '修前：结论要点按关键词表逐个点名（loadClass / loader 等）' },
+  { no: 12, lab: '实验：从抓到的 X-Sign 反推服务端的字符串规范化规则', kind: 'noLeakAny',
+    notInDetail: ['真正命中的候选是'],
+    why: '修前：③ 把"这一对值真正命中的候选"（= 规则答案）报出来' },
+  { no: 12, lab: '实验：从十六进制报文里定出字段边界（长度 / 类型 / 序号 / 校验）', kind: 'noLeakAny',
+    notInDetail: ['偏移 4 处', '偏移 3 处', '偏移 8 处'],
+    why: '修前：①②③ 的失败文案把字段偏移与端序直接给出' },
+  { no: 12, lab: '实验：抓包失败诊断器', kind: 'noLeakAny',
+    notInDetail: ['这一层的关键词是', 't.layer'],
+    why: '修前：② 直接点名这一层的关键词（= 层级答案）' },
+  { no: 13, lab: '实验：解析一段自吐日志，并复算出被截断的密文', kind: 'noLeakAny',
+    notInDetail: ['e605e27d94d91e7edc77ad38f25512c9', 'AES-256'],
+    why: '修前：失败时先打印真实密文（32 字节 hex），再说"必须用 AES-256"' },
+  { no: 14, lab: '实验：白盒表的统计指纹——熵骗了你，差分谱没有', kind: 'noLeakAny',
+    notInDetail: ['命中情况', '差分谱'],
+    why: '修前：把要点清单印出来（差分谱 ✔ / 熵 ✘ / 仿射编码 ✔），等于逐项告诉答案' },
+  { no: 14, lab: '实验：DFA 故障扩散推演器（真加密两次 + 真实候选收缩）', kind: 'noLeakAny',
+    notInDetail: ['命中情况', '① 倒数第二个'],
+    why: '修前：四个要点的逐条 ✔/✘ 清单（①的措辞就是答案本身）' },
+  { no: 14, lab: '实验：故障样本筛选器——哪些样本能用，哪些必须丢掉', kind: 'noLeakAny',
+    notInDetail: ['正确答案是', '漏掉的：', '多选的：'],
+    why: '修前：直接列出答案集合、漏掉的、多选的（还附上筛选判据）' },
+  { no: 18, lab: '实验：ClassLoader 委托链推演', kind: 'noLeakAny',
+    notInDetail: ['DexClassLoader', '平级加载器互不可见', '默认加载器找不到它'],
+    why: '修前：结论与完整机制（壳用自定义 DexClassLoader、平级加载器互不可见）全给出' },
+  { no: 20, lab: '实验：字节码反查原始指令', kind: 'noLeakAny',
+    notInDetail: ['正确序列', '加密轮函数的骨架'],
+    why: '修前：给出正确序列 LOAD → XOR → ROL → STORE → HLT 与"加密轮函数骨架"的结论' },
+  { no: 22, lab: '实验一：从一段 16 字节常量认出算法家族', kind: 'noLeakAny',
+    notInDetail: ['0xa12b8f3e', '0x3e8f2ba1'],
+    why: '修前：小端还原那一步直接给了算完的结果（0xa12b8f3e）' },
+  { no: 24, lab: '实验：对抗手段的覆盖度推演', kind: 'noLeakAny',
+    notInDetail: ['gadget', 'hook-open', 'hook-str'],
+    why: '修前：把还差哪几项列出来，并点名三种手段各挡什么' },
+  { no: 26, lab: '实验：ART 版本演进与脚本失效诊断', kind: 'noLeakAny',
+    notInDetail: ['CompactDex', '关键变化是'],
+    why: '修前：把这一代的关键变化（如 CompactDex / cdex）直接写出来' },
+  { no: 28, lab: '实验：iOS 反调试检测与绕过配对', kind: 'noLeakAny',
+    notInDetail: ['内联 SVC', '正确答案是'],
+    why: '修前：② 直接说"正确答案是内联 SVC"并解释它为什么最难绕' },
+  { no: 30, lab: '实验：翻译模式选型', kind: 'noLeakAny',
+    notInDetail: ['全系统模拟', '应用级翻译', '把 GKI 当成了翻译方案'],
+    why: '修前：三问都直接给出答案（①全系统模拟 ②应用级翻译 ③错在把 GKI 当翻译方案）' }
 ];
 
 let pinned = 0;
@@ -429,6 +548,38 @@ for (const p of PINS) {
     const bad = (p.notInDetail || []).filter(s => r.detail.replace(/\s+/g, '').includes(s.replace(/\s+/g, '')));
     if (bad.length) {
       err(where, '失败详情里出现了答案痕迹：' + bad.map(s => '「' + s + '」').join('、') + ' —— ' + p.why);
+    } else {
+      pinned++;
+    }
+    continue;
+  }
+  /* 「通用三种提交下，失败详情都不许出现答案痕迹」：
+     全空 / 原样预填 / 每个"要自己产出"的字段填 X —— 三种都喂一遍。
+     为什么要三种：不同 lab 的提前返回不一样（比如"文件总大小没填"会先返回），
+     只用一种提交会漏掉后面的分支。
+     为什么"通过了的提交"直接跳过：通过时打的不是失败详情，那属于 ① 机械扫描的活。 */
+  if (p.kind === 'noLeakAny') {
+    const pre = PREFILL(lab);
+    const blank = BLANK(lab);
+    const junk = Object.assign({}, pre);
+    (lab.inputs || []).forEach((inp, i) => {
+      const k = inp.key || i;
+      if (!(inp.value != null && String(inp.value).trim() !== '')) junk[k] = 'X';
+    });
+    const subs = [['全空', blank], ['原样预填', pre], ['每个作答字段填 X', junk]];
+    const leaks = [];
+    for (const [tag, vals] of subs) {
+      const r = ask(lab, vals);
+      if (r.threw) continue;            /* 抛错既不是"通过"也不是"泄漏"，覆盖缺口由 ④ 单独报 */
+      if (r.ok === true) continue;
+      for (const s of (p.notInDetail || [])) {
+        if (r.detail.replace(/\s+/g, '').includes(s.replace(/\s+/g, ''))) {
+          leaks.push('（' + tag + '）「' + s + '」');
+        }
+      }
+    }
+    if (leaks.length) {
+      err(where, '失败详情里又出现了答案痕迹：' + leaks.join('、') + ' —— ' + p.why);
     } else {
       pinned++;
     }

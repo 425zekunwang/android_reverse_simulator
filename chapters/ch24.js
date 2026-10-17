@@ -405,10 +405,8 @@ window.CHAPTER = {
               ? '<b>全覆盖达成。</b>你用了 ' + new Set(enabled).size + ' 种手段挡住全部 ' + sweep.length + ' 项检测。<br>' +
                 '注意一个规律：<b>能一次挡住多项的手段（如 gadget）性价比最高</b>，' +
                 '而像"改端口"这种只挡一项的，应该最后才做。'
-              : '<b>还有 ' + (sweep.length - blocked) + ' 项暴露：</b>' +
-                sweep.filter(d => !d.blocked).map(d => d.name).join('、') + '。<br>' +
-                '提示：<code>gadget</code>（编号 2）能同时挡住两项；' +
-                '<code>hook-open</code>（3）挡 maps 检测；<code>hook-str</code>（4）挡字符串扫描。'
+              : '<b>还有 ' + (sweep.length - blocked) + ' 项暴露。</b>「运行」的表里有每一轮的判定（哪几项被挡住了），照着它调勾选。<br>' +
+                '提示：先找「能一次挡住多项」的手段，最后再管那些只挡一项的。'
           };
         },
         showAnswer:

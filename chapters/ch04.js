@@ -851,15 +851,16 @@ window.CHAPTER = {
           var dangerOk = hasDangerName && hasDangerWhy;
 
           var ok = setOk && safeOk && dangerOk;
-          var d = '判定器算出的"任意 App 可调用"清单：<b>' + (truth.join('、') || '（空）') + '</b>（共 ' + truth.length + ' 个）。<br>';
+          var d = ok ? ('判定器算出的"任意 App 可调用"清单：<b>' + (truth.join('、') || '（空）') + '</b>（共 ' + truth.length + ' 个）。<br>')
+            : ('<b>还没对上。</b>「运行」输出里有判定器给出的完整判定，照着它对。<br>');
           d += setOk ? '✅ ① 完整且没有多写。' :
             '❌ ① ' + (got.length ? '' : '这一栏还没填。') +
-            (miss.length ? '漏了：<b>' + miss.join('、') + '</b>。' : '') +
-            (extra.length ? '多写了：<b>' + extra.join('、') + '</b>（它们要么没导出，要么由 signature 级权限保护着）。' : '');
+            (miss.length ? '有漏。' : '') +
+            (extra.length ? '有多写——回去看那几条的 <code>exported</code> 与权限级别。' : '');
           d += '<br>' + (safeOk ? '✅ ② 说对了：PayConfirmActivity 有 intent-filter 但显式写了 exported="false" —— filter 只是"能被隐式匹配到"的声明，导不导出由 exported 说了算。'
-            : '❌ ② 需要点出 <b>PayConfirmActivity</b>，并说清"安全"的原因是<b>它的 exported 被显式写成了 false</b>（有 intent-filter 并不等于导出）。');
+            : '❌ ② 还没说到点上：找一个<b>有 intent-filter 但仍然安全</b>的组件，说清它靠的是哪个属性。');
           d += '<br>' + (dangerOk ? '✅ ③ 说对了：AdminPanelActivity / DebugReceiver 挂着权限，但那个权限的 protectionLevel 是 normal —— 第三方声明一下就能拿到。'
-            : '❌ ③ 需要点出 <b>AdminPanelActivity</b>（或 DebugReceiver），并说清原因：<b>protectionLevel=normal 的权限挡不住第三方</b>，必须有 signature 级才算保护。');
+            : '❌ ③ 还没说到点上：找一个<b>挂了权限</b>的组件，说清它的 <code>protectionLevel</code> 为什么挡不住第三方。');
           return { ok: ok, detail: d };
         },
         showAnswer:
@@ -1835,16 +1836,16 @@ window.CHAPTER = {
           var fixOk = f1 && (f2 || f3);
 
           var ok = setOk && fixOk;
-          var d = '判定器算出真正越权的请求：<b>' + (truth.map(function (x) { return '第 ' + x.idx + ' 行'; }).join('、') || '（无）') + '</b>（共 ' + truth.length + ' 条）。<br>';
+          var d = ok ? ('判定器算出真正越权的请求：<b>' + (truth.map(function (x) { return '第 ' + x.idx + ' 行'; }).join('、') || '（无）') + '</b>（共 ' + truth.length + ' 条）。<br>')
+            : ('<b>还没对上。</b>「运行」输出的表里有每一行的「归一化后的真实路径」——不在根目录内的就是越权。<br>');
           d += setOk ? '✅ ① 全部找对，也没有多报。' :
             '❌ ① ' + (tokens.length ? '' : '这一栏还没填。') +
-            (miss.length ? '漏了：<b>' + miss.join('、') + '</b>。' : '') +
-            (extra.length ? '多报了：<b>' + extra.join('、') + '</b>（这些请求归一化之后仍然落在根目录内）。' : '');
+            (miss.length ? '有漏。' : '') +
+            (extra.length ? '有多报——这些请求归一化之后仍然落在根目录内。' : '');
           d += '<br>' + (fixOk ? '✅ ② 修复方向对：' +
             (f1 ? '提到了归一化（canonical）' : '') + (f2 ? '、白名单/映射' : '') + (f3 ? '、分隔符边界' : '') + '。'
-            : '❌ ② 修复方案还差关键点：' +
-              (f1 ? '' : '必须<b>先归一化</b>（getCanonicalPath / realpath）再比较；') +
-              (f2 || f3 ? '' : '比较时要有<b>分隔符边界</b>，或者更彻底地<b>不让 Uri 参与路径拼接</b>（ID 映射白名单 / FileProvider）。'));
+            : '❌ ② 修复方案还差关键点。回看上面那张表的两列：为什么「不归一化检查」几乎全放行？' +
+              '为什么同一个文件的两种写法会给出<b>同一个指纹</b>？把这两点想通，方案自然就有了。');
           return { ok: ok, detail: d };
         },
         showAnswer:
@@ -1977,19 +1978,20 @@ window.CHAPTER = {
             '查不出', '隐藏', '不记录', '崩溃平台', '监控', '后续逻辑']);
           var whyOk = w1 && w2;
           var ok = countOk && safeOk && whyOk;
-          var d = '当前参数下，判定器算出：<b>' + r.count + '</b> / ' + r.total + ' 行会崩；' +
+          var d = ok ? ('当前参数下，判定器算出：<b>' + r.count + '</b> / ' + r.total + ' 行会崩；' +
             '不崩的是第 <b>' + r.safe.map(function (x) { return x.id; }).join('、') + '</b> 行，' +
-            '其中"看着危险其实不崩"的是第 <b>' + (safeTruth.join('、') || '（无）') + '</b> 行。<br>';
-          d += countOk ? '✅ ① 行数正确。' : '❌ ① 行数不对（你填 ' + (isNaN(n) ? '空' : n) + '，实际 ' + r.count + '）。' +
-            (r.overLimit ? '注意 byte[] 载荷超过了教学上限 ' + r.limit.toLocaleString() + ' 字节，第 6 行会崩。'
-                         : '当前 byte[] 载荷<b>没超过</b>教学上限，第 6 行不会崩——这正是"结果跟着输入变"的地方。');
+            '其中"看着危险其实不崩"的是第 <b>' + (safeTruth.join('、') || '（无）') + '</b> 行。<br>')
+            : ('<b>还没对上。</b>「运行」输出里有逐行的判定结果，照着它对。<br>');
+          d += countOk ? '✅ ① 行数正确。' : '❌ ① 行数不对（你填 ' + (isNaN(n) ? '空' : n) + '）。' +
+            (r.overLimit ? '注意 byte[] 载荷已超过教学上限——体积类那一行的结果会跟着载荷变。'
+                         : '当前 byte[] 载荷<b>没超过</b>教学上限——这正是"结果跟着输入变"的地方。');
           d += '<br>' + (safeOk ? '✅ ② 找到了那一行（第 ' + safeTruth.join('、') + ' 行）。'
-            : '❌ ② 应该是第 <b>' + safeTruth.join('、') + '</b> 行——' +
-              '"看着危险其实不崩"专指那一条原始类型 getter 的写法（你填的是 ' + (gotSafe.join('、') || '空') + '）。' +
-              '注意：不崩的行里还有一条是对照组（本来类型就匹配），它不属于"看着危险"。');
+            : '❌ ② 还不对（你填的是 ' + (gotSafe.join('、') || '空') + '）。' +
+              '分两步：先在逐行判定里找出「不崩」的行，再从中挑出那条<b>看着危险其实不崩</b>的——' +
+              '注意有个对照组（类型本来就匹配）容易混进去。');
           d += '<br>' + (whyOk ? '✅ ③ 说清了"不崩"的机制与它更危险的原因。'
-            : '❌ ③ 还差两个点：' + (w1 ? '' : '要说明<b>它为什么不崩</b>（原始类型 getter 捕获了类型异常并返回默认值）；') +
-              (w2 ? '' : '以及<b>为什么这比崩溃更麻烦</b>（静默拿到错值、后续逻辑继续跑、监控里看不到）。'));
+            : '❌ ③ 还差两个点：' + (w1 ? '' : '要说明<b>它为什么不崩</b>；') +
+              (w2 ? '' : '以及<b>为什么这比崩溃更麻烦</b>。'));
           return { ok: ok, detail: d };
         },
         showAnswer:

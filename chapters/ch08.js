@@ -1401,12 +1401,11 @@ window.CHAPTER = {
           return {
             ok: ok,
             detail: (setOk ? '✅ 可疑行找全了：<code>' + truth.join(', ') + '</code>。'
-                           : '❌ 可疑行不对。' + (miss.length ? '漏了：<code>' + miss.join(', ') + '</code>。' : '') +
-                             (extra.length ? '多算了：<code>' + extra.join(', ') + '</code>（回去看它的判定与依据——多半是 ART 合法映射或你的 dump 目标）。' : '')) + '<br>' +
-              (keyOk ? '✅ 关键那条抓准了。' : '❌ 第 ② 问：能说明「从内存里加载」的是 <code>(deleted)</code> 的 so（' +
-                (keyFloor === null ? '本片段里没有' : keyFloor) + ' 行）或 <code>memfd</code> 那行——它们表示<b>文件系统里没有可回溯源</b>。') + '<br>' +
+                           : '❌ 可疑行不对。' + (miss.length ? '有漏。' : '') +
+                             (extra.length ? '有多算——回去看它的判定与依据（多半是 ART 合法映射或你的 dump 目标）。' : '')) + '<br>' +
+              (keyOk ? '✅ 关键那条抓准了。' : '❌ 第 ② 问：哪两处标记说明「这个文件在文件系统里没有可回溯源」？把标记和行号写进答案。') + '<br>' +
               (whyOk ? '✅ 加载方式说对了：不是走系统加载器从磁盘加载，而是运行时造内存/落地后自删再加载。'
-                     : '❌ 第 ③ 问还差一点。关键词方向：<b>内存加载 / 自删 / memfd / 自定义 linker / 不落地 / dlopen</b>，任选一个说清即可。')
+                     : '❌ 第 ③ 问还差一点。用一句话说清这批映射<b>和「从磁盘上的文件正常加载」有什么不同</b>——卡住了点「💡 提示」。')
           };
         },
         showAnswer:

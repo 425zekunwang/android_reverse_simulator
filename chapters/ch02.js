@@ -641,14 +641,12 @@ window.CHAPTER = {
             ok: p0Ok && tOk,
             detail:
               (p0Ok ? '✅ p0 算对了：p0 = v(locals) = <code>v' + p0 + '</code>。'
-                    : '❌ p0 不对。用公式 <b>p0 = v(locals)</b>：locals 是 <code>' + localsN + '</code>，' +
-                      '所以 p0 应该是 <code>v' + p0 + '</code>。' +
-                      (st ? '（这是静态方法，p0 是第一个真实参数）' : '（这是实例方法，p0 是 this）')) +
+                    : '❌ p0 不对。用公式 <b>p0 = v(locals)</b> 自己算：locals 是多少，p0 就是 v 几。' +
+                       (st ? '（这是静态方法，p0 是第一个真实参数）' : '（这是实例方法，p0 是 this）')) +
               '<br>' +
               (tOk ? '✅ 总槽位算对了：' + localsN + ' + ' + paramSlots + ' = <code>' + total + '</code>。'
-                   : '❌ 总槽位不对。参数占 <b>' + paramSlots + '</b> 个槽位（别忘了宽类型算 2 个、' +
-                     (st ? '静态方法没有 this' : '实例方法的 this 也占 1 个') + '），' +
-                     '加上 locals ' + localsN + ' → 应该写 <code>.registers ' + total + '</code>。')
+                   : '❌ 总槽位不对。总槽位 = locals + 参数槽位数——参数槽位自己数一遍（宽类型算 2 个、' +
+                     (st ? '静态方法没有 this' : '实例方法的 this 也占 1 个') + '），数完加上 locals 就是答案。')
           };
         },
         showAnswer:
@@ -1277,13 +1275,12 @@ window.CHAPTER = {
                       : '❌ 第①问还差得远。提示：看 <code>iget-object</code> 读了什么、<code>append</code> 追加了谁。') +
               '<br>' +
               (p0Ok ? '✅ p0 = <code>v2</code> 算对了（.registers 4，参数槽位 2，locals = 2）。'
-                    : '❌ p0 不对。算一遍：<code>.registers 4</code>，参数槽位 = <code>this</code>(1) + ' +
-                      '<code>String</code>(1) = 2，所以 locals = 4 - 2 = 2，<b>p0 = v(locals) = v2</b>，' +
-                      '<code>p1 = v3</code>。') +
+                    : '❌ p0 不对。用两个公式自己算：<code>参数槽位 = 真实参数个数 + 1（实例方法）</code>、' +
+                       '<code>locals = .registers − 参数槽位</code>，然后 <code>p0 = v(locals)</code>。') +
               '<br>' +
               (whyOk ? '✅ 构造方法的理由说对了：它不可被重写，所以走非虚调用。'
-                     : '❌ 第③问要说到点上：<code>&lt;init&gt;</code> <b>不能被重写 / 没有虚方法表条目</b>，' +
-                       '不存在"按实际类型分派一个构造器"这回事，所以只能用 <code>invoke-direct</code>。')
+                     : '❌ 第③问要说到点上：想一想「构造方法能不能被重写」——如果不能，它还走不走虚方法分派？' +
+                       '把「为什么只能用 <code>invoke-direct</code>」的因果说清楚。')
           };
         },
         showAnswer:
