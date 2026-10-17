@@ -342,9 +342,9 @@ node validate-labs.mjs <章号>
 ## 6. 禁止事项
 
 - ❌ 修改 `assets/` 下任何文件（基础设施已就绪，改它会连带影响现有 25 章）
-  —— **默认规则（main 分支），不放松**；实战模式分支 `feat/practice-simulator` 的放开范围见 6.1
+  —— **默认规则，不放松**；实战区相关的放开范围见 6.1（原 `feat/practice-simulator` 分支，2026-10-17 已合入 `main`）
 - ❌ 修改现有 `chapters/ch01.js`–`ch25.js`
-  —— **默认规则（main 分支），不放松**；迁移期按章放开的范围见 6.1
+  —— **默认规则，不放松**；迁移期按章放开的范围见 6.1
 - ❌ 修改 `index.html` / `README.md` / `slides.html` / `toolbox.html`（由主控统一更新）
 - ❌ 使用 `require` / `import` / `fetch` / 任何外部依赖 —— 数据文件必须是纯 `window.CHAPTER = {…}` 赋值
   （例外：为了**验证案例链接**可以临时写 `.mjs` 脚本，但必须跑完即删，不要留在仓库里）
@@ -353,18 +353,20 @@ node validate-labs.mjs <章号>
 - ❌ 编造案例链接
 - ❌ 留下临时文件（自检脚本、`.json` 中间产物等）——交付前清干净
 
-### 6.1 实战模式分支（`feat/practice-simulator`）的放开范围
+### 6.1 实战区的放开范围（原 `feat/practice-simulator` 分支）
 
-实战模式（工单模式）需要仿真引擎、交接卡与独立实战区，`assets/`、`chapters/` 都要动到——
-但**只在 `feat/practice-simulator` 分支上**开这组有边界的例外。
-**默认规则不松：新章节仍然不许改 `assets/` 下已有文件、不许改别的章节文件**；回到 main 分支时，本节不适用，上面两条禁令原样执行。
+实战模式（工单模式）需要仿真引擎、交接卡与独立实战区，`assets/`、`chapters/` 都要动到。
+这组例外**原先只开在 `feat/practice-simulator` 分支上**（2026-10-16）；
+**2026-10-17 该分支已合入 `main`**，所以下表从"分支例外"改为**常设规则**——
+面对实战区相关的落点按表执行，其余一律照旧。
+**默认规则不松**：新章节仍然不许改 `assets/` 下已有文件、不许改别的章节文件。
 
 | 对象 | 允许的程度 |
 |---|---|
-| **新增** `assets/sim/*`、`assets/practice.js`、`assets/practice.css`、`practice.html`、`validate-missions.mjs` | 只许**新增**（`assets/` 既有文件的可动范围见下面两行） |
+| **新增** `assets/sim/*`、`assets/practice.js`、`assets/practice.css`、`practice.html`、`validate-missions.mjs`、`validate-labs.mjs`、`audit-lab-details.mjs` | 只许**新增**（`assets/` 既有文件的可动范围见下面两行） |
 | `assets/app.js` | 只许**增量扩展**：在 `Lab` 组件与 `mountTopbar` 内加分支；**不许重写既有组件** |
 | `assets/style.css` | 只许**追加新规则块**；**不许改动既有规则** |
-| `chapters/chNN.js` | 按章放开**迁移**：一次只改正在迁移的那一章、不许动别的章节；**每章迁移必须单独提交**，且迁移后 `validate-chapters.mjs` 仍须零错误 |
+| `chapters/chNN.js` | 迁移期按章放开：一次只改正在迁移的那一章、不许动别的章节；**每章迁移必须单独提交**，且迁移后 `validate-chapters.mjs` 仍须零错误；迁移前该章必须判分过关（`PRACTICE-SPEC.md` §7.3 的硬前置） |
 
 **边界精神：只许新增与增量扩展，不许重写、不许顺手改。** 依据：`PRACTICE-SPEC.md` §11.2，修订经过见文末「修订记录」。
 
@@ -374,6 +376,8 @@ node validate-labs.mjs <章号>
 
 | 日期 | 修订 | 说明 |
 |---|---|---|
+| 2026-10-17 | 实战区合入 `main`：§6.1 由"分支例外"改为**常设规则**（放开范围不变）；§6 两条禁令的注脚去掉"（main 分支）"限定 | 分支 `feat/practice-simulator` 的提交一并合入；**默认禁令本身没有放松** |
+| 2026-10-17 | §6.1「新增」清单补登 `validate-labs.mjs`、`audit-lab-details.mjs` | 判分自检与失败详情审计工具，见 §2.3 与文末批次记录 |
 | 2026-10-16 | 为实战模式分支（`feat/practice-simulator`）放开两条禁令（`assets/`、`chapters/chNN.js`） | 默认（main）仍一律禁止；放开范围见 6.1 |
 | 2026-10-16 | 更正 §1「必读文件」里 `assets/app.js` 的行号区间：**236–1160 → 306–1567** | 见下方说明。这是**既有错误**，不是本次改动引入的漂移 |
 | 2026-10-16 | 新增 §2.3「判分纪律」小节，§5 自检流程加第 4 步（`node validate-labs.mjs`） | 把"不做题就通过"的堵法写成规矩；配套工具与 12 章的修复见文末清单 |
